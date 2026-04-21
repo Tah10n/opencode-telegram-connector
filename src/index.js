@@ -7,6 +7,7 @@ import { OpenCodeClient } from "./opencode/client.js"
 import { startOpenCodeSseLoop } from "./opencode/sse.js"
 import { ensureStartupSession } from "./opencode/startup-session.js"
 import { ensureOpenCodeRunning, openAttachWindowWindows } from "./opencode/launcher.js"
+import { extractPatchFiles, formatChangedFilesText } from "./message-display.js"
 import { resolveSessionRoute } from "./session-route.js"
 import { StateStore, resolveDefaultStatePath, sessionKey } from "./state/store.js"
 import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "./session-list.js"
@@ -134,6 +135,13 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
   const logger = loggerIn || defaultLogger()
   const startedAt = Date.now()
   const sseDebugFilter = parseSseDebugFilter(process.env.DEBUG_SSE_ROUTING)
+  if (sseDebugFilter?.projectAlias) {
+    logger.info("SSE debug routing enabled:", process.env.DEBUG_SSE_ROUTING)
+  }
+  const mirrorCompaction = (() => {
+    const raw = String(process.env.MIRROR_COMPACTION || "").trim().toLowerCase()
+    return raw === "1" || raw === "true" || raw === "yes" || raw === "on"
+  })()
 
   const stateFile = config?.stateFile || resolveDefaultStatePath({ cwd: config?.cwd })
   const store = new StateStore({ filePath: stateFile, logger })
@@ -756,8 +764,20 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
 
     if (messageId) {
       const msg = await oc.getMessage(messageSessionId, messageId).catch(() => null)
-      const fetched = extractTextParts(msg)
-      if (fetched && fetched.trim()) text = fetched
+      if (!mirrorCompaction && (msg?.info?.mode === "compaction" || msg?.info?.agent === "compaction")) {
+        // don't surface internal compaction output
+      } else {
+        const fetched = extractTextParts(msg)
+        if (fetched && fetched.trim()) {
+          text = fetched
+        } else {
+          const files = extractPatchFiles(msg)
+          const summary = files.length
+            ? formatChangedFilesText(files, { baseDir: projects?.[binding.projectAlias]?.directory, limit: 10 })
+            : ""
+          if (summary) text = summary
+        }
+      }
     }
 
     if (!text || !text.trim()) {
@@ -1217,6 +1237,10 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
       }
 
       if (info.role === "assistant") {
+        if (!mirrorCompaction && (info.mode === "compaction" || info.agent === "compaction")) {
+          logSseDebug(projectAlias, sessionId, `drop=compaction msg=${info.id}`)
+          return
+        }
         const completed = normalizeEpochMs(info.time?.completed) != null
         const hasError = !!info.error
         if (!completed || hasError) {
@@ -1241,7 +1265,18 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
               logSseDebug(projectAlias, sessionId, `drop=assistant_message_before_start msg=${info.id}`)
               return
             }
-            const text = extractTextParts(msg)
+            if (!mirrorCompaction && (msg?.info?.mode === "compaction" || msg?.info?.agent === "compaction")) {
+              logSseDebug(projectAlias, sessionId, `drop=compaction_message msg=${info.id}`)
+              return
+            }
+
+            let text = extractTextParts(msg)
+            if (!text || !text.trim()) {
+              const files = extractPatchFiles(msg)
+              if (files.length) {
+                text = formatChangedFilesText(files, { baseDir: projects?.[projectAlias]?.directory, limit: 10 })
+              }
+            }
             if (!text || !text.trim()) {
               logSseDebug(projectAlias, sessionId, `drop=assistant_empty msg=${info.id}`)
               return
