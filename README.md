@@ -8,6 +8,17 @@ Small Node.js bridge that:
 - Lets you send messages from Telegram into the bound opencode session (optional prefix `TG_PREFIX`, default empty).
 - Lets you approve/deny opencode **permission** and answer **question** prompts via Telegram **buttons**.
 
+Unlike bots that keep a single "current project" and force you to switch back and forth, this connector binds each Telegram chat/topic to its own `{ projectAlias, sessionId }`. That means you can keep **multiple projects active at the same time** in different chats or forum topics and continue each session independently.
+
+## Key advantage
+
+This connector is optimized for **parallel multi-project work**:
+
+- one Telegram topic can stay bound to project A
+- another topic can stay bound to project B
+- each topic keeps its own opencode session binding
+- no manual global project switching is required between conversations
+
 ## Prereqs
 
 - Node.js 18+ (this repo has Node 24).

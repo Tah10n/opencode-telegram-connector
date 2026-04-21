@@ -1,5 +1,6 @@
 {
   "name": "telegram-opencode-connector",
+  "description": "Telegram connector for opencode with concurrent per-thread bindings across multiple projects.",
   "version": "0.1.0",
   "private": true,
   "license": "MIT",
