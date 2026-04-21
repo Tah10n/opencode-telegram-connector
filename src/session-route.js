@@ -2,7 +2,7 @@ import { sessionKey } from "./state/store.js"
 
 const NO_PARENT = ""
 
-export async function resolveSessionRoute({ projectAlias, sessionId, sessionIndex, getSession, parentBySessionKey, maxDepth = 8 }) {
+export async function resolveSessionRoute({ projectAlias, sessionId, sessionIndex, getSession, parentBySessionKey, maxDepth = 8, debug } = {}) {
   if (!projectAlias || !sessionId) return null
 
   let currentSessionId = sessionId
@@ -14,20 +14,31 @@ export async function resolveSessionRoute({ projectAlias, sessionId, sessionInde
     const currentKey = sessionKey(projectAlias, currentSessionId)
     const directRoute = sessionIndex?.[currentKey]
     if (directRoute) {
+      debug?.(`route hit session=${currentSessionId}`)
       return { route: directRoute, boundSessionId: currentSessionId }
     }
 
     let parentSessionId = parentBySessionKey.get(currentKey)
     if (parentSessionId === undefined) {
       const session = await getSession(currentSessionId).catch(() => null)
-      if (!session) return null
+      if (!session) {
+        debug?.(`route miss session=${currentSessionId} reason=session_lookup_failed`)
+        return null
+      }
       parentSessionId = typeof session.parentID === "string" && session.parentID.trim() ? session.parentID.trim() : NO_PARENT
       parentBySessionKey.set(currentKey, parentSessionId)
+      debug?.(`parent fetched session=${currentSessionId} parent=${parentSessionId || "(none)"}`)
+    } else {
+      debug?.(`parent cached session=${currentSessionId} parent=${parentSessionId || "(none)"}`)
     }
 
-    if (!parentSessionId) return null
+    if (!parentSessionId) {
+      debug?.(`route miss session=${currentSessionId} reason=no_parent`)
+      return null
+    }
     currentSessionId = parentSessionId
   }
 
+  debug?.(`route miss session=${sessionId} reason=cycle_or_depth`)
   return null
 }

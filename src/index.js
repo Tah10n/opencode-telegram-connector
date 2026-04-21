@@ -23,6 +23,16 @@ function defaultLogger() {
   }
 }
 
+function parseSseDebugFilter(rawValue) {
+  const raw = String(rawValue || "").trim()
+  if (!raw) return null
+  const [projectAlias, sessionId] = raw.split(":", 2)
+  return {
+    projectAlias: projectAlias ? projectAlias.trim() : "",
+    sessionId: sessionId ? sessionId.trim() : "",
+  }
+}
+
 class LruSet {
   constructor(limit) {
     this.limit = limit
@@ -123,6 +133,7 @@ function extractTextParts(message) {
 export async function startConnector({ config, logger: loggerIn } = {}) {
   const logger = loggerIn || defaultLogger()
   const startedAt = Date.now()
+  const sseDebugFilter = parseSseDebugFilter(process.env.DEBUG_SSE_ROUTING)
 
   const stateFile = config?.stateFile || resolveDefaultStatePath({ cwd: config?.cwd })
   const store = new StateStore({ filePath: stateFile, logger })
@@ -547,7 +558,20 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
       sessionIndex: store.get().sessionIndex || {},
       getSession: (id) => oc.getSession(id),
       parentBySessionKey: parentSessionBySession,
+      debug: shouldDebugSse(projectAlias, sessionId) ? (message) => logger.info(`[sse-debug] ${projectAlias} ${message}`) : undefined,
     })
+  }
+
+  function shouldDebugSse(projectAlias, sessionId) {
+    if (!sseDebugFilter?.projectAlias) return false
+    if (sseDebugFilter.projectAlias !== projectAlias) return false
+    if (sseDebugFilter.sessionId && sseDebugFilter.sessionId !== sessionId) return false
+    return true
+  }
+
+  function logSseDebug(projectAlias, sessionId, message) {
+    if (!shouldDebugSse(projectAlias, sessionId)) return
+    logger.info(`[sse-debug] ${projectAlias}${sessionId ? `:${sessionId}` : ""} ${message}`)
   }
 
   function eventStartedAfterLaunch(info, { allowCompletedAfterStart = false } = {}) {
@@ -1133,22 +1157,40 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
       const sessionId = props.sessionID
       const info = props.info
       if (!sessionId || !info?.id || !info?.role) return
+      logSseDebug(projectAlias, sessionId, `event type=message.updated role=${info.role} msg=${info.id}`)
       const sk = sessionKey(projectAlias, sessionId)
       const resolved = await resolveBoundRoute(projectAlias, sessionId)
-      if (!resolved?.route) return
+      if (!resolved?.route) {
+        logSseDebug(projectAlias, sessionId, "drop=no_route")
+        return
+      }
       const route = resolved.route
       const boundKey = sessionKey(projectAlias, resolved.boundSessionId)
 
-      if (!eventStartedAfterLaunch(info, { allowCompletedAfterStart: info.role === "assistant" })) return
+      if (resolved.boundSessionId !== sessionId) {
+        logSseDebug(projectAlias, sessionId, `drop=child_message bound=${resolved.boundSessionId}`)
+        return
+      }
+
+      if (!eventStartedAfterLaunch(info, { allowCompletedAfterStart: info.role === "assistant" })) {
+        logSseDebug(projectAlias, sessionId, "drop=before_connector_start")
+        return
+      }
 
       const oc = ocByAlias[projectAlias]
       const sets = ensureForwardedSets(sk)
 
       if (info.role === "user") {
-        if (sets.user.has(info.id)) return
+        if (sets.user.has(info.id)) {
+          logSseDebug(projectAlias, sessionId, `drop=user_already_forwarded msg=${info.id}`)
+          return
+        }
         const msg = await oc.getMessage(sessionId, info.id).catch(() => null)
         const text = extractTextParts(msg)
-        if (!text || !text.trim()) return
+        if (!text || !text.trim()) {
+          logSseDebug(projectAlias, sessionId, `drop=user_empty msg=${info.id}`)
+          return
+        }
         const mode = config.echoFilterMode ?? "recent"
 
         let isEcho = false
@@ -1163,17 +1205,24 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
             isEcho = true
           }
         }
-        if (isEcho) return
+        if (isEcho) {
+          logSseDebug(projectAlias, sessionId, `drop=user_echo msg=${info.id}`)
+          return
+        }
 
         const blocks = [{ type: "text", html: "<b>User</b>" }, ...formatMarkdownToTelegramHtmlBlocks(text)]
         await tg.sendHtmlBlocks(route.chatId, blocks, null, { message_thread_id: route.threadIdOr0 || undefined })
         sets.user.add(info.id)
+        logSseDebug(projectAlias, sessionId, `send=user msg=${info.id} thread=${route.threadIdOr0 || 0}`)
       }
 
       if (info.role === "assistant") {
         const completed = normalizeEpochMs(info.time?.completed) != null
         const hasError = !!info.error
-        if (!completed || hasError) return
+        if (!completed || hasError) {
+          logSseDebug(projectAlias, sessionId, `drop=assistant_incomplete msg=${info.id} completed=${completed} error=${hasError}`)
+          return
+        }
 
         // Remember the most recent assistant message for /sendlast.
         lastAssistantBySession.set(boundKey, { messageId: info.id, sessionId, text: null })
@@ -1182,12 +1231,21 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
         if (existing) clearTimeout(existing)
         const t = setTimeout(() => {
           assistantDebounce.delete(info.id)
-          if (sets.assistant.has(info.id)) return
+          if (sets.assistant.has(info.id)) {
+            logSseDebug(projectAlias, sessionId, `drop=assistant_already_forwarded msg=${info.id}`)
+            return
+          }
           void (async () => {
             const msg = await oc.getMessage(sessionId, info.id).catch(() => null)
-            if (!eventStartedAfterLaunch(msg?.info, { allowCompletedAfterStart: true })) return
+            if (!eventStartedAfterLaunch(msg?.info, { allowCompletedAfterStart: true })) {
+              logSseDebug(projectAlias, sessionId, `drop=assistant_message_before_start msg=${info.id}`)
+              return
+            }
             const text = extractTextParts(msg)
-            if (!text || !text.trim()) return
+            if (!text || !text.trim()) {
+              logSseDebug(projectAlias, sessionId, `drop=assistant_empty msg=${info.id}`)
+              return
+            }
 
             // Only attach text if this is still the latest.
             const current = lastAssistantBySession.get(boundKey)
@@ -1196,6 +1254,7 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
             const blocks = formatMarkdownToTelegramHtmlBlocks(text)
             await tg.sendHtmlBlocks(route.chatId, blocks, null, { message_thread_id: route.threadIdOr0 || undefined })
             sets.assistant.add(info.id)
+            logSseDebug(projectAlias, sessionId, `send=assistant msg=${info.id} thread=${route.threadIdOr0 || 0}`)
           })().catch(() => {})
         }, 250)
         assistantDebounce.set(info.id, t)
@@ -1205,8 +1264,12 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
 
     if (type === "permission.asked") {
       const sessionId = props.sessionID
+      logSseDebug(projectAlias, sessionId, `event type=permission.asked id=${props.id}`)
       const resolved = await resolveBoundRoute(projectAlias, sessionId)
-      if (!resolved?.route) return
+      if (!resolved?.route) {
+        logSseDebug(projectAlias, sessionId, "drop=permission_no_route")
+        return
+      }
       const route = resolved.route
       await ensureBaselineLoaded(projectAlias)
       if (!promptBaseline[projectAlias]?.loaded) return
@@ -1245,8 +1308,12 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
 
     if (type === "question.asked") {
       const sessionId = props.sessionID
+      logSseDebug(projectAlias, sessionId, `event type=question.asked id=${props.id}`)
       const resolved = await resolveBoundRoute(projectAlias, sessionId)
-      if (!resolved?.route) return
+      if (!resolved?.route) {
+        logSseDebug(projectAlias, sessionId, "drop=question_no_route")
+        return
+      }
       const route = resolved.route
       await ensureBaselineLoaded(projectAlias)
       if (!promptBaseline[projectAlias]?.loaded) return
