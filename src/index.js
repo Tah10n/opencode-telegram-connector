@@ -1147,8 +1147,6 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
       if (info.role === "user") {
         if (sets.user.has(info.id)) return
         const msg = await oc.getMessage(sessionId, info.id).catch(() => null)
-        const msgCreated = normalizeEpochMs(msg?.info?.time?.created)
-        if (msgCreated == null || msgCreated < startedAt) return
         const text = extractTextParts(msg)
         if (!text || !text.trim()) return
         const mode = config.echoFilterMode ?? "recent"

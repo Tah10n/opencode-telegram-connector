@@ -1,5 +1,7 @@
 import { sessionKey } from "./state/store.js"
 
+const NO_PARENT = ""
+
 export async function resolveSessionRoute({ projectAlias, sessionId, sessionIndex, getSession, parentBySessionKey, maxDepth = 8 }) {
   if (!projectAlias || !sessionId) return null
 
@@ -18,7 +20,8 @@ export async function resolveSessionRoute({ projectAlias, sessionId, sessionInde
     let parentSessionId = parentBySessionKey.get(currentKey)
     if (parentSessionId === undefined) {
       const session = await getSession(currentSessionId).catch(() => null)
-      parentSessionId = typeof session?.parentID === "string" && session.parentID.trim() ? session.parentID.trim() : null
+      if (!session) return null
+      parentSessionId = typeof session.parentID === "string" && session.parentID.trim() ? session.parentID.trim() : NO_PARENT
       parentBySessionKey.set(currentKey, parentSessionId)
     }
 

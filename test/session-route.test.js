@@ -79,6 +79,39 @@ test("resolveSessionRoute caches parent lookups", async () => {
   assert.equal(second.boundSessionId, "ses_parent")
 })
 
+test("resolveSessionRoute does not cache transient lookup failures", async () => {
+  const sessionIndex = {
+    "demo:ses_parent": { chatId: 10, threadIdOr0: 20 },
+  }
+  let callCount = 0
+  const parentBySessionKey = new Map()
+
+  const first = await resolveSessionRoute({
+    projectAlias: "demo",
+    sessionId: "ses_child",
+    sessionIndex,
+    getSession: async () => {
+      callCount += 1
+      throw new Error("temporary failure")
+    },
+    parentBySessionKey,
+  })
+  const second = await resolveSessionRoute({
+    projectAlias: "demo",
+    sessionId: "ses_child",
+    sessionIndex,
+    getSession: async () => {
+      callCount += 1
+      return { parentID: "ses_parent" }
+    },
+    parentBySessionKey,
+  })
+
+  assert.equal(first, null)
+  assert.equal(callCount, 2)
+  assert.equal(second?.boundSessionId, "ses_parent")
+})
+
 test("resolveSessionRoute returns null when no ancestor is bound", async () => {
   const result = await resolveSessionRoute({
     projectAlias: "demo",
