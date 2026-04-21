@@ -7,6 +7,7 @@ import { OpenCodeClient } from "./opencode/client.js"
 import { startOpenCodeSseLoop } from "./opencode/sse.js"
 import { ensureStartupSession } from "./opencode/startup-session.js"
 import { ensureOpenCodeRunning, openAttachWindowWindows } from "./opencode/launcher.js"
+import { resolveSessionRoute } from "./session-route.js"
 import { StateStore, resolveDefaultStatePath, sessionKey } from "./state/store.js"
 import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "./session-list.js"
 import { sanitizeBaseUrlForDisplay } from "./url-utils.js"
@@ -282,7 +283,8 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
   const forwardedBySession = new LruMap(2000) // sessionKey -> {user:LruSet, assistant:LruSet}
   const assistantDebounce = new Map() // msgId -> timeout
   const recentTgPromptsBySession = new LruMap(2000) // sessionKey -> LruSet(hash)
-  const lastAssistantBySession = new LruMap(2000) // sessionKey -> { messageId, text }
+  const lastAssistantBySession = new LruMap(2000) // sessionKey -> { messageId, sessionId, text }
+  const parentSessionBySession = new Map() // key `${projectAlias}:${sessionId}` -> parent session id or null
 
   const promptBaseline = {}
   const prompted = {}
@@ -534,6 +536,30 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
   async function bindCtxToSession(ctxMeta, projectAlias, sessionId) {
     store.setBinding(ctxMeta.ctxKey, { projectAlias, sessionId }, { chatId: ctxMeta.chatId, threadIdOr0: ctxMeta.threadIdOr0 })
     logger.info("Bound", ctxMeta.ctxKey, "->", projectAlias, sessionId)
+  }
+
+  async function resolveBoundRoute(projectAlias, sessionId) {
+    const oc = ocByAlias[projectAlias]
+    if (!oc || !sessionId) return null
+    return resolveSessionRoute({
+      projectAlias,
+      sessionId,
+      sessionIndex: store.get().sessionIndex || {},
+      getSession: (id) => oc.getSession(id),
+      parentBySessionKey: parentSessionBySession,
+    })
+  }
+
+  function eventStartedAfterLaunch(info, { allowCompletedAfterStart = false } = {}) {
+    if (allowCompletedAfterStart) {
+      const completedMs = normalizeEpochMs(info?.time?.completed)
+      if (completedMs != null) return completedMs >= startedAt
+      const updatedMs = normalizeEpochMs(info?.time?.updated)
+      if (updatedMs != null) return updatedMs >= startedAt
+    }
+    const createdMs = normalizeEpochMs(info?.time?.created)
+    if (createdMs != null) return createdMs >= startedAt
+    return true
   }
 
   async function ensureBaselineLoaded(projectAlias) {
@@ -1108,11 +1134,12 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
       const info = props.info
       if (!sessionId || !info?.id || !info?.role) return
       const sk = sessionKey(projectAlias, sessionId)
-      const route = store.get().sessionIndex[sk]
-      if (!route) return
+      const resolved = await resolveBoundRoute(projectAlias, sessionId)
+      if (!resolved?.route) return
+      const route = resolved.route
+      const boundKey = sessionKey(projectAlias, resolved.boundSessionId)
 
-      const createdMs = normalizeEpochMs(info.time?.created)
-      if (createdMs != null && createdMs < startedAt) return
+      if (!eventStartedAfterLaunch(info, { allowCompletedAfterStart: info.role === "assistant" })) return
 
       const oc = ocByAlias[projectAlias]
       const sets = ensureForwardedSets(sk)
@@ -1151,7 +1178,7 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
         if (!completed || hasError) return
 
         // Remember the most recent assistant message for /sendlast.
-        lastAssistantBySession.set(sk, { messageId: info.id, text: null })
+        lastAssistantBySession.set(boundKey, { messageId: info.id, sessionId, text: null })
 
         const existing = assistantDebounce.get(info.id)
         if (existing) clearTimeout(existing)
@@ -1160,14 +1187,13 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
           if (sets.assistant.has(info.id)) return
           void (async () => {
             const msg = await oc.getMessage(sessionId, info.id).catch(() => null)
-            const msgCreated = normalizeEpochMs(msg?.info?.time?.created)
-            if (msgCreated == null || msgCreated < startedAt) return
+            if (!eventStartedAfterLaunch(msg?.info, { allowCompletedAfterStart: true })) return
             const text = extractTextParts(msg)
             if (!text || !text.trim()) return
 
             // Only attach text if this is still the latest.
-            const current = lastAssistantBySession.get(sk)
-            if (current?.messageId === info.id) lastAssistantBySession.set(sk, { messageId: info.id, text })
+            const current = lastAssistantBySession.get(boundKey)
+            if (current?.messageId === info.id) lastAssistantBySession.set(boundKey, { messageId: info.id, sessionId, text })
 
             const blocks = formatMarkdownToTelegramHtmlBlocks(text)
             await tg.sendHtmlBlocks(route.chatId, blocks, null, { message_thread_id: route.threadIdOr0 || undefined })
@@ -1181,9 +1207,9 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
 
     if (type === "permission.asked") {
       const sessionId = props.sessionID
-      const sk = sessionKey(projectAlias, sessionId)
-      const route = store.get().sessionIndex[sk]
-      if (!route) return
+      const resolved = await resolveBoundRoute(projectAlias, sessionId)
+      if (!resolved?.route) return
+      const route = resolved.route
       await ensureBaselineLoaded(projectAlias)
       if (!promptBaseline[projectAlias]?.loaded) return
       if (promptBaseline[projectAlias].permission.has(props.id)) return
@@ -1221,9 +1247,9 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
 
     if (type === "question.asked") {
       const sessionId = props.sessionID
-      const sk = sessionKey(projectAlias, sessionId)
-      const route = store.get().sessionIndex[sk]
-      if (!route) return
+      const resolved = await resolveBoundRoute(projectAlias, sessionId)
+      if (!resolved?.route) return
+      const route = resolved.route
       await ensureBaselineLoaded(projectAlias)
       if (!promptBaseline[projectAlias]?.loaded) return
       if (promptBaseline[projectAlias].question.has(props.id)) return
