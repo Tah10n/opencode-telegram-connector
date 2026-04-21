@@ -4,7 +4,7 @@ Thanks for contributing.
 
 ## Development
 
-- Node.js 18+
+- Node.js 20+
 - ESM modules only
 - Prefer small, local changes
 - Do not commit secrets such as `.env`, `projects.json`, or runtime state

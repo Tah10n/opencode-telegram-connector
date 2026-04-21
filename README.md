@@ -21,7 +21,7 @@ This connector is optimized for **parallel multi-project work**:
 
 ## Prereqs
 
-- Node.js 18+ (this repo has Node 24).
+- Node.js 20+.
 - A Telegram bot token (via @BotFather).
 - opencode installed and available on PATH.
 
@@ -55,7 +55,7 @@ npm start
 - `/help`
 - `/bind <projectAlias>` (bind current thread to that project's startup session)
 - `/new [title]` (create a new session in this thread's project and bind)
-- `/use <sessionId>` (bind to an existing session in this thread's project)
+- `/use <sessionId|shareLink>` (bind to an existing session in this thread's project)
 - `/sessions` (list recent sessions for this thread's current project and switch via buttons)
 - `/status` (show current binding)
 - `/projects` (list project aliases)

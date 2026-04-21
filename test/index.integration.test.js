@@ -161,7 +161,7 @@ function createFakeOpenCodeClient({
 } = {}) {
   const calls = {
     health: 0,
-    listSessions: 0,
+    listSessions: [],
     getSession: [],
     createSession: [],
     promptAsync: [],
@@ -179,9 +179,9 @@ function createFakeOpenCodeClient({
       calls.health += 1
       return healthImpl ? healthImpl() : { ok: true }
     },
-    async listSessions() {
-      calls.listSessions += 1
-      return listSessionsImpl ? listSessionsImpl() : startupSessions
+    async listSessions(input = {}) {
+      calls.listSessions.push(input)
+      return listSessionsImpl ? listSessionsImpl(input) : startupSessions
     },
     async getSession(sessionId) {
       calls.getSession.push(sessionId)
@@ -230,7 +230,9 @@ async function createHarness({
   messagesById,
   tgOptions,
   ocOptions,
+  ocOptionsByAlias,
   projectPatch,
+  extraProjects,
   initialUpdates = [],
   ensureOpenCodeRunningImpl,
   ensureStartupSessionImpl,
@@ -244,7 +246,31 @@ async function createHarness({
 
   const tg = createFakeTelegramClient(tgOptions)
   for (const update of initialUpdates) tg.enqueue(update)
-  const { client: oc, calls: ocCalls } = createFakeOpenCodeClient({ startupSessions, messagesById, ...(ocOptions || {}) })
+  const projects = {
+    demo: {
+      baseUrl: "http://127.0.0.1:4312",
+      directory: path.join(dir, "demo"),
+      autoStart: false,
+      startMode: "tui",
+      openAttachOnNew: false,
+      username: "",
+      password: "",
+      ...(projectPatch || {}),
+    },
+    ...(extraProjects || {}),
+  }
+
+  const ocClientsByAlias = {}
+  const ocCallsByAlias = {}
+  for (const alias of Object.keys(projects)) {
+    const perAliasOptions = alias === "demo" ? { startupSessions, messagesById, ...(ocOptions || {}) } : { ...(ocOptionsByAlias?.[alias] || {}) }
+    const { client, calls } = createFakeOpenCodeClient(perAliasOptions)
+    ocClientsByAlias[alias] = client
+    ocCallsByAlias[alias] = calls
+  }
+
+  const oc = ocClientsByAlias.demo
+  const ocCalls = ocCallsByAlias.demo
   const sseHandlers = new Map()
 
   const config = {
@@ -258,26 +284,17 @@ async function createHarness({
       botToken: "test-token",
       allowedUserId: 42,
     },
-    projects: {
-      demo: {
-        baseUrl: "http://127.0.0.1:4312",
-        directory: path.join(dir, "demo"),
-        autoStart: false,
-        startMode: "tui",
-        openAttachOnNew: false,
-        username: "",
-        password: "",
-        ...(projectPatch || {}),
-      },
-    },
+    projects,
   }
+
+  const ocAliases = Object.keys(projects)
 
   const connector = await startConnector({
     config,
     logger: makeLogger(),
     deps: {
       createTelegramClient: () => tg,
-      createOpenCodeClient: () => oc,
+      createOpenCodeClient: () => ocClientsByAlias[ocAliases.shift()],
       startSseLoop: ({ projectAlias, ...rest }) => {
         sseHandlers.set(projectAlias, rest)
         return { stop() {} }
@@ -296,6 +313,8 @@ async function createHarness({
     tg,
     oc,
     ocCalls,
+    ocByAlias: ocClientsByAlias,
+    ocCallsByAlias,
     connector,
     async emitSse(projectAlias, evt) {
       const handler = sseHandlers.get(projectAlias)
@@ -378,6 +397,369 @@ test("startConnector mirrors assistant SSE output and /sendlast replays the late
       { sessionId: "ses_1", messageId: "msg_assistant" },
       { sessionId: "ses_1", messageId: "msg_assistant" },
     ])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector /use without arguments returns usage", async () => {
+  const harness = await createHarness()
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(211, "/use"))
+
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+
+    assert.ok(harness.tg.sentMessages.some((entry) => entry.text === "Usage: /use <sessionId|shareLink>"))
+    assert.deepEqual(harness.ocCalls.getSession, [])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector /use keeps supporting raw session ids", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 220,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_current" },
+      },
+      sessionIndex: {
+        "demo:ses_current": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(221, "/use ses_manual"))
+
+    await waitFor(() => harness.ocCalls.getSession.includes("ses_manual"))
+    await delay(30)
+    await harness.connector.stop()
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.bindings, {
+      "100:7": { projectAlias: "demo", sessionId: "ses_manual" },
+    })
+    assert.ok(harness.tg.sentMessages.some((entry) => entry.text.includes("Switched to session: ses_manual")))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector /use share link requires an existing binding", async () => {
+  const harness = await createHarness()
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(231, "/use https://opncd.ai/s/abc123"))
+
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+
+    assert.ok(harness.tg.sentMessages.some((entry) => entry.text === "Not bound. Use /bind <projectAlias> first."))
+    assert.deepEqual(harness.ocCalls.getSession, [])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector /use rejects unsupported links", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 240,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_current" },
+      },
+      sessionIndex: {
+        "demo:ses_current": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(241, "/use https://opncd.ai/session/ses_123"))
+
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+
+    assert.ok(
+      harness.tg.sentMessages.some((entry) =>
+        entry.text.startsWith("Unsupported link. Use an OpenCode share link like https://opncd.ai/s/<share-id> or a raw session id."),
+      ),
+    )
+    assert.deepEqual(harness.ocCalls.getSession, [])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector /use accepts a shared session link for the current project", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 250,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_current" },
+      },
+      sessionIndex: {
+        "demo:ses_current": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    ocOptions: {
+      listSessionsImpl: () => [
+        { id: "ses_current", title: "Current" },
+        { id: "ses_shared", title: "Shared", share: { url: "https://opncd.ai/s/abc123/" } },
+      ],
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(251, "/use https://opncd.ai/s/abc123?utm_source=tg"))
+
+    await waitFor(() => harness.ocCalls.getSession.includes("ses_shared"))
+    await delay(30)
+    await harness.connector.stop()
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.bindings, {
+      "100:7": { projectAlias: "demo", sessionId: "ses_shared" },
+    })
+    assert.ok(
+      harness.ocCalls.listSessions.some(
+        (call) => call?.directory === path.join(harness.dir, "demo") && !Object.hasOwn(call, "limit"),
+      ),
+    )
+    assert.ok(harness.tg.sentMessages.some((entry) => entry.text.includes("Switched to session: ses_shared")))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector /use reports when a shared session link is not found", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 255,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_current" },
+      },
+      sessionIndex: {
+        "demo:ses_current": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    ocOptions: {
+      listSessionsImpl: () => [{ id: "ses_current", title: "Current" }],
+    },
+    extraProjects: {
+      other: {
+        baseUrl: "http://127.0.0.1:4313",
+        directory: path.join(os.tmpdir(), `telegram-connector-other-${crypto.randomUUID()}`),
+        autoStart: false,
+        startMode: "tui",
+        openAttachOnNew: false,
+        username: "",
+        password: "",
+      },
+    },
+    ocOptionsByAlias: {
+      other: {
+        listSessionsImpl: () => [{ id: "ses_other", share: { url: "https://opncd.ai/s/not-this-one" } }],
+      },
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(256, "/use https://opncd.ai/s/missing"))
+
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+    await delay(30)
+    await harness.connector.stop()
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.bindings, {
+      "100:7": { projectAlias: "demo", sessionId: "ses_current" },
+    })
+    assert.ok(
+      harness.tg.sentMessages.some((entry) => entry.text.includes("Share link not found in project 'demo'")),
+    )
+    assert.deepEqual(harness.ocCalls.getSession, [])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector rejects a shared session link from a different project", async () => {
+  const otherDir = path.join(os.tmpdir(), `telegram-connector-other-${crypto.randomUUID()}`)
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 260,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_current" },
+      },
+      sessionIndex: {
+        "demo:ses_current": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    ocOptions: {
+      listSessionsImpl: () => [{ id: "ses_current", title: "Current" }],
+    },
+    extraProjects: {
+      other: {
+        baseUrl: "http://127.0.0.1:4313",
+        directory: otherDir,
+        autoStart: false,
+        startMode: "tui",
+        openAttachOnNew: false,
+        username: "",
+        password: "",
+      },
+    },
+    ocOptionsByAlias: {
+      other: {
+        listSessionsImpl: () => [{ id: "ses_other", share: { url: "https://opncd.ai/s/xyz789" } }],
+      },
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(261, "/use https://opncd.ai/s/xyz789"))
+
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+    await delay(30)
+    await harness.connector.stop()
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.bindings, {
+      "100:7": { projectAlias: "demo", sessionId: "ses_current" },
+    })
+    assert.ok(
+      harness.tg.sentMessages.some((entry) => entry.text.includes("belongs to project 'other'") && entry.text.includes("Use /bind other first")),
+    )
+    assert.ok(harness.ocCallsByAlias.other.listSessions.some((call) => call?.directory === otherDir && !Object.hasOwn(call, "limit")))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector /use keeps checking other projects when one lookup fails", async () => {
+  const brokenDir = path.join(os.tmpdir(), `telegram-connector-broken-${crypto.randomUUID()}`)
+  const otherDir = path.join(os.tmpdir(), `telegram-connector-other-${crypto.randomUUID()}`)
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 270,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_current" },
+      },
+      sessionIndex: {
+        "demo:ses_current": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    ocOptions: {
+      listSessionsImpl: () => [{ id: "ses_current", title: "Current" }],
+    },
+    extraProjects: {
+      broken: {
+        baseUrl: "http://127.0.0.1:4313",
+        directory: brokenDir,
+        autoStart: false,
+        startMode: "tui",
+        openAttachOnNew: false,
+        username: "",
+        password: "",
+      },
+      other: {
+        baseUrl: "http://127.0.0.1:4314",
+        directory: otherDir,
+        autoStart: false,
+        startMode: "tui",
+        openAttachOnNew: false,
+        username: "",
+        password: "",
+      },
+    },
+    ocOptionsByAlias: {
+      broken: {
+        listSessionsImpl: () => {
+          throw new Error("temporary failure")
+        },
+      },
+      other: {
+        listSessionsImpl: () => [{ id: "ses_other", share: { url: "https://opncd.ai/s/xyz789" } }],
+      },
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(271, "/use https://opncd.ai/s/xyz789"))
+
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+    await delay(30)
+    await harness.connector.stop()
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.bindings, {
+      "100:7": { projectAlias: "demo", sessionId: "ses_current" },
+    })
+    assert.ok(
+      harness.tg.sentMessages.some((entry) => entry.text.includes("belongs to project 'other'") && entry.text.includes("Use /bind other first")),
+    )
+    assert.ok(harness.ocCallsByAlias.broken.listSessions.some((call) => call?.directory === brokenDir && !Object.hasOwn(call, "limit")))
+    assert.ok(harness.ocCallsByAlias.other.listSessions.some((call) => call?.directory === otherDir && !Object.hasOwn(call, "limit")))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector /use reports cross-project lookup failures honestly", async () => {
+  const brokenDir = path.join(os.tmpdir(), `telegram-connector-broken-${crypto.randomUUID()}`)
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 280,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_current" },
+      },
+      sessionIndex: {
+        "demo:ses_current": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    ocOptions: {
+      listSessionsImpl: () => [{ id: "ses_current", title: "Current" }],
+    },
+    extraProjects: {
+      broken: {
+        baseUrl: "http://127.0.0.1:4313",
+        directory: brokenDir,
+        autoStart: false,
+        startMode: "tui",
+        openAttachOnNew: false,
+        username: "",
+        password: "",
+      },
+    },
+    ocOptionsByAlias: {
+      broken: {
+        listSessionsImpl: () => {
+          throw new Error("temporary failure")
+        },
+      },
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(281, "/use https://opncd.ai/s/missing"))
+
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+    await delay(30)
+    await harness.connector.stop()
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.bindings, {
+      "100:7": { projectAlias: "demo", sessionId: "ses_current" },
+    })
+    assert.ok(
+      harness.tg.sentMessages.some(
+        (entry) =>
+          entry.text.includes("Share link was not found in project 'demo'") &&
+          entry.text.includes("these project lookups failed: broken"),
+      ),
+    )
+    assert.ok(harness.ocCallsByAlias.broken.listSessions.some((call) => call?.directory === brokenDir && !Object.hasOwn(call, "limit")))
   } finally {
     await harness.connector.stop()
   }

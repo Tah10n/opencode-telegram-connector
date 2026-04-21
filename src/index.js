@@ -8,6 +8,7 @@ import { startOpenCodeSseLoop } from "./opencode/sse.js"
 import { ensureStartupSession } from "./opencode/startup-session.js"
 import { ensureOpenCodeRunning, openAttachWindowWindows } from "./opencode/launcher.js"
 import { extractPatchFiles, formatChangedFilesText } from "./message-display.js"
+import { findSessionByShareUrl, parseSessionReference } from "./session-ref.js"
 import { resolveSessionRoute } from "./session-route.js"
 import { StateStore, resolveDefaultStatePath, sessionKey } from "./state/store.js"
 import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "./session-list.js"
@@ -20,7 +21,9 @@ function now() {
 function defaultLogger() {
   return {
     info: (...args) => console.log(now(), ...args),
+    warn: (...args) => console.warn(now(), ...args),
     error: (...args) => console.error(now(), ...args),
+    debug: (...args) => console.debug(now(), ...args),
   }
 }
 
@@ -681,8 +684,13 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   }
 
   async function handleUseCommand(ctxMeta, sessionId) {
-    if (!sessionId) {
-      await sendToThread(ctxMeta, "Usage: /use <sessionId>")
+    const sessionRef = parseSessionReference(sessionId)
+    if (!sessionRef) {
+      await sendToThread(ctxMeta, "Usage: /use <sessionId|shareLink>")
+      return
+    }
+    if (sessionRef.type === "invalid-link") {
+      await sendToThread(ctxMeta, "Unsupported link. Use an OpenCode share link like https://opncd.ai/s/<share-id> or a raw session id.")
       return
     }
     const binding = store.getBinding(ctxMeta.ctxKey)
@@ -691,10 +699,66 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       return
     }
     const oc = ocByAlias[binding.projectAlias]
+
+    async function listSessionsForShareLookup(projectAlias) {
+      // For share-link lookup we intentionally request the full session list for the
+      // project instead of a recent-session subset, so older shared sessions still resolve.
+      return ocByAlias[projectAlias].listSessions({ directory: projects?.[projectAlias]?.directory })
+    }
+
     try {
-      await oc.getSession(sessionId)
-      await bindCtxToSession(ctxMeta, binding.projectAlias, sessionId)
-      await sendToThread(ctxMeta, `Switched to session: ${sessionId}`)
+      let targetSessionId = sessionRef.sessionId
+
+      if (sessionRef.type === "share-link") {
+        const currentSessions = await listSessionsForShareLookup(binding.projectAlias)
+        const currentMatch = findSessionByShareUrl(currentSessions, sessionRef.shareUrl)
+        if (currentMatch?.id) {
+          targetSessionId = currentMatch.id
+        } else {
+          let mismatch = null
+          const otherLookupErrors = []
+          for (const alias of Object.keys(projects)) {
+            if (alias === binding.projectAlias) continue
+            try {
+              const otherSessions = await listSessionsForShareLookup(alias)
+              const otherMatch = findSessionByShareUrl(otherSessions, sessionRef.shareUrl)
+              if (otherMatch?.id) {
+                mismatch = { projectAlias: alias, sessionId: otherMatch.id }
+                break
+              }
+            } catch (err) {
+              logger.warn(`Failed to check share link against project '${alias}':`, err?.message || String(err))
+              otherLookupErrors.push(alias)
+            }
+          }
+
+          if (mismatch) {
+            await sendToThread(
+              ctxMeta,
+              `This share link belongs to project '${mismatch.projectAlias}' (session: ${mismatch.sessionId}), but this thread is bound to '${binding.projectAlias}'. Use /bind ${mismatch.projectAlias} first.`,
+            )
+            return
+          }
+
+          if (otherLookupErrors.length) {
+            await sendToThread(
+              ctxMeta,
+              `Share link was not found in project '${binding.projectAlias}', but these project lookups failed: ${otherLookupErrors.join(", ")}. The link may belong to one of them; try again when those projects are available.`,
+            )
+            return
+          }
+
+          await sendToThread(
+            ctxMeta,
+            `Share link not found in project '${binding.projectAlias}'. It may belong to a different project or may not be shared on this server.`,
+          )
+          return
+        }
+      }
+
+      await oc.getSession(targetSessionId)
+      await bindCtxToSession(ctxMeta, binding.projectAlias, targetSessionId)
+      await sendToThread(ctxMeta, `Switched to session: ${targetSessionId}`)
     } catch (err) {
       await sendToThread(ctxMeta, formatProjectUnavailable(binding.projectAlias, err)).catch(() => {})
     }
@@ -891,7 +955,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
             "Commands:",
             "/bind <projectAlias>",
             "/new [title]",
-            "/use <sessionId>",
+            "/use <sessionId|shareLink>",
             "/sessions",
             "/status",
             "/sendlast",
