@@ -1,0 +1,66 @@
+function clampString(value, max) {
+  const str = String(value ?? "").trim()
+  if (!str) return ""
+  if (str.length <= max) return str
+  return `${str.slice(0, Math.max(0, max - 1))}…`
+}
+
+function sessionIdOf(session) {
+  const id = session?.id
+  return typeof id === "string" && id.trim() ? id.trim() : ""
+}
+
+function sessionTitleOf(session) {
+  const title = session?.title
+  return typeof title === "string" && title.trim() ? clampString(title, 80) : ""
+}
+
+function sessionMarkers(sessionId, { currentSessionId, startupSessionId } = {}) {
+  const markers = []
+  if (sessionId && sessionId === currentSessionId) markers.push("current")
+  if (sessionId && sessionId === startupSessionId) markers.push("startup")
+  return markers
+}
+
+export function formatSessionsListText(projectAlias, sessions, { currentSessionId, startupSessionId, limit = 10 } = {}) {
+  const safeProjectAlias = String(projectAlias || "").trim() || "(unknown)"
+  const normalized = Array.isArray(sessions)
+    ? sessions
+        .map((session) => {
+          const id = sessionIdOf(session)
+          if (!id) return null
+          return {
+            id,
+            title: sessionTitleOf(session),
+          }
+        })
+        .filter(Boolean)
+    : []
+
+  const lines = [`Sessions for '${safeProjectAlias}':`]
+  if (currentSessionId) lines.push(`Current: ${currentSessionId}`)
+  if (startupSessionId && startupSessionId !== currentSessionId) lines.push(`Startup: ${startupSessionId}`)
+  lines.push("")
+
+  if (normalized.length === 0) {
+    lines.push("No sessions found.")
+    lines.push("Use /new to create one or /use <sessionId> to switch.")
+    return lines.join("\n")
+  }
+
+  lines.push("Recent sessions:")
+  for (const session of normalized.slice(0, limit)) {
+    const markers = sessionMarkers(session.id, { currentSessionId, startupSessionId })
+    const suffix = []
+    if (markers.length) suffix.push(`[${markers.join(", ")}]`)
+    if (session.title) suffix.push(`— ${session.title}`)
+    lines.push(`- ${session.id}${suffix.length ? ` ${suffix.join(" ")}` : ""}`)
+  }
+
+  if (normalized.length > limit) {
+    lines.push(`…and ${normalized.length - limit} more.`)
+  }
+  lines.push("")
+  lines.push("Use /use <sessionId> to switch.")
+  return lines.join("\n")
+}

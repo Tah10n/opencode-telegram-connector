@@ -56,6 +56,7 @@ npm start
 - `/bind <projectAlias>` (bind current thread to that project's startup session)
 - `/new [title]` (create a new session in this thread's project and bind)
 - `/use <sessionId>` (bind to an existing session in this thread's project)
+- `/sessions` (list recent sessions for this thread's current project)
 - `/status` (show current binding)
 - `/projects` (list project aliases)
 - `/unbind`

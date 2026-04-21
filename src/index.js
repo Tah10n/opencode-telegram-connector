@@ -8,6 +8,7 @@ import { startOpenCodeSseLoop } from "./opencode/sse.js"
 import { ensureStartupSession } from "./opencode/startup-session.js"
 import { ensureOpenCodeRunning, openAttachWindowWindows } from "./opencode/launcher.js"
 import { StateStore, resolveDefaultStatePath, sessionKey } from "./state/store.js"
+import { formatSessionsListText } from "./session-list.js"
 import { sanitizeBaseUrlForDisplay } from "./url-utils.js"
 
 function now() {
@@ -149,6 +150,7 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
       { command: "bind", description: "Привязать чат к проекту (спросит alias)" },
       { command: "new", description: "Создать новую сессию" },
       { command: "use", description: "Переключиться на сессию" },
+      { command: "sessions", description: "Недавние сессии проекта" },
       { command: "status", description: "Показать текущую привязку" },
       { command: "sendlast", description: "Отправить последнее сообщение модели" },
       { command: "unbind", description: "Убрать привязку" },
@@ -631,6 +633,26 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
     }
   }
 
+  async function handleSessions(ctxMeta) {
+    const binding = store.getBinding(ctxMeta.ctxKey)
+    if (!binding) {
+      await sendToThread(ctxMeta, "Not bound. Use /bind <projectAlias> first.")
+      return
+    }
+    const oc = ocByAlias[binding.projectAlias]
+    try {
+      const sessions = await oc.listSessions({ directory: projects?.[binding.projectAlias]?.directory, limit: 10 })
+      markProjectUp(binding.projectAlias)
+      const text = formatSessionsListText(binding.projectAlias, sessions, {
+        currentSessionId: binding.sessionId,
+        startupSessionId: startupSessionByProject[binding.projectAlias],
+      })
+      await sendToThread(ctxMeta, text)
+    } catch (err) {
+      await sendToThread(ctxMeta, formatProjectUnavailable(binding.projectAlias, err)).catch(() => {})
+    }
+  }
+
   async function handleWhere(ctxMeta) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
@@ -765,6 +787,7 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
             "/bind <projectAlias>",
             "/new [title]",
             "/use <sessionId>",
+            "/sessions",
             "/status",
             "/sendlast",
             "/projects",
@@ -785,6 +808,7 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
       }
       if (cmd === "/new") return handleNewCommand(ctxMeta, args)
       if (cmd === "/use") return handleUseCommand(ctxMeta, argv[0])
+      if (cmd === "/sessions") return handleSessions(ctxMeta)
       if (cmd === "/status") return handleWhere(ctxMeta)
       if (cmd === "/sendlast") return handleSendLast(ctxMeta)
       if (cmd === "/projects") return handleProjects(ctxMeta)
