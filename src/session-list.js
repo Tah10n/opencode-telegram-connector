@@ -37,12 +37,15 @@ export function normalizeSessionsList(sessions) {
     : []
 }
 
-export function formatSessionButtonLabel(sessionId, { currentSessionId, startupSessionId } = {}) {
+export function formatSessionButtonLabel(session, { currentSessionId, startupSessionId } = {}) {
+  const sessionId = typeof session === "string" ? session : session?.id
+  const title = typeof session === "string" ? "" : session?.title
   const markers = sessionMarkers(sessionId, { currentSessionId, startupSessionId })
   let prefix = ""
   if (markers.includes("current")) prefix += "✅ "
   if (markers.includes("startup")) prefix += "🏁 "
-  return `${prefix}${clampString(sessionId, 48)}`
+  const label = title ? clampString(title, 48) : clampString(sessionId, 48)
+  return `${prefix}${label}`
 }
 
 export function formatSessionsListText(projectAlias, sessions, { currentSessionId, startupSessionId, limit = 10 } = {}) {

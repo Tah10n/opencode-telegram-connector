@@ -652,7 +652,7 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
     return makeInlineKeyboard(
       normalized.map((session) => [
         {
-          text: formatSessionButtonLabel(session.id, { currentSessionId, startupSessionId }),
+          text: formatSessionButtonLabel(session, { currentSessionId, startupSessionId }),
           callback_data: cb.pack(`s|${projectAlias}|${session.id}`),
         },
       ]),

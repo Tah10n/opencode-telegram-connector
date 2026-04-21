@@ -50,8 +50,15 @@ test("normalizeSessionsList keeps valid ids and trimmed titles", () => {
 
 test("formatSessionButtonLabel adds current and startup markers", () => {
   assert.equal(
-    formatSessionButtonLabel("ses_1", { currentSessionId: "ses_1", startupSessionId: "ses_1" }),
-    "✅ 🏁 ses_1",
+    formatSessionButtonLabel({ id: "ses_1", title: "Current session" }, { currentSessionId: "ses_1", startupSessionId: "ses_1" }),
+    "✅ 🏁 Current session",
   )
-  assert.equal(formatSessionButtonLabel("ses_2", { currentSessionId: "ses_1", startupSessionId: "ses_2" }), "🏁 ses_2")
+  assert.equal(
+    formatSessionButtonLabel({ id: "ses_2", title: "Startup session" }, { currentSessionId: "ses_1", startupSessionId: "ses_2" }),
+    "🏁 Startup session",
+  )
+})
+
+test("formatSessionButtonLabel falls back to session id when title is missing", () => {
+  assert.equal(formatSessionButtonLabel({ id: "ses_3", title: "" }), "ses_3")
 })
