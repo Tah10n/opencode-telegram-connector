@@ -1,0 +1,19 @@
+{
+  "name": "telegram-opencode-connector",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "telegram-opencode-connector": "./src/cli.js"
+  },
+  "scripts": {
+    "start": "node src/cli.js",
+    "check": "node --check src/cli.js && node --check src/index.js && node --check src/opencode/launcher.js && node --check src/opencode/sse.js && node --check src/opencode/startup-session.js && node --check src/url-utils.js",
+    "lint": "npm run check",
+    "test": "node --test"
+  }
+}

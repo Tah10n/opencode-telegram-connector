@@ -1,0 +1,17 @@
+{
+  "pocket": {
+    "directory": "C:/Users/me/dev/pocket",
+    "port": 4100,
+    "autoStart": true,
+    "startMode": "tui",
+    "openAttachOnNew": true,
+    "username": "opencode",
+    "passwordEnv": "POCKET_OPENCODE_PASSWORD"
+  },
+  "foo": {
+    "directory": "C:/Users/me/dev/foo",
+    "port": 4101,
+    "autoStart": true,
+    "startMode": "tui"
+  }
+}
