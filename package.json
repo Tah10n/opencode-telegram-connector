@@ -12,7 +12,7 @@
   },
   "scripts": {
     "start": "node src/cli.js",
-    "check": "node --check src/cli.js && node --check src/index.js && node --check src/opencode/launcher.js && node --check src/opencode/sse.js && node --check src/opencode/startup-session.js && node --check src/url-utils.js",
+    "check": "node scripts/check-syntax.mjs",
     "lint": "npm run check",
     "test": "node --test"
   }
