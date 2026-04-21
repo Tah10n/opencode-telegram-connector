@@ -43,6 +43,36 @@ test("StateStore replaces previous context binding and unbind clears the session
   assert.deepEqual(store.get().sessionIndex, {})
 })
 
+test("StateStore keeps multiple topics in the same chat isolated", () => {
+  const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-state.json"), logger: makeLogger() })
+  store.scheduleSave = () => {}
+
+  store.setBinding("100:0", { projectAlias: "demo", sessionId: "ses_main" }, { chatId: 100, threadIdOr0: 0 })
+  store.setBinding("100:11", { projectAlias: "demo", sessionId: "ses_topic" }, { chatId: 100, threadIdOr0: 11 })
+
+  assert.deepEqual(store.getBinding("100:0"), { projectAlias: "demo", sessionId: "ses_main" })
+  assert.deepEqual(store.getBinding("100:11"), { projectAlias: "demo", sessionId: "ses_topic" })
+  assert.deepEqual(store.get().sessionIndex, {
+    "demo:ses_main": { chatId: 100, threadIdOr0: 0 },
+    "demo:ses_topic": { chatId: 100, threadIdOr0: 11 },
+  })
+})
+
+test("StateStore unbind removes only the targeted topic binding", () => {
+  const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-state.json"), logger: makeLogger() })
+  store.scheduleSave = () => {}
+
+  store.setBinding("100:7", { projectAlias: "demo", sessionId: "ses_alpha" }, { chatId: 100, threadIdOr0: 7 })
+  store.setBinding("100:9", { projectAlias: "demo", sessionId: "ses_beta" }, { chatId: 100, threadIdOr0: 9 })
+
+  assert.equal(store.unbind("100:7"), true)
+  assert.equal(store.getBinding("100:7"), null)
+  assert.deepEqual(store.getBinding("100:9"), { projectAlias: "demo", sessionId: "ses_beta" })
+  assert.deepEqual(store.get().sessionIndex, {
+    "demo:ses_beta": { chatId: 100, threadIdOr0: 9 },
+  })
+})
+
 test("StateStore migrates legacy state and flush persists the new schema", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")

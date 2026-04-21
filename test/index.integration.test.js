@@ -47,12 +47,12 @@ async function waitFor(predicate, { timeoutMs = 1500, intervalMs = 10 } = {}) {
   throw new Error("Timed out waiting for condition")
 }
 
-function makeMessageUpdate(updateId, text, { userId = 42, chatId = 100, threadIdOr0 = 7, messageId = updateId } = {}) {
+function makeMessageUpdate(updateId, text, { userId = 42, chatId = 100, chatType = "supergroup", threadIdOr0 = 7, messageId = updateId } = {}) {
   return {
     update_id: updateId,
     message: {
       message_id: messageId,
-      chat: { id: chatId, type: "supergroup" },
+      chat: { id: chatId, type: chatType },
       from: { id: userId },
       ...(threadIdOr0 ? { message_thread_id: threadIdOr0 } : {}),
       text,
@@ -60,7 +60,7 @@ function makeMessageUpdate(updateId, text, { userId = 42, chatId = 100, threadId
   }
 }
 
-function makeCallbackUpdate(updateId, data, { userId = 42, chatId = 100, threadIdOr0 = 7, messageId = 900 } = {}) {
+function makeCallbackUpdate(updateId, data, { userId = 42, chatId = 100, chatType = "supergroup", threadIdOr0 = 7, messageId = 900 } = {}) {
   return {
     update_id: updateId,
     callback_query: {
@@ -69,7 +69,7 @@ function makeCallbackUpdate(updateId, data, { userId = 42, chatId = 100, threadI
       data,
       message: {
         message_id: messageId,
-        chat: { id: chatId, type: "supergroup" },
+        chat: { id: chatId, type: chatType },
         ...(threadIdOr0 ? { message_thread_id: threadIdOr0 } : {}),
       },
     },
@@ -151,6 +151,7 @@ function createFakeOpenCodeClient({
   listSessionsImpl,
   getSessionImpl,
   createSessionImpl,
+  abortSessionImpl,
   promptAsyncImpl,
   getMessageImpl,
   replyPermissionImpl,
@@ -164,6 +165,7 @@ function createFakeOpenCodeClient({
     listSessions: [],
     getSession: [],
     createSession: [],
+    abortSession: [],
     promptAsync: [],
     getMessage: [],
     replyPermission: [],
@@ -190,6 +192,10 @@ function createFakeOpenCodeClient({
     async createSession(input = {}) {
       calls.createSession.push(input)
       return createSessionImpl ? createSessionImpl(input) : { id: "ses_created" }
+    },
+    async abortSession(sessionId) {
+      calls.abortSession.push(sessionId)
+      return abortSessionImpl ? abortSessionImpl(sessionId) : true
     },
     async promptAsync(sessionId, text) {
       calls.promptAsync.push({ sessionId, text })
@@ -320,6 +326,16 @@ async function createHarness({
       const handler = sseHandlers.get(projectAlias)
       assert.ok(handler, `Missing SSE handler for ${projectAlias}`)
       await handler.onEvent({ projectAlias, evt })
+    },
+    async connectSse(projectAlias) {
+      const handler = sseHandlers.get(projectAlias)
+      assert.ok(handler, `Missing SSE handler for ${projectAlias}`)
+      await handler.onConnect?.({ projectAlias })
+    },
+    async failSse(projectAlias, err) {
+      const handler = sseHandlers.get(projectAlias)
+      assert.ok(handler, `Missing SSE handler for ${projectAlias}`)
+      await handler.onError?.({ projectAlias, err })
     },
   }
 }
@@ -762,6 +778,265 @@ test("startConnector /use reports cross-project lookup failures honestly", async
     assert.ok(harness.ocCallsByAlias.broken.listSessions.some((call) => call?.directory === brokenDir && !Object.hasOwn(call, "limit")))
   } finally {
     await harness.connector.stop()
+  }
+})
+
+test("startConnector /abort aborts the currently bound session", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 290,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_current" },
+      },
+      sessionIndex: {
+        "demo:ses_current": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(291, "/abort"))
+
+    await waitFor(() => harness.ocCalls.abortSession.length === 1)
+
+    assert.deepEqual(harness.ocCalls.abortSession, ["ses_current"])
+    assert.ok(harness.tg.sentMessages.some((entry) => entry.text === "Abort requested for session: ses_current"))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector /abort without binding returns guidance", async () => {
+  const harness = await createHarness()
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(292, "/abort"))
+
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+
+    assert.deepEqual(harness.ocCalls.abortSession, [])
+    assert.ok(harness.tg.sentMessages.some((entry) => entry.text === "Not bound. Use /bind <projectAlias> first."))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector /status shows startup session, SSE status, and sanitized base URL", async () => {
+  let startupCalls = 0
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 293,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_current" },
+      },
+      sessionIndex: {
+        "demo:ses_current": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    projectPatch: {
+      baseUrl: "http://user:secret@example.test:4312/path?token=abc#frag",
+    },
+    ensureStartupSessionImpl: async ({ alias, startupSessionByProject }) => {
+      startupCalls += 1
+      startupSessionByProject[alias] = "ses_startup"
+      return "ses_startup"
+    },
+  })
+
+  try {
+    await waitFor(() => startupCalls > 0)
+    await harness.connectSse("demo")
+    harness.tg.enqueue(makeMessageUpdate(294, "/status"))
+
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+
+    const status = harness.tg.sentMessages.at(-1)?.text || ""
+    assert.match(status, /Project: demo/)
+    assert.match(status, /Session: ses_current/)
+    assert.match(status, /Startup session: ses_startup/)
+    assert.match(status, /SSE: connected/)
+    assert.match(status, /Base URL: http:\/\/example\.test:4312\/path\?token=\*\*\*/) 
+    assert.doesNotMatch(status, /secret|user|frag|abc/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector /status keeps SSE connected after a non-SSE request failure", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 295,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_current" },
+      },
+      sessionIndex: {
+        "demo:ses_current": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    ocOptions: {
+      listSessionsImpl: async () => {
+        throw new Error("GET /session failed: 503 unavailable")
+      },
+    },
+    ensureStartupSessionImpl: async ({ alias, startupSessionByProject }) => {
+      startupSessionByProject[alias] = "ses_startup"
+      return "ses_startup"
+    },
+  })
+
+  try {
+    await harness.connectSse("demo")
+    harness.tg.enqueue(makeMessageUpdate(296, "/sessions"))
+    harness.tg.enqueue(makeMessageUpdate(297, "/status"))
+
+    await waitFor(() => harness.tg.sentMessages.length >= 2)
+
+    const unavailable = harness.tg.sentMessages[0]?.text || ""
+    const status = harness.tg.sentMessages[1]?.text || ""
+    assert.match(unavailable, /Project 'demo' is unavailable/)
+    assert.match(status, /SSE: connected/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector /bindings refuses to leak bindings in group chats", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 298,
+      bindings: {
+        "100:0": { projectAlias: "demo", sessionId: "ses_main" },
+        "100:11": { projectAlias: "demo", sessionId: "ses_topic" },
+        "200:3": { projectAlias: "demo", sessionId: "ses_other" },
+      },
+      sessionIndex: {
+        "demo:ses_main": { chatId: 100, threadIdOr0: 0 },
+        "demo:ses_topic": { chatId: 100, threadIdOr0: 11 },
+        "demo:ses_other": { chatId: 200, threadIdOr0: 3 },
+      },
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(299, "/bindings", { threadIdOr0: 11 }))
+
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+
+    const text = harness.tg.sentMessages.at(-1)?.text || ""
+    assert.match(text, /private chat/i)
+    assert.doesNotMatch(text, /ses_main|ses_topic|ses_other/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector /bindings lists all active bindings in a private chat", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 300,
+      bindings: {
+        "42:0": { projectAlias: "demo", sessionId: "ses_dm" },
+        "100:0": { projectAlias: "demo", sessionId: "ses_main" },
+        "100:11": { projectAlias: "demo", sessionId: "ses_topic" },
+        "200:3": { projectAlias: "demo", sessionId: "ses_other" },
+      },
+      sessionIndex: {
+        "demo:ses_dm": { chatId: 42, threadIdOr0: 0 },
+        "demo:ses_main": { chatId: 100, threadIdOr0: 0 },
+        "demo:ses_topic": { chatId: 100, threadIdOr0: 11 },
+        "demo:ses_other": { chatId: 200, threadIdOr0: 3 },
+      },
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(301, "/bindings", { chatId: 42, chatType: "private", threadIdOr0: 0 }))
+
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+
+    const text = harness.tg.sentMessages.at(-1)?.text || ""
+    assert.match(text, /^Bindings:/)
+    assert.match(text, /- chat 42 \/ main \(current\) -> demo \/ ses_dm/)
+    assert.match(text, /- chat 100 \/ main -> demo \/ ses_main/)
+    assert.match(text, /- chat 100 \/ topic 11 -> demo \/ ses_topic/)
+    assert.match(text, /- chat 200 \/ topic 3 -> demo \/ ses_other/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector /unbind removes the current binding and blocks further prompts", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 297,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_current" },
+      },
+      sessionIndex: {
+        "demo:ses_current": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(298, "/unbind"))
+    harness.tg.enqueue(makeMessageUpdate(299, "hello after unbind"))
+
+    await waitFor(
+      () =>
+        harness.tg.sentMessages.some((entry) => entry.text === "Unbound.") &&
+        harness.tg.sentMessages.some((entry) => entry.text === "Not bound. Use /bind <projectAlias>."),
+    )
+    await harness.connector.stop()
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(harness.ocCalls.promptAsync, [])
+    assert.deepEqual(state.bindings, {})
+    assert.deepEqual(state.sessionIndex, {})
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector restores persisted multi-topic bindings after restart", async () => {
+  const firstHarness = await createHarness({
+    statePatch: {
+      updateOffset: 350,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_alpha" },
+        "100:9": { projectAlias: "demo", sessionId: "ses_beta" },
+      },
+      sessionIndex: {
+        "demo:ses_alpha": { chatId: 100, threadIdOr0: 7 },
+        "demo:ses_beta": { chatId: 100, threadIdOr0: 9 },
+      },
+    },
+  })
+
+  let persistedState
+  try {
+    await firstHarness.connector.stop()
+    persistedState = await readState(firstHarness.stateFile)
+  } finally {
+    await firstHarness.connector.stop()
+  }
+
+  const secondHarness = await createHarness({
+    statePatch: persistedState,
+  })
+
+  try {
+    secondHarness.tg.enqueue(makeMessageUpdate(351, "hello alpha", { threadIdOr0: 7 }))
+    secondHarness.tg.enqueue(makeMessageUpdate(352, "hello beta", { threadIdOr0: 9 }))
+
+    await waitFor(() => secondHarness.ocCalls.promptAsync.length === 2)
+
+    assert.deepEqual(secondHarness.ocCalls.promptAsync, [
+      { sessionId: "ses_alpha", text: "[TG] hello alpha" },
+      { sessionId: "ses_beta", text: "[TG] hello beta" },
+    ])
+  } finally {
+    await secondHarness.connector.stop()
   }
 })
 

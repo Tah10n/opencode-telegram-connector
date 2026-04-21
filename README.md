@@ -57,7 +57,9 @@ npm start
 - `/new [title]` (create a new session in this thread's project and bind)
 - `/use <sessionId|shareLink>` (bind to an existing session in this thread's project)
 - `/sessions` (list recent sessions for this thread's current project and switch via buttons)
-- `/status` (show current binding)
+- `/status` (show current binding, startup session, SSE status, and base URL)
+- `/bindings` (list all active chat/topic bindings; private chat only)
+- `/abort` (abort the current thread's running session)
 - `/projects` (list project aliases)
 - `/unbind`
 

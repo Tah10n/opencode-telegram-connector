@@ -105,6 +105,10 @@ function clampString(s, max) {
   return str.slice(0, Math.max(0, max - 1)) + "…"
 }
 
+function compareNumbers(a, b) {
+  return a === b ? 0 : a < b ? -1 : 1
+}
+
 function isCommand(text) {
   return typeof text === "string" && text.trim().startsWith("/")
 }
@@ -184,6 +188,8 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       { command: "use", description: "Переключиться на сессию" },
       { command: "sessions", description: "Недавние сессии проекта" },
       { command: "status", description: "Показать текущую привязку" },
+      { command: "bindings", description: "Показать все активные привязки в личке" },
+      { command: "abort", description: "Прервать текущую сессию" },
       { command: "sendlast", description: "Отправить последнее сообщение модели" },
       { command: "unbind", description: "Убрать привязку" },
       { command: "cancel", description: "Отменить текущий ввод" },
@@ -326,12 +332,26 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
 
   // projectAlias -> boolean (used to suppress repeated Telegram notices while a project stays down)
   const projectIsDown = new Map()
+  const projectSseState = new Map(Object.keys(projects).map((alias) => [alias, "unknown"]))
 
   function markProjectUp(projectAlias) {
     if (projectIsDown.get(projectAlias)) {
       projectIsDown.set(projectAlias, false)
       projectLastUnavailableNoticeAt.set(projectAlias, 0)
     }
+  }
+
+  function markProjectSseConnected(projectAlias) {
+    projectSseState.set(projectAlias, "connected")
+    markProjectUp(projectAlias)
+  }
+
+  function markProjectSseDown(projectAlias) {
+    projectSseState.set(projectAlias, "down")
+  }
+
+  function getProjectSseStatus(projectAlias) {
+    return projectSseState.get(projectAlias) || "unknown"
   }
 
 
@@ -488,8 +508,9 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
 
   function ctxMetaFromMessage(msg) {
     const chatId = msg?.chat?.id
+    const chatType = msg?.chat?.type
     const threadIdOr0 = threadIdOr0FromMessage(msg)
-    return { chatId, threadIdOr0, ctxKey: ctxKeyFrom(chatId, threadIdOr0) }
+    return { chatId, chatType, threadIdOr0, ctxKey: ctxKeyFrom(chatId, threadIdOr0) }
   }
 
   function isAllowedUser(from) {
@@ -509,6 +530,10 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     const m = String(key).match(/^(-?\d+):(\d+)$/)
     if (!m) return null
     return { chatId: Number(m[1]), threadIdOr0: Number(m[2]), ctxKey: key }
+  }
+
+  function formatThreadLabel(threadIdOr0) {
+    return threadIdOr0 ? `topic ${threadIdOr0}` : "main"
   }
 
   function formatProjectUnavailable(projectAlias, err) {
@@ -777,6 +802,25 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     }
   }
 
+  async function handleAbort(ctxMeta) {
+    const binding = store.getBinding(ctxMeta.ctxKey)
+    if (!binding) {
+      await sendToThread(ctxMeta, "Not bound. Use /bind <projectAlias> first.")
+      return
+    }
+    const oc = ocByAlias[binding.projectAlias]
+    try {
+      const aborted = await oc.abortSession(binding.sessionId)
+      markProjectUp(binding.projectAlias)
+      await sendToThread(
+        ctxMeta,
+        aborted === false ? `No active run to abort for session: ${binding.sessionId}` : `Abort requested for session: ${binding.sessionId}`,
+      )
+    } catch (err) {
+      await sendToThread(ctxMeta, formatProjectUnavailable(binding.projectAlias, err)).catch(() => {})
+    }
+  }
+
   function sessionsKeyboard(projectAlias, sessions, { currentSessionId, startupSessionId, limit = 10 } = {}) {
     const normalized = normalizeSessionsList(sessions).slice(0, limit)
     if (!normalized.length) return null
@@ -815,7 +859,50 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       await sendToThread(ctxMeta, "Not bound. Use /bind <projectAlias>.")
       return
     }
-    await sendToThread(ctxMeta, `Project: ${binding.projectAlias}\nSession: ${binding.sessionId}`)
+    const startupSessionId = startupSessionByProject[binding.projectAlias] || "unknown"
+    const sseStatus = getProjectSseStatus(binding.projectAlias)
+    const baseUrl = sanitizeBaseUrlForDisplay(projects?.[binding.projectAlias]?.baseUrl) || "unknown"
+    await sendToThread(
+      ctxMeta,
+      [
+        `Project: ${binding.projectAlias}`,
+        `Session: ${binding.sessionId}`,
+        `Startup session: ${startupSessionId}`,
+        `SSE: ${sseStatus}`,
+        `Base URL: ${baseUrl}`,
+      ].join("\n"),
+    )
+  }
+
+  async function handleBindings(ctxMeta) {
+    if (ctxMeta?.chatType !== "private") {
+      await sendToThread(ctxMeta, "Use /bindings only in a private chat with the bot. Bindings contain sensitive session IDs.")
+      return
+    }
+
+    const entries = Object.entries(store.get().bindings || {})
+      .map(([ctxKey, binding]) => ({ ctxKey, binding, ctx: parseCtxKey(ctxKey) }))
+      .sort((a, b) => {
+        const byChat = compareNumbers(a.ctx?.chatId ?? 0, b.ctx?.chatId ?? 0)
+        if (byChat !== 0) return byChat
+        const byThread = compareNumbers(a.ctx?.threadIdOr0 ?? 0, b.ctx?.threadIdOr0 ?? 0)
+        if (byThread !== 0) return byThread
+        return a.ctxKey.localeCompare(b.ctxKey)
+      })
+
+    if (!entries.length) {
+      await sendToThread(ctxMeta, "No bindings.")
+      return
+    }
+
+    const lines = ["Bindings:"]
+    for (const entry of entries) {
+      const scope = entry.ctx ? `chat ${entry.ctx.chatId} / ${formatThreadLabel(entry.ctx.threadIdOr0)}` : entry.ctxKey
+      const current = entry.ctxKey === ctxMeta.ctxKey ? " (current)" : ""
+      lines.push(`- ${scope}${current} -> ${entry.binding.projectAlias} / ${entry.binding.sessionId}`)
+    }
+
+    await sendToThread(ctxMeta, lines.join("\n"))
   }
 
   async function handleSendLast(ctxMeta) {
@@ -958,6 +1045,8 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
             "/use <sessionId|shareLink>",
             "/sessions",
             "/status",
+            "/bindings (private chat only)",
+            "/abort",
             "/sendlast",
             "/projects",
             "/unbind",
@@ -979,6 +1068,8 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       if (cmd === "/use") return handleUseCommand(ctxMeta, argv[0])
       if (cmd === "/sessions") return handleSessions(ctxMeta)
       if (cmd === "/status") return handleWhere(ctxMeta)
+      if (cmd === "/bindings") return handleBindings(ctxMeta)
+      if (cmd === "/abort") return handleAbort(ctxMeta)
       if (cmd === "/sendlast") return handleSendLast(ctxMeta)
       if (cmd === "/projects") return handleProjects(ctxMeta)
       if (cmd === "/unbind") return handleUnbind(ctxMeta)
@@ -1537,9 +1628,12 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         projectAlias: alias,
         ocClient: ocByAlias[alias],
         logger,
-        onConnect: ({ projectAlias }) => markProjectUp(projectAlias),
+        onConnect: ({ projectAlias }) => markProjectSseConnected(projectAlias),
         onEvent: onSseEvent,
-        onError: ({ projectAlias, err }) => notifyProjectUnavailable(projectAlias, err),
+        onError: ({ projectAlias, err }) => {
+          markProjectSseDown(projectAlias)
+          return notifyProjectUnavailable(projectAlias, err)
+        },
         abortSignal: abortController.signal,
       }),
     )

@@ -87,6 +87,10 @@ export class OpenCodeClient {
     return this.request("/session", { method: "POST", json: title ? { title } : {} })
   }
 
+  abortSession(sessionId) {
+    return this.request(`/session/${sessionId}/abort`, { method: "POST" })
+  }
+
   promptAsync(sessionId, text) {
     return this.request(`/session/${sessionId}/prompt_async`, {
       method: "POST",
