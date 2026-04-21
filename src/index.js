@@ -131,8 +131,17 @@ function extractTextParts(message) {
   return parts.map((p) => p.text).join("")
 }
 
-export async function startConnector({ config, logger: loggerIn } = {}) {
+export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const logger = loggerIn || defaultLogger()
+  const createStateStore = deps?.createStateStore || ((options) => new StateStore(options))
+  const createTelegramClient = deps?.createTelegramClient || ((token) => new TelegramClient(token))
+  const createOpenCodeClient = deps?.createOpenCodeClient || ((options) => new OpenCodeClient(options))
+  const startSseLoop = deps?.startSseLoop || startOpenCodeSseLoop
+  const ensureStartupSessionFn = deps?.ensureStartupSession || ensureStartupSession
+  const ensureOpenCodeRunningFn = deps?.ensureOpenCodeRunning || ensureOpenCodeRunning
+  const openAttachWindowWindowsFn = deps?.openAttachWindowWindows || openAttachWindowWindows
+  const platform = deps?.platform || process.platform
+  const sleep = deps?.delay || delay
   const startedAt = Date.now()
   const sseDebugFilter = parseSseDebugFilter(process.env.DEBUG_SSE_ROUTING)
   if (sseDebugFilter?.projectAlias) {
@@ -144,7 +153,7 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
   })()
 
   const stateFile = config?.stateFile || resolveDefaultStatePath({ cwd: config?.cwd })
-  const store = new StateStore({ filePath: stateFile, logger })
+  const store = createStateStore({ filePath: stateFile, logger })
   await store.load()
 
   // Log only aggregate persisted-state info; bindings themselves are sensitive.
@@ -156,7 +165,7 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
     // ignore
   }
 
-  const tg = new TelegramClient(config.telegram.botToken)
+  const tg = createTelegramClient(config.telegram.botToken)
   const me = await tg.getMe().catch(() => null)
   const hasTopicsEnabled = !!me?.has_topics_enabled
   logger.info("Telegram bot:", me?.username ? `@${me.username}` : "(unknown)", "topics:", hasTopicsEnabled)
@@ -181,7 +190,7 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
   const projects = config.projects
   const ocByAlias = {}
   for (const [alias, p] of Object.entries(projects)) {
-    ocByAlias[alias] = new OpenCodeClient({
+    ocByAlias[alias] = createOpenCodeClient({
       baseUrl: p.baseUrl,
       username: p.username,
       password: p.password,
@@ -197,7 +206,7 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
   const startupSessionInProgress = new Map() // alias -> Promise<sessionId|null>
 
   async function getStartupSession(alias, options) {
-    return ensureStartupSession({
+    return ensureStartupSessionFn({
       alias,
       startInProgress,
       startupSessionByProject,
@@ -216,7 +225,7 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
     const promise = (async () => {
       try {
         logger.info(`[${alias}] autoStart check...`)
-        const handle = await ensureOpenCodeRunning({ projectAlias: alias, project: p, ocClient: oc, logger })
+        const handle = await ensureOpenCodeRunningFn({ projectAlias: alias, project: p, ocClient: oc, logger })
         if (handle?.stop) autoStarted.set(alias, handle)
         markProjectUp(alias)
         await getStartupSession(alias, { waitForStart: false })
@@ -250,7 +259,7 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
     const p = projects?.[alias]
     if (!p?.autoStart) return false
     if (!p.directory || !p.port) return false
-    if (process.platform === "win32") return true
+    if (platform === "win32") return true
     // Non-Windows: only headless serve can be started.
     return p.startMode === "serve"
   }
@@ -658,8 +667,8 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
 
       const p = projects[binding.projectAlias]
       if (p?.openAttachOnNew === true) {
-        if (process.platform === "win32") {
-          await openAttachWindowWindows({ directory: p.directory, baseUrl: p.baseUrl, sessionId: created.id }).catch((err) => {
+        if (platform === "win32") {
+          await openAttachWindowWindowsFn({ directory: p.directory, baseUrl: p.baseUrl, sessionId: created.id }).catch((err) => {
             logger.error("Failed to open attach window:", binding.projectAlias, err?.message || String(err))
           })
         } else {
@@ -1399,7 +1408,7 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
         })
 
       if (!Array.isArray(updates)) {
-        await delay(backoff)
+        await sleep(backoff)
         backoff = Math.min(30_000, backoff * 2)
         continue
       }
@@ -1407,7 +1416,7 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
       backoff = 1000
       if (updates.length === 0) break
       offset = updates[updates.length - 1].update_id + 1
-      await delay(200)
+      await sleep(200)
     }
     store.setUpdateOffset(offset)
     logger.info("Telegram backlog drained. Starting from offset:", offset)
@@ -1426,7 +1435,7 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
         })
       if (!Array.isArray(updates)) {
         // Avoid a tight loop on network/API errors.
-        await delay(backoff)
+        await sleep(backoff)
         backoff = Math.min(30_000, backoff * 2)
         continue
       }
@@ -1450,7 +1459,7 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
         if (ok) {
           store.setUpdateOffset(u.update_id + 1)
         } else {
-          await delay(1000)
+          await sleep(1000)
           break
         }
       }
@@ -1460,7 +1469,7 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
   const sseLoops = []
   for (const alias of Object.keys(projects)) {
     sseLoops.push(
-      startOpenCodeSseLoop({
+      startSseLoop({
         projectAlias: alias,
         ocClient: ocByAlias[alias],
         logger,
@@ -1495,7 +1504,7 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
           }
         }
       }
-      await delay(15_000)
+      await sleep(15_000)
     }
   })()
 
@@ -1506,7 +1515,7 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
     clearInterval(wizardGcTimer)
     for (const s of sseLoops) s.stop?.()
     for (const h of autoStarted.values()) {
-      await h.stop?.().catch(() => {})
+      await Promise.resolve(h.stop?.()).catch(() => {})
     }
     await store.flush().catch(() => {})
   }

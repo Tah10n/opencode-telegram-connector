@@ -11,7 +11,7 @@ export function parseDotEnv(text) {
     const key = line.slice(0, eq).trim()
     let value = line.slice(eq + 1).trim()
 
-    const match = value.match(/^(['"])(.*?)\\1(\\s*#.*)?$/)
+    const match = value.match(/^(['"])(.*?)\1(\s*#.*)?$/)
     if (match) {
       value = match[2]
     } else {
