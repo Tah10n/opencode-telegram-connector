@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { formatSessionsListText } from "../src/session-list.js"
+import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "../src/session-list.js"
 
 test("formatSessionsListText shows current and startup markers", () => {
   const text = formatSessionsListText(
@@ -16,6 +16,7 @@ test("formatSessionsListText shows current and startup markers", () => {
   assert.match(text, /Sessions for 'pocket':/)
   assert.match(text, /Current: ses_current/)
   assert.match(text, /Startup: ses_startup/)
+  assert.match(text, /Tap a button below to switch:/)
   assert.match(text, /- ses_current \[current\] — Current session/)
   assert.match(text, /- ses_startup \[startup\] — Startup session/)
   assert.match(text, /Use \/use <sessionId> to switch\./)
@@ -39,4 +40,18 @@ test("formatSessionsListText limits long lists and ignores invalid entries", () 
   assert.match(text, /- ses_10/)
   assert.doesNotMatch(text, /- ses_11/)
   assert.match(text, /…and 2 more\./)
+})
+
+test("normalizeSessionsList keeps valid ids and trimmed titles", () => {
+  const sessions = normalizeSessionsList([{ id: " ses_1 ", title: "  Demo title  " }, { title: "missing id" }, null])
+
+  assert.deepEqual(sessions, [{ id: "ses_1", title: "Demo title" }])
+})
+
+test("formatSessionButtonLabel adds current and startup markers", () => {
+  assert.equal(
+    formatSessionButtonLabel("ses_1", { currentSessionId: "ses_1", startupSessionId: "ses_1" }),
+    "✅ 🏁 ses_1",
+  )
+  assert.equal(formatSessionButtonLabel("ses_2", { currentSessionId: "ses_1", startupSessionId: "ses_2" }), "🏁 ses_2")
 })

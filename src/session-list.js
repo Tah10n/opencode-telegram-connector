@@ -22,9 +22,8 @@ function sessionMarkers(sessionId, { currentSessionId, startupSessionId } = {}) 
   return markers
 }
 
-export function formatSessionsListText(projectAlias, sessions, { currentSessionId, startupSessionId, limit = 10 } = {}) {
-  const safeProjectAlias = String(projectAlias || "").trim() || "(unknown)"
-  const normalized = Array.isArray(sessions)
+export function normalizeSessionsList(sessions) {
+  return Array.isArray(sessions)
     ? sessions
         .map((session) => {
           const id = sessionIdOf(session)
@@ -36,6 +35,19 @@ export function formatSessionsListText(projectAlias, sessions, { currentSessionI
         })
         .filter(Boolean)
     : []
+}
+
+export function formatSessionButtonLabel(sessionId, { currentSessionId, startupSessionId } = {}) {
+  const markers = sessionMarkers(sessionId, { currentSessionId, startupSessionId })
+  let prefix = ""
+  if (markers.includes("current")) prefix += "✅ "
+  if (markers.includes("startup")) prefix += "🏁 "
+  return `${prefix}${clampString(sessionId, 48)}`
+}
+
+export function formatSessionsListText(projectAlias, sessions, { currentSessionId, startupSessionId, limit = 10 } = {}) {
+  const safeProjectAlias = String(projectAlias || "").trim() || "(unknown)"
+  const normalized = normalizeSessionsList(sessions)
 
   const lines = [`Sessions for '${safeProjectAlias}':`]
   if (currentSessionId) lines.push(`Current: ${currentSessionId}`)
@@ -48,6 +60,8 @@ export function formatSessionsListText(projectAlias, sessions, { currentSessionI
     return lines.join("\n")
   }
 
+  lines.push("Tap a button below to switch:")
+  lines.push("")
   lines.push("Recent sessions:")
   for (const session of normalized.slice(0, limit)) {
     const markers = sessionMarkers(session.id, { currentSessionId, startupSessionId })

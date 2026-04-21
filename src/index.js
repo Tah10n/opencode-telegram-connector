@@ -8,7 +8,7 @@ import { startOpenCodeSseLoop } from "./opencode/sse.js"
 import { ensureStartupSession } from "./opencode/startup-session.js"
 import { ensureOpenCodeRunning, openAttachWindowWindows } from "./opencode/launcher.js"
 import { StateStore, resolveDefaultStatePath, sessionKey } from "./state/store.js"
-import { formatSessionsListText } from "./session-list.js"
+import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "./session-list.js"
 import { sanitizeBaseUrlForDisplay } from "./url-utils.js"
 
 function now() {
@@ -639,18 +639,43 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
       await sendToThread(ctxMeta, "Not bound. Use /bind <projectAlias> first.")
       return
     }
-    const oc = ocByAlias[binding.projectAlias]
     try {
-      const sessions = await oc.listSessions({ directory: projects?.[binding.projectAlias]?.directory, limit: 10 })
-      markProjectUp(binding.projectAlias)
-      const text = formatSessionsListText(binding.projectAlias, sessions, {
-        currentSessionId: binding.sessionId,
-        startupSessionId: startupSessionByProject[binding.projectAlias],
-      })
-      await sendToThread(ctxMeta, text)
+      await renderSessionsList(ctxMeta, { binding })
     } catch (err) {
       await sendToThread(ctxMeta, formatProjectUnavailable(binding.projectAlias, err)).catch(() => {})
     }
+  }
+
+  function sessionsKeyboard(projectAlias, sessions, { currentSessionId, startupSessionId, limit = 10 } = {}) {
+    const normalized = normalizeSessionsList(sessions).slice(0, limit)
+    if (!normalized.length) return null
+    return makeInlineKeyboard(
+      normalized.map((session) => [
+        {
+          text: formatSessionButtonLabel(session.id, { currentSessionId, startupSessionId }),
+          callback_data: cb.pack(`s|${projectAlias}|${session.id}`),
+        },
+      ]),
+    )
+  }
+
+  async function renderSessionsList(ctxMeta, { binding, editMessageId } = {}) {
+    const oc = ocByAlias[binding.projectAlias]
+    const sessions = await oc.listSessions({ directory: projects?.[binding.projectAlias]?.directory, limit: 10 })
+    markProjectUp(binding.projectAlias)
+    const text = formatSessionsListText(binding.projectAlias, sessions, {
+      currentSessionId: binding.sessionId,
+      startupSessionId: startupSessionByProject[binding.projectAlias],
+    })
+    const replyMarkup = sessionsKeyboard(binding.projectAlias, sessions, {
+      currentSessionId: binding.sessionId,
+      startupSessionId: startupSessionByProject[binding.projectAlias],
+    })
+    if (editMessageId) {
+      await tg.editMessageText(ctxMeta.chatId, editMessageId, text, replyMarkup)
+      return
+    }
+    await sendToThread(ctxMeta, text, replyMarkup)
   }
 
   async function handleWhere(ctxMeta) {
@@ -856,9 +881,51 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
 
     // p|<projectAlias>|<permissionId>|<action>
     // q|<projectAlias>|<questionId>|<action>
+    // s|<projectAlias>|<sessionId>
     // srv|<projectAlias>|start
     const parts = String(data).split("|")
     const kind = parts[0]
+
+    if (kind === "s") {
+      const projectAlias = parts[1]
+      const targetSessionId = parts[2]
+      const oc = ocByAlias[projectAlias]
+      const binding = store.getBinding(ctxMeta.ctxKey)
+      if (!oc || !projectAlias || !targetSessionId) {
+        await tg.answerCallbackQuery(callbackQuery.id, "Invalid")
+        return
+      }
+      if (!binding) {
+        await tg.answerCallbackQuery(callbackQuery.id, "Not bound")
+        return
+      }
+      if (binding.projectAlias !== projectAlias) {
+        await tg.answerCallbackQuery(callbackQuery.id, "Binding changed")
+        return
+      }
+      if (binding.sessionId === targetSessionId) {
+        await tg.answerCallbackQuery(callbackQuery.id, "Already current")
+        return
+      }
+      try {
+        await oc.getSession(targetSessionId)
+        await bindCtxToSession(ctxMeta, projectAlias, targetSessionId)
+      } catch (err) {
+        await tg.answerCallbackQuery(callbackQuery.id, "Unavailable")
+        await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err)).catch(() => {})
+        return
+      }
+
+      await tg.answerCallbackQuery(callbackQuery.id, "Switched")
+      await renderSessionsList({ ...ctxMeta, chatId: msg?.chat?.id || ctxMeta.chatId }, {
+        binding: { projectAlias, sessionId: targetSessionId },
+        editMessageId: msg?.message_id,
+      }).catch(async (err) => {
+        logger.error("Failed to refresh sessions list:", err?.message || String(err))
+        await sendToThread(ctxMeta, `Switched to session: ${targetSessionId}`).catch(() => {})
+      })
+      return
+    }
 
     if (kind === "srv") {
       const projectAlias = parts[1]
