@@ -701,10 +701,11 @@ export async function startConnector({ config, logger: loggerIn } = {}) {
     const sk = sessionKey(binding.projectAlias, binding.sessionId)
     const last = lastAssistantBySession.get(sk)
     const messageId = last?.messageId
+    const messageSessionId = last?.sessionId || binding.sessionId
     let text = typeof last?.text === "string" ? last.text : ""
 
     if (messageId) {
-      const msg = await oc.getMessage(binding.sessionId, messageId).catch(() => null)
+      const msg = await oc.getMessage(messageSessionId, messageId).catch(() => null)
       const fetched = extractTextParts(msg)
       if (fetched && fetched.trim()) text = fetched
     }
