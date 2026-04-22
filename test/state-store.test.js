@@ -73,6 +73,104 @@ test("StateStore unbind removes only the targeted topic binding", () => {
   })
 })
 
+test("StateStore persists pending prompt recovery state", () => {
+  const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-state.json"), logger: makeLogger() })
+  store.scheduleSave = () => {}
+
+  store.setPendingPermission({
+    projectAlias: "demo",
+    permissionId: "perm_1",
+    sessionID: "ses_1",
+    permission: "shell",
+    patterns: ["npm test"],
+    ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    createdAt: 1,
+  })
+  store.setRejectNoteAwaiting("100:7", { projectAlias: "demo", permissionId: "perm_1" })
+  store.setAwaitingCustomAnswer("100:7", { projectAlias: "demo", requestId: "q_1", qIndex: 0 })
+  store.setQuestionWizard("demo:q_1", {
+    projectAlias: "demo",
+    id: "q_1",
+    request: {
+      id: "q_1",
+      questions: [{ header: "Reason", question: "Why?", custom: true, options: [] }],
+    },
+    sessionID: "ses_1",
+    index: 0,
+    answers: [[]],
+    selectedByIndex: {},
+    createdAt: 2,
+    ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+  })
+
+  assert.deepEqual(store.getPendingPrompts().permissions, {
+    "demo:perm_1": {
+      projectAlias: "demo",
+      permissionId: "perm_1",
+      sessionID: "ses_1",
+      permission: "shell",
+      patterns: ["npm test"],
+      ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+      createdAt: 1,
+    },
+  })
+  assert.deepEqual(store.getPendingPrompts().rejectNotes, {
+    "100:7": { projectAlias: "demo", permissionId: "perm_1" },
+  })
+  assert.deepEqual(store.getPendingPrompts().customAnswers, {
+    "100:7": { projectAlias: "demo", requestId: "q_1", qIndex: 0 },
+  })
+  assert.deepEqual(store.getPendingPrompts().questionWizards, {
+    "demo:q_1": {
+      projectAlias: "demo",
+      id: "q_1",
+      sessionID: "ses_1",
+      request: {
+        id: "q_1",
+        questions: [{ header: "Reason", question: "Why?", custom: true, options: [] }],
+      },
+      index: 0,
+      answers: [[]],
+      selectedByIndex: {},
+      createdAt: 2,
+      ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    },
+  })
+
+  assert.equal(store.deletePendingPermission("demo", "perm_1"), true)
+  assert.equal(store.deleteRejectNoteAwaiting("100:7"), true)
+  assert.equal(store.deleteAwaitingCustomAnswer("100:7"), true)
+  assert.equal(store.deleteQuestionWizard("demo:q_1"), true)
+  assert.deepEqual(store.getPendingPrompts(), {
+    permissions: {},
+    rejectNotes: {},
+    customAnswers: {},
+    questionWizards: {},
+  })
+})
+
+test("StateStore migrates schema version 1 state to version 2", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  await fs.writeFile(
+    filePath,
+    JSON.stringify({ schemaVersion: 1, updateOffset: 77, bindings: { "1:0": { projectAlias: "demo", sessionId: "ses_1" } }, sessionIndex: { "demo:ses_1": { chatId: 1, threadIdOr0: 0 } } }, null, 2),
+    "utf8",
+  )
+
+  const store = new StateStore({ filePath, logger: makeLogger() })
+  const loaded = await store.load()
+
+  assert.equal(loaded.schemaVersion, 2)
+  assert.equal(loaded.updateOffset, 77)
+  assert.deepEqual(loaded.pendingPrompts, {
+    permissions: {},
+    rejectNotes: {},
+    customAnswers: {},
+    questionWizards: {},
+  })
+})
+
 test("StateStore migrates legacy state and flush persists the new schema", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
@@ -85,10 +183,16 @@ test("StateStore migrates legacy state and flush persists the new schema", async
   const store = new StateStore({ filePath, logger: makeLogger() })
   const loaded = await store.load()
 
-  assert.equal(loaded.schemaVersion, 1)
+  assert.equal(loaded.schemaVersion, 2)
   assert.equal(loaded.updateOffset, 123)
   assert.deepEqual(loaded.bindings, {})
   assert.deepEqual(loaded.sessionIndex, {})
+  assert.deepEqual(loaded.pendingPrompts, {
+    permissions: {},
+    rejectNotes: {},
+    customAnswers: {},
+    questionWizards: {},
+  })
 
   store.scheduleSave = () => {}
   store.setBinding("42:0", { projectAlias: "demo", sessionId: "ses_9" }, { chatId: 42, threadIdOr0: 0 })
@@ -96,13 +200,19 @@ test("StateStore migrates legacy state and flush persists the new schema", async
   await store.flush()
 
   const persisted = JSON.parse(await fs.readFile(filePath, "utf8"))
-  assert.equal(persisted.schemaVersion, 1)
+  assert.equal(persisted.schemaVersion, 2)
   assert.equal(persisted.updateOffset, 456)
   assert.deepEqual(persisted.bindings, {
     "42:0": { projectAlias: "demo", sessionId: "ses_9" },
   })
   assert.deepEqual(persisted.sessionIndex, {
     "demo:ses_9": { chatId: 42, threadIdOr0: 0 },
+  })
+  assert.deepEqual(persisted.pendingPrompts, {
+    permissions: {},
+    rejectNotes: {},
+    customAnswers: {},
+    questionWizards: {},
   })
 })
 

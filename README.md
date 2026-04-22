@@ -68,6 +68,9 @@ npm start
 - The bot only accepts messages from a single Telegram user id (`TELEGRAM_ALLOWED_USER_ID`).
 - On first start it **drains** old Telegram updates so it does not replay history.
 - State is stored in `./.data/state.json` by default (override with `STATE_FILE`).
+- Assistant replies stream into the bound Telegram thread while opencode is still generating output.
+- Very long assistant code/log output falls back to a `.txt` attachment instead of flooding the chat with many chunks.
+- Pending permission/question flows are restored after restart so you can continue approving or answering from Telegram.
 - Mirrored messages are sent with `parse_mode=HTML`. Triple-backtick fences (```code```) are rendered as Telegram `<pre><code>` blocks.
 - Common markdown like `**bold**`, `*italic*`, `` `inline code` ``, `# headings`, `- bullets`, and `[links](https://example.com)` is converted (clickable links are http/https only).
 

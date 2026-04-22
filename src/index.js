@@ -162,6 +162,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const stateFile = config?.stateFile || resolveDefaultStatePath({ cwd: config?.cwd })
   const store = createStateStore({ filePath: stateFile, logger })
   await store.load()
+  const recoverPendingPromptsOnStartup = Number.isInteger(store.get().updateOffset)
 
   // Log only aggregate persisted-state info; bindings themselves are sensitive.
   try {
@@ -316,9 +317,12 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   }
 
   const cb = makeCallbackStore()
+  const STREAM_PREVIEW_MAX_CHARS = 3500
+  const TEXT_ATTACHMENT_THRESHOLD = 12_000
   // Bound the amount of per-session state we keep.
   const forwardedBySession = new LruMap(2000) // sessionKey -> {user:LruSet, assistant:LruSet}
   const assistantDebounce = new Map() // msgId -> timeout
+  const assistantPreviewBySession = new Map() // bound sessionKey -> { messageId, telegramMessageId, lastPreviewHtml, lastPreviewAt }
   const recentTgPromptsBySession = new LruMap(2000) // sessionKey -> LruSet(hash)
   const lastAssistantBySession = new LruMap(2000) // sessionKey -> { messageId, sessionId, text }
   const parentSessionBySession = new Map() // key `${projectAlias}:${sessionId}` -> parent session id or null
@@ -338,6 +342,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     if (projectIsDown.get(projectAlias)) {
       projectIsDown.set(projectAlias, false)
       projectLastUnavailableNoticeAt.set(projectAlias, 0)
+      void notifyProjectRecovered(projectAlias).catch(() => {})
     }
   }
 
@@ -362,7 +367,61 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const bindAliasAwaiting = new Map() // key ctxKey -> { startedAt }
 
   const wizardKey = (projectAlias, requestId) => `${projectAlias}:${requestId}`
+  const permissionPromptKey = (projectAlias, permissionId) => `${projectAlias}:${permissionId}`
   const getWizard = (projectAlias, requestId) => questionWizards.get(wizardKey(projectAlias, requestId)) || null
+
+  function persistQuestionWizard(wizard) {
+    store.setQuestionWizard(wizardKey(wizard.projectAlias, wizard.request.id), wizard)
+  }
+
+  function clearPersistedQuestionWizard(projectAlias, requestId) {
+    store.deleteQuestionWizard(wizardKey(projectAlias, requestId))
+  }
+
+  function setRejectNoteAwaitingState(ctxKey, value) {
+    if (value) {
+      rejectNoteAwaiting.set(ctxKey, value)
+      store.setRejectNoteAwaiting(ctxKey, value)
+      return
+    }
+    rejectNoteAwaiting.delete(ctxKey)
+    store.deleteRejectNoteAwaiting(ctxKey)
+  }
+
+  function setAwaitingCustomAnswerState(ctxKey, value) {
+    if (value) {
+      awaitingCustomAnswer.set(ctxKey, value)
+      store.setAwaitingCustomAnswer(ctxKey, value)
+      return
+    }
+    awaitingCustomAnswer.delete(ctxKey)
+    store.deleteAwaitingCustomAnswer(ctxKey)
+  }
+
+  function cloneWizardState(wizard, overrides = {}) {
+    return {
+      ...wizard,
+      answers: Array.isArray(wizard.answers) ? wizard.answers.map((entry) => (Array.isArray(entry) ? [...entry] : [])) : [],
+      selectedByIndex:
+        wizard.selectedByIndex && typeof wizard.selectedByIndex === "object"
+          ? Object.fromEntries(
+              Object.entries(wizard.selectedByIndex).map(([idx, selected]) => [idx, Array.isArray(selected) ? [...selected] : []]),
+            )
+          : {},
+      messageIdByIndex:
+        wizard.messageIdByIndex && typeof wizard.messageIdByIndex === "object"
+          ? { ...wizard.messageIdByIndex }
+          : {},
+      ...overrides,
+    }
+  }
+
+  function applyWizardState(target, source) {
+    target.index = source.index
+    target.answers = source.answers
+    target.selectedByIndex = source.selectedByIndex
+    target.messageIdByIndex = source.messageIdByIndex
+  }
 
   function renderQuestionStep(projectAlias, req, stepIndex, selectedLabels) {
     const q = req.questions[stepIndex]
@@ -460,11 +519,216 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     wizard.messageIdByIndex[idx] = msg?.message_id
   }
 
+  function renderPermissionPrompt(projectAlias, props) {
+    return {
+      blocks: [
+        {
+          type: "text",
+          html:
+            `<b>Permission request</b>\n<code>${escapeHtml(props.id)}</code>\n\n` +
+            escapeHtml(`Project: ${projectAlias}`) +
+            "\n" +
+            escapeHtml(`Permission: ${props.permission}`) +
+            (Array.isArray(props.patterns) && props.patterns.length
+              ? "\n\n" + escapeHtml("Patterns:\n" + props.patterns.map((p) => `- ${p}`).join("\n"))
+              : ""),
+        },
+      ],
+      replyMarkup: makeInlineKeyboard([
+        [
+          { text: "Allow once", callback_data: cb.pack(`p|${projectAlias}|${props.id}|once`) },
+          { text: "Always allow", callback_data: cb.pack(`p|${projectAlias}|${props.id}|always`) },
+        ],
+        [
+          { text: "Reject", callback_data: cb.pack(`p|${projectAlias}|${props.id}|reject`) },
+          { text: "Reject with note", callback_data: cb.pack(`p|${projectAlias}|${props.id}|reject_note`) },
+        ],
+      ]),
+    }
+  }
+
+  async function sendPermissionPrompt(projectAlias, props, ctxMeta) {
+    const rendered = renderPermissionPrompt(projectAlias, props)
+    await sendBlocksToThread(ctxMeta, rendered.blocks, rendered.replyMarkup)
+  }
+
+  async function sendRejectNotePrompt(ctxMeta, projectAlias, permissionId, { resumed = false } = {}) {
+    const prefix = resumed ? "Resumed. " : ""
+    await sendToThread(
+      ctxMeta,
+      `${prefix}Send rejection note for ${permissionId} (next message will be used).`,
+      makeInlineKeyboard([[{ text: "Cancel", callback_data: cb.pack(`p|${projectAlias}|${permissionId}|cancel_note`) }]]),
+    )
+  }
+
+  async function sendQuestionCustomAnswerPrompt(ctxMeta, projectAlias, questionId, qIndex, label, { resumed = false } = {}) {
+    const prefix = resumed ? "Resumed. " : ""
+    await sendToThread(
+      ctxMeta,
+      `${prefix}Send your answer for: ${label || "question"} (next message will be used).`,
+      makeInlineKeyboard([[{ text: "Cancel", callback_data: cb.pack(`q|${projectAlias}|${questionId}|${qIndex}|cancel_custom`) }]]),
+    )
+  }
+
+  function extractAssistantDisplayText(projectAlias, msg) {
+    let text = extractTextParts(msg)
+    if (!text || !text.trim()) {
+      const files = extractPatchFiles(msg)
+      if (files.length) {
+        text = formatChangedFilesText(files, { baseDir: projects?.[projectAlias]?.directory, limit: 10 })
+      }
+    }
+    return text
+  }
+
+  function shouldSendAssistantAsAttachment(text) {
+    return typeof text === "string" && text.length >= TEXT_ATTACHMENT_THRESHOLD
+  }
+
+  function assistantAttachmentName(projectAlias, sessionId, messageId) {
+    const clean = (value, fallback) => {
+      const s = String(value || fallback)
+        .replace(/[^a-z0-9._-]+/gi, "-")
+        .replace(/^-+|-+$/g, "")
+      return s || fallback
+    }
+    return `${clean(projectAlias, "project")}-${clean(sessionId, "session")}-${clean(messageId, "reply")}.txt`
+  }
+
+  function buildAssistantStreamPreviewHtml(text) {
+    const body = String(text || "").trim()
+    if (!body) return "<i>Streaming reply…</i>"
+    const trimmed = clampString(body, STREAM_PREVIEW_MAX_CHARS)
+    return `<i>Streaming reply…</i>\n${escapeHtml(trimmed)}`
+  }
+
+  async function deliverAssistantText(ctxMeta, projectAlias, sessionId, messageId, text, { replaceMessageId } = {}) {
+    if (!text || !text.trim()) return null
+
+    if (shouldSendAssistantAsAttachment(text)) {
+      const notice = "Assistant reply was attached as a .txt file because it is too long for Telegram messages."
+      if (replaceMessageId) {
+        const edited = await tg.editMessageText(ctxMeta.chatId, replaceMessageId, notice, null).catch(() => null)
+        if (!edited) {
+          await sendToThread(ctxMeta, notice)
+        }
+      } else {
+        await sendToThread(ctxMeta, notice)
+      }
+      await tg.sendDocument(
+        ctxMeta.chatId,
+        text,
+        assistantAttachmentName(projectAlias, sessionId, messageId),
+        `Assistant reply (${projectAlias}/${sessionId})`,
+        { message_thread_id: ctxMeta.threadIdOr0 || undefined },
+      )
+      return { mode: "attachment" }
+    }
+
+    const blocks = formatMarkdownToTelegramHtmlBlocks(text)
+    if (!blocks.length) return null
+
+    if (replaceMessageId && blocks[0]?.type === "text") {
+      const edited = await tg
+        .editMessageText(ctxMeta.chatId, replaceMessageId, blocks[0].html, null, {
+          parse_mode: "HTML",
+          disable_web_page_preview: true,
+        })
+        .catch(() => null)
+      if (!edited) {
+        await sendBlocksToThread(ctxMeta, blocks, null)
+        return { mode: "resent" }
+      }
+      if (blocks.length > 1) {
+        await sendBlocksToThread(ctxMeta, blocks.slice(1), null)
+      }
+      return { mode: "edited" }
+    }
+
+    await sendBlocksToThread(ctxMeta, blocks, null)
+    return { mode: "sent" }
+  }
+
+  async function restorePendingPromptState() {
+    const pending = store.getPendingPrompts?.() || store.get().pendingPrompts || {}
+
+    for (const entry of Object.values(pending.permissions || {})) {
+      const ctx = entry?.ctx
+      if (!entry?.projectAlias || !entry?.permissionId || !ctx?.chatId || !ctx?.ctxKey) continue
+      prompted[entry.projectAlias]?.permission.add(entry.permissionId)
+      await sendPermissionPrompt(
+        entry.projectAlias,
+        {
+          id: entry.permissionId,
+          sessionID: entry.sessionID,
+          permission: entry.permission,
+          patterns: Array.isArray(entry.patterns) ? entry.patterns : [],
+        },
+        ctx,
+      ).catch(() => {})
+    }
+
+    for (const snapshot of Object.values(pending.questionWizards || {})) {
+      const ctx = snapshot?.ctx
+      if (!snapshot?.projectAlias || !snapshot?.id || !ctx?.chatId || !ctx?.ctxKey) continue
+      prompted[snapshot.projectAlias]?.question.add(snapshot.id)
+      const wizard = {
+        projectAlias: snapshot.projectAlias,
+        id: snapshot.id,
+        sessionID: snapshot.sessionID,
+        request: snapshot.request,
+        index: Number.isInteger(snapshot.index) ? snapshot.index : 0,
+        answers: Array.isArray(snapshot.answers) ? snapshot.answers.map((entry) => (Array.isArray(entry) ? [...entry] : [])) : [],
+        selectedByIndex:
+          snapshot.selectedByIndex && typeof snapshot.selectedByIndex === "object"
+            ? Object.fromEntries(
+                Object.entries(snapshot.selectedByIndex).map(([idx, selected]) => [idx, Array.isArray(selected) ? [...selected] : []]),
+              )
+            : {},
+        messageIdByIndex: {},
+        createdAt: typeof snapshot.createdAt === "number" ? snapshot.createdAt : Date.now(),
+        ctx,
+      }
+      questionWizards.set(wizardKey(wizard.projectAlias, wizard.id), wizard)
+      await sendBlocksToThread(wizard.ctx, [
+        {
+          type: "text",
+          html: `<b>Question request resumed</b>\n<code>${escapeHtml(wizard.id)}</code>\n\n${escapeHtml(`Project: ${wizard.projectAlias}`)}`,
+        },
+      ]).catch(() => {})
+      await sendCurrentQuestionStep(wizard).catch(() => {})
+    }
+
+    for (const [ctxKey, value] of Object.entries(pending.rejectNotes || {})) {
+      if (!value?.projectAlias || !value?.permissionId) continue
+      setRejectNoteAwaitingState(ctxKey, value)
+      const bindingCtx = parseCtxKey(ctxKey)
+      if (bindingCtx?.chatId) {
+        await sendRejectNotePrompt(bindingCtx, value.projectAlias, value.permissionId, { resumed: true }).catch(() => {})
+      }
+    }
+
+    for (const [ctxKey, value] of Object.entries(pending.customAnswers || {})) {
+      if (!value?.projectAlias || !value?.requestId || !Number.isInteger(value?.qIndex)) continue
+      setAwaitingCustomAnswerState(ctxKey, value)
+      const wizard = getWizard(value.projectAlias, value.requestId)
+      const label = wizard?.request?.questions?.[value.qIndex]?.header || "question"
+      const bindingCtx = parseCtxKey(ctxKey)
+      if (bindingCtx?.chatId) {
+        await sendQuestionCustomAnswerPrompt(bindingCtx, value.projectAlias, value.requestId, value.qIndex, label, { resumed: true }).catch(
+          () => {},
+        )
+      }
+    }
+  }
+
   async function finishQuestionWizard(wizard) {
     const oc = ocByAlias[wizard.projectAlias]
     await oc.replyQuestion(wizard.request.id, wizard.answers)
     questionWizards.delete(wizardKey(wizard.projectAlias, wizard.request.id))
-    await sendToThread(wizard.ctx, `Answered: ${wizard.request.id}`)
+    clearPersistedQuestionWizard(wizard.projectAlias, wizard.request.id)
+    setAwaitingCustomAnswerState(wizard.ctx.ctxKey, null)
+    await sendToThread(wizard.ctx, `Answered: ${wizard.request.id}`).catch(() => {})
   }
 
   const abortController = new AbortController()
@@ -475,7 +739,10 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     const t = Date.now()
     for (const [k, w] of questionWizards.entries()) {
       const createdAt = typeof w?.createdAt === "number" ? w.createdAt : 0
-      if (!createdAt || t - createdAt > WIZARD_TTL_MS) questionWizards.delete(k)
+      if (!createdAt || t - createdAt > WIZARD_TTL_MS) {
+        questionWizards.delete(k)
+        clearPersistedQuestionWizard(w?.projectAlias, w?.request?.id)
+      }
     }
   }, 10 * 60 * 1000)
   wizardGcTimer.unref?.()
@@ -574,6 +841,18 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     }
   }
 
+  async function notifyProjectRecovered(projectAlias) {
+    const st = store.get()
+    const baseUrl = sanitizeBaseUrlForDisplay(projects?.[projectAlias]?.baseUrl) || "unknown"
+    const message = `Project '${projectAlias}' is back online at ${baseUrl}.`
+    for (const [ctxKey, binding] of Object.entries(st.bindings || {})) {
+      if (binding?.projectAlias !== projectAlias) continue
+      const ctx = parseCtxKey(ctxKey)
+      if (!ctx) continue
+      await sendToThread(ctx, message).catch(() => {})
+    }
+  }
+
   async function sendBlocksToThread(ctxMeta, blocks, replyMarkup) {
     if (!ctxMeta?.chatId) return
     await tg.sendHtmlBlocks(ctxMeta.chatId, blocks, replyMarkup, {
@@ -634,6 +913,10 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   async function ensureBaselineLoaded(projectAlias) {
     const base = promptBaseline[projectAlias]
     if (!base || base.loaded) return
+    if (recoverPendingPromptsOnStartup) {
+      base.loaded = true
+      return
+    }
     const oc = ocByAlias[projectAlias]
     try {
       const [perms, questions] = await Promise.all([oc.listPermissions(), oc.listQuestions()])
@@ -927,15 +1210,9 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       if (!mirrorCompaction && (msg?.info?.mode === "compaction" || msg?.info?.agent === "compaction")) {
         // don't surface internal compaction output
       } else {
-        const fetched = extractTextParts(msg)
+        const fetched = extractAssistantDisplayText(binding.projectAlias, msg)
         if (fetched && fetched.trim()) {
           text = fetched
-        } else {
-          const files = extractPatchFiles(msg)
-          const summary = files.length
-            ? formatChangedFilesText(files, { baseDir: projects?.[binding.projectAlias]?.directory, limit: 10 })
-            : ""
-          if (summary) text = summary
         }
       }
     }
@@ -945,8 +1222,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       return
     }
 
-    const blocks = formatMarkdownToTelegramHtmlBlocks(text)
-    await sendBlocksToThread(ctxMeta, blocks, null)
+    await deliverAssistantText(ctxMeta, binding.projectAlias, messageSessionId, messageId || "sendlast", text)
   }
 
   async function handleProjects(ctxMeta) {
@@ -976,28 +1252,35 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
 
     const awaitingQ = awaitingCustomAnswer.get(ctxMeta.ctxKey)
     if (awaitingQ) {
-      awaitingCustomAnswer.delete(ctxMeta.ctxKey)
       const wizard = getWizard(awaitingQ.projectAlias, awaitingQ.requestId)
       if (!wizard || wizard.index !== awaitingQ.qIndex) {
         await sendToThread(ctxMeta, "Question is no longer active.")
         return
       }
-      wizard.answers[awaitingQ.qIndex] = [text]
-      wizard.index = awaitingQ.qIndex + 1
-      if (wizard.index >= wizard.request.questions.length) {
-        await finishQuestionWizard(wizard)
+      const nextWizard = cloneWizardState(wizard)
+      nextWizard.answers[awaitingQ.qIndex] = [text]
+      const nextIndex = awaitingQ.qIndex + 1
+      if (nextIndex >= wizard.request.questions.length) {
+        persistQuestionWizard(nextWizard)
+        await finishQuestionWizard(nextWizard)
+        setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
       } else {
-        await sendCurrentQuestionStep(wizard)
+        nextWizard.index = nextIndex
+        await sendCurrentQuestionStep(nextWizard)
+        applyWizardState(wizard, nextWizard)
+        persistQuestionWizard(wizard)
+        setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
       }
       return
     }
 
     const awaiting = rejectNoteAwaiting.get(ctxMeta.ctxKey)
     if (awaiting) {
-      rejectNoteAwaiting.delete(ctxMeta.ctxKey)
       const oc = ocByAlias[awaiting.projectAlias]
       await oc.replyPermission(awaiting.permissionId, { reply: "reject", message: text })
-      await sendToThread(ctxMeta, "Rejection note sent.")
+      store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId)
+      setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
+      await sendToThread(ctxMeta, "Rejection note sent.").catch(() => {})
       return
     }
 
@@ -1028,11 +1311,13 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     if (isCommand(text)) {
       const { cmd, args, argv } = parseCommand(text)
       if (cmd === "/cancel") {
-        const had =
-          bindAliasAwaiting.delete(ctxMeta.ctxKey) ||
-          rejectNoteAwaiting.delete(ctxMeta.ctxKey) ||
-          awaitingCustomAnswer.delete(ctxMeta.ctxKey)
-        await sendToThread(ctxMeta, had ? "Cancelled." : "Nothing to cancel.")
+        const hadBind = bindAliasAwaiting.delete(ctxMeta.ctxKey)
+        const hadRejectNote = rejectNoteAwaiting.has(ctxMeta.ctxKey)
+        const hadCustomAnswer = awaitingCustomAnswer.has(ctxMeta.ctxKey)
+        if (hadRejectNote) setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
+        if (hadCustomAnswer) setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
+        const cancelled = hadBind || hadRejectNote || hadCustomAnswer
+        await sendToThread(ctxMeta, cancelled ? "Cancelled." : "Nothing to cancel.")
         return
       }
       if (cmd === "/help" || cmd === "/start") {
@@ -1190,21 +1475,19 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
 
       if (action === "once" || action === "always" || action === "reject") {
         await oc.replyPermission(permissionId, { reply: action })
-        await tg.answerCallbackQuery(callbackQuery.id, "OK")
+        store.deletePendingPermission(projectAlias, permissionId)
+        setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
+        await tg.answerCallbackQuery(callbackQuery.id, "OK").catch(() => {})
         return
       }
       if (action === "reject_note") {
-        rejectNoteAwaiting.set(ctxMeta.ctxKey, { projectAlias, permissionId })
+        setRejectNoteAwaitingState(ctxMeta.ctxKey, { projectAlias, permissionId })
         await tg.answerCallbackQuery(callbackQuery.id, "Send note")
-        await sendToThread(
-          ctxMeta,
-          `Send rejection note for ${permissionId} (next message will be used).`,
-          makeInlineKeyboard([[{ text: "Cancel", callback_data: cb.pack(`p|${projectAlias}|${permissionId}|cancel_note`) }]]),
-        )
+        await sendRejectNotePrompt(ctxMeta, projectAlias, permissionId)
         return
       }
       if (action === "cancel_note") {
-        rejectNoteAwaiting.delete(ctxMeta.ctxKey)
+        setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
         await tg.answerCallbackQuery(callbackQuery.id, "Cancelled")
         return
       }
@@ -1226,9 +1509,12 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       // reject (works even if wizard isn't found)
       if (parts.length === 4 && parts[3] === "reject") {
         await oc.rejectQuestion(questionId)
-        if (wizard) questionWizards.delete(wizardKey(projectAlias, questionId))
-        awaitingCustomAnswer.delete(ctxMeta.ctxKey)
-        await tg.answerCallbackQuery(callbackQuery.id, "Rejected")
+        if (wizard) {
+          questionWizards.delete(wizardKey(projectAlias, questionId))
+          clearPersistedQuestionWizard(projectAlias, questionId)
+        }
+        setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
+        await tg.answerCallbackQuery(callbackQuery.id, "Rejected").catch(() => {})
         return
       }
 
@@ -1261,18 +1547,14 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
           await tg.answerCallbackQuery(callbackQuery.id, "Custom disabled")
           return
         }
-        awaitingCustomAnswer.set(ctxMeta.ctxKey, { projectAlias, requestId: questionId, qIndex })
+        setAwaitingCustomAnswerState(ctxMeta.ctxKey, { projectAlias, requestId: questionId, qIndex })
         await tg.answerCallbackQuery(callbackQuery.id, "Send answer")
-        await sendToThread(
-          ctxMeta,
-          `Send your answer for: ${q.header || "question"} (next message will be used).`,
-          makeInlineKeyboard([[{ text: "Cancel", callback_data: cb.pack(`q|${projectAlias}|${questionId}|${qIndex}|cancel_custom`) }]]),
-        )
+        await sendQuestionCustomAnswerPrompt(ctxMeta, projectAlias, questionId, qIndex, q.header || "question")
         return
       }
 
       if (action === "cancel_custom") {
-        awaitingCustomAnswer.delete(ctxMeta.ctxKey)
+        setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
         await tg.answerCallbackQuery(callbackQuery.id, "Cancelled")
         return
       }
@@ -1284,11 +1566,19 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
           return
         }
         const label = String(q.options[optIndex].label)
-        wizard.answers[qIndex] = [label]
-        wizard.index = qIndex + 1
-        await tg.answerCallbackQuery(callbackQuery.id, "Selected")
-        if (wizard.index >= req.questions.length) await finishQuestionWizard(wizard)
-        else await sendCurrentQuestionStep(wizard)
+        const nextWizard = cloneWizardState(wizard)
+        nextWizard.answers[qIndex] = [label]
+        const nextIndex = qIndex + 1
+        if (nextIndex >= req.questions.length) {
+          persistQuestionWizard(nextWizard)
+          await finishQuestionWizard(nextWizard)
+        } else {
+          nextWizard.index = nextIndex
+          await sendCurrentQuestionStep(nextWizard)
+          applyWizardState(wizard, nextWizard)
+          persistQuestionWizard(wizard)
+        }
+        await tg.answerCallbackQuery(callbackQuery.id, "Selected").catch(() => {})
         return
       }
 
@@ -1306,9 +1596,12 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         const current = new Set(wizard.selectedByIndex?.[qIndex] || [])
         if (current.has(label)) current.delete(label)
         else current.add(label)
-        wizard.selectedByIndex[qIndex] = Array.from(current)
-        await tg.answerCallbackQuery(callbackQuery.id)
-        if (messageId) await sendCurrentQuestionStep(wizard, { editMessageId: messageId })
+        const nextWizard = cloneWizardState(wizard)
+        nextWizard.selectedByIndex[qIndex] = Array.from(current)
+        if (messageId) await sendCurrentQuestionStep(nextWizard, { editMessageId: messageId })
+        applyWizardState(wizard, nextWizard)
+        persistQuestionWizard(wizard)
+        await tg.answerCallbackQuery(callbackQuery.id).catch(() => {})
         return
       }
 
@@ -1318,11 +1611,19 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
           return
         }
         const selected = wizard.selectedByIndex?.[qIndex] || []
-        wizard.answers[qIndex] = selected
-        wizard.index = qIndex + 1
-        await tg.answerCallbackQuery(callbackQuery.id, "Done")
-        if (wizard.index >= req.questions.length) await finishQuestionWizard(wizard)
-        else await sendCurrentQuestionStep(wizard)
+        const nextWizard = cloneWizardState(wizard)
+        nextWizard.answers[qIndex] = selected
+        const nextIndex = qIndex + 1
+        if (nextIndex >= req.questions.length) {
+          persistQuestionWizard(nextWizard)
+          await finishQuestionWizard(nextWizard)
+        } else {
+          nextWizard.index = nextIndex
+          await sendCurrentQuestionStep(nextWizard)
+          applyWizardState(wizard, nextWizard)
+          persistQuestionWizard(wizard)
+        }
+        await tg.answerCallbackQuery(callbackQuery.id, "Done").catch(() => {})
         return
       }
 
@@ -1407,13 +1708,70 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         }
         const completed = normalizeEpochMs(info.time?.completed) != null
         const hasError = !!info.error
-        if (!completed || hasError) {
-          logSseDebug(projectAlias, sessionId, `drop=assistant_incomplete msg=${info.id} completed=${completed} error=${hasError}`)
-          return
-        }
 
         // Remember the most recent assistant message for /sendlast.
         lastAssistantBySession.set(boundKey, { messageId: info.id, sessionId, text: null })
+
+        if (hasError) {
+          const previewState = assistantPreviewBySession.get(boundKey)
+          if (previewState?.messageId === info.id && previewState.telegramMessageId) {
+            await tg
+              .editMessageText(route.chatId, previewState.telegramMessageId, `Assistant reply failed.\n\n${String(info.error)}`, null)
+              .catch(() => {})
+            assistantPreviewBySession.delete(boundKey)
+          }
+          logSseDebug(projectAlias, sessionId, `drop=assistant_error msg=${info.id}`)
+          return
+        }
+
+        if (!completed) {
+          const previewState = assistantPreviewBySession.get(boundKey)
+          const lastPreviewAt = previewState?.messageId === info.id ? previewState.lastPreviewAt || 0 : 0
+          if (Date.now() - lastPreviewAt < 200) {
+            logSseDebug(projectAlias, sessionId, `drop=assistant_preview_throttled msg=${info.id}`)
+            return
+          }
+
+          const msg = await oc.getMessage(sessionId, info.id).catch(() => null)
+          if (!eventStartedAfterLaunch(msg?.info || info, { allowCompletedAfterStart: true })) {
+            logSseDebug(projectAlias, sessionId, `drop=assistant_preview_before_start msg=${info.id}`)
+            return
+          }
+          if (!mirrorCompaction && (msg?.info?.mode === "compaction" || msg?.info?.agent === "compaction")) {
+            logSseDebug(projectAlias, sessionId, `drop=assistant_preview_compaction msg=${info.id}`)
+            return
+          }
+
+          const text = extractAssistantDisplayText(projectAlias, msg)
+          const previewHtml = buildAssistantStreamPreviewHtml(text)
+          const state =
+            previewState?.messageId === info.id
+              ? previewState
+              : { messageId: info.id, telegramMessageId: null, lastPreviewHtml: "", lastPreviewAt: 0 }
+          if (state.lastPreviewHtml === previewHtml) return
+          if (!state.telegramMessageId) {
+            const sent = await tg
+              .sendMessage(route.chatId, previewHtml, null, {
+                parse_mode: "HTML",
+                disable_web_page_preview: true,
+                message_thread_id: route.threadIdOr0 || undefined,
+              })
+              .catch(() => null)
+            state.telegramMessageId = sent?.message_id || null
+          } else {
+            await tg
+              .editMessageText(route.chatId, state.telegramMessageId, previewHtml, null, {
+                parse_mode: "HTML",
+                disable_web_page_preview: true,
+              })
+              .catch(() => {})
+          }
+          state.lastPreviewHtml = previewHtml
+          state.lastPreviewAt = Date.now()
+          assistantPreviewBySession.set(boundKey, state)
+          logSseDebug(projectAlias, sessionId, `stream=assistant msg=${info.id} thread=${route.threadIdOr0 || 0}`)
+          return
+        }
 
         const existing = assistantDebounce.get(info.id)
         if (existing) clearTimeout(existing)
@@ -1434,13 +1792,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
               return
             }
 
-            let text = extractTextParts(msg)
-            if (!text || !text.trim()) {
-              const files = extractPatchFiles(msg)
-              if (files.length) {
-                text = formatChangedFilesText(files, { baseDir: projects?.[projectAlias]?.directory, limit: 10 })
-              }
-            }
+            const text = extractAssistantDisplayText(projectAlias, msg)
             if (!text || !text.trim()) {
               logSseDebug(projectAlias, sessionId, `drop=assistant_empty msg=${info.id}`)
               return
@@ -1450,8 +1802,17 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
             const current = lastAssistantBySession.get(boundKey)
             if (current?.messageId === info.id) lastAssistantBySession.set(boundKey, { messageId: info.id, sessionId, text })
 
-            const blocks = formatMarkdownToTelegramHtmlBlocks(text)
-            await tg.sendHtmlBlocks(route.chatId, blocks, null, { message_thread_id: route.threadIdOr0 || undefined })
+            const previewState = assistantPreviewBySession.get(boundKey)
+            const replaceMessageId = previewState?.messageId === info.id ? previewState.telegramMessageId : undefined
+            await deliverAssistantText(
+              { chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey: ctxKeyFrom(route.chatId, route.threadIdOr0) },
+              projectAlias,
+              sessionId,
+              info.id,
+              text,
+              { replaceMessageId },
+            )
+            if (replaceMessageId) assistantPreviewBySession.delete(boundKey)
             sets.assistant.add(info.id)
             logSseDebug(projectAlias, sessionId, `send=assistant msg=${info.id} thread=${route.threadIdOr0 || 0}`)
           })().catch(() => {})
@@ -1476,32 +1837,16 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       if (prompted[projectAlias].permission.has(props.id)) return
       prompted[projectAlias].permission.add(props.id)
       const ctxMeta = { chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey: ctxKeyFrom(route.chatId, route.threadIdOr0) }
-      await sendBlocksToThread(
-        ctxMeta,
-        [
-          {
-            type: "text",
-            html:
-              `<b>Permission request</b>\n<code>${escapeHtml(props.id)}</code>\n\n` +
-              escapeHtml(`Project: ${projectAlias}`) +
-              "\n" +
-              escapeHtml(`Permission: ${props.permission}`) +
-              (Array.isArray(props.patterns) && props.patterns.length
-                ? "\n\n" + escapeHtml("Patterns:\n" + props.patterns.map((p) => `- ${p}`).join("\n"))
-                : ""),
-          },
-        ],
-        makeInlineKeyboard([
-          [
-            { text: "Allow once", callback_data: cb.pack(`p|${projectAlias}|${props.id}|once`) },
-            { text: "Always allow", callback_data: cb.pack(`p|${projectAlias}|${props.id}|always`) },
-          ],
-          [
-            { text: "Reject", callback_data: cb.pack(`p|${projectAlias}|${props.id}|reject`) },
-            { text: "Reject with note", callback_data: cb.pack(`p|${projectAlias}|${props.id}|reject_note`) },
-          ],
-        ]),
-      )
+      store.setPendingPermission({
+        projectAlias,
+        permissionId: props.id,
+        sessionID: props.sessionID,
+        permission: props.permission,
+        patterns: Array.isArray(props.patterns) ? props.patterns : [],
+        ctx: ctxMeta,
+        createdAt: Date.now(),
+      })
+      await sendPermissionPrompt(projectAlias, props, ctxMeta)
       return
     }
 
@@ -1536,6 +1881,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         ctx,
       }
       questionWizards.set(wizardKey(projectAlias, props.id), wizard)
+      persistQuestionWizard(wizard)
 
       await sendBlocksToThread(ctx, [
         {
@@ -1619,6 +1965,12 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         }
       }
     }
+  }
+
+  if (recoverPendingPromptsOnStartup) {
+    await restorePendingPromptState().catch((err) => {
+      logger.error("Failed to restore pending prompts:", err?.message || String(err))
+    })
   }
 
   const sseLoops = []

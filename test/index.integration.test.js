@@ -76,11 +76,12 @@ function makeCallbackUpdate(updateId, data, { userId = 42, chatId = 100, chatTyp
   }
 }
 
-function createFakeTelegramClient({ emptyPollDelayMs = 10, sendMessageImpl } = {}) {
+function createFakeTelegramClient({ emptyPollDelayMs = 10, sendMessageImpl, sendDocumentImpl, editMessageTextImpl } = {}) {
   let nextMessageId = 1000
   const updates = []
   const sentMessages = []
   const sentHtmlBlocks = []
+  const sentDocuments = []
   const callbackAnswers = []
   const editedMessages = []
   const getUpdatesCalls = []
@@ -88,6 +89,7 @@ function createFakeTelegramClient({ emptyPollDelayMs = 10, sendMessageImpl } = {
   return {
     sentMessages,
     sentHtmlBlocks,
+    sentDocuments,
     callbackAnswers,
     editedMessages,
     getUpdatesCalls,
@@ -129,7 +131,19 @@ function createFakeTelegramClient({ emptyPollDelayMs = 10, sendMessageImpl } = {
       sentHtmlBlocks.push({ chatId, blocks, replyMarkup, options, result })
       return result
     },
+    async sendDocument(chatId, contents, filename, caption, options = {}) {
+      const result = { message_id: nextMessageId++ }
+      const maybeResult = sendDocumentImpl
+        ? await sendDocumentImpl({ chatId, contents, filename, caption, options, result, callIndex: sentDocuments.length + 1 })
+        : undefined
+      const finalResult = maybeResult ?? result
+      sentDocuments.push({ chatId, contents, filename, caption, options, result: finalResult })
+      return finalResult
+    },
     async editMessageText(chatId, messageId, text, replyMarkup, options = {}) {
+      if (editMessageTextImpl) {
+        await editMessageTextImpl({ chatId, messageId, text, replyMarkup, options, callIndex: editedMessages.length + 1 })
+      }
       editedMessages.push({ kind: "text", chatId, messageId, text, replyMarkup, options })
       return { message_id: messageId }
     },
@@ -413,6 +427,194 @@ test("startConnector mirrors assistant SSE output and /sendlast replays the late
       { sessionId: "ses_1", messageId: "msg_assistant" },
       { sessionId: "ses_1", messageId: "msg_assistant" },
     ])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector streams assistant replies in isolated threads and finalizes them in place", async () => {
+  const updatedAt = new Date(Date.now() + 60_000).toISOString()
+  const completedAt = new Date(Date.now() + 61_000).toISOString()
+  const messagesById = {
+    msg_alpha: {
+      info: { id: "msg_alpha", role: "assistant", time: { updated: updatedAt } },
+      parts: [{ type: "text", text: "alpha partial" }],
+    },
+    msg_beta: {
+      info: { id: "msg_beta", role: "assistant", time: { updated: updatedAt } },
+      parts: [{ type: "text", text: "beta partial" }],
+    },
+  }
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 205,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_alpha" },
+        "100:9": { projectAlias: "demo", sessionId: "ses_beta" },
+      },
+      sessionIndex: {
+        "demo:ses_alpha": { chatId: 100, threadIdOr0: 7 },
+        "demo:ses_beta": { chatId: 100, threadIdOr0: 9 },
+      },
+    },
+    messagesById,
+  })
+
+  try {
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: {
+        sessionID: "ses_alpha",
+        info: { id: "msg_alpha", role: "assistant", time: { updated: updatedAt } },
+      },
+    })
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: {
+        sessionID: "ses_beta",
+        info: { id: "msg_beta", role: "assistant", time: { updated: updatedAt } },
+      },
+    })
+
+    await waitFor(() => harness.tg.sentMessages.length >= 2)
+
+    const previewAlpha = harness.tg.sentMessages[0]
+    const previewBeta = harness.tg.sentMessages[1]
+    assert.match(previewAlpha.text, /Streaming reply/)
+    assert.match(previewBeta.text, /Streaming reply/)
+    assert.equal(previewAlpha.options.message_thread_id, 7)
+    assert.equal(previewBeta.options.message_thread_id, 9)
+
+    messagesById.msg_alpha = {
+      info: { id: "msg_alpha", role: "assistant", time: { created: completedAt, completed: completedAt } },
+      parts: [{ type: "text", text: "Hello **alpha**" }],
+    }
+    messagesById.msg_beta = {
+      info: { id: "msg_beta", role: "assistant", time: { created: completedAt, completed: completedAt } },
+      parts: [{ type: "text", text: "Hello **beta**" }],
+    }
+
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: {
+        sessionID: "ses_alpha",
+        info: { id: "msg_alpha", role: "assistant", time: { completed: completedAt } },
+      },
+    })
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: {
+        sessionID: "ses_beta",
+        info: { id: "msg_beta", role: "assistant", time: { completed: completedAt } },
+      },
+    })
+
+    await waitFor(() => harness.tg.editedMessages.filter((entry) => entry.kind === "text").length >= 2)
+
+    const editedTexts = harness.tg.editedMessages.filter((entry) => entry.kind === "text")
+    assert.ok(editedTexts.some((entry) => entry.messageId === previewAlpha.result.message_id && entry.text === "Hello <b>alpha</b>"))
+    assert.ok(editedTexts.some((entry) => entry.messageId === previewBeta.result.message_id && entry.text === "Hello <b>beta</b>"))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector falls back to a .txt attachment for very long assistant output", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const longOutput = `\`\`\`\n${Array.from({ length: 1200 }, (_, index) => `line ${index}: ${"x".repeat(20)}`).join("\n")}\n\`\`\``
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 206,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    messagesById: {
+      msg_long: {
+        info: { id: "msg_long", role: "assistant", time: { created: completedAt, completed: completedAt } },
+        parts: [{ type: "text", text: longOutput }],
+      },
+    },
+  })
+
+  try {
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: {
+        sessionID: "ses_1",
+        info: { id: "msg_long", role: "assistant", time: { completed: completedAt } },
+      },
+    })
+
+    await waitFor(() => harness.tg.sentMessages.length >= 1 && harness.tg.sentDocuments.length >= 1)
+
+    assert.match(harness.tg.sentMessages[0].text, /attached as a \.txt file/i)
+    assert.equal(harness.tg.sentDocuments[0].options.message_thread_id, 7)
+    assert.match(harness.tg.sentDocuments[0].filename, /demo-ses_1-msg_long\.txt/)
+    assert.match(String(harness.tg.sentDocuments[0].contents), /line 0: x{20}/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector resends the final assistant reply if preview edit fails", async () => {
+  const updatedAt = new Date(Date.now() + 60_000).toISOString()
+  const completedAt = new Date(Date.now() + 61_000).toISOString()
+  const messagesById = {
+    msg_preview: {
+      info: { id: "msg_preview", role: "assistant", time: { updated: updatedAt } },
+      parts: [{ type: "text", text: "partial" }],
+    },
+  }
+  let editAttempts = 0
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 207,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    messagesById,
+    tgOptions: {
+      editMessageTextImpl: async () => {
+        editAttempts += 1
+        throw new Error("message no longer exists")
+      },
+    },
+  })
+
+  try {
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: {
+        sessionID: "ses_1",
+        info: { id: "msg_preview", role: "assistant", time: { updated: updatedAt } },
+      },
+    })
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+
+    messagesById.msg_preview = {
+      info: { id: "msg_preview", role: "assistant", time: { created: completedAt, completed: completedAt } },
+      parts: [{ type: "text", text: "Final **reply**" }],
+    }
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: {
+        sessionID: "ses_1",
+        info: { id: "msg_preview", role: "assistant", time: { completed: completedAt } },
+      },
+    })
+
+    await waitFor(() => editAttempts >= 1 && harness.tg.sentHtmlBlocks.length >= 1)
+
+    assert.equal(harness.tg.sentHtmlBlocks[0].options.message_thread_id, 7)
+    assert.equal(harness.tg.sentHtmlBlocks[0].blocks[0].html, "Final <b>reply</b>")
   } finally {
     await harness.connector.stop()
   }
@@ -1040,6 +1242,281 @@ test("startConnector restores persisted multi-topic bindings after restart", asy
   }
 })
 
+test("startConnector restores pending permission reject-note flows after restart", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 360,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+      pendingPrompts: {
+        permissions: {
+          "demo:perm_1": {
+            projectAlias: "demo",
+            permissionId: "perm_1",
+            sessionID: "ses_1",
+            permission: "shell",
+            patterns: ["npm test"],
+            ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+            createdAt: Date.now(),
+          },
+        },
+        rejectNotes: {
+          "100:7": { projectAlias: "demo", permissionId: "perm_1" },
+        },
+        customAnswers: {},
+        questionWizards: {},
+      },
+    },
+  })
+
+  try {
+    await waitFor(() => harness.tg.sentHtmlBlocks.length >= 1 && harness.tg.sentMessages.length >= 1)
+
+    assert.match(harness.tg.sentHtmlBlocks[0].blocks[0].html, /Permission request/)
+    assert.match(harness.tg.sentMessages[0].text, /Resumed\. Send rejection note for perm_1/)
+
+    harness.tg.enqueue(makeMessageUpdate(361, "because it is unsafe"))
+    await waitFor(() => harness.ocCalls.replyPermission.length === 1)
+    await harness.connector.stop()
+
+    assert.deepEqual(harness.ocCalls.replyPermission, [
+      { permissionId: "perm_1", payload: { reply: "reject", message: "because it is unsafe" } },
+    ])
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.pendingPrompts.permissions, {})
+    assert.deepEqual(state.pendingPrompts.rejectNotes, {})
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector retries reject-note input after a transient permission reply failure", async () => {
+  let replyAttempts = 0
+  const noteUpdate = makeMessageUpdate(362, "because it is unsafe")
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 362,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+      pendingPrompts: {
+        permissions: {
+          "demo:perm_retry": {
+            projectAlias: "demo",
+            permissionId: "perm_retry",
+            sessionID: "ses_1",
+            permission: "shell",
+            patterns: ["npm test"],
+            ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+            createdAt: Date.now(),
+          },
+        },
+        rejectNotes: {
+          "100:7": { projectAlias: "demo", permissionId: "perm_retry" },
+        },
+        customAnswers: {},
+        questionWizards: {},
+      },
+    },
+    ocOptions: {
+      replyPermissionImpl: async () => {
+        replyAttempts += 1
+        if (replyAttempts === 1) throw new Error("temporary permission failure")
+        return { ok: true }
+      },
+    },
+    initialUpdates: [[noteUpdate], [noteUpdate]],
+  })
+
+  try {
+    await waitFor(() => harness.ocCalls.replyPermission.length === 2)
+    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text === "Rejection note sent."))
+    await harness.connector.stop()
+
+    assert.deepEqual(harness.ocCalls.replyPermission, [
+      { permissionId: "perm_retry", payload: { reply: "reject", message: "because it is unsafe" } },
+      { permissionId: "perm_retry", payload: { reply: "reject", message: "because it is unsafe" } },
+    ])
+    assert.deepEqual(harness.ocCalls.promptAsync, [])
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.pendingPrompts.permissions, {})
+    assert.deepEqual(state.pendingPrompts.rejectNotes, {})
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector restores pending question custom-answer flows after restart", async () => {
+  const request = {
+    id: "q_restore",
+    sessionID: "ses_1",
+    questions: [
+      {
+        header: "Checks",
+        question: "Which checks should run?",
+        multiple: true,
+        options: [{ label: "lint" }, { label: "test" }],
+      },
+      {
+        header: "Reason",
+        question: "Why do you want this?",
+        custom: true,
+        options: [],
+      },
+    ],
+  }
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 370,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+      pendingPrompts: {
+        permissions: {},
+        rejectNotes: {},
+        customAnswers: {
+          "100:7": { projectAlias: "demo", requestId: "q_restore", qIndex: 1 },
+        },
+        questionWizards: {
+          "demo:q_restore": {
+            projectAlias: "demo",
+            id: "q_restore",
+            sessionID: "ses_1",
+            request,
+            index: 1,
+            answers: [["lint"], []],
+            selectedByIndex: { 0: ["lint"] },
+            createdAt: Date.now(),
+            ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+          },
+        },
+      },
+    },
+  })
+
+  try {
+    await waitFor(() => harness.tg.sentHtmlBlocks.length >= 1 && harness.tg.sentMessages.length >= 2)
+
+    assert.match(harness.tg.sentHtmlBlocks[0].blocks[0].html, /Question request resumed/)
+    assert.match(harness.tg.sentMessages[0].text, /Reason \(2\/2\)/)
+    assert.match(harness.tg.sentMessages[1].text, /Resumed\. Send your answer for: Reason/)
+
+    harness.tg.enqueue(makeMessageUpdate(371, "because restarts happen"))
+    await waitFor(() => harness.ocCalls.replyQuestion.length === 1)
+    await harness.connector.stop()
+
+    assert.deepEqual(harness.ocCalls.replyQuestion, [
+      { questionId: "q_restore", answers: [["lint"], ["because restarts happen"]] },
+    ])
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.pendingPrompts.questionWizards, {})
+    assert.deepEqual(state.pendingPrompts.customAnswers, {})
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector restores final question submission after a restart during reply failure", async () => {
+  const request = {
+    id: "q_restart",
+    sessionID: "ses_1",
+    questions: [
+      {
+        header: "Reason",
+        question: "Why do you want this?",
+        custom: true,
+        options: [],
+      },
+    ],
+  }
+  const firstAnswer = makeMessageUpdate(372, "because the first try failed")
+  const firstHarness = await createHarness({
+    statePatch: {
+      updateOffset: 372,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+      pendingPrompts: {
+        permissions: {},
+        rejectNotes: {},
+        customAnswers: {
+          "100:7": { projectAlias: "demo", requestId: "q_restart", qIndex: 0 },
+        },
+        questionWizards: {
+          "demo:q_restart": {
+            projectAlias: "demo",
+            id: "q_restart",
+            sessionID: "ses_1",
+            request,
+            index: 0,
+            answers: [[]],
+            selectedByIndex: {},
+            createdAt: Date.now(),
+            ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+          },
+        },
+      },
+    },
+    ocOptions: {
+      replyQuestionImpl: async () => {
+        throw new Error("temporary question failure")
+      },
+    },
+    initialUpdates: [[firstAnswer]],
+  })
+
+  let persistedState
+  try {
+    await waitFor(() => firstHarness.ocCalls.replyQuestion.length === 1)
+    await firstHarness.connector.stop()
+    persistedState = await readState(firstHarness.stateFile)
+  } finally {
+    await firstHarness.connector.stop()
+  }
+
+  assert.ok(Object.keys(persistedState.pendingPrompts.questionWizards).includes("demo:q_restart"))
+  assert.deepEqual(persistedState.pendingPrompts.customAnswers, {
+    "100:7": { projectAlias: "demo", requestId: "q_restart", qIndex: 0 },
+  })
+
+  const secondHarness = await createHarness({
+    statePatch: persistedState,
+  })
+
+  try {
+    await waitFor(() => secondHarness.tg.sentHtmlBlocks.length >= 1 && secondHarness.tg.sentMessages.length >= 2)
+    secondHarness.tg.enqueue(makeMessageUpdate(373, "because the retry succeeded"))
+    await waitFor(() => secondHarness.ocCalls.replyQuestion.length === 1)
+    await secondHarness.connector.stop()
+
+    assert.deepEqual(secondHarness.ocCalls.replyQuestion, [
+      { questionId: "q_restart", answers: [["because the retry succeeded"]] },
+    ])
+
+    const finalState = await readState(secondHarness.stateFile)
+    assert.deepEqual(finalState.pendingPrompts.questionWizards, {})
+    assert.deepEqual(finalState.pendingPrompts.customAnswers, {})
+  } finally {
+    await secondHarness.connector.stop()
+  }
+})
+
 test("startConnector delivers permission prompts and handles allow callbacks", async () => {
   const harness = await createHarness({
     statePatch: {
@@ -1201,6 +1678,47 @@ test("startConnector offers a start button on connect errors and recovers after 
 
     assert.ok(harness.tg.callbackAnswers.some((entry) => entry.callbackQueryId === "cb_502" && entry.text === "Starting…"))
     assert.deepEqual(startCalls, ["demo", "demo"])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector sends one reconnected notice after project recovery", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 550,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    ocOptions: {
+      listPermissionsImpl: async () => {
+        throw new Error("temporary permission poll failure")
+      },
+      listQuestionsImpl: async () => {
+        throw new Error("temporary question poll failure")
+      },
+    },
+  })
+
+  try {
+    await harness.failSse("demo", new Error("SSE 503 unavailable"))
+    await waitFor(() => harness.tg.sentMessages.some((entry) => /Project 'demo' is unavailable/.test(entry.text)))
+
+    const sentAfterFailure = harness.tg.sentMessages.length
+    await harness.connectSse("demo")
+    await waitFor(() => harness.tg.sentMessages.length > sentAfterFailure)
+
+    const recovered = harness.tg.sentMessages.at(-1)?.text || ""
+    assert.match(recovered, /Project 'demo' is back online/)
+
+    const sentAfterRecovery = harness.tg.sentMessages.length
+    await harness.connectSse("demo")
+    await delay(30)
+    assert.equal(harness.tg.sentMessages.length, sentAfterRecovery)
   } finally {
     await harness.connector.stop()
   }

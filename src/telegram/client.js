@@ -56,6 +56,22 @@ export class TelegramClient {
     return json.result
   }
 
+  async callMultipart(method, formData, { timeoutMs } = {}) {
+    const url = `${this.baseUrl}/${method}`
+    const { signal, cancel } = makeTimeoutSignal(timeoutMs)
+    const res = await fetch(url, {
+      method: "POST",
+      body: formData,
+      signal,
+    }).finally(cancel)
+    const json = await res.json().catch(() => null)
+    if (!res.ok || !json || json.ok !== true) {
+      const msg = json?.description || res.statusText || "Telegram API error"
+      throw new Error(`${method} failed: ${msg}`)
+    }
+    return json.result
+  }
+
   getMe() {
     return this.call("getMe", null, { timeoutMs: 15_000 })
   }
@@ -116,6 +132,15 @@ export class TelegramClient {
       replyMarkup = null
     }
     return last
+  }
+
+  sendDocument(chatId, contents, filename, caption, options = {}) {
+    const formData = new FormData()
+    formData.set("chat_id", String(chatId))
+    if (options.message_thread_id) formData.set("message_thread_id", String(options.message_thread_id))
+    if (caption) formData.set("caption", String(caption))
+    formData.set("document", new Blob([contents], { type: "text/plain;charset=utf-8" }), filename || "output.txt")
+    return this.callMultipart("sendDocument", formData, { timeoutMs: 60_000 })
   }
 
   editMessageText(chatId, messageId, text, replyMarkup, options = {}) {

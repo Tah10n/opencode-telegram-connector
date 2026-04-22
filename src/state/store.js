@@ -1,7 +1,16 @@
 import path from "node:path"
 import { readJsonFile, writeJsonFileAtomic } from "./fileStore.js"
 
-export const STATE_SCHEMA_VERSION = 1
+export const STATE_SCHEMA_VERSION = 2
+
+function defaultPendingPrompts() {
+  return {
+    permissions: {},
+    rejectNotes: {},
+    customAnswers: {},
+    questionWizards: {},
+  }
+}
 
 export function defaultState() {
   return {
@@ -9,6 +18,7 @@ export function defaultState() {
     updateOffset: null,
     bindings: {},
     sessionIndex: {},
+    pendingPrompts: defaultPendingPrompts(),
   }
 }
 
@@ -39,6 +49,10 @@ export class StateStore {
     return this.state
   }
 
+  getPendingPrompts() {
+    return this.state.pendingPrompts
+  }
+
   scheduleSave(delayMs = 250) {
     if (this._saveTimer) return
     this._saveTimer = setTimeout(() => {
@@ -62,6 +76,105 @@ export class StateStore {
 
   getBinding(ctxKey) {
     return this.state.bindings[ctxKey] ?? null
+  }
+
+  setPendingPermission(record) {
+    if (!record?.projectAlias || !record?.permissionId) return
+    this.state.pendingPrompts.permissions[sessionKey(record.projectAlias, record.permissionId)] = {
+      projectAlias: record.projectAlias,
+      permissionId: record.permissionId,
+      sessionID: record.sessionID || "",
+      permission: record.permission || "",
+      patterns: Array.isArray(record.patterns) ? [...record.patterns] : [],
+      ctx: {
+        chatId: record?.ctx?.chatId,
+        threadIdOr0: record?.ctx?.threadIdOr0 || 0,
+        ctxKey: record?.ctx?.ctxKey || "",
+      },
+      createdAt: typeof record?.createdAt === "number" ? record.createdAt : Date.now(),
+    }
+    this.scheduleSave()
+  }
+
+  deletePendingPermission(projectAlias, permissionId) {
+    if (!projectAlias || !permissionId) return false
+    const key = sessionKey(projectAlias, permissionId)
+    const existed = delete this.state.pendingPrompts.permissions[key]
+    if (existed) this.scheduleSave()
+    return existed
+  }
+
+  setRejectNoteAwaiting(ctxKey, value) {
+    if (!ctxKey) return
+    if (!value) {
+      this.deleteRejectNoteAwaiting(ctxKey)
+      return
+    }
+    this.state.pendingPrompts.rejectNotes[ctxKey] = {
+      projectAlias: value.projectAlias,
+      permissionId: value.permissionId,
+    }
+    this.scheduleSave()
+  }
+
+  deleteRejectNoteAwaiting(ctxKey) {
+    if (!ctxKey) return false
+    const existed = delete this.state.pendingPrompts.rejectNotes[ctxKey]
+    if (existed) this.scheduleSave()
+    return existed
+  }
+
+  setAwaitingCustomAnswer(ctxKey, value) {
+    if (!ctxKey) return
+    if (!value) {
+      this.deleteAwaitingCustomAnswer(ctxKey)
+      return
+    }
+    this.state.pendingPrompts.customAnswers[ctxKey] = {
+      projectAlias: value.projectAlias,
+      requestId: value.requestId,
+      qIndex: value.qIndex,
+    }
+    this.scheduleSave()
+  }
+
+  deleteAwaitingCustomAnswer(ctxKey) {
+    if (!ctxKey) return false
+    const existed = delete this.state.pendingPrompts.customAnswers[ctxKey]
+    if (existed) this.scheduleSave()
+    return existed
+  }
+
+  setQuestionWizard(key, wizard) {
+    if (!key || !wizard) return
+    this.state.pendingPrompts.questionWizards[key] = {
+      projectAlias: wizard.projectAlias,
+      id: wizard.id,
+      sessionID: wizard.sessionID,
+      request: wizard.request,
+      index: wizard.index,
+      answers: Array.isArray(wizard.answers) ? wizard.answers.map((entry) => (Array.isArray(entry) ? [...entry] : [])) : [],
+      selectedByIndex:
+        wizard.selectedByIndex && typeof wizard.selectedByIndex === "object"
+          ? Object.fromEntries(
+              Object.entries(wizard.selectedByIndex).map(([idx, selected]) => [idx, Array.isArray(selected) ? [...selected] : []]),
+            )
+          : {},
+      createdAt: typeof wizard.createdAt === "number" ? wizard.createdAt : Date.now(),
+      ctx: {
+        chatId: wizard?.ctx?.chatId,
+        threadIdOr0: wizard?.ctx?.threadIdOr0 || 0,
+        ctxKey: wizard?.ctx?.ctxKey || "",
+      },
+    }
+    this.scheduleSave()
+  }
+
+  deleteQuestionWizard(key) {
+    if (!key) return false
+    const existed = delete this.state.pendingPrompts.questionWizards[key]
+    if (existed) this.scheduleSave()
+    return existed
   }
 
   setBinding(ctxKey, binding, ctxMeta) {
@@ -111,6 +224,17 @@ function migrateStateIfNeeded(loaded) {
       updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
       bindings: loaded.bindings && typeof loaded.bindings === "object" ? loaded.bindings : {},
       sessionIndex: loaded.sessionIndex && typeof loaded.sessionIndex === "object" ? loaded.sessionIndex : {},
+      pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
+    }
+  }
+
+  if (loaded && typeof loaded === "object" && loaded.schemaVersion === 1) {
+    return {
+      schemaVersion: STATE_SCHEMA_VERSION,
+      updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
+      bindings: loaded.bindings && typeof loaded.bindings === "object" ? loaded.bindings : {},
+      sessionIndex: loaded.sessionIndex && typeof loaded.sessionIndex === "object" ? loaded.sessionIndex : {},
+      pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
     }
   }
 
@@ -122,8 +246,20 @@ function migrateStateIfNeeded(loaded) {
       updateOffset: Number.isInteger(loaded.telegram.updateOffset) ? loaded.telegram.updateOffset : null,
       bindings: {},
       sessionIndex: {},
+      pendingPrompts: defaultPendingPrompts(),
     }
   }
 
   return defaultState()
+}
+
+function normalizePendingPrompts(value) {
+  const base = defaultPendingPrompts()
+  if (!value || typeof value !== "object") return base
+  return {
+    permissions: value.permissions && typeof value.permissions === "object" ? value.permissions : {},
+    rejectNotes: value.rejectNotes && typeof value.rejectNotes === "object" ? value.rejectNotes : {},
+    customAnswers: value.customAnswers && typeof value.customAnswers === "object" ? value.customAnswers : {},
+    questionWizards: value.questionWizards && typeof value.questionWizards === "object" ? value.questionWizards : {},
+  }
 }
