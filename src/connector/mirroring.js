@@ -93,7 +93,12 @@ export function createMirroringHandlers(runtime) {
   function feedKeyboard(ctxKey) {
     const current = getFeedMode(ctxKey)
     const button = (mode, label) => ({ text: `${current === mode ? "✓ " : ""}${label}`, callback_data: cb.pack(`feed|${mode}`) })
-    return makeInlineKeyboard([[button("main", "Main")], [button("main+changes", "Main + changes")], [button("verbose", "Verbose")]])
+    return makeInlineKeyboard([
+      [button("main", "Main")],
+      [button("main+changes", "Main + changes")],
+      [button("verbose", "Verbose")],
+      [{ text: "Close", callback_data: cb.pack("feed|close") }],
+    ])
   }
 
   async function renderFeedSettings(ctxMeta, { editMessageId } = {}) {

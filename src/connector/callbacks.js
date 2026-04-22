@@ -44,6 +44,17 @@ export function createCallbackHandlers(runtime) {
     await tg.answerCallbackQuery(callbackQueryId, text).catch(ignoreError)
   }
 
+  async function closeInteractiveMessage(callbackQueryId, ctxMeta, messageId) {
+    await answerCallbackQuery(callbackQueryId, "Closed")
+    if (typeof tg.deleteMessage === "function") {
+      await tg.deleteMessage(ctxMeta.chatId, messageId).catch(ignoreError)
+      return
+    }
+    if (typeof tg.editMessageReplyMarkup === "function") {
+      await tg.editMessageReplyMarkup(ctxMeta.chatId, messageId, null).catch(ignoreError)
+    }
+  }
+
   async function handleTelegramCallback(callbackQuery) {
     if (!isAllowedUser(callbackQuery?.from)) return
     const msg = callbackQuery.message
@@ -59,6 +70,10 @@ export function createCallbackHandlers(runtime) {
 
     try {
       if (kind === "s") {
+        if (parts[1] === "close") {
+          await closeInteractiveMessage(callbackQuery.id, ctxMeta, msg?.message_id)
+          return
+        }
         const projectAlias = parts[1]
         const targetSessionId = parts[2]
         const oc = ocByAlias[projectAlias]
@@ -117,6 +132,10 @@ export function createCallbackHandlers(runtime) {
 
       if (kind === "feed") {
         const rawMode = parts[1]
+        if (rawMode === "close") {
+          await closeInteractiveMessage(callbackQuery.id, ctxMeta, msg?.message_id)
+          return
+        }
         if (rawMode !== "main" && rawMode !== "main+changes" && rawMode !== "verbose") {
           await answerCallbackQuery(callbackQuery.id, "Invalid")
           return
@@ -130,25 +149,31 @@ export function createCallbackHandlers(runtime) {
 
       if (kind === "m") {
         const action = parts[1]
+        if (action === "close") {
+          await closeInteractiveMessage(callbackQuery.id, ctxMeta, msg?.message_id)
+          return
+        }
+
         const binding = store.getBinding(ctxMeta.ctxKey)
         if (!binding) {
           await answerCallbackQuery(callbackQuery.id, "Not bound")
           return
         }
 
-        if (action === "close") {
-          await answerCallbackQuery(callbackQuery.id, "Closed")
-          if (typeof tg.deleteMessage === "function") {
-            await tg.deleteMessage(ctxMeta.chatId, msg?.message_id).catch(ignoreError)
-          } else if (typeof tg.editMessageReplyMarkup === "function") {
-            await tg.editMessageReplyMarkup(ctxMeta.chatId, msg?.message_id, null).catch(ignoreError)
-          }
+        if (action === "root" || action === "back") {
+          await answerCallbackQuery(callbackQuery.id, "Back")
+          await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(ignoreError)
           return
         }
 
-        if (action === "back") {
-          await answerCallbackQuery(callbackQuery.id, "Back")
-          await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(ignoreError)
+        if (action === "provider") {
+          const providerId = parts[2]
+          if (!providerId) {
+            await answerCallbackQuery(callbackQuery.id, "Invalid")
+            return
+          }
+          await answerCallbackQuery(callbackQuery.id, "Pick model")
+          await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id, selectedProviderId: providerId }).catch(ignoreError)
           return
         }
 
@@ -173,14 +198,24 @@ export function createCallbackHandlers(runtime) {
           return
         }
 
-        if (action === "pick") {
+        if (action === "pick" || action === "model") {
           const modelKey = parts[2]
           if (!modelKey) {
             await answerCallbackQuery(callbackQuery.id, "Invalid")
             return
           }
+          const selectedModel = normalizeModelReference(modelKey)
+          if (!selectedModel) {
+            await answerCallbackQuery(callbackQuery.id, "Invalid")
+            return
+          }
           await answerCallbackQuery(callbackQuery.id, "Pick variant")
-          await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id, selectedModelKey: modelKey }).catch(ignoreError)
+          await renderModelSettings(ctxMeta, {
+            binding,
+            editMessageId: msg?.message_id,
+            selectedProviderId: selectedModel.providerID,
+            selectedModelKey: modelKey,
+          }).catch(ignoreError)
           return
         }
 

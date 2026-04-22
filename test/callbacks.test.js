@@ -375,6 +375,28 @@ test("createCallbackHandlers handles server-start, feed, and changed-files callb
   ])
 })
 
+test("createCallbackHandlers closes feed and sessions messages", async () => {
+  const deletedMessages = []
+  const { runtime, callbackAnswers } = makeRuntime({
+    tg: {
+      deleteMessage: async (chatId, messageId) => {
+        deletedMessages.push({ chatId, messageId })
+        return true
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("feed|close"))
+  await handlers.handleTelegramCallback(makeCallback("s|close"))
+
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Closed", "Closed"])
+  assert.deepEqual(deletedMessages, [
+    { chatId: 100, messageId: 900 },
+    { chatId: 100, messageId: 900 },
+  ])
+})
+
 test("createCallbackHandlers answers invalid feed and changed-files callbacks", async () => {
   const { runtime, callbackAnswers } = makeRuntime()
   const handlers = createCallbackHandlers(runtime)
@@ -392,13 +414,15 @@ test("createCallbackHandlers updates model preference and rerenders settings", a
   const handlers = createCallbackHandlers(runtime)
 
   await handlers.handleTelegramCallback(makeCallback("m|set|project-default"))
-  await handlers.handleTelegramCallback(makeCallback("m|pick|openai/gpt-5"))
+  await handlers.handleTelegramCallback(makeCallback("m|provider|openai"))
+  await handlers.handleTelegramCallback(makeCallback("m|model|openai/gpt-5"))
   await handlers.handleTelegramCallback(makeCallback("m|apply|openai/gpt-5|xhigh"))
-  await handlers.handleTelegramCallback(makeCallback("m|back"))
+  await handlers.handleTelegramCallback(makeCallback("m|root"))
   await handlers.handleTelegramCallback(makeCallback("m|set|inherit"))
 
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), [
     "Model: project default",
+    "Pick model",
     "Pick variant",
     "Model: openai/gpt-5 xhigh",
     "Back",
@@ -414,7 +438,12 @@ test("createCallbackHandlers updates model preference and rerenders settings", a
     {
       type: "render",
       ctxMeta: { chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" },
-      options: { binding: { projectAlias: "demo", sessionId: "ses_current" }, editMessageId: 900, selectedModelKey: "openai/gpt-5" },
+      options: { binding: { projectAlias: "demo", sessionId: "ses_current" }, editMessageId: 900, selectedProviderId: "openai" },
+    },
+    {
+      type: "render",
+      ctxMeta: { chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" },
+      options: { binding: { projectAlias: "demo", sessionId: "ses_current" }, editMessageId: 900, selectedProviderId: "openai", selectedModelKey: "openai/gpt-5" },
     },
     { type: "set", ctxKey: "100:7", value: { mode: "custom", model: "openai/gpt-5", variant: "xhigh" } },
     {

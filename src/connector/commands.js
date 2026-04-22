@@ -237,7 +237,114 @@ export function createCommandHandlers(runtime) {
     return chunks
   }
 
-  function buildModelSettingsText({ binding, preference, effectiveState, configuredInfo, sessionModelInfo, selectedModelKey }) {
+  function trimString(value) {
+    return typeof value === "string" ? value.trim() : ""
+  }
+
+  function formatProviderChoiceLabel(provider) {
+    const providerId = trimString(provider?.id)
+    const providerName = trimString(provider?.name)
+    if (!providerId) return providerName || "unknown"
+    if (!providerName || providerName.toLowerCase() === providerId.toLowerCase()) return providerId
+    return `${providerName} (${providerId})`
+  }
+
+  function formatModelChoiceLabel(entry) {
+    const modelId = trimString(entry?.model?.modelID)
+    const modelName = trimString(entry?.name)
+    if (!modelId) return modelName || "unknown"
+    if (!modelName || modelName.toLowerCase() === modelId.toLowerCase()) return modelId
+    return `${modelName} (${modelId})`
+  }
+
+  async function resolveModelProviderCatalog(projectAlias, ...fallbackEntries) {
+    const oc = ocByAlias[projectAlias]
+    const providersInfo = await oc?.getConfigProviders?.().catch(() => null)
+    const providerMap = new Map()
+
+    function ensureProvider(providerId, providerName = "") {
+      const normalizedProviderId = trimString(providerId)
+      if (!normalizedProviderId) return null
+      const existing = providerMap.get(normalizedProviderId)
+      if (existing) {
+        if (providerName && (!existing.name || existing.name === existing.id)) existing.name = providerName
+        return existing
+      }
+      const created = {
+        id: normalizedProviderId,
+        name: trimString(providerName) || normalizedProviderId,
+        modelByKey: new Map(),
+      }
+      providerMap.set(normalizedProviderId, created)
+      return created
+    }
+
+    function addModel(providerId, providerName, modelValue, modelName = "") {
+      const model = normalizeModelReference(modelValue)
+      if (!model) return
+      const provider = ensureProvider(model.providerID || providerId, providerName)
+      if (!provider) return
+      const key = modelKeyOf(model)
+      if (!key || provider.modelByKey.has(key)) return
+      provider.modelByKey.set(key, {
+        key,
+        model,
+        name: trimString(modelName) || trimString(model.modelID),
+      })
+    }
+
+    if (Array.isArray(providersInfo?.providers)) {
+      for (const providerEntry of providersInfo.providers) {
+        const providerId = trimString(providerEntry?.id || providerEntry?.providerID || providerEntry?.providerId || providerEntry?.provider)
+        if (!providerId) continue
+        const providerName = trimString(providerEntry?.name)
+        ensureProvider(providerId, providerName)
+
+        const models = providerEntry?.models
+        if (Array.isArray(models)) {
+          for (const modelEntry of models) {
+            addModel(providerId, providerName, modelEntry, modelEntry?.name || modelEntry?.id || modelEntry?.modelID || modelEntry?.modelId)
+          }
+          continue
+        }
+
+        if (models && typeof models === "object") {
+          for (const [modelId, modelEntry] of Object.entries(models)) {
+            const normalizedModel =
+              normalizeModelReference(modelEntry) ||
+              normalizeModelReference({
+                providerID: providerId,
+                modelID: trimString(modelEntry?.id || modelEntry?.modelID || modelEntry?.modelId || modelId),
+              })
+            addModel(providerId, providerName, normalizedModel, modelEntry?.name || modelId)
+          }
+        }
+      }
+    }
+
+    for (const candidate of collectModelCandidates(...fallbackEntries)) {
+      addModel(candidate.model?.providerID, candidate.model?.providerID, candidate.model, candidate.model?.modelID)
+    }
+
+    return [...providerMap.values()]
+      .map((provider) => ({
+        id: provider.id,
+        name: provider.name,
+        models: [...provider.modelByKey.values()].sort((a, b) => {
+          const byName = formatModelChoiceLabel(a).localeCompare(formatModelChoiceLabel(b))
+          if (byName !== 0) return byName
+          return a.key.localeCompare(b.key)
+        }),
+      }))
+      .filter((provider) => provider.models.length > 0)
+      .sort((a, b) => {
+        const byName = formatProviderChoiceLabel(a).localeCompare(formatProviderChoiceLabel(b))
+        if (byName !== 0) return byName
+        return a.id.localeCompare(b.id)
+      })
+  }
+
+  function buildModelSettingsText({ binding, preference, effectiveState, configuredInfo, sessionModelInfo, providerCatalog, selectedProviderId, selectedModelKey }) {
     const lines = [
       "Model for this thread:",
       `Project: ${binding.projectAlias}`,
@@ -257,8 +364,12 @@ export function createCommandHandlers(runtime) {
     if (selectedModelKey) {
       lines.push(`Pick a variant for: ${selectedModelKey}`)
       lines.push("Use 'No variant' to keep only provider/model.")
+    } else if (selectedProviderId) {
+      const selectedProvider = providerCatalog.find((provider) => provider.id === selectedProviderId)
+      lines.push(`Pick a model from provider: ${selectedProvider ? formatProviderChoiceLabel(selectedProvider) : selectedProviderId}`)
     } else {
-      lines.push("Pick a mode or choose a common model below.")
+      lines.push("Pick a mode, then choose a provider below.")
+      if (!providerCatalog.length) lines.push("No providers discovered automatically. Use a typed /model command if needed.")
     }
     lines.push("Typed forms: /model default, /model reset, /model <provider/model> [variant]")
 
@@ -293,27 +404,14 @@ export function createCommandHandlers(runtime) {
     return { ok: true, callbackText: "Model: inherit" }
   }
 
-  function modelSettingsKeyboard({ preference, configuredInfo, sessionModelInfo, selectedModelKey }) {
-    const rows = [
-      [
-        { text: `${preference.mode === "inherit" ? "✓ " : ""}Inherit`, callback_data: runtime.cb.pack("m|set|inherit") },
-        {
-          text: `${preference.mode === "project-default" ? "✓ " : ""}Project default`,
-          callback_data: runtime.cb.pack("m|set|project-default"),
-        },
-      ],
-    ]
-
+  function modelSettingsKeyboard({ preference, providerCatalog, selectedProviderId, selectedModelKey }) {
     const currentCustomModelKey = preference.mode === "custom" ? modelKeyOf(preference.model) : ""
-    const candidates = collectModelCandidates(preference.mode === "custom" ? preference.model : null, sessionModelInfo?.model, configuredInfo?.model)
-    for (const candidate of candidates) {
-      const candidateKey = modelKeyOf(candidate.model)
-      const prefix = selectedModelKey === candidateKey ? "▶ " : currentCustomModelKey === candidateKey ? "✓ " : ""
-      rows.push([{ text: `${prefix}${candidate.label}`, callback_data: runtime.cb.pack(`m|pick|${candidateKey}`) }])
-    }
+    const currentCustomProviderId = preference.mode === "custom" ? trimString(preference.model?.providerID) : ""
 
     if (selectedModelKey) {
       const selectedModel = normalizeModelReference(selectedModelKey)
+      const selectedProvider = providerCatalog.find((provider) => provider.id === selectedProviderId)
+      const rows = []
       const currentVariant = preference.mode === "custom" && currentCustomModelKey === selectedModelKey ? normalizeVariant(preference.variant) : ""
       rows.push([
         {
@@ -329,14 +427,47 @@ export function createCommandHandlers(runtime) {
           })),
         )
       }
-      rows.push([{ text: "Back", callback_data: runtime.cb.pack("m|back") }])
+      rows.push([
+        { text: "Back", callback_data: runtime.cb.pack(`m|provider|${selectedProvider?.id || selectedModel?.providerID || selectedProviderId}`) },
+        { text: "Close", callback_data: runtime.cb.pack("m|close") },
+      ])
+      return makeInlineKeyboard(rows)
+    }
+
+    if (selectedProviderId) {
+      const selectedProvider = providerCatalog.find((provider) => provider.id === selectedProviderId)
+      const rows = []
+      for (const candidate of selectedProvider?.models || []) {
+        const prefix = currentCustomModelKey === candidate.key ? "✓ " : ""
+        rows.push([{ text: `${prefix}${formatModelChoiceLabel(candidate)}`, callback_data: runtime.cb.pack(`m|model|${candidate.key}`) }])
+      }
+      rows.push([
+        { text: "Back", callback_data: runtime.cb.pack("m|root") },
+        { text: "Close", callback_data: runtime.cb.pack("m|close") },
+      ])
+      return makeInlineKeyboard(rows)
+    }
+
+    const rows = [
+      [
+        { text: `${preference.mode === "inherit" ? "✓ " : ""}Inherit`, callback_data: runtime.cb.pack("m|set|inherit") },
+        {
+          text: `${preference.mode === "project-default" ? "✓ " : ""}Project default`,
+          callback_data: runtime.cb.pack("m|set|project-default"),
+        },
+      ],
+    ]
+
+    for (const provider of providerCatalog) {
+      const prefix = currentCustomProviderId === provider.id ? "✓ " : ""
+      rows.push([{ text: `${prefix}${formatProviderChoiceLabel(provider)}`, callback_data: runtime.cb.pack(`m|provider|${provider.id}`) }])
     }
 
     rows.push([{ text: "Close", callback_data: runtime.cb.pack("m|close") }])
     return makeInlineKeyboard(rows)
   }
 
-  async function renderModelSettings(ctxMeta, { binding, editMessageId, selectedModelKey } = {}) {
+  async function renderModelSettings(ctxMeta, { binding, editMessageId, selectedProviderId, selectedModelKey } = {}) {
     const currentBinding = binding || store.getBinding(ctxMeta.ctxKey)
     if (!currentBinding) {
       await sendToThread(ctxMeta, "Not bound. Use /bind <projectAlias> first.")
@@ -349,19 +480,40 @@ export function createCommandHandlers(runtime) {
       resolveSessionModelInfo(currentBinding.projectAlias, currentBinding.sessionId),
     ])
     const effectiveState = await resolveEffectiveModelState(ctxMeta.ctxKey, currentBinding, { configuredInfo, sessionModelInfo })
-    const normalizedSelectedModelKey = selectedModelKey && modelKeyOf(selectedModelKey) ? modelKeyOf(selectedModelKey) : ""
+    const providerCatalog = await resolveModelProviderCatalog(
+      currentBinding.projectAlias,
+      preference.mode === "custom" ? preference.model : null,
+      sessionModelInfo?.model,
+      configuredInfo?.model,
+    )
+    const requestedModelKey = selectedModelKey && modelKeyOf(selectedModelKey) ? modelKeyOf(selectedModelKey) : ""
+    const requestedModel = requestedModelKey ? normalizeModelReference(requestedModelKey) : null
+    const normalizedSelectedModelKey =
+      requestedModelKey && requestedModel
+        ? providerCatalog.some((provider) => provider.id === requestedModel.providerID && provider.models.some((entry) => entry.key === requestedModelKey))
+          ? requestedModelKey
+          : ""
+        : ""
+    const normalizedSelectedProviderId =
+      trimString(selectedProviderId) && providerCatalog.some((provider) => provider.id === trimString(selectedProviderId))
+        ? trimString(selectedProviderId)
+        : normalizedSelectedModelKey && requestedModel && providerCatalog.some((provider) => provider.id === requestedModel.providerID)
+          ? requestedModel.providerID
+          : ""
     const text = buildModelSettingsText({
       binding: currentBinding,
       preference,
       effectiveState,
       configuredInfo,
       sessionModelInfo,
+      providerCatalog,
+      selectedProviderId: normalizedSelectedProviderId,
       selectedModelKey: normalizedSelectedModelKey,
     })
     const replyMarkup = modelSettingsKeyboard({
       preference,
-      configuredInfo,
-      sessionModelInfo,
+      providerCatalog,
+      selectedProviderId: normalizedSelectedProviderId,
       selectedModelKey: normalizedSelectedModelKey,
     })
 
@@ -454,15 +606,14 @@ export function createCommandHandlers(runtime) {
 
   function sessionsKeyboard(projectAlias, sessions, { currentSessionId, startupSessionId, limit = 10 } = {}) {
     const normalized = normalizeSessionsList(sessions).slice(0, limit)
-    if (!normalized.length) return null
-    return makeInlineKeyboard(
-      normalized.map((session) => [
-        {
-          text: formatSessionButtonLabel(session, { currentSessionId, startupSessionId }),
-          callback_data: runtime.cb.pack(`s|${projectAlias}|${session.id}`),
-        },
-      ]),
-    )
+    const rows = normalized.map((session) => [
+      {
+        text: formatSessionButtonLabel(session, { currentSessionId, startupSessionId }),
+        callback_data: runtime.cb.pack(`s|${projectAlias}|${session.id}`),
+      },
+    ])
+    rows.push([{ text: "Close", callback_data: runtime.cb.pack("s|close") }])
+    return makeInlineKeyboard(rows)
   }
 
   async function renderSessionsList(ctxMeta, { binding, editMessageId } = {}) {

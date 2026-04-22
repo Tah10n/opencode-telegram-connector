@@ -1282,6 +1282,7 @@ test("startConnector /feed shows the current mode and updates it via callbacks",
       "Main",
       "✓ Main + changes",
       "Verbose",
+      "Close",
     ])
 
     harness.tg.enqueue(makeCallbackUpdate(299, "feed|verbose", { threadIdOr0: 11, messageId: feedMessage.result.message_id }))

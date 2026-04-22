@@ -550,9 +550,57 @@ test("createCommandHandlers renderSessionsList shows the current model when avai
   assert.equal(sent.length, 1)
   assert.match(sent[0].text, /Current: ses_current/)
   assert.match(sent[0].text, /Current model: openai\/gpt-5 xhigh \(Inherited from session history\)/)
+  assert.equal(sent[0].replyMarkup.inline_keyboard.at(-1)?.[0]?.text, "Close")
 })
 
-test("createCommandHandlers renderModelSettings edits the message for project-default model selection", async () => {
+test("createCommandHandlers renderModelSettings shows provider selection before models", async () => {
+  const editCalls = []
+  const { runtime } = makeRuntime({
+    storeState: {
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    tg: {
+      async editMessageText(chatId, messageId, text, replyMarkup) {
+        editCalls.push({ chatId, messageId, text, replyMarkup })
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async getConfig() {
+          return { model: "openai/gpt-5" }
+        },
+        async getConfigProviders() {
+          return {
+            providers: [
+              {
+                id: "openai",
+                name: "OpenAI",
+                models: {
+                  "gpt-5": { id: "gpt-5", name: "GPT-5" },
+                },
+              },
+            ],
+          }
+        },
+        async listMessages() {
+          return []
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderModelSettings({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, { editMessageId: 123 })
+
+  assert.equal(editCalls.length, 1)
+  assert.match(editCalls[0].text, /Pick a mode, then choose a provider below\./)
+  const labels = editCalls[0].replyMarkup.inline_keyboard.flat().map((button) => button.text)
+  assert.ok(labels.includes("Project default"))
+  assert.ok(labels.includes("openai"))
+  assert.ok(labels.includes("Close"))
+})
+
+test("createCommandHandlers renderModelSettings edits the message for model and variant selection", async () => {
   const editCalls = []
   const { runtime } = makeRuntime({
     storeState: {
@@ -569,6 +617,19 @@ test("createCommandHandlers renderModelSettings edits the message for project-de
         async getConfig() {
           return { model: "openai/gpt-5" }
         },
+        async getConfigProviders() {
+          return {
+            providers: [
+              {
+                id: "openai",
+                name: "OpenAI",
+                models: {
+                  "gpt-5": { id: "gpt-5", name: "GPT-5" },
+                },
+              },
+            ],
+          }
+        },
         async listMessages() {
           return []
         },
@@ -579,7 +640,7 @@ test("createCommandHandlers renderModelSettings edits the message for project-de
 
   await handlers.renderModelSettings(
     { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
-    { editMessageId: 123, selectedModelKey: "openai/gpt-5" },
+    { editMessageId: 123, selectedProviderId: "openai", selectedModelKey: "openai/gpt-5" },
   )
 
   assert.equal(editCalls.length, 1)
@@ -591,7 +652,6 @@ test("createCommandHandlers renderModelSettings edits the message for project-de
   assert.match(editCalls[0].text, /Pick a variant for: openai\/gpt-5/)
   assert.match(editCalls[0].text, /Use 'No variant' to keep only provider\/model\./)
   const labels = editCalls[0].replyMarkup.inline_keyboard.flat().map((button) => button.text)
-  assert.ok(labels.includes("✓ Project default"))
   assert.ok(labels.includes("No variant"))
   assert.ok(labels.includes("xhigh"))
   assert.ok(labels.includes("Back"))
