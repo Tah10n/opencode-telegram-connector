@@ -1,7 +1,17 @@
 import path from "node:path"
 import { readJsonFile, writeJsonFileAtomic } from "./fileStore.js"
 
-export const STATE_SCHEMA_VERSION = 2
+export const STATE_SCHEMA_VERSION = 3
+export const DEFAULT_FEED_MODE = "main+changes"
+
+export function normalizeFeedMode(value) {
+  if (value === "main" || value === "main+changes" || value === "verbose") return value
+  return DEFAULT_FEED_MODE
+}
+
+function defaultFeedByContext() {
+  return {}
+}
 
 function defaultPendingPrompts() {
   return {
@@ -18,6 +28,7 @@ export function defaultState() {
     updateOffset: null,
     bindings: {},
     sessionIndex: {},
+    feedByContext: defaultFeedByContext(),
     pendingPrompts: defaultPendingPrompts(),
   }
 }
@@ -51,6 +62,16 @@ export class StateStore {
 
   getPendingPrompts() {
     return this.state.pendingPrompts
+  }
+
+  getFeedMode(ctxKey) {
+    return normalizeFeedMode(this.state.feedByContext?.[ctxKey]?.mode)
+  }
+
+  setFeedMode(ctxKey, mode) {
+    if (!ctxKey) return
+    this.state.feedByContext[ctxKey] = { mode: normalizeFeedMode(mode) }
+    this.scheduleSave()
   }
 
   scheduleSave(delayMs = 250) {
@@ -224,6 +245,18 @@ function migrateStateIfNeeded(loaded) {
       updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
       bindings: loaded.bindings && typeof loaded.bindings === "object" ? loaded.bindings : {},
       sessionIndex: loaded.sessionIndex && typeof loaded.sessionIndex === "object" ? loaded.sessionIndex : {},
+      feedByContext: normalizeFeedByContext(loaded.feedByContext),
+      pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
+    }
+  }
+
+  if (loaded && typeof loaded === "object" && loaded.schemaVersion === 2) {
+    return {
+      schemaVersion: STATE_SCHEMA_VERSION,
+      updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
+      bindings: loaded.bindings && typeof loaded.bindings === "object" ? loaded.bindings : {},
+      sessionIndex: loaded.sessionIndex && typeof loaded.sessionIndex === "object" ? loaded.sessionIndex : {},
+      feedByContext: defaultFeedByContext(),
       pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
     }
   }
@@ -234,6 +267,7 @@ function migrateStateIfNeeded(loaded) {
       updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
       bindings: loaded.bindings && typeof loaded.bindings === "object" ? loaded.bindings : {},
       sessionIndex: loaded.sessionIndex && typeof loaded.sessionIndex === "object" ? loaded.sessionIndex : {},
+      feedByContext: defaultFeedByContext(),
       pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
     }
   }
@@ -246,6 +280,7 @@ function migrateStateIfNeeded(loaded) {
       updateOffset: Number.isInteger(loaded.telegram.updateOffset) ? loaded.telegram.updateOffset : null,
       bindings: {},
       sessionIndex: {},
+      feedByContext: defaultFeedByContext(),
       pendingPrompts: defaultPendingPrompts(),
     }
   }
@@ -262,4 +297,13 @@ function normalizePendingPrompts(value) {
     customAnswers: value.customAnswers && typeof value.customAnswers === "object" ? value.customAnswers : {},
     questionWizards: value.questionWizards && typeof value.questionWizards === "object" ? value.questionWizards : {},
   }
+}
+
+function normalizeFeedByContext(value) {
+  if (!value || typeof value !== "object") return defaultFeedByContext()
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([ctxKey]) => typeof ctxKey === "string" && ctxKey)
+      .map(([ctxKey, settings]) => [ctxKey, { mode: normalizeFeedMode(settings?.mode) }]),
+  )
 }

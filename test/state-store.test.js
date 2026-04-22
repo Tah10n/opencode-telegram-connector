@@ -4,7 +4,7 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import crypto from "node:crypto"
-import { StateStore, resolveDefaultStatePath } from "../src/state/store.js"
+import { DEFAULT_FEED_MODE, StateStore, resolveDefaultStatePath } from "../src/state/store.js"
 
 function makeLogger() {
   return { info() {}, warn() {}, error() {} }
@@ -149,7 +149,23 @@ test("StateStore persists pending prompt recovery state", () => {
   })
 })
 
-test("StateStore migrates schema version 1 state to version 2", async () => {
+test("StateStore keeps feed mode per context and defaults to main+changes", () => {
+  const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-state.json"), logger: makeLogger() })
+  store.scheduleSave = () => {}
+
+  assert.equal(store.getFeedMode("100:7"), DEFAULT_FEED_MODE)
+  store.setFeedMode("100:7", "main")
+  store.setFeedMode("100:9", "verbose")
+
+  assert.equal(store.getFeedMode("100:7"), "main")
+  assert.equal(store.getFeedMode("100:9"), "verbose")
+  assert.deepEqual(store.get().feedByContext, {
+    "100:7": { mode: "main" },
+    "100:9": { mode: "verbose" },
+  })
+})
+
+test("StateStore migrates schema version 1 state to version 3", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -161,14 +177,43 @@ test("StateStore migrates schema version 1 state to version 2", async () => {
   const store = new StateStore({ filePath, logger: makeLogger() })
   const loaded = await store.load()
 
-  assert.equal(loaded.schemaVersion, 2)
+  assert.equal(loaded.schemaVersion, 3)
   assert.equal(loaded.updateOffset, 77)
+  assert.deepEqual(loaded.feedByContext, {})
   assert.deepEqual(loaded.pendingPrompts, {
     permissions: {},
     rejectNotes: {},
     customAnswers: {},
     questionWizards: {},
   })
+})
+
+test("StateStore migrates schema version 2 state to version 3", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  await fs.writeFile(
+    filePath,
+    JSON.stringify(
+      {
+        schemaVersion: 2,
+        updateOffset: 88,
+        bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+        sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+        pendingPrompts: { permissions: {}, rejectNotes: {}, customAnswers: {}, questionWizards: {} },
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  )
+
+  const store = new StateStore({ filePath, logger: makeLogger() })
+  const loaded = await store.load()
+
+  assert.equal(loaded.schemaVersion, 3)
+  assert.equal(loaded.updateOffset, 88)
+  assert.deepEqual(loaded.feedByContext, {})
+  assert.deepEqual(loaded.bindings, { "100:7": { projectAlias: "demo", sessionId: "ses_1" } })
 })
 
 test("StateStore migrates legacy state and flush persists the new schema", async () => {
@@ -183,10 +228,11 @@ test("StateStore migrates legacy state and flush persists the new schema", async
   const store = new StateStore({ filePath, logger: makeLogger() })
   const loaded = await store.load()
 
-  assert.equal(loaded.schemaVersion, 2)
+  assert.equal(loaded.schemaVersion, 3)
   assert.equal(loaded.updateOffset, 123)
   assert.deepEqual(loaded.bindings, {})
   assert.deepEqual(loaded.sessionIndex, {})
+  assert.deepEqual(loaded.feedByContext, {})
   assert.deepEqual(loaded.pendingPrompts, {
     permissions: {},
     rejectNotes: {},
@@ -200,7 +246,7 @@ test("StateStore migrates legacy state and flush persists the new schema", async
   await store.flush()
 
   const persisted = JSON.parse(await fs.readFile(filePath, "utf8"))
-  assert.equal(persisted.schemaVersion, 2)
+  assert.equal(persisted.schemaVersion, 3)
   assert.equal(persisted.updateOffset, 456)
   assert.deepEqual(persisted.bindings, {
     "42:0": { projectAlias: "demo", sessionId: "ses_9" },
@@ -208,6 +254,7 @@ test("StateStore migrates legacy state and flush persists the new schema", async
   assert.deepEqual(persisted.sessionIndex, {
     "demo:ses_9": { chatId: 42, threadIdOr0: 0 },
   })
+  assert.deepEqual(persisted.feedByContext, {})
   assert.deepEqual(persisted.pendingPrompts, {
     permissions: {},
     rejectNotes: {},

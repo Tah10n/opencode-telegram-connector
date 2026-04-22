@@ -57,6 +57,7 @@ npm start
 - `/new [title]` (create a new session in this thread's project and bind)
 - `/use <sessionId|shareLink>` (bind to an existing session in this thread's project)
 - `/sessions` (list recent sessions for this thread's current project and switch via buttons)
+- `/feed` (configure which updates are mirrored into this thread: Main, Main + changes, Verbose)
 - `/status` (show current binding, startup session, SSE status, and base URL)
 - `/bindings` (list all active chat/topic bindings; private chat only)
 - `/abort` (abort the current thread's running session)
@@ -68,8 +69,13 @@ npm start
 - The bot only accepts messages from a single Telegram user id (`TELEGRAM_ALLOWED_USER_ID`).
 - On first start it **drains** old Telegram updates so it does not replay history.
 - State is stored in `./.data/state.json` by default (override with `STATE_FILE`).
+- Feed mode is stored per Telegram thread/topic and survives rebinds and restarts.
+- `Main` shows only final assistant replies.
+- `Main + changes` shows final assistant replies plus first-class `Changed files` cards.
+- `Verbose` also includes streaming previews and non-echo user mirroring.
 - Assistant replies stream into the bound Telegram thread while opencode is still generating output.
 - Very long assistant code/log output falls back to a `.txt` attachment instead of flooding the chat with many chunks.
+- `Changed files` cards support `Show diff` / `Back`; if the diff is unavailable or too large, the bot falls back gracefully and may attach a `.txt` file.
 - Pending permission/question flows are restored after restart so you can continue approving or answering from Telegram.
 - Mirrored messages are sent with `parse_mode=HTML`. Triple-backtick fences (```code```) are rendered as Telegram `<pre><code>` blocks.
 - Common markdown like `**bold**`, `*italic*`, `` `inline code` ``, `# headings`, `- bullets`, and `[links](https://example.com)` is converted (clickable links are http/https only).

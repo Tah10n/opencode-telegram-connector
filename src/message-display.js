@@ -2,6 +2,10 @@ function toForwardSlashes(p) {
   return String(p || "").replace(/\\/g, "/")
 }
 
+function cleanString(value) {
+  return typeof value === "string" ? value.trim() : ""
+}
+
 export function extractPatchFiles(message) {
   const parts = Array.isArray(message?.parts) ? message.parts : []
   const out = []
@@ -25,6 +29,33 @@ export function extractPatchFiles(message) {
     uniq.push(f)
   }
   return uniq
+}
+
+export function extractPatchDiffText(message) {
+  const parts = Array.isArray(message?.parts) ? message.parts : []
+  const out = []
+  for (const part of parts) {
+    if (!part || part.type !== "patch") continue
+    const direct = cleanString(part.diff || part.patch || part.text || part.content)
+    if (direct) {
+      out.push(direct)
+      continue
+    }
+
+    const hunks = Array.isArray(part.hunks) ? part.hunks : []
+    const chunk = hunks
+      .map((hunk) => {
+        if (typeof hunk === "string") return hunk
+        const header = cleanString(hunk?.header)
+        const lines = Array.isArray(hunk?.lines) ? hunk.lines.filter((line) => typeof line === "string") : []
+        return [header, ...lines].filter(Boolean).join("\n")
+      })
+      .filter(Boolean)
+      .join("\n")
+      .trim()
+    if (chunk) out.push(chunk)
+  }
+  return out.join("\n\n").trim()
 }
 
 export function formatChangedFilesText(files, { baseDir, limit = 10 } = {}) {

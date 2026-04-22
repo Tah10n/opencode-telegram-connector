@@ -456,6 +456,10 @@ test("startConnector streams assistant replies in isolated threads and finalizes
         "demo:ses_alpha": { chatId: 100, threadIdOr0: 7 },
         "demo:ses_beta": { chatId: 100, threadIdOr0: 9 },
       },
+      feedByContext: {
+        "100:7": { mode: "verbose" },
+        "100:9": { mode: "verbose" },
+      },
     },
     messagesById,
   })
@@ -578,6 +582,9 @@ test("startConnector resends the final assistant reply if preview edit fails", a
       },
       sessionIndex: {
         "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+      feedByContext: {
+        "100:7": { mode: "verbose" },
       },
     },
     messagesById,
@@ -1056,6 +1063,7 @@ test("startConnector /status shows startup session, SSE status, and sanitized ba
     assert.match(status, /Project: demo/)
     assert.match(status, /Session: ses_current/)
     assert.match(status, /Startup session: ses_startup/)
+    assert.match(status, /Feed: Main \+ changes/)
     assert.match(status, /SSE: connected/)
     assert.match(status, /Base URL: http:\/\/example\.test:4312\/path\?token=\*\*\*/) 
     assert.doesNotMatch(status, /secret|user|frag|abc/)
@@ -1097,6 +1105,311 @@ test("startConnector /status keeps SSE connected after a non-SSE request failure
     const status = harness.tg.sentMessages[1]?.text || ""
     assert.match(unavailable, /Project 'demo' is unavailable/)
     assert.match(status, /SSE: connected/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector /feed shows the current mode and updates it via callbacks", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 297,
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(298, "/feed", { threadIdOr0: 11 }))
+
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+
+    const feedMessage = harness.tg.sentMessages[0]
+    assert.match(feedMessage.text, /Feed for this thread: Main \+ changes/)
+    assert.deepEqual(feedMessage.replyMarkup.inline_keyboard.map((row) => row[0].text), [
+      "Main",
+      "✓ Main + changes",
+      "Verbose",
+    ])
+
+    harness.tg.enqueue(makeCallbackUpdate(299, "feed|verbose", { threadIdOr0: 11, messageId: feedMessage.result.message_id }))
+
+    await waitFor(() => harness.tg.editedMessages.length >= 1)
+    await harness.connector.stop()
+
+    assert.ok(harness.tg.callbackAnswers.some((entry) => entry.callbackQueryId === "cb_299" && entry.text === "Feed: Verbose"))
+    assert.match(harness.tg.editedMessages[0].text, /Feed for this thread: Verbose/)
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.feedByContext, {
+      "100:11": { mode: "verbose" },
+    })
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector finalizes an in-flight preview when /feed switches to a mode that filters the completion", async () => {
+  const updatedAt = new Date(Date.now() + 60_000).toISOString()
+  const completedAt = new Date(Date.now() + 61_000).toISOString()
+  const messagesById = {
+    msg_feed_transition: {
+      info: { id: "msg_feed_transition", role: "assistant", time: { updated: updatedAt } },
+      parts: [{ type: "text", text: "preview text" }],
+    },
+  }
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 299,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+      feedByContext: {
+        "100:7": { mode: "verbose" },
+      },
+    },
+    messagesById,
+  })
+
+  try {
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_1", info: { id: "msg_feed_transition", role: "assistant", time: { updated: updatedAt } } },
+    })
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+
+    const previewMessage = harness.tg.sentMessages[0]
+    harness.tg.enqueue(makeMessageUpdate(300, "/feed"))
+    await waitFor(() => harness.tg.sentMessages.length >= 2)
+    const feedMessage = harness.tg.sentMessages[1]
+
+    harness.tg.enqueue(makeCallbackUpdate(301, "feed|main", { threadIdOr0: 7, messageId: feedMessage.result.message_id }))
+    await waitFor(() => harness.tg.editedMessages.some((entry) => entry.messageId === feedMessage.result.message_id))
+
+    messagesById.msg_feed_transition = {
+      info: { id: "msg_feed_transition", role: "assistant", time: { created: completedAt, completed: completedAt } },
+      parts: [{ type: "patch", files: ["/repo/only-change.js"], diff: "--- a/only-change.js\n+++ b/only-change.js" }],
+    }
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_1", info: { id: "msg_feed_transition", role: "assistant", time: { completed: completedAt } } },
+    })
+
+    await waitFor(
+      () => harness.tg.editedMessages.some((entry) => entry.messageId === previewMessage.result.message_id && /no updates matched/.test(entry.text)),
+    )
+
+    assert.ok(!harness.tg.sentMessages.slice(2).some((entry) => /Changed files:/.test(entry.text)))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector applies feed modes per thread for assistant, user, and changed-file updates", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const updatedAt = new Date(Date.now() + 59_000).toISOString()
+  const messagesById = {
+    user_main: { info: { id: "user_main", role: "user", time: { created: completedAt, completed: completedAt } }, parts: [{ type: "text", text: "main user" }] },
+    user_changes: { info: { id: "user_changes", role: "user", time: { created: completedAt, completed: completedAt } }, parts: [{ type: "text", text: "changes user" }] },
+    user_verbose: { info: { id: "user_verbose", role: "user", time: { created: completedAt, completed: completedAt } }, parts: [{ type: "text", text: "verbose user" }] },
+    asst_main: {
+      info: { id: "asst_main", role: "assistant", time: { created: completedAt, completed: completedAt } },
+      parts: [{ type: "text", text: "Main answer" }, { type: "patch", files: ["/repo/main.js"], diff: "--- a/main.js\n+++ b/main.js" }],
+    },
+    asst_changes: {
+      info: { id: "asst_changes", role: "assistant", time: { created: completedAt, completed: completedAt } },
+      parts: [{ type: "text", text: "Changes answer" }, { type: "patch", files: ["/repo/changes.js"], diff: "--- a/changes.js\n+++ b/changes.js" }],
+    },
+    asst_verbose: {
+      info: { id: "asst_verbose", role: "assistant", time: { updated: updatedAt } },
+      parts: [{ type: "text", text: "Streaming verbose reply" }],
+    },
+    asst_verbose_final: {
+      info: { id: "asst_verbose", role: "assistant", time: { created: completedAt, completed: completedAt } },
+      parts: [{ type: "text", text: "Verbose answer" }, { type: "patch", files: ["/repo/verbose.js"], diff: "--- a/verbose.js\n+++ b/verbose.js" }],
+    },
+    asst_compaction: {
+      info: { id: "asst_compaction", role: "assistant", mode: "compaction", time: { created: completedAt, completed: completedAt } },
+      parts: [{ type: "text", text: "internal" }],
+    },
+  }
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 300,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_main" },
+        "100:9": { projectAlias: "demo", sessionId: "ses_changes" },
+        "100:11": { projectAlias: "demo", sessionId: "ses_verbose" },
+      },
+      sessionIndex: {
+        "demo:ses_main": { chatId: 100, threadIdOr0: 7 },
+        "demo:ses_changes": { chatId: 100, threadIdOr0: 9 },
+        "demo:ses_verbose": { chatId: 100, threadIdOr0: 11 },
+      },
+      feedByContext: {
+        "100:7": { mode: "main" },
+        "100:9": { mode: "main+changes" },
+        "100:11": { mode: "verbose" },
+      },
+    },
+    messagesById,
+  })
+
+  try {
+    await harness.emitSse("demo", { type: "message.updated", properties: { sessionID: "ses_main", info: { id: "user_main", role: "user", time: { completed: completedAt } } } })
+    await harness.emitSse("demo", { type: "message.updated", properties: { sessionID: "ses_changes", info: { id: "user_changes", role: "user", time: { completed: completedAt } } } })
+    await harness.emitSse("demo", { type: "message.updated", properties: { sessionID: "ses_verbose", info: { id: "user_verbose", role: "user", time: { completed: completedAt } } } })
+    await harness.emitSse("demo", { type: "message.updated", properties: { sessionID: "ses_verbose", info: { id: "asst_verbose", role: "assistant", time: { updated: updatedAt } } } })
+    await harness.emitSse("demo", { type: "message.updated", properties: { sessionID: "ses_main", info: { id: "asst_main", role: "assistant", time: { completed: completedAt } } } })
+    await harness.emitSse("demo", { type: "message.updated", properties: { sessionID: "ses_changes", info: { id: "asst_changes", role: "assistant", time: { completed: completedAt } } } })
+    messagesById.asst_verbose = messagesById.asst_verbose_final
+    await harness.emitSse("demo", { type: "message.updated", properties: { sessionID: "ses_verbose", info: { id: "asst_verbose", role: "assistant", time: { completed: completedAt } } } })
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_verbose", info: { id: "asst_compaction", role: "assistant", mode: "compaction", time: { completed: completedAt } } },
+    })
+
+    await waitFor(() => harness.tg.sentHtmlBlocks.length >= 3 && harness.tg.sentMessages.length >= 3 && harness.tg.editedMessages.length >= 1)
+
+    const htmlByThread = harness.tg.sentHtmlBlocks.map((entry) => ({ threadId: entry.options.message_thread_id, first: entry.blocks[0]?.html }))
+    const textByThread = harness.tg.sentMessages.map((entry) => ({ threadId: entry.options.message_thread_id, text: entry.text }))
+
+    assert.ok(htmlByThread.some((entry) => entry.threadId === 7 && entry.first === "Main answer"))
+    assert.ok(htmlByThread.some((entry) => entry.threadId === 9 && entry.first === "Changes answer"))
+    assert.ok(htmlByThread.some((entry) => entry.threadId === 11 && entry.first === "<b>User</b>"))
+    assert.ok(harness.tg.editedMessages.some((entry) => entry.kind === "text" && entry.messageId && entry.text === "Verbose answer"))
+    assert.ok(!htmlByThread.some((entry) => entry.threadId === 7 && entry.first === "<b>User</b>"))
+    assert.ok(!htmlByThread.some((entry) => entry.threadId === 9 && entry.first === "<b>User</b>"))
+
+    assert.ok(textByThread.some((entry) => entry.threadId === 9 && /Changed files:/.test(entry.text)))
+    assert.ok(textByThread.some((entry) => entry.threadId === 11 && /Streaming reply/.test(entry.text)))
+    assert.ok(textByThread.some((entry) => entry.threadId === 11 && /Changed files:/.test(entry.text)))
+    assert.ok(!textByThread.some((entry) => entry.threadId === 7 && /Changed files:/.test(entry.text)))
+    assert.ok(!textByThread.some((entry) => entry.threadId === 9 && /Streaming reply/.test(entry.text)))
+    assert.ok(!textByThread.some((entry) => /internal/.test(entry.text)))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector changed-files cards support Show diff and Back", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 301,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    messagesById: {
+      msg_patch: {
+        info: { id: "msg_patch", role: "assistant", time: { created: completedAt, completed: completedAt } },
+        parts: [
+          { type: "text", text: "Patched" },
+          { type: "patch", files: ["/repo/a.js"], diff: "--- a/a.js\n+++ b/a.js\n@@ -1 +1 @@\n-old\n+new" },
+        ],
+      },
+    },
+  })
+
+  try {
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_1", info: { id: "msg_patch", role: "assistant", time: { completed: completedAt } } },
+    })
+
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+    const summary = harness.tg.sentMessages[0]
+    assert.match(summary.text, /Changed files:/)
+
+    harness.tg.enqueue(makeCallbackUpdate(302, "cf|demo|ses_1|msg_patch|show", { threadIdOr0: 7, messageId: summary.result.message_id }))
+    await waitFor(() => harness.tg.editedMessages.length >= 1)
+    assert.match(harness.tg.editedMessages[0].text, /Changed files diff/)
+
+    harness.tg.enqueue(makeCallbackUpdate(303, "cf|demo|ses_1|msg_patch|back", { threadIdOr0: 7, messageId: summary.result.message_id }))
+    await waitFor(() => harness.tg.editedMessages.length >= 2)
+    assert.match(harness.tg.editedMessages[1].text, /Changed files:/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector changed-files Show diff falls back gracefully when diff is unavailable", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 302,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    messagesById: {
+      msg_patch_unavailable: {
+        info: { id: "msg_patch_unavailable", role: "assistant", time: { created: completedAt, completed: completedAt } },
+        parts: [{ type: "patch", files: ["/repo/a.js"] }],
+      },
+    },
+  })
+
+  try {
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_1", info: { id: "msg_patch_unavailable", role: "assistant", time: { completed: completedAt } } },
+    })
+
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+    const summary = harness.tg.sentMessages[0]
+    harness.tg.enqueue(makeCallbackUpdate(304, "cf|demo|ses_1|msg_patch_unavailable|show", { threadIdOr0: 7, messageId: summary.result.message_id }))
+
+    await waitFor(() => harness.tg.editedMessages.length >= 1)
+    assert.equal(harness.tg.editedMessages[0].text, "Diff unavailable for this update.")
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector changed-files Show diff attaches large diffs as text files", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const longDiff = Array.from({ length: 900 }, (_, index) => `+line ${index} ${"x".repeat(10)}`).join("\n")
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 303,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    messagesById: {
+      msg_patch_large: {
+        info: { id: "msg_patch_large", role: "assistant", time: { created: completedAt, completed: completedAt } },
+        parts: [{ type: "patch", files: ["/repo/a.js"], diff: longDiff }],
+      },
+    },
+  })
+
+  try {
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_1", info: { id: "msg_patch_large", role: "assistant", time: { completed: completedAt } } },
+    })
+
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+    const summary = harness.tg.sentMessages[0]
+    harness.tg.enqueue(makeCallbackUpdate(305, "cf|demo|ses_1|msg_patch_large|show", { threadIdOr0: 7, messageId: summary.result.message_id }))
+
+    await waitFor(() => harness.tg.editedMessages.length >= 1 && harness.tg.sentDocuments.length >= 1)
+    assert.match(harness.tg.editedMessages[0].text, /Diff is too large for an inline preview/)
+    assert.match(harness.tg.sentDocuments[0].filename, /msg_patch_large.*\.diff\.txt/)
+    assert.match(String(harness.tg.sentDocuments[0].contents), /\+line 0/)
   } finally {
     await harness.connector.stop()
   }

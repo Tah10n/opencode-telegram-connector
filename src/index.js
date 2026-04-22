@@ -7,10 +7,10 @@ import { OpenCodeClient } from "./opencode/client.js"
 import { startOpenCodeSseLoop } from "./opencode/sse.js"
 import { ensureStartupSession } from "./opencode/startup-session.js"
 import { ensureOpenCodeRunning, openAttachWindowWindows } from "./opencode/launcher.js"
-import { extractPatchFiles, formatChangedFilesText } from "./message-display.js"
+import { extractPatchDiffText, extractPatchFiles, formatChangedFilesText } from "./message-display.js"
 import { findSessionByShareUrl, parseSessionReference } from "./session-ref.js"
 import { resolveSessionRoute } from "./session-route.js"
-import { StateStore, resolveDefaultStatePath, sessionKey } from "./state/store.js"
+import { DEFAULT_FEED_MODE, StateStore, normalizeFeedMode, resolveDefaultStatePath, sessionKey } from "./state/store.js"
 import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "./session-list.js"
 import { sanitizeBaseUrlForDisplay } from "./url-utils.js"
 
@@ -188,6 +188,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       { command: "new", description: "Создать новую сессию" },
       { command: "use", description: "Переключиться на сессию" },
       { command: "sessions", description: "Недавние сессии проекта" },
+      { command: "feed", description: "Настроить Telegram feed для треда" },
       { command: "status", description: "Показать текущую привязку" },
       { command: "bindings", description: "Показать все активные привязки в личке" },
       { command: "abort", description: "Прервать текущую сессию" },
@@ -317,10 +318,12 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   }
 
   const cb = makeCallbackStore()
+  const CHANGED_FILES_LIMIT = 10
+  const INLINE_DIFF_TEXT_MAX_CHARS = 2500
   const STREAM_PREVIEW_MAX_CHARS = 3500
   const TEXT_ATTACHMENT_THRESHOLD = 12_000
   // Bound the amount of per-session state we keep.
-  const forwardedBySession = new LruMap(2000) // sessionKey -> {user:LruSet, assistant:LruSet}
+  const forwardedBySession = new LruMap(2000) // sessionKey -> {user:LruSet, assistant:LruSet, changes:LruSet}
   const assistantDebounce = new Map() // msgId -> timeout
   const assistantPreviewBySession = new Map() // bound sessionKey -> { messageId, telegramMessageId, lastPreviewHtml, lastPreviewAt }
   const recentTgPromptsBySession = new LruMap(2000) // sessionKey -> LruSet(hash)
@@ -570,13 +573,109 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     )
   }
 
+  function changedFilesAttachmentName(projectAlias, sessionId, messageId) {
+    const clean = (value, fallback) => {
+      const s = String(value || fallback)
+        .replace(/[^a-z0-9._-]+/gi, "-")
+        .replace(/^-+|-+$/g, "")
+      return s || fallback
+    }
+    return `${clean(projectAlias, "project")}-${clean(sessionId, "session")}-${clean(messageId, "reply")}.diff.txt`
+  }
+
+  function changedFilesSummaryKeyboard(projectAlias, sessionId, messageId) {
+    return makeInlineKeyboard([[{ text: "Show diff", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|show`) }]])
+  }
+
+  function changedFilesDiffKeyboard(projectAlias, sessionId, messageId) {
+    return makeInlineKeyboard([[{ text: "Back", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|back`) }]])
+  }
+
+  function extractChangedFilesSummary(projectAlias, msg) {
+    const files = extractPatchFiles(msg)
+    if (!files.length) return ""
+    return formatChangedFilesText(files, { baseDir: projects?.[projectAlias]?.directory, limit: CHANGED_FILES_LIMIT })
+  }
+
+  function renderChangedFilesDiffHtml(diffText) {
+    return `<b>Changed files diff</b>\n<pre><code>${escapeHtml(diffText)}</code></pre>`
+  }
+
+  async function deliverChangedFilesSummary(ctxMeta, projectAlias, sessionId, messageId, msg, { replaceMessageId } = {}) {
+    const text = extractChangedFilesSummary(projectAlias, msg)
+    if (!text) return null
+    const replyMarkup = changedFilesSummaryKeyboard(projectAlias, sessionId, messageId)
+    if (replaceMessageId) {
+      const edited = await tg.editMessageText(ctxMeta.chatId, replaceMessageId, text, replyMarkup).catch(() => null)
+      if (edited) return { mode: "edited" }
+    }
+    await sendToThread(ctxMeta, text, replyMarkup)
+    return { mode: "sent" }
+  }
+
+  async function renderChangedFilesView(ctxMeta, projectAlias, sessionId, messageId, action, { editMessageId } = {}) {
+    if (!editMessageId) return
+    const oc = ocByAlias[projectAlias]
+    if (!oc) {
+      await tg.editMessageText(ctxMeta.chatId, editMessageId, `Unknown project: ${projectAlias}`).catch(() => {})
+      return
+    }
+    const msg = await oc.getMessage(sessionId, messageId).catch(() => null)
+    if (!msg) {
+      await tg.editMessageText(ctxMeta.chatId, editMessageId, "Changed files update is no longer available.").catch(() => {})
+      return
+    }
+
+    if (action === "back") {
+      const summary = extractChangedFilesSummary(projectAlias, msg) || "Changed files are unavailable for this update."
+      await tg.editMessageText(
+        ctxMeta.chatId,
+        editMessageId,
+        summary,
+        changedFilesSummaryKeyboard(projectAlias, sessionId, messageId),
+      )
+      return
+    }
+
+    const diffText = extractPatchDiffText(msg)
+    if (!diffText) {
+      await tg.editMessageText(
+        ctxMeta.chatId,
+        editMessageId,
+        "Diff unavailable for this update.",
+        changedFilesDiffKeyboard(projectAlias, sessionId, messageId),
+      )
+      return
+    }
+
+    const diffHtml = renderChangedFilesDiffHtml(diffText)
+    if (diffText.length > INLINE_DIFF_TEXT_MAX_CHARS || diffHtml.length > 3900) {
+      await tg.editMessageText(
+        ctxMeta.chatId,
+        editMessageId,
+        "Diff is too large for an inline preview. It was attached as a .txt file.",
+        changedFilesDiffKeyboard(projectAlias, sessionId, messageId),
+      )
+      await tg.sendDocument(
+        ctxMeta.chatId,
+        diffText,
+        changedFilesAttachmentName(projectAlias, sessionId, messageId),
+        `Changed files diff (${projectAlias}/${sessionId})`,
+        { message_thread_id: ctxMeta.threadIdOr0 || undefined },
+      )
+      return
+    }
+
+    await tg.editMessageText(ctxMeta.chatId, editMessageId, diffHtml, changedFilesDiffKeyboard(projectAlias, sessionId, messageId), {
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+    })
+  }
+
   function extractAssistantDisplayText(projectAlias, msg) {
     let text = extractTextParts(msg)
     if (!text || !text.trim()) {
-      const files = extractPatchFiles(msg)
-      if (files.length) {
-        text = formatChangedFilesText(files, { baseDir: projects?.[projectAlias]?.directory, limit: 10 })
-      }
+      text = extractChangedFilesSummary(projectAlias, msg)
     }
     return text
   }
@@ -752,7 +851,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   function ensureForwardedSets(sk) {
     let s = forwardedBySession.get(sk)
     if (!s) {
-      s = { user: new LruSet(8000), assistant: new LruSet(8000) }
+      s = { user: new LruSet(8000), assistant: new LruSet(8000), changes: new LruSet(8000) }
       forwardedBySession.set(sk, s)
     }
     return s
@@ -778,6 +877,65 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     const chatType = msg?.chat?.type
     const threadIdOr0 = threadIdOr0FromMessage(msg)
     return { chatId, chatType, threadIdOr0, ctxKey: ctxKeyFrom(chatId, threadIdOr0) }
+  }
+
+  function ctxMetaFromRoute(route) {
+    return { chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey: ctxKeyFrom(route.chatId, route.threadIdOr0) }
+  }
+
+  function getFeedMode(ctxKey) {
+    return store.getFeedMode?.(ctxKey) || DEFAULT_FEED_MODE
+  }
+
+  function feedModeLabel(mode) {
+    const normalized = normalizeFeedMode(mode)
+    if (normalized === "main") return "Main"
+    if (normalized === "verbose") return "Verbose"
+    return "Main + changes"
+  }
+
+  function shouldMirrorToFeed(ctxKey, kind) {
+    const mode = getFeedMode(ctxKey)
+    if (kind === "internal") return false
+    if (mode === "main") return kind === "assistant-final"
+    if (mode === "main+changes") return kind === "assistant-final" || kind === "changed-files"
+    return kind === "assistant-final" || kind === "assistant-stream" || kind === "user-mirror" || kind === "changed-files"
+  }
+
+  function renderFeedSettingsText(ctxKey) {
+    const mode = getFeedMode(ctxKey)
+    return [
+      `Feed for this thread: ${feedModeLabel(mode)}`,
+      "",
+      "Main — final assistant replies only.",
+      "Main + changes — final assistant replies and changed files.",
+      "Verbose — final replies, streaming previews, user mirror, and changed files.",
+      "",
+      "Internal compaction output stays hidden in all modes.",
+    ].join("\n")
+  }
+
+  function feedKeyboard(ctxKey) {
+    const current = getFeedMode(ctxKey)
+    const button = (mode, label) => ({
+      text: `${current === mode ? "✓ " : ""}${label}`,
+      callback_data: cb.pack(`feed|${mode}`),
+    })
+    return makeInlineKeyboard([
+      [button("main", "Main")],
+      [button("main+changes", "Main + changes")],
+      [button("verbose", "Verbose")],
+    ])
+  }
+
+  async function renderFeedSettings(ctxMeta, { editMessageId } = {}) {
+    const text = renderFeedSettingsText(ctxMeta.ctxKey)
+    const replyMarkup = feedKeyboard(ctxMeta.ctxKey)
+    if (editMessageId) {
+      await tg.editMessageText(ctxMeta.chatId, editMessageId, text, replyMarkup)
+      return
+    }
+    await sendToThread(ctxMeta, text, replyMarkup)
   }
 
   function isAllowedUser(from) {
@@ -1145,16 +1303,22 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     const startupSessionId = startupSessionByProject[binding.projectAlias] || "unknown"
     const sseStatus = getProjectSseStatus(binding.projectAlias)
     const baseUrl = sanitizeBaseUrlForDisplay(projects?.[binding.projectAlias]?.baseUrl) || "unknown"
+    const feedMode = feedModeLabel(getFeedMode(ctxMeta.ctxKey))
     await sendToThread(
       ctxMeta,
       [
         `Project: ${binding.projectAlias}`,
         `Session: ${binding.sessionId}`,
         `Startup session: ${startupSessionId}`,
+        `Feed: ${feedMode}`,
         `SSE: ${sseStatus}`,
         `Base URL: ${baseUrl}`,
       ].join("\n"),
     )
+  }
+
+  async function handleFeed(ctxMeta, { editMessageId } = {}) {
+    await renderFeedSettings(ctxMeta, { editMessageId })
   }
 
   async function handleBindings(ctxMeta) {
@@ -1329,6 +1493,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
             "/new [title]",
             "/use <sessionId|shareLink>",
             "/sessions",
+            "/feed",
             "/status",
             "/bindings (private chat only)",
             "/abort",
@@ -1352,6 +1517,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       if (cmd === "/new") return handleNewCommand(ctxMeta, args)
       if (cmd === "/use") return handleUseCommand(ctxMeta, argv[0])
       if (cmd === "/sessions") return handleSessions(ctxMeta)
+      if (cmd === "/feed") return handleFeed(ctxMeta)
       if (cmd === "/status") return handleWhere(ctxMeta)
       if (cmd === "/bindings") return handleBindings(ctxMeta)
       if (cmd === "/abort") return handleAbort(ctxMeta)
@@ -1403,6 +1569,8 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     // q|<projectAlias>|<questionId>|<action>
     // s|<projectAlias>|<sessionId>
     // srv|<projectAlias>|start
+    // feed|<mode>
+    // cf|<projectAlias>|<sessionId>|<messageId>|<show|back>
     const parts = String(data).split("|")
     const kind = parts[0]
 
@@ -1460,6 +1628,35 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       }
       await tg.answerCallbackQuery(callbackQuery.id, "Starting…")
       void ensureProjectStarted(projectAlias, ctxMeta)
+      return
+    }
+
+    if (kind === "feed") {
+      const rawMode = parts[1]
+      if (rawMode !== "main" && rawMode !== "main+changes" && rawMode !== "verbose") {
+        await tg.answerCallbackQuery(callbackQuery.id, "Invalid")
+        return
+      }
+      const mode = normalizeFeedMode(rawMode)
+      store.setFeedMode(ctxMeta.ctxKey, mode)
+      await tg.answerCallbackQuery(callbackQuery.id, `Feed: ${feedModeLabel(mode)}`).catch(() => {})
+      await handleFeed(ctxMeta, { editMessageId: msg?.message_id }).catch(() => {})
+      return
+    }
+
+    if (kind === "cf") {
+      const projectAlias = parts[1]
+      const sessionId = parts[2]
+      const opencodeMessageId = parts[3]
+      const action = parts[4]
+      if (!projectAlias || !sessionId || !opencodeMessageId || (action !== "show" && action !== "back")) {
+        await tg.answerCallbackQuery(callbackQuery.id, "Invalid")
+        return
+      }
+      await tg.answerCallbackQuery(callbackQuery.id).catch(() => {})
+      await renderChangedFilesView(ctxMeta, projectAlias, sessionId, opencodeMessageId, action, { editMessageId: msg?.message_id }).catch(
+        () => {},
+      )
       return
     }
 
@@ -1650,6 +1847,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         return
       }
       const route = resolved.route
+      const routeCtx = ctxMetaFromRoute(route)
       const boundKey = sessionKey(projectAlias, resolved.boundSessionId)
 
       if (resolved.boundSessionId !== sessionId) {
@@ -1695,6 +1893,12 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
           return
         }
 
+        if (!shouldMirrorToFeed(routeCtx.ctxKey, "user-mirror")) {
+          sets.user.add(info.id)
+          logSseDebug(projectAlias, sessionId, `drop=user_feed msg=${info.id} mode=${getFeedMode(routeCtx.ctxKey)}`)
+          return
+        }
+
         const blocks = [{ type: "text", html: "<b>User</b>" }, ...formatMarkdownToTelegramHtmlBlocks(text)]
         await tg.sendHtmlBlocks(route.chatId, blocks, null, { message_thread_id: route.threadIdOr0 || undefined })
         sets.user.add(info.id)
@@ -1725,6 +1929,11 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         }
 
         if (!completed) {
+          if (!shouldMirrorToFeed(routeCtx.ctxKey, "assistant-stream")) {
+            logSseDebug(projectAlias, sessionId, `drop=assistant_preview_feed msg=${info.id} mode=${getFeedMode(routeCtx.ctxKey)}`)
+            return
+          }
+
           const previewState = assistantPreviewBySession.get(boundKey)
           const lastPreviewAt = previewState?.messageId === info.id ? previewState.lastPreviewAt || 0 : 0
           if (Date.now() - lastPreviewAt < 200) {
@@ -1742,7 +1951,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
             return
           }
 
-          const text = extractAssistantDisplayText(projectAlias, msg)
+          const text = extractTextParts(msg)
           const previewHtml = buildAssistantStreamPreviewHtml(text)
           const state =
             previewState?.messageId === info.id
@@ -1792,26 +2001,56 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
               return
             }
 
-            const text = extractAssistantDisplayText(projectAlias, msg)
-            if (!text || !text.trim()) {
+            const displayText = extractAssistantDisplayText(projectAlias, msg)
+            const text = extractTextParts(msg)
+            const changedFilesSummary = extractChangedFilesSummary(projectAlias, msg)
+            const hasAssistantText = !!text?.trim()
+            const hasChangedFiles = !!changedFilesSummary
+
+            const previewState = assistantPreviewBySession.get(boundKey)
+            const replaceMessageId = previewState?.messageId === info.id ? previewState.telegramMessageId : undefined
+
+            if (!displayText || !displayText.trim()) {
+              if (replaceMessageId) {
+                await tg
+                  .editMessageText(route.chatId, replaceMessageId, "Assistant reply finished with no Telegram-visible content.", null)
+                  .catch(() => {})
+                assistantPreviewBySession.delete(boundKey)
+              }
+              sets.assistant.add(info.id)
               logSseDebug(projectAlias, sessionId, `drop=assistant_empty msg=${info.id}`)
               return
             }
 
             // Only attach text if this is still the latest.
             const current = lastAssistantBySession.get(boundKey)
-            if (current?.messageId === info.id) lastAssistantBySession.set(boundKey, { messageId: info.id, sessionId, text })
+            if (current?.messageId === info.id) lastAssistantBySession.set(boundKey, { messageId: info.id, sessionId, text: displayText })
+            const allowChangedFiles = hasChangedFiles && shouldMirrorToFeed(routeCtx.ctxKey, "changed-files")
+            let visibleOutputSent = false
 
-            const previewState = assistantPreviewBySession.get(boundKey)
-            const replaceMessageId = previewState?.messageId === info.id ? previewState.telegramMessageId : undefined
-            await deliverAssistantText(
-              { chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey: ctxKeyFrom(route.chatId, route.threadIdOr0) },
-              projectAlias,
-              sessionId,
-              info.id,
-              text,
-              { replaceMessageId },
-            )
+            if (hasAssistantText) {
+              await deliverAssistantText(routeCtx, projectAlias, sessionId, info.id, text, { replaceMessageId })
+              visibleOutputSent = true
+            }
+
+            if (allowChangedFiles) {
+              await deliverChangedFilesSummary(routeCtx, projectAlias, sessionId, info.id, msg, {
+                replaceMessageId: !hasAssistantText ? replaceMessageId : undefined,
+              })
+              visibleOutputSent = true
+              sets.changes.add(info.id)
+              logSseDebug(projectAlias, sessionId, `send=changed_files msg=${info.id} thread=${route.threadIdOr0 || 0}`)
+            } else if (hasChangedFiles) {
+              sets.changes.add(info.id)
+              logSseDebug(projectAlias, sessionId, `drop=changed_files_feed msg=${info.id} mode=${getFeedMode(routeCtx.ctxKey)}`)
+            }
+
+            if (replaceMessageId && !visibleOutputSent) {
+              await tg
+                .editMessageText(route.chatId, replaceMessageId, "Assistant reply finished, but no updates matched the current feed mode.", null)
+                .catch(() => {})
+            }
+
             if (replaceMessageId) assistantPreviewBySession.delete(boundKey)
             sets.assistant.add(info.id)
             logSseDebug(projectAlias, sessionId, `send=assistant msg=${info.id} thread=${route.threadIdOr0 || 0}`)
