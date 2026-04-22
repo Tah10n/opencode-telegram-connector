@@ -3,6 +3,7 @@ import { parseSessionReference, findSessionByShareUrl } from "../session-ref.js"
 import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "../session-list.js"
 import { sanitizeBaseUrlForDisplay } from "../url-utils.js"
 import { sessionKey } from "../state/store.js"
+import { getLaunchSupport } from "../opencode/launcher.js"
 import {
   collectModelCandidates,
   commonVariantsForModel,
@@ -49,6 +50,7 @@ export function createCommandHandlers(runtime) {
     logger,
     platform,
     getStartupSession,
+    openAttachWindowFn,
     openAttachWindowWindowsFn,
     validateProject,
     bindCtxToSession,
@@ -102,6 +104,10 @@ export function createCommandHandlers(runtime) {
       await oc.getSession(startupSid)
       return startupSid
     }
+  }
+
+  async function safeInformThread(ctxMeta, text, replyMarkup, options) {
+    await sendToThread(ctxMeta, text, replyMarkup, options).catch(() => {})
   }
 
   function normalizeEpochMs(value) {
@@ -520,7 +526,7 @@ export function createCommandHandlers(runtime) {
   async function handleNewCommand(ctxMeta, title) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await sendToThread(ctxMeta, "Not bound. Use /bind <projectAlias> first.")
+      await safeInformThread(ctxMeta, "Not bound. Use /bind <projectAlias> first.")
       return
     }
     const oc = ocByAlias[binding.projectAlias]
@@ -531,14 +537,21 @@ export function createCommandHandlers(runtime) {
       await sendToThread(ctxMeta, await buildNewSessionText(binding.projectAlias, created.id, { ctxKey: ctxMeta.ctxKey }))
 
       const p = projects[binding.projectAlias]
-      if (p?.openAttachOnNew === true) {
-        if (platform === "win32") {
-          await openAttachWindowWindowsFn({ directory: p.directory, baseUrl: p.baseUrl, sessionId: created.id }).catch((err) => {
+      const attachOnNewMode = String(p?.openAttachOnNewMode || "same-window")
+      if (attachOnNewMode === "new-window") {
+        const launchSupport = getLaunchSupport({ project: p, platform })
+        const openAttach = openAttachWindowFn || openAttachWindowWindowsFn
+        if (launchSupport.canOpenAttachWindow && openAttach) {
+          await openAttach({ directory: p.directory, baseUrl: p.baseUrl, sessionId: created.id, platform }).catch((err) => {
             logger.error("Failed to open attach window:", binding.projectAlias, err?.message || String(err))
           })
         } else {
-          logger.info(`[${binding.projectAlias}] openAttachOnNew is enabled, but attach auto-open is only implemented on Windows.`)
+          logger.info(`[${binding.projectAlias}] openAttachOnNewMode=new-window is configured, but no attach-window launcher is available on platform=${platform}.`)
         }
+      } else if (attachOnNewMode === "same-window") {
+        logger.info(
+          `[${binding.projectAlias}] /new created ${created.id}; openAttachOnNewMode=same-window does not spawn another attach window. Reuse the current TUI window manually if needed.`,
+        )
       }
     } catch (err) {
       await sendToThread(ctxMeta, formatProjectUnavailable(binding.projectAlias, err)).catch(() => {})
@@ -548,11 +561,11 @@ export function createCommandHandlers(runtime) {
   async function handleUseCommand(ctxMeta, sessionId) {
     const sessionRef = parseSessionReference(sessionId)
     if (!sessionRef) {
-      await sendToThread(ctxMeta, "Usage: /use <sessionId|shareLink>")
+      await safeInformThread(ctxMeta, "Usage: /use <sessionId|shareLink>")
       return
     }
     if (sessionRef.type === "invalid-link") {
-      await sendToThread(
+      await safeInformThread(
         ctxMeta,
         "Unsupported link. Use an OpenCode share link like https://opncd.ai/share/<share-id> (or https://opncd.ai/s/<share-id>) or a raw session id.",
       )
@@ -560,7 +573,7 @@ export function createCommandHandlers(runtime) {
     }
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await sendToThread(ctxMeta, "Not bound. Use /bind <projectAlias> first.")
+      await safeInformThread(ctxMeta, "Not bound. Use /bind <projectAlias> first.")
       return
     }
     const oc = ocByAlias[binding.projectAlias]
@@ -595,7 +608,7 @@ export function createCommandHandlers(runtime) {
           }
 
           if (mismatch) {
-            await sendToThread(
+            await safeInformThread(
               ctxMeta,
               `This share link belongs to project '${mismatch.projectAlias}' (session: ${mismatch.sessionId}), but this thread is bound to '${binding.projectAlias}'. Use /bind ${mismatch.projectAlias} first.`,
             )
@@ -603,14 +616,14 @@ export function createCommandHandlers(runtime) {
           }
 
           if (otherLookupErrors.length) {
-            await sendToThread(
+            await safeInformThread(
               ctxMeta,
               `Share link was not found in project '${binding.projectAlias}', but these project lookups failed: ${otherLookupErrors.join(", ")}. The link may belong to one of them; try again when those projects are available.`,
             )
             return
           }
 
-          await sendToThread(
+          await safeInformThread(
             ctxMeta,
             `Share link not found in project '${binding.projectAlias}'. It may belong to a different project or may not be shared on this server.`,
           )
@@ -629,7 +642,7 @@ export function createCommandHandlers(runtime) {
   async function handleSessions(ctxMeta) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await sendToThread(ctxMeta, "Not bound. Use /bind <projectAlias> first.")
+      await safeInformThread(ctxMeta, "Not bound. Use /bind <projectAlias> first.")
       return
     }
     try {
@@ -642,7 +655,7 @@ export function createCommandHandlers(runtime) {
   async function handleAbort(ctxMeta) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await sendToThread(ctxMeta, "Not bound. Use /bind <projectAlias> first.")
+      await safeInformThread(ctxMeta, "Not bound. Use /bind <projectAlias> first.")
       return
     }
     const oc = ocByAlias[binding.projectAlias]
@@ -661,7 +674,7 @@ export function createCommandHandlers(runtime) {
   async function handleWhere(ctxMeta) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await sendToThread(ctxMeta, "Not bound. Use /bind <projectAlias>.")
+      await safeInformThread(ctxMeta, "Not bound. Use /bind <projectAlias>.")
       return
     }
     const startupSessionId = startupSessionByProject[binding.projectAlias] || "unknown"
@@ -691,7 +704,7 @@ export function createCommandHandlers(runtime) {
 
   async function handleBindings(ctxMeta) {
     if (ctxMeta?.chatType !== "private") {
-      await sendToThread(ctxMeta, "Use /bindings only in a private chat with the bot. Bindings contain sensitive session IDs.")
+      await safeInformThread(ctxMeta, "Use /bindings only in a private chat with the bot. Bindings contain sensitive session IDs.")
       return
     }
     const entries = Object.entries(store.get().bindings || {})
@@ -705,7 +718,7 @@ export function createCommandHandlers(runtime) {
       })
 
     if (!entries.length) {
-      await sendToThread(ctxMeta, "No bindings.")
+      await safeInformThread(ctxMeta, "No bindings.")
       return
     }
 
@@ -721,12 +734,12 @@ export function createCommandHandlers(runtime) {
   async function handleSendLast(ctxMeta) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await sendToThread(ctxMeta, "Not bound. Use /bind <projectAlias>.")
+      await safeInformThread(ctxMeta, "Not bound. Use /bind <projectAlias>.")
       return
     }
     const oc = ocByAlias[binding.projectAlias]
     if (!oc) {
-      await sendToThread(ctxMeta, `Unknown project: ${binding.projectAlias}`)
+      await safeInformThread(ctxMeta, `Unknown project: ${binding.projectAlias}`)
       return
     }
     const sk = sessionKey(binding.projectAlias, binding.sessionId)
@@ -753,7 +766,7 @@ export function createCommandHandlers(runtime) {
     }
 
     if (!text || !text.trim()) {
-      await sendToThread(ctxMeta, "No assistant message yet.")
+      await safeInformThread(ctxMeta, "No assistant message yet.")
       return
     }
     await deliverAssistantText(ctxMeta, binding.projectAlias, messageSessionId, messageId || "sendlast", text)

@@ -12,7 +12,7 @@ import { ctxKeyFrom, threadIdOr0FromMessage } from "./telegram/routing.js"
 import { OpenCodeClient } from "./opencode/client.js"
 import { startOpenCodeSseLoop } from "./opencode/sse.js"
 import { ensureStartupSession } from "./opencode/startup-session.js"
-import { ensureOpenCodeRunning, openAttachWindowWindows } from "./opencode/launcher.js"
+import { ensureOpenCodeRunning, openAttachWindow } from "./opencode/launcher.js"
 import { extractPatchDiffText, extractPatchFiles, formatChangedFilesText } from "./message-display.js"
 import { findSessionByShareUrl, parseSessionReference } from "./session-ref.js"
 import { resolveSessionRoute } from "./session-route.js"
@@ -155,7 +155,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const startSseLoop = deps?.startSseLoop || startOpenCodeSseLoop
   const ensureStartupSessionFn = deps?.ensureStartupSession || ensureStartupSession
   const ensureOpenCodeRunningFn = deps?.ensureOpenCodeRunning || ensureOpenCodeRunning
-  const openAttachWindowWindowsFn = deps?.openAttachWindowWindows || openAttachWindowWindows
+  const openAttachWindowFn = deps?.openAttachWindow || deps?.openAttachWindowWindows || openAttachWindow
   const platform = deps?.platform || process.platform
   const sleep = deps?.delay || delay
   const wizardTtlMs = Number.isFinite(deps?.wizardTtlMs) ? Math.max(0, Number(deps.wizardTtlMs)) : 2 * 60 * 60 * 1000
@@ -248,7 +248,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     const promise = (async () => {
       try {
         logger.info(`[${alias}] autoStart check...`)
-        const handle = await ensureOpenCodeRunningFn({ projectAlias: alias, project: p, ocClient: oc, logger })
+        const handle = await ensureOpenCodeRunningFn({ projectAlias: alias, project: p, ocClient: oc, logger, platform })
         if (handle?.stop) autoStarted.set(alias, handle)
         markProjectUp(alias)
         await getStartupSession(alias, { waitForStart: false })
@@ -282,7 +282,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     if (!canAutoStartProject(alias, { platform })) {
       await sendToThread(
         ctxMeta,
-        `Project '${alias}' cannot be auto-started. Set {autoStart:true, directory, port} in projects.json.`,
+        `Project '${alias}' cannot be auto-started. Check {autoStart:true, directory, port} and the project's launch settings (serverLaunchMode/openTuiOnAutoStart) in projects.json.`,
       ).catch(() => {})
       return
     }
@@ -418,6 +418,20 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     })
     try {
       await Promise.race([sleep(ms), abortPromise])
+    } finally {
+      if (onAbort) abortController.signal.removeEventListener("abort", onAbort)
+    }
+  }
+
+  async function waitForPromiseOrAbort(promise) {
+    if (!promise || abortController.signal.aborted) return
+    let onAbort = null
+    const abortPromise = new Promise((resolve) => {
+      onAbort = () => resolve()
+      abortController.signal.addEventListener("abort", onAbort, { once: true })
+    })
+    try {
+      await Promise.race([Promise.resolve(promise).catch(() => {}), abortPromise])
     } finally {
       if (onAbort) abortController.signal.removeEventListener("abort", onAbort)
     }
@@ -583,7 +597,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     tg,
     cb,
     getStartupSession,
-    openAttachWindowWindowsFn,
+    openAttachWindowFn,
     validateProject,
     bindCtxToSession,
     sendToThread,
@@ -737,20 +751,27 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   }
 
   const sseLoops = []
+  const sseLoopStarters = []
   for (const alias of Object.keys(projects)) {
-    sseLoops.push(
-      startSseLoop({
-        projectAlias: alias,
-        ocClient: ocByAlias[alias],
-        logger,
-        onConnect: ({ projectAlias }) => markProjectSseConnected(projectAlias),
-        onEvent: onSseEvent,
-        onError: ({ projectAlias, err }) => {
-          markProjectSseDown(projectAlias)
-          return notifyProjectUnavailable(projectAlias, err, { platform })
-        },
-        abortSignal: abortController.signal,
-      }),
+    sseLoopStarters.push(
+      (async () => {
+        await waitForPromiseOrAbort(startInProgress.get(alias))
+        if (abortController.signal.aborted) return null
+        const handle = startSseLoop({
+          projectAlias: alias,
+          ocClient: ocByAlias[alias],
+          logger,
+          onConnect: ({ projectAlias }) => markProjectSseConnected(projectAlias),
+          onEvent: onSseEvent,
+          onError: ({ projectAlias, err }) => {
+            markProjectSseDown(projectAlias)
+            return notifyProjectUnavailable(projectAlias, err, { platform })
+          },
+          abortSignal: abortController.signal,
+        })
+        sseLoops.push(handle)
+        return handle
+      })(),
     )
   }
 
@@ -792,7 +813,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     for (const h of autoStarted.values()) {
       await Promise.resolve(h.stop?.()).catch(() => {})
     }
-    await Promise.allSettled([telegramLoopPromise, promptPollPromise])
+    await Promise.allSettled([telegramLoopPromise, promptPollPromise, ...sseLoopStarters])
     await store.flush().catch(() => {})
   }
 

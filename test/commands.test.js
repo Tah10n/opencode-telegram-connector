@@ -248,6 +248,18 @@ test("createCommandHandlers handleAbort without binding returns guidance", async
   assert.equal(sent[0].text, "Not bound. Use /bind <projectAlias> first.")
 })
 
+test("createCommandHandlers handleSessions swallows Telegram send failures for the not-bound guidance", async () => {
+  const handlers = createCommandHandlers(
+    makeRuntime({
+      sendToThread: async () => {
+        throw new Error("telegram send failed")
+      },
+    }).runtime,
+  )
+
+  await assert.doesNotReject(() => handlers.handleSessions({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }))
+})
+
 test("createCommandHandlers handleAbort reports when there is no active run", async () => {
   const { runtime, sent } = makeRuntime({
     storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },

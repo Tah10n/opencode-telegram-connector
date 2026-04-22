@@ -37,6 +37,11 @@ export async function loadProjectsConfig({ projectsFile, projectsJson, baseDir }
   } else {
     throw new Error("Missing PROJECTS_FILE or PROJECTS_JSON")
   }
+  return normalizeProjectsConfig(raw, { baseDir: resolvedBaseDir, sourceLabel: projectsFile ? `PROJECTS_FILE (${projectsFile})` : "PROJECTS_JSON" })
+}
+
+export function normalizeProjectsConfig(raw, { baseDir, sourceLabel } = {}) {
+  const resolvedBaseDir = baseDir || process.cwd()
   if (!isPlainObject(raw)) throw new Error("Projects config must be a JSON object")
 
   const projects = {}
@@ -61,12 +66,23 @@ export async function loadProjectsConfig({ projectsFile, projectsJson, baseDir }
     }
 
     const autoStart = cfg.autoStart === true
-    const startMode = cfg.startMode ? String(cfg.startMode) : "tui"
-    if (startMode !== "tui" && startMode !== "serve") {
-      throw new Error(`Project '${alias}' invalid startMode (expected 'tui' or 'serve')`)
+    if (cfg.startMode != null) {
+      throw new Error(`Project '${alias}' uses removed setting 'startMode'. Use 'openTuiOnAutoStart' instead.`)
     }
-
-    const openAttachOnNew = cfg.openAttachOnNew === true
+    const serverLaunchModeRaw = cfg.serverLaunchMode ? String(cfg.serverLaunchMode).trim().toLowerCase() : ""
+    if (serverLaunchModeRaw && serverLaunchModeRaw !== "background" && serverLaunchModeRaw !== "window") {
+      throw new Error(`Project '${alias}' invalid serverLaunchMode (expected 'background' or 'window')`)
+    }
+    const serverLaunchMode = serverLaunchModeRaw || "background"
+    const openTuiOnAutoStart = cfg.openTuiOnAutoStart != null ? cfg.openTuiOnAutoStart === true : true
+    const openAttachOnNewModeRaw = cfg.openAttachOnNewMode ? String(cfg.openAttachOnNewMode).trim().toLowerCase() : ""
+    if (openAttachOnNewModeRaw && openAttachOnNewModeRaw !== "new-window" && openAttachOnNewModeRaw !== "same-window") {
+      throw new Error(`Project '${alias}' invalid openAttachOnNewMode (expected 'new-window' or 'same-window')`)
+    }
+    if (cfg.openAttachOnNew != null) {
+      throw new Error(`Project '${alias}' uses removed setting 'openAttachOnNew'. Use 'openAttachOnNewMode' instead.`)
+    }
+    const openAttachOnNewMode = openAttachOnNewModeRaw || "same-window"
 
     if (autoStart && !directory) throw new Error(`Project '${alias}' autoStart requires 'directory'`)
     if (autoStart && !port) throw new Error(`Project '${alias}' autoStart requires 'port'`)
@@ -77,13 +93,14 @@ export async function loadProjectsConfig({ projectsFile, projectsJson, baseDir }
       directory,
       port,
       autoStart,
-      startMode,
-      openAttachOnNew,
+      serverLaunchMode,
+      openTuiOnAutoStart,
+      openAttachOnNewMode,
       username: username ? String(username) : "",
       password: password ? String(password) : "",
       displayName: cfg.displayName ? String(cfg.displayName) : undefined,
     }
   }
-  if (Object.keys(projects).length === 0) throw new Error("Projects config is empty")
+  if (Object.keys(projects).length === 0) throw new Error(`${sourceLabel ? `${sourceLabel}: ` : ""}Projects config is empty`)
   return projects
 }

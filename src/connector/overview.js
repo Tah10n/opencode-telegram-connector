@@ -1,6 +1,7 @@
 import { makeInlineKeyboard } from "../telegram/client.js"
 import { sanitizeBaseUrlForDisplay } from "../url-utils.js"
 import { isRetryableBoundaryError, normalizeBoundaryError } from "../boundary-errors.js"
+import { getLaunchSupport } from "../opencode/launcher.js"
 
 export function buildProjectsOverviewText({
   projects,
@@ -51,11 +52,7 @@ export function createOverviewHelpers({ projects, store, startInProgress, parseC
   const projectSseState = new Map(Object.keys(projects).map((alias) => [alias, "unknown"]))
 
   function canAutoStartProject(alias, { platform }) {
-    const p = projects?.[alias]
-    if (!p?.autoStart) return false
-    if (!p.directory || !p.port) return false
-    if (platform === "win32") return true
-    return p.startMode === "serve"
+    return getLaunchSupport({ project: projects?.[alias], platform }).canAutoStart
   }
 
   function isRetryableProjectError(err) {

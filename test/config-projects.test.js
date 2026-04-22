@@ -49,8 +49,9 @@ test("loadProjectsConfig resolves relative directories from the projects file an
     directory: path.resolve(dir, "repo"),
     port: 4312,
     autoStart: true,
-    startMode: "tui",
-    openAttachOnNew: false,
+    serverLaunchMode: "background",
+    openTuiOnAutoStart: true,
+    openAttachOnNewMode: "same-window",
     username: "",
     password: "",
     displayName: undefined,
@@ -101,5 +102,61 @@ test("loadProjectsConfig rejects autoStart projects without a port", async () =>
       }),
     }),
     /Project 'demo' autoStart requires 'port'/,
+  )
+})
+
+test("loadProjectsConfig rejects invalid serverLaunchMode", async () => {
+  await assert.rejects(
+    loadProjectsConfig({
+      projectsJson: JSON.stringify({
+        demo: {
+          baseUrl: "http://127.0.0.1:4312",
+          serverLaunchMode: "popup",
+        },
+      }),
+    }),
+    /invalid serverLaunchMode/,
+  )
+})
+
+test("loadProjectsConfig rejects removed startMode", async () => {
+  await assert.rejects(
+    loadProjectsConfig({
+      projectsJson: JSON.stringify({
+        demo: {
+          baseUrl: "http://127.0.0.1:4312",
+          startMode: "tui",
+        },
+      }),
+    }),
+    /removed setting 'startMode'/,
+  )
+})
+
+test("loadProjectsConfig rejects removed openAttachOnNew", async () => {
+  await assert.rejects(
+    loadProjectsConfig({
+      projectsJson: JSON.stringify({
+        demo: {
+          baseUrl: "http://127.0.0.1:4312",
+          openAttachOnNew: true,
+        },
+      }),
+    }),
+    /removed setting 'openAttachOnNew'/,
+  )
+})
+
+test("loadProjectsConfig rejects invalid openAttachOnNewMode", async () => {
+  await assert.rejects(
+    loadProjectsConfig({
+      projectsJson: JSON.stringify({
+        demo: {
+          baseUrl: "http://127.0.0.1:4312",
+          openAttachOnNewMode: "reuse",
+        },
+      }),
+    }),
+    /invalid openAttachOnNewMode/,
   )
 })

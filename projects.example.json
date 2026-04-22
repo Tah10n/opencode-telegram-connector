@@ -1,17 +1,20 @@
 {
   "pocket": {
-    "directory": "C:/Users/me/dev/pocket",
+    "directory": "./project-a",
     "port": 4100,
     "autoStart": true,
-    "startMode": "tui",
-    "openAttachOnNew": true,
+    "serverLaunchMode": "background",
+    "openTuiOnAutoStart": true,
+    "openAttachOnNewMode": "new-window",
     "username": "opencode",
-    "passwordEnv": "POCKET_OPENCODE_PASSWORD"
+    "passwordEnv": "PROJECT_A_OPENCODE_PASSWORD"
   },
   "foo": {
-    "directory": "C:/Users/me/dev/foo",
+    "directory": "./project-b",
     "port": 4101,
     "autoStart": true,
-    "startMode": "tui"
+    "serverLaunchMode": "window",
+    "openTuiOnAutoStart": false,
+    "openAttachOnNewMode": "same-window"
   }
 }

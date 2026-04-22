@@ -9,10 +9,12 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
         node-version: [20, 22]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,3 +29,39 @@ jobs:
 
       - name: Run tests
         run: npm test
+
+  platform-behavior:
+    name: Platform behavior (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-native
+            os: windows-latest
+            node-version: 22
+          - name: linux-headless
+            os: ubuntu-latest
+            node-version: 22
+            display: ""
+            wayland-display: ""
+            ssh-connection: "ci-headless"
+          - name: macos-headless
+            os: macos-latest
+            node-version: 22
+            ssh-connection: "ci-headless"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Run platform behavior tests
+        env:
+          DISPLAY: ${{ matrix.display }}
+          WAYLAND_DISPLAY: ${{ matrix.wayland-display }}
+          SSH_CONNECTION: ${{ matrix.ssh-connection }}
+        run: npm run test:platform

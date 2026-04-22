@@ -2,6 +2,8 @@
 
 Thanks for contributing.
 
+Please follow `CODE_OF_CONDUCT.md` in all project spaces.
+
 ## Development
 
 - Node.js 20+
@@ -11,7 +13,7 @@ Thanks for contributing.
 
 Run before opening a PR:
 
-```powershell
+```sh
 npm run check
 npm test
 npm run test:coverage
@@ -19,7 +21,8 @@ npm run test:coverage
 
 ## Architecture map
 
-- `src/cli.js` — env/config loading and process startup
+- `src/cli.js` — CLI entrypoint, env/config loading, and process startup
+- `src/config/*` — `.env`, `connector.config.mjs`, and legacy `projects.json` loading/normalization
 - `src/index.js` — high-level orchestration for Telegram polling, SSE wiring, state, and shutdown
 - `src/connector/*` — command handlers, callback handlers, mirroring, prompt recovery, and overview notifications
 - `src/opencode/*` — HTTP client, SSE loop, startup-session resolution, and auto-start helpers
@@ -41,3 +44,4 @@ npm run test:coverage
 - Update docs when behavior or configuration changes.
 - Include tests when changing non-trivial logic.
 - When changing a completed roadmap feature, keep the public docs (`README.md`) and the relevant test coverage in sync.
+- Use `RELEASING.md` as the public-release checklist when preparing a release.

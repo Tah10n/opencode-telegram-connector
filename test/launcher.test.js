@@ -5,8 +5,11 @@ import process from "node:process"
 import { createRequire, syncBuiltinESMExports } from "node:module"
 import {
   ensureOpenCodeRunning,
+  getLaunchSupport,
   killProcessWindows,
+  openAttachContinueWindow,
   openAttachContinueWindowWindows,
+  openAttachWindow,
   openAttachWindowWindows,
   startOpenCodeInNewWindowWindows,
   startOpenCodeServeDetached,
@@ -16,6 +19,9 @@ import {
 
 const require = createRequire(import.meta.url)
 const childProcess = require("node:child_process")
+const fsSync = require("node:fs")
+const os = require("node:os")
+const path = require("node:path")
 const timersPromises = require("node:timers/promises")
 
 function swapEnv(t, patch) {
@@ -94,6 +100,10 @@ function useSpawnPlans(t, plans) {
     calls.push({ command, args, options, child })
 
     queueMicrotask(() => {
+      if (plan.spawn !== false) {
+        child.emit("spawn")
+        plan.onSpawn?.({ command, args, options, child })
+      }
       for (const chunk of [].concat(plan.stdout ?? [])) {
         child.stdout.emit("data", Buffer.from(String(chunk)))
       }
@@ -115,6 +125,17 @@ function useSpawnPlans(t, plans) {
     syncBuiltinESMExports()
   })
   return calls
+}
+
+function makeFakeLauncherDir(t, ...names) {
+  const dir = fsSync.mkdtempSync(path.join(os.tmpdir(), "telegram-connector-launcher-"))
+  for (const name of names) {
+    fsSync.writeFileSync(path.join(dir, name), "")
+  }
+  t.after(() => {
+    fsSync.rmSync(dir, { recursive: true, force: true })
+  })
+  return dir
 }
 
 function makeLogger() {
@@ -190,6 +211,92 @@ test("waitForHealth times out with the last error in the message", async (t) => 
   assert.match(logger.logs.error[0], /^\[demo\] Timed out waiting for health/)
 })
 
+test("getLaunchSupport reports cross-platform TUI and attach support", (t) => {
+  const fakeBin = makeFakeLauncherDir(t, "x-terminal-emulator")
+  swapEnv(t, { DISPLAY: ":0", WAYLAND_DISPLAY: undefined, PATH: fakeBin, OPENCODE_TERMINAL: undefined })
+
+  assert.deepEqual(
+    getLaunchSupport({
+      project: { autoStart: true, openTuiOnAutoStart: true, directory: "/repo", port: 4312 },
+      platform: "linux",
+    }),
+    {
+      serverLaunchMode: "background",
+      openTuiOnAutoStart: true,
+      autoStartConfigured: true,
+      canAutoStart: true,
+      canOpenAttachWindow: true,
+      canAutoOpenTui: true,
+      canLaunchServerWindow: true,
+    },
+  )
+
+  assert.equal(
+    getLaunchSupport({
+      project: { autoStart: true, openTuiOnAutoStart: true, directory: "/repo", port: 4312 },
+      platform: "freebsd",
+    }).canAutoStart,
+    false,
+  )
+
+  const configured = getLaunchSupport({
+    project: {
+      autoStart: true,
+      directory: "/repo",
+      port: 4312,
+      serverLaunchMode: "window",
+      openTuiOnAutoStart: false,
+    },
+    platform: "linux",
+  })
+  assert.equal(configured.serverLaunchMode, "window")
+  assert.equal(configured.openTuiOnAutoStart, false)
+})
+
+test("getLaunchSupport disables Linux TUI/window auto-start without GUI launcher support", (t) => {
+  swapEnv(t, { DISPLAY: undefined, WAYLAND_DISPLAY: undefined, PATH: "", OPENCODE_TERMINAL: undefined })
+
+  const tui = getLaunchSupport({
+    project: { autoStart: true, openTuiOnAutoStart: true, directory: "/repo", port: 4312 },
+    platform: "linux",
+  })
+  assert.equal(tui.canOpenAttachWindow, false)
+  assert.equal(tui.canAutoStart, false)
+
+  const backgroundOnly = getLaunchSupport({
+    project: { autoStart: true, openTuiOnAutoStart: false, serverLaunchMode: "background", directory: "/repo", port: 4312 },
+    platform: "linux",
+  })
+  assert.equal(backgroundOnly.canLaunchServerWindow, true)
+  assert.equal(backgroundOnly.canAutoStart, true)
+})
+
+test("getLaunchSupport honors OPENCODE_TERMINAL on Linux when the preferred launcher exists", (t) => {
+  const fakeBin = makeFakeLauncherDir(t, "custom-term")
+  swapEnv(t, { DISPLAY: ":0", WAYLAND_DISPLAY: undefined, PATH: fakeBin, OPENCODE_TERMINAL: "custom-term" })
+
+  const support = getLaunchSupport({
+    project: { autoStart: true, openTuiOnAutoStart: true, directory: "/repo", port: 4312 },
+    platform: "linux",
+  })
+
+  assert.equal(support.canOpenAttachWindow, true)
+  assert.equal(support.canAutoStart, true)
+})
+
+test("getLaunchSupport disables macOS attach auto-start in SSH sessions", (t) => {
+  const fakeBin = makeFakeLauncherDir(t, "osascript")
+  swapEnv(t, { PATH: fakeBin, SSH_CONNECTION: "ci-session", SSH_TTY: "/dev/ttys001" })
+
+  const support = getLaunchSupport({
+    project: { autoStart: true, openTuiOnAutoStart: true, directory: "/repo", port: 4312 },
+    platform: "darwin",
+  })
+
+  assert.equal(support.canOpenAttachWindow, false)
+  assert.equal(support.canAutoStart, false)
+})
+
 test("startOpenCodeServeInNewWindowWindows normalizes style and enables debug flags", async (t) => {
   swapEnv(t, { OPENCODE_SERVER_DEBUG: "yes" })
   const calls = useSpawnPlans(t, [{ stdout: "321\n" }])
@@ -202,7 +309,7 @@ test("startOpenCodeServeInNewWindowWindows normalizes style and enables debug fl
 
   assert.equal(result.pid, 321)
   assert.equal(calls[0].command, "powershell")
-  assert.match(calls[0].args[3], /-WindowStyle Minimized/)
+  assert.match(calls[0].args[3], /-WindowStyle Normal/)
   assert.match(calls[0].args[3], /--print-logs/)
   assert.match(calls[0].args[3], /--log-level/)
   assert.match(calls[0].args[3], /DEBUG/)
@@ -282,6 +389,38 @@ test("openAttachContinueWindowWindows keeps the console open and passes --dir", 
   assert.match(calls[0].args[3], /'C:\\repo'/)
 })
 
+test("openAttachWindow launches a Linux terminal for attach sessions", async (t) => {
+  usePatchedPlatform(t, "linux")
+  const calls = useSpawnPlans(t, [{ code: 0 }])
+
+  await openAttachWindow({
+    directory: "/repo",
+    baseUrl: "http://127.0.0.1:4312",
+    sessionId: "ses_linux",
+  })
+
+  assert.equal(calls[0].command, "x-terminal-emulator")
+  assert.deepEqual(calls[0].args.slice(0, 3), ["-e", "sh", "-lc"])
+  assert.match(calls[0].args[3], /opencode'/)
+  assert.match(calls[0].args[3], /--session'/)
+  assert.match(calls[0].args[3], /ses_linux/)
+})
+
+test("openAttachContinueWindow launches macOS Terminal via osascript", async (t) => {
+  usePatchedPlatform(t, "darwin")
+  const calls = useSpawnPlans(t, [{ code: 0 }])
+
+  await openAttachContinueWindow({
+    directory: "/repo",
+    baseUrl: "http://127.0.0.1:4312",
+  })
+
+  assert.equal(calls[0].command, "osascript")
+  assert.match(calls[0].args.join(" "), /Terminal/)
+  assert.match(calls[0].args.join(" "), /--continue/)
+  assert.match(calls[0].args.join(" "), /--dir/)
+})
+
 test("killProcessWindows shells out to taskkill and ignores launcher errors", async (t) => {
   const calls = useSpawnPlans(t, [{ error: new Error("taskkill missing") }])
 
@@ -307,7 +446,7 @@ test("startOpenCodeServeDetached spawns a detached server process and unreferenc
 test("ensureOpenCodeRunning returns early when the project is already healthy", async () => {
   const result = await ensureOpenCodeRunning({
     projectAlias: "demo",
-    project: { startMode: "serve" },
+    project: { openTuiOnAutoStart: false },
     ocClient: { health: async () => ({ ok: true }) },
     logger: makeLogger(),
   })
@@ -321,7 +460,7 @@ test("ensureOpenCodeRunning reports disabled auto-start clearly", async () => {
   await assert.rejects(
     ensureOpenCodeRunning({
       projectAlias: "demo",
-      project: { autoStart: false, startMode: "serve" },
+      project: { autoStart: false, openTuiOnAutoStart: false },
       ocClient: { health: async () => Promise.reject(new Error("down")) },
       logger: makeLogger(),
     }),
@@ -333,7 +472,7 @@ test("ensureOpenCodeRunning validates auto-start configuration before launching"
   await assert.rejects(
     ensureOpenCodeRunning({
       projectAlias: "demo",
-      project: { autoStart: true, startMode: "serve", port: 4312 },
+      project: { autoStart: true, openTuiOnAutoStart: false, port: 4312 },
       ocClient: { health: async () => Promise.reject(new Error("down")) },
       logger: makeLogger(),
     }),
@@ -341,21 +480,14 @@ test("ensureOpenCodeRunning validates auto-start configuration before launching"
   )
 })
 
-test("ensureOpenCodeRunning detects an existing TUI and does not open another one", async (t) => {
-  const calls = useSpawnPlans(t, [
-    {
-      stdout: JSON.stringify({
-        ProcessId: 42,
-        CommandLine: 'C:\\\\tools\\\\opencode.cmd attach "http://127.0.0.1:4312" --continue',
-      }),
-    },
-  ])
+test("ensureOpenCodeRunning does not auto-open attach UI when the server is already healthy", async (t) => {
+  const calls = useSpawnPlans(t, [])
   const logger = makeLogger()
 
   const result = await ensureOpenCodeRunning({
     projectAlias: "demo",
     project: {
-      startMode: "tui",
+      openTuiOnAutoStart: true,
       port: 4312,
       baseUrl: "http://127.0.0.1:4312",
     },
@@ -364,31 +496,41 @@ test("ensureOpenCodeRunning detects an existing TUI and does not open another on
   })
 
   assert.equal(result.started, false)
-  assert.equal(calls.length, 1)
-  assert.equal(logger.logs.info.length, 1)
-  assert.match(logger.logs.info[0], /opencode UI already running for port=4312/)
-  assert.equal(logger.logs.debug.length, 1)
-  assert.match(logger.logs.debug[0], /opencode UI cmdline:/)
+  assert.equal(calls.length, 0)
+  assert.equal(logger.logs.info.length, 0)
+  assert.equal(logger.logs.debug.length, 0)
 })
 
-test("ensureOpenCodeRunning skips auto-open when process detection falls back and the baseUrl is sensitive", async (t) => {
-  const calls = useSpawnPlans(t, [{ stdout: "not-json" }])
+test("ensureOpenCodeRunning skips auto-open after start when the baseUrl is sensitive", async (t) => {
+  usePatchedDelay(t, async () => {})
+  const calls = useSpawnPlans(t, [{ pid: 900, close: false }])
   const logger = makeLogger()
+  let healthCalls = 0
 
   const result = await ensureOpenCodeRunning({
     projectAlias: "demo",
     project: {
-      startMode: "tui",
+      autoStart: true,
+      openTuiOnAutoStart: true,
       directory: "C:\\repo",
       port: 4312,
       baseUrl: "http://127.0.0.1:4312?token=abc",
     },
-    ocClient: { health: async () => ({ healthy: true }) },
+    ocClient: {
+      async health() {
+        healthCalls += 1
+        if (healthCalls === 1) throw new Error("down")
+        return { healthy: true }
+      },
+    },
     logger,
   })
 
-  assert.equal(result.started, false)
-  assert.equal(calls.length, 1)
+  assert.equal(result.started, true)
+  assert.equal(calls.length, 3)
+  assert.equal(calls[0].command, "powershell")
+  assert.equal(calls[1].command, "cmd.exe")
+  assert.equal(calls[2].command, "powershell")
   assert.equal(logger.logs.warn.length, 1)
   assert.match(logger.logs.warn[0], /baseUrl contains sensitive URL parts/)
 })
@@ -419,7 +561,7 @@ test("ensureOpenCodeRunning waits for a running TUI to bring the server back", a
     projectAlias: "demo",
     project: {
       autoStart: true,
-      startMode: "tui",
+      openTuiOnAutoStart: true,
       directory: "C:\\repo",
       port: 4312,
       baseUrl: "http://127.0.0.1:4312",
@@ -433,12 +575,12 @@ test("ensureOpenCodeRunning waits for a running TUI to bring the server back", a
   assert.equal(healthCalls, 3)
 })
 
-test("ensureOpenCodeRunning starts headless serve mode on Windows and returns a stop handle", async (t) => {
+test("ensureOpenCodeRunning starts background serve mode on Windows and returns a stop handle", async (t) => {
   usePatchedDelay(t, async () => {})
   usePatchedProcessKill(t, () => {
     throw new Error("missing pid")
   })
-  const calls = useSpawnPlans(t, [{ stdout: "900\n" }, { code: 0 }])
+  const calls = useSpawnPlans(t, [{ pid: 900, close: false }, { code: 0 }])
   const logger = makeLogger()
 
   let healthCalls = 0
@@ -454,7 +596,9 @@ test("ensureOpenCodeRunning starts headless serve mode on Windows and returns a 
     projectAlias: "demo",
     project: {
       autoStart: true,
-      startMode: "serve",
+      serverLaunchMode: "background",
+      openTuiOnAutoStart: false,
+      openTuiOnAutoStart: false,
       directory: "C:\\repo",
       port: 4312,
       baseUrl: "http://127.0.0.1:4312",
@@ -467,9 +611,11 @@ test("ensureOpenCodeRunning starts headless serve mode on Windows and returns a 
   assert.equal(result.pid, 900)
   assert.equal(healthCalls, 2)
   assert.equal(calls.length, 1)
+  assert.equal(calls[0].command, "cmd.exe")
+  assert.deepEqual(calls[0].args.slice(0, 3), ["/c", "opencode", "serve"])
   assert.equal(logger.logs.error.length, 1)
   assert.match(logger.logs.error[0], /opencode serve exited immediately/)
-  assert.match(logger.logs.info.at(-1), /started opencode \(serve\) pid=900 port=4312/)
+  assert.match(logger.logs.info.at(-1), /started opencode \(background\+serve\) pid=900 port=4312/)
 
   await result.stop()
   assert.equal(calls.length, 2)
@@ -477,23 +623,98 @@ test("ensureOpenCodeRunning starts headless serve mode on Windows and returns a 
   assert.deepEqual(calls[1].args, ["/PID", "900", "/T", "/F"])
 })
 
-test("ensureOpenCodeRunning refuses TUI auto-start on non-Windows platforms", async (t) => {
+test("ensureOpenCodeRunning starts a visible server window on Linux when configured", async (t) => {
   usePatchedPlatform(t, "linux")
-
-  await assert.rejects(
-    ensureOpenCodeRunning({
-      projectAlias: "demo",
-      project: {
-        autoStart: true,
-        startMode: "tui",
-        directory: "/repo",
-        port: 4312,
+  usePatchedDelay(t, async () => {})
+  const fakeBin = makeFakeLauncherDir(t, "x-terminal-emulator")
+  swapEnv(t, { DISPLAY: ":0", WAYLAND_DISPLAY: undefined, PATH: fakeBin, OPENCODE_TERMINAL: undefined })
+  const calls = useSpawnPlans(t, [
+    {
+      code: 0,
+      onSpawn: ({ args }) => {
+        const match = String(args?.[3] || "").match(/> '([^']+\.pid)'/)
+        assert.ok(match)
+        fsSync.writeFileSync(match[1], "812\n")
       },
-      ocClient: { health: async () => Promise.reject(new Error("down")) },
-      logger: makeLogger(),
-    }),
-    /autoStart startMode=tui is currently supported only on Windows/,
-  )
+    },
+  ])
+  const killCalls = []
+  usePatchedProcessKill(t, (...args) => {
+    killCalls.push(args)
+  })
+
+  let healthCalls = 0
+  const ocClient = {
+    async health() {
+      healthCalls += 1
+      if (healthCalls === 1) throw new Error("down")
+      return { ok: true }
+    },
+  }
+
+  const result = await ensureOpenCodeRunning({
+    projectAlias: "demo",
+    project: {
+      autoStart: true,
+      serverLaunchMode: "window",
+      openTuiOnAutoStart: false,
+      directory: "/repo",
+      port: 4312,
+      baseUrl: "http://127.0.0.1:4312",
+    },
+    ocClient,
+    logger: makeLogger(),
+  })
+
+  assert.equal(result.started, true)
+  assert.equal(result.pid, 812)
+  assert.equal(calls[0].command, "x-terminal-emulator")
+  assert.match(calls[0].args[3], /opencode' 'serve'/)
+  await result.stop()
+  assert.deepEqual(killCalls, [[812, "SIGTERM"]])
+})
+
+test("ensureOpenCodeRunning starts detached serve plus TUI attach on Linux", async (t) => {
+  usePatchedPlatform(t, "linux")
+  usePatchedDelay(t, async () => {})
+  const fakeBin = makeFakeLauncherDir(t, "x-terminal-emulator")
+  swapEnv(t, { DISPLAY: ":0", WAYLAND_DISPLAY: undefined, PATH: fakeBin, OPENCODE_TERMINAL: undefined })
+  const calls = useSpawnPlans(t, [{ pid: 777, close: false }, { code: 0 }])
+  const killCalls = []
+  usePatchedProcessKill(t, (...args) => {
+    killCalls.push(args)
+  })
+
+  let healthCalls = 0
+  const ocClient = {
+    async health() {
+      healthCalls += 1
+      if (healthCalls === 1) throw new Error("down")
+      return { ok: true }
+    },
+  }
+
+  const result = await ensureOpenCodeRunning({
+    projectAlias: "demo",
+    project: {
+      autoStart: true,
+      openTuiOnAutoStart: true,
+      directory: "/repo",
+      port: 4312,
+      baseUrl: "http://127.0.0.1:4312",
+    },
+    ocClient,
+    logger: makeLogger(),
+  })
+
+  assert.equal(result.started, true)
+  assert.equal(result.pid, 777)
+  assert.equal(healthCalls, 2)
+  assert.equal(calls[0].command, "opencode")
+  assert.equal(calls[1].command, "x-terminal-emulator")
+
+  await result.stop()
+  assert.deepEqual(killCalls, [[777, "SIGTERM"]])
 })
 
 test("ensureOpenCodeRunning starts detached serve mode on non-Windows platforms", async (t) => {
@@ -517,7 +738,7 @@ test("ensureOpenCodeRunning starts detached serve mode on non-Windows platforms"
     projectAlias: "demo",
     project: {
       autoStart: true,
-      startMode: "serve",
+      openTuiOnAutoStart: false,
       directory: "/repo",
       port: 4312,
     },

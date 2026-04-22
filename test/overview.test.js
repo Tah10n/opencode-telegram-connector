@@ -1,6 +1,33 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
 import { createOverviewHelpers } from "../src/connector/overview.js"
+
+function swapEnv(t, patch) {
+  const previous = new Map()
+  for (const key of Object.keys(patch)) previous.set(key, process.env[key])
+  for (const [key, value] of Object.entries(patch)) {
+    if (value == null) delete process.env[key]
+    else process.env[key] = value
+  }
+  t.after(() => {
+    for (const [key, value] of previous.entries()) {
+      if (value == null) delete process.env[key]
+      else process.env[key] = value
+    }
+  })
+}
+
+function makeFakeLauncherDir(t, ...names) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "telegram-connector-overview-"))
+  for (const name of names) fs.writeFileSync(path.join(dir, name), "")
+  t.after(() => {
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  return dir
+}
 
 test("createOverviewHelpers startServerKeyboard packs callback data", () => {
   const helpers = createOverviewHelpers({
@@ -61,4 +88,112 @@ test("createOverviewHelpers sends unavailable and recovered notices only to thre
   assert.match(sent[0].text, /Project 'demo' is unavailable/)
   assert.match(sent[2].text, /Project 'demo' is back online/)
   assert.ok(!sent.some((entry) => entry.ctx.ctxKey === "200:0"))
+})
+
+test("createOverviewHelpers offers a Start button for Linux TUI auto-start projects", async (t) => {
+  const fakeBin = makeFakeLauncherDir(t, "x-terminal-emulator")
+  swapEnv(t, { DISPLAY: ":0", WAYLAND_DISPLAY: undefined, PATH: fakeBin, OPENCODE_TERMINAL: undefined })
+
+  const sent = []
+  const helpers = createOverviewHelpers({
+    projects: {
+      demo: {
+        baseUrl: "http://127.0.0.1:4312",
+        autoStart: true,
+        directory: "/demo",
+        port: 4312,
+        openTuiOnAutoStart: true,
+      },
+    },
+    store: {
+      get: () => ({
+        bindings: {
+          "100:7": { projectAlias: "demo", sessionId: "ses_demo_1" },
+        },
+      }),
+    },
+    startInProgress: new Map(),
+    parseCtxKey: (ctxKey) => ({ chatId: 100, threadIdOr0: 7, ctxKey }),
+    sendToThread: async (ctx, text, replyMarkup) => {
+      sent.push({ ctx, text, replyMarkup })
+    },
+    cb: { pack: (value) => value },
+  })
+
+  await helpers.notifyProjectUnavailable("demo", new Error("fetch failed"), { platform: "linux" })
+
+  assert.equal(sent.length, 1)
+  assert.ok(sent[0].replyMarkup)
+  assert.equal(sent[0].replyMarkup.inline_keyboard[0][0].callback_data, "srv|demo|start")
+})
+
+test("createOverviewHelpers hides the Start button for Linux TUI auto-start projects without GUI launcher support", async (t) => {
+  swapEnv(t, { DISPLAY: undefined, WAYLAND_DISPLAY: undefined, PATH: "", OPENCODE_TERMINAL: undefined })
+
+  const sent = []
+  const helpers = createOverviewHelpers({
+    projects: {
+      demo: {
+        baseUrl: "http://127.0.0.1:4312",
+        autoStart: true,
+        directory: "/demo",
+        port: 4312,
+        openTuiOnAutoStart: true,
+      },
+    },
+    store: {
+      get: () => ({
+        bindings: {
+          "100:7": { projectAlias: "demo", sessionId: "ses_demo_1" },
+        },
+      }),
+    },
+    startInProgress: new Map(),
+    parseCtxKey: (ctxKey) => ({ chatId: 100, threadIdOr0: 7, ctxKey }),
+    sendToThread: async (ctx, text, replyMarkup) => {
+      sent.push({ ctx, text, replyMarkup })
+    },
+    cb: { pack: (value) => value },
+  })
+
+  await helpers.notifyProjectUnavailable("demo", new Error("fetch failed"), { platform: "linux" })
+
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].replyMarkup, null)
+})
+
+test("createOverviewHelpers hides the Start button for macOS SSH sessions", async (t) => {
+  const fakeBin = makeFakeLauncherDir(t, "osascript")
+  swapEnv(t, { PATH: fakeBin, SSH_CONNECTION: "ci-session", SSH_TTY: "/dev/ttys001" })
+
+  const sent = []
+  const helpers = createOverviewHelpers({
+    projects: {
+      demo: {
+        baseUrl: "http://127.0.0.1:4312",
+        autoStart: true,
+        directory: "/demo",
+        port: 4312,
+        openTuiOnAutoStart: true,
+      },
+    },
+    store: {
+      get: () => ({
+        bindings: {
+          "100:7": { projectAlias: "demo", sessionId: "ses_demo_1" },
+        },
+      }),
+    },
+    startInProgress: new Map(),
+    parseCtxKey: (ctxKey) => ({ chatId: 100, threadIdOr0: 7, ctxKey }),
+    sendToThread: async (ctx, text, replyMarkup) => {
+      sent.push({ ctx, text, replyMarkup })
+    },
+    cb: { pack: (value) => value },
+  })
+
+  await helpers.notifyProjectUnavailable("demo", new Error("fetch failed"), { platform: "darwin" })
+
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].replyMarkup, null)
 })

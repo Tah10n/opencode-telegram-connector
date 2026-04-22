@@ -1,7 +1,90 @@
+import crypto from "node:crypto"
 import { spawn } from "node:child_process"
+import fsSync from "node:fs"
+import fs from "node:fs/promises"
+import os from "node:os"
+import path from "node:path"
 import process from "node:process"
 import { setTimeout as delay } from "node:timers/promises"
 import { redactCmdlineSecrets, sanitizeBaseUrlForCli } from "../url-utils.js"
+
+const ATTACH_WINDOW_PLATFORMS = new Set(["win32", "linux", "darwin"])
+
+function normalizeServerLaunchMode(value) {
+  return String(value || "background").trim().toLowerCase() === "window" ? "window" : "background"
+}
+
+function resolveOpenTuiOnAutoStart(project) {
+  return project?.openTuiOnAutoStart !== false
+}
+
+function commandExistsOnPath(command, { platform = process.platform } = {}) {
+  const raw = String(command || "").trim()
+  if (!raw) return false
+
+  const candidateNames = (() => {
+    if (platform !== "win32") return [raw]
+    const ext = path.extname(raw)
+    if (ext) return [raw]
+    const pathext = String(process.env.PATHEXT || ".EXE;.CMD;.BAT;.COM")
+      .split(";")
+      .map((value) => value.trim())
+      .filter(Boolean)
+    return [raw, ...pathext.map((value) => `${raw}${value.toLowerCase()}`), ...pathext.map((value) => `${raw}${value.toUpperCase()}`)]
+  })()
+
+  const looksLikePath = raw.includes("/") || raw.includes("\\") || path.isAbsolute(raw)
+  if (looksLikePath) {
+    return candidateNames.some((candidate) => fsSync.existsSync(candidate))
+  }
+
+  const dirs = String(process.env.PATH || "")
+    .split(path.delimiter)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+  return dirs.some((dir) => candidateNames.some((candidate) => fsSync.existsSync(path.join(dir, candidate))))
+}
+
+function hasLinuxGuiSession() {
+  return !!(process.env.DISPLAY || process.env.WAYLAND_DISPLAY)
+}
+
+function hasLinuxTerminalLauncher() {
+  const preferred = String(process.env.OPENCODE_TERMINAL || "").trim()
+  const candidates = [...new Set([preferred, "x-terminal-emulator", "gnome-terminal", "konsole", "xfce4-terminal", "kitty", "wezterm", "alacritty", "xterm"].filter(Boolean))]
+  return candidates.some((candidate) => commandExistsOnPath(candidate, { platform: "linux" }))
+}
+
+function hasMacGuiSession() {
+  if (process.env.SSH_CONNECTION || process.env.SSH_TTY) return false
+  return true
+}
+
+function canOpenAttachWindowOnPlatform(platform) {
+  if (!ATTACH_WINDOW_PLATFORMS.has(platform)) return false
+  if (platform === "win32") return true
+  if (platform === "linux") return hasLinuxGuiSession() && hasLinuxTerminalLauncher()
+  if (platform === "darwin") return hasMacGuiSession() && commandExistsOnPath("osascript", { platform: "darwin" })
+  return false
+}
+
+export function getLaunchSupport({ project, platform = process.platform } = {}) {
+  const openTuiOnAutoStart = resolveOpenTuiOnAutoStart(project)
+  const serverLaunchMode = normalizeServerLaunchMode(project?.serverLaunchMode)
+  const autoStartConfigured = project?.autoStart === true && !!project?.directory && !!project?.port
+  const canOpenAttachWindow = canOpenAttachWindowOnPlatform(platform)
+  const canLaunchServerWindow = serverLaunchMode === "background" || canOpenAttachWindow
+  const canAutoStart = autoStartConfigured && canLaunchServerWindow && (!openTuiOnAutoStart || canOpenAttachWindow)
+  return {
+    serverLaunchMode,
+    openTuiOnAutoStart,
+    autoStartConfigured,
+    canAutoStart,
+    canOpenAttachWindow,
+    canAutoOpenTui: openTuiOnAutoStart && canOpenAttachWindow,
+    canLaunchServerWindow,
+  }
+}
 
 async function listOpenCodeProcessesWindows({ timeoutMs = 2500 } = {}) {
   const ps = [
@@ -194,6 +277,242 @@ function psQuote(s) {
   return `'${String(s).replaceAll("'", "''")}'`
 }
 
+function shQuote(s) {
+  return `'${String(s).replaceAll("'", "'\\''")}'`
+}
+
+function appleScriptQuote(s) {
+  return `"${String(s).replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`
+}
+
+function safeAttachBaseUrl(baseUrl) {
+  const safe = sanitizeBaseUrlForCli(baseUrl)
+  if (safe.seemsSensitive && !isTrueEnv("OPENCODE_ALLOW_SENSITIVE_BASEURL")) {
+    throw new Error(
+      "Refusing to open opencode attach window with URL credentials or sensitive query params. " +
+        "Set OPENCODE_ALLOW_SENSITIVE_BASEURL=1 to override.",
+    )
+  }
+  return safe
+}
+
+function buildPosixShellCommand(argv, { directory } = {}) {
+  const steps = []
+  if (directory) steps.push(`cd ${shQuote(directory)}`)
+  steps.push(argv.map((part) => shQuote(part)).join(" "))
+  return [
+    steps.join(" && "),
+    'status=$?',
+    'if [ "$status" -ne 0 ]; then',
+    `  printf '\nOpenCode command failed (exit %s). Press Enter to close...' "$status"`,
+    "  read _",
+    "fi",
+  ].join("; ")
+}
+
+function buildServeArgs(port) {
+  const args = ["serve", "--port", String(port)]
+  const debug = String(process.env.OPENCODE_SERVER_DEBUG || "").toLowerCase()
+  const debugEnabled = debug === "1" || debug === "true" || debug === "yes" || debug === "y" || debug === "on"
+  if (debugEnabled) args.push("--print-logs", "--log-level", "DEBUG")
+  return args
+}
+
+function makeTempPidFile(prefix) {
+  return path.join(os.tmpdir(), `${prefix}-${crypto.randomUUID()}.pid`)
+}
+
+function buildPosixServeWindowCommand({ directory, port, pidFile }) {
+  const steps = []
+  const serveCmd = ["opencode", ...buildServeArgs(port)].map((part) => shQuote(part)).join(" ")
+  if (directory) steps.push(`cd ${shQuote(directory)}`)
+  steps.push(`${serveCmd} & pid=$!; printf '%s' "$pid" > ${shQuote(pidFile)}; wait "$pid"`)
+  return [
+    steps.join(" && "),
+    'status=$?',
+    'rm -f ' + shQuote(pidFile),
+    'if [ "$status" -ne 0 ]; then',
+    `  printf '\nOpenCode server exited (status %s). Press Enter to close...' "$status"`,
+    "  read _",
+    "fi",
+  ].join("; ")
+}
+
+async function waitForPidFile(pidFile, { timeoutMs = 3000 } = {}) {
+  const deadline = Date.now() + Math.max(100, Number(timeoutMs) || 3000)
+  while (Date.now() < deadline) {
+    try {
+      const text = String(await fs.readFile(pidFile, "utf8")).trim()
+      const pid = Number(text)
+      if (Number.isInteger(pid) && pid > 0) return pid
+    } catch {}
+    await delay(50)
+  }
+  return null
+}
+
+function launchDetachedProcess(command, args, { cwd, errorPrefix, successDelayMs = 40 } = {}) {
+  return new Promise((resolve, reject) => {
+    let child = null
+    let settled = false
+    let successTimer = null
+    const finish = (err) => {
+      if (settled) return
+      settled = true
+      if (successTimer) clearTimeout(successTimer)
+      if (err) {
+        reject(err)
+        return
+      }
+      child?.unref?.()
+      resolve()
+    }
+
+    try {
+      child = spawn(command, args, {
+        cwd,
+        stdio: "ignore",
+        windowsHide: true,
+        detached: true,
+      })
+    } catch (err) {
+      finish(new Error(`${errorPrefix}: ${err?.message || String(err)}`))
+      return
+    }
+
+    child.on("spawn", () => {
+      successTimer = setTimeout(() => finish(), Math.max(10, Number(successDelayMs) || 40))
+      successTimer.unref?.()
+    })
+    child.on("error", (err) => finish(new Error(`${errorPrefix}: ${err?.message || String(err)}`)))
+    child.on("close", (code) => {
+      if (settled) return
+      if (code === 0) {
+        finish()
+        return
+      }
+      finish(new Error(`${errorPrefix} (code=${code ?? "?"})`))
+    })
+  })
+}
+
+async function openTerminalWindowMac({ shellCommand }) {
+  const script = [
+    'tell application "Terminal"',
+    "activate",
+    `do script ${appleScriptQuote(shellCommand)}`,
+    "end tell",
+  ]
+  await new Promise((resolve, reject) => {
+    const child = spawn("osascript", script.flatMap((line) => ["-e", line]), {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    })
+    let out = ""
+    let err = ""
+    child.stdout.on("data", (d) => (out += d.toString("utf8")))
+    child.stderr.on("data", (d) => (err += d.toString("utf8")))
+    child.on("error", (spawnErr) => reject(new Error(`Failed to open macOS Terminal window: ${spawnErr?.message || String(spawnErr)}`)))
+    child.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`Failed to open macOS Terminal window (code=${code}): ${err || out}`))
+        return
+      }
+      resolve()
+    })
+  })
+}
+
+function linuxTerminalCandidate(command, shellCommand) {
+  switch (command) {
+    case "gnome-terminal":
+      return { command, args: ["--", "sh", "-lc", shellCommand] }
+    case "konsole":
+      return { command, args: ["-e", "sh", "-lc", shellCommand] }
+    case "xfce4-terminal":
+      return { command, args: ["--command", `sh -lc ${shQuote(shellCommand)}`] }
+    case "kitty":
+      return { command, args: ["--detach", "sh", "-lc", shellCommand] }
+    case "wezterm":
+      return { command, args: ["start", "--", "sh", "-lc", shellCommand] }
+    case "alacritty":
+      return { command, args: ["-e", "sh", "-lc", shellCommand] }
+    case "xterm":
+      return { command, args: ["-e", "sh", "-lc", shellCommand] }
+    case "x-terminal-emulator":
+    default:
+      return { command, args: ["-e", "sh", "-lc", shellCommand] }
+  }
+}
+
+async function openTerminalWindowLinux({ shellCommand, cwd }) {
+  const preferred = String(process.env.OPENCODE_TERMINAL || "").trim()
+  const candidates = [...new Set([preferred, "x-terminal-emulator", "gnome-terminal", "konsole", "xfce4-terminal", "kitty", "wezterm", "alacritty", "xterm"].filter(Boolean))]
+  let lastErr = null
+  for (const name of candidates) {
+    const candidate = linuxTerminalCandidate(name, shellCommand)
+    try {
+      await launchDetachedProcess(candidate.command, candidate.args, {
+        cwd,
+        errorPrefix: `Failed to launch terminal '${candidate.command}'`,
+      })
+      return
+    } catch (err) {
+      lastErr = err
+    }
+  }
+  throw new Error(lastErr ? `Failed to open Linux terminal window: ${lastErr.message}` : "Failed to open Linux terminal window")
+}
+
+async function openAttachWindowPosix({ directory, baseUrl, sessionId, platform }) {
+  const safe = safeAttachBaseUrl(baseUrl)
+  const shellCommand = buildPosixShellCommand(["opencode", "attach", String(safe.url), "--session", String(sessionId)], { directory })
+  if (platform === "darwin") {
+    await openTerminalWindowMac({ shellCommand })
+    return
+  }
+  if (platform === "linux") {
+    await openTerminalWindowLinux({ shellCommand, cwd: directory })
+    return
+  }
+  throw new Error(`Opening an attach window is not supported on platform '${platform}'`)
+}
+
+async function openAttachContinueWindowPosix({ directory, baseUrl, platform }) {
+  const safe = safeAttachBaseUrl(baseUrl)
+  const shellCommand = buildPosixShellCommand(
+    ["opencode", "attach", String(safe.url), "--continue", ...(directory ? ["--dir", String(directory)] : [])],
+    { directory },
+  )
+  if (platform === "darwin") {
+    await openTerminalWindowMac({ shellCommand })
+    return
+  }
+  if (platform === "linux") {
+    await openTerminalWindowLinux({ shellCommand, cwd: directory })
+    return
+  }
+  throw new Error(`Opening an attach window is not supported on platform '${platform}'`)
+}
+
+async function startOpenCodeServeInWindowPosix({ directory, port, platform }) {
+  const pidFile = makeTempPidFile("telegram-connector-opencode")
+  const shellCommand = buildPosixServeWindowCommand({ directory, port, pidFile })
+  try {
+    if (platform === "darwin") {
+      await openTerminalWindowMac({ shellCommand })
+    } else if (platform === "linux") {
+      await openTerminalWindowLinux({ shellCommand, cwd: directory })
+    } else {
+      throw new Error(`Opening a server window is not supported on platform '${platform}'`)
+    }
+    const pid = await waitForPidFile(pidFile)
+    return { pid: Number.isInteger(pid) ? pid : null }
+  } finally {
+    await fs.rm(pidFile, { force: true }).catch(() => {})
+  }
+}
+
 export async function startOpenCodeInNewWindowWindows({ directory, port, mode = "tui" }) {
   const args =
     mode === "serve"
@@ -236,14 +555,11 @@ export async function startOpenCodeInNewWindowWindows({ directory, port, mode = 
   })
 }
 
-export async function startOpenCodeServeInNewWindowWindows({ directory, port, windowStyle = "Minimized" }) {
+export async function startOpenCodeServeInNewWindowWindows({ directory, port, windowStyle = "Normal" }) {
   const allowedStyles = new Set(["Normal", "Hidden", "Minimized", "Maximized"])
-  const style = allowedStyles.has(String(windowStyle)) ? String(windowStyle) : "Minimized"
-  const debug = String(process.env.OPENCODE_SERVER_DEBUG || "").toLowerCase()
-  const debugEnabled = debug === "1" || debug === "true" || debug === "yes" || debug === "y" || debug === "on"
+  const style = allowedStyles.has(String(windowStyle)) ? String(windowStyle) : "Normal"
 
-  const args = ["serve", "--port", String(port)]
-  if (debugEnabled) args.push("--print-logs", "--log-level", "DEBUG")
+  const args = buildServeArgs(port)
 
   // Use cmd.exe so `.cmd` shims resolve correctly.
   const ps = [
@@ -280,14 +596,19 @@ export async function startOpenCodeServeInNewWindowWindows({ directory, port, wi
   })
 }
 
+export function startOpenCodeServeDetachedWindows({ directory, port }) {
+  const child = spawn("cmd.exe", ["/c", "opencode", ...buildServeArgs(port)], {
+    cwd: directory,
+    stdio: "ignore",
+    windowsHide: true,
+    detached: true,
+  })
+  child.unref()
+  return { child }
+}
+
 export async function openAttachWindowWindows({ directory, baseUrl, sessionId }) {
-  const safe = sanitizeBaseUrlForCli(baseUrl)
-  if (safe.seemsSensitive && !isTrueEnv("OPENCODE_ALLOW_SENSITIVE_BASEURL")) {
-    throw new Error(
-      "Refusing to open opencode attach window with URL credentials or sensitive query params. " +
-        "Set OPENCODE_ALLOW_SENSITIVE_BASEURL=1 to override.",
-    )
-  }
+  const safe = safeAttachBaseUrl(baseUrl)
   const args = ["attach", String(safe.url), "--session", String(sessionId)]
   const ps = [
     "Start-Process -FilePath cmd.exe -ArgumentList @(",
@@ -321,13 +642,7 @@ export async function openAttachWindowWindows({ directory, baseUrl, sessionId })
 }
 
 export async function openAttachContinueWindowWindows({ directory, baseUrl }) {
-  const safe = sanitizeBaseUrlForCli(baseUrl)
-  if (safe.seemsSensitive && !isTrueEnv("OPENCODE_ALLOW_SENSITIVE_BASEURL")) {
-    throw new Error(
-      "Refusing to open opencode attach window with URL credentials or sensitive query params. " +
-        "Set OPENCODE_ALLOW_SENSITIVE_BASEURL=1 to override.",
-    )
-  }
+  const safe = safeAttachBaseUrl(baseUrl)
   const args = [
     "attach",
     String(safe.url),
@@ -375,9 +690,19 @@ export async function killProcessWindows(pid) {
   })
 }
 
+export async function openAttachWindow({ directory, baseUrl, sessionId, platform = process.platform }) {
+  if (platform === "win32") return openAttachWindowWindows({ directory, baseUrl, sessionId })
+  return openAttachWindowPosix({ directory, baseUrl, sessionId, platform })
+}
+
+export async function openAttachContinueWindow({ directory, baseUrl, platform = process.platform }) {
+  if (platform === "win32") return openAttachContinueWindowWindows({ directory, baseUrl })
+  return openAttachContinueWindowPosix({ directory, baseUrl, platform })
+}
+
 export function startOpenCodeServeDetached({ directory, port }) {
   // Non-Windows: start as a detached background process.
-  const child = spawn("opencode", ["serve", "--port", String(port)], {
+  const child = spawn("opencode", buildServeArgs(port), {
     cwd: directory,
     stdio: "ignore",
     windowsHide: true,
@@ -387,31 +712,33 @@ export function startOpenCodeServeDetached({ directory, port }) {
   return { child }
 }
 
-export async function ensureOpenCodeRunning({ projectAlias, project, ocClient, logger }) {
-  const requestedMode = project?.startMode ?? "tui"
-  const platform = process.platform
+export async function ensureOpenCodeRunning({ projectAlias, project, ocClient, logger, platform = process.platform }) {
+  const launchSupport = getLaunchSupport({ project, platform })
+  const serverLaunchMode = launchSupport.serverLaunchMode
 
   const maybeOpenAttachUi = async () => {
-    if (platform !== "win32" || requestedMode !== "tui") return
-    // Only open a UI if one is not already present for this port.
-    let uiAlreadyRunning = false
-    let match = null
-    try {
-      match = await findOpenCodeUiProcessWindows({ port: project?.port })
-      uiAlreadyRunning = !!match
-    } catch (err) {
-      const warn = logger?.warn || logger?.info || logger?.error
-      warn?.(
-        `[${projectAlias}] failed to detect existing opencode UI during attach; opening UI anyway: ${err?.message || String(err)}`,
-      )
-      uiAlreadyRunning = false
-    }
-    if (uiAlreadyRunning) {
-      logger?.info?.(`[${projectAlias}] opencode UI already running for port=${project?.port} (pid=${match?.pid || "?"})`)
-      const cmd = redactCmdlineSecrets(String(match?.cmd || ""))
-      const shortCmd = cmd.length > 180 ? cmd.slice(0, 179) + "…" : cmd
-      logger?.debug?.(`[${projectAlias}] opencode UI cmdline: ${shortCmd}`)
-      return
+    if (!launchSupport.openTuiOnAutoStart || !launchSupport.canOpenAttachWindow) return
+    if (platform === "win32") {
+      // Only open a UI if one is not already present for this port.
+      let uiAlreadyRunning = false
+      let match = null
+      try {
+        match = await findOpenCodeUiProcessWindows({ port: project?.port })
+        uiAlreadyRunning = !!match
+      } catch (err) {
+        const warn = logger?.warn || logger?.info || logger?.error
+        warn?.(
+          `[${projectAlias}] failed to detect existing opencode UI during attach; opening UI anyway: ${err?.message || String(err)}`,
+        )
+        uiAlreadyRunning = false
+      }
+      if (uiAlreadyRunning) {
+        logger?.info?.(`[${projectAlias}] opencode UI already running for port=${project?.port} (pid=${match?.pid || "?"})`)
+        const cmd = redactCmdlineSecrets(String(match?.cmd || ""))
+        const shortCmd = cmd.length > 180 ? cmd.slice(0, 179) + "…" : cmd
+        logger?.debug?.(`[${projectAlias}] opencode UI cmdline: ${shortCmd}`)
+        return
+      }
     }
 
     logger?.info?.(`[${projectAlias}] opening opencode TUI (attach --continue)`)
@@ -424,18 +751,20 @@ export async function ensureOpenCodeRunning({ projectAlias, project, ocClient, l
       logger?.warn?.(`[${projectAlias}] baseUrl contains URL credentials; skipping auto-open attach UI window`)
       return
     }
-    await openAttachContinueWindowWindows({
+    await openAttachContinueWindow({
       directory: project?.directory,
       baseUrl: safe.url,
+      platform,
     }).catch((err) => {
       logger?.error?.(`[${projectAlias}] Failed to open attach UI window: ${err?.message || String(err)}`)
     })
   }
 
   // Already up?
+  // Do not auto-open a new attach/TUI window here: `openTuiOnAutoStart`
+  // should only apply when this connector actually had to start the server.
   try {
     await ocClient.health()
-    await maybeOpenAttachUi()
     return { started: false, pid: null, stop: async () => {} }
   } catch {}
 
@@ -445,15 +774,20 @@ export async function ensureOpenCodeRunning({ projectAlias, project, ocClient, l
   if (!project.directory || !project.port) {
     throw new Error(`Project '${projectAlias}' missing directory/port for autoStart`)
   }
+  if (!launchSupport.canAutoStart) {
+    throw new Error(
+      `Project '${projectAlias}' cannot auto-start on platform '${platform}' with serverLaunchMode=${serverLaunchMode} and openTuiOnAutoStart=${launchSupport.openTuiOnAutoStart}.`,
+    )
+  }
 
   let pid = null
   let stop = async () => {}
-  let startedMode = requestedMode
+  let startedMode = `${serverLaunchMode}+${launchSupport.openTuiOnAutoStart ? "tui" : "serve"}`
 
   if (platform === "win32") {
     // If a UI is already running for this port, it may be in the middle of bringing the server up.
     let uiAlreadyRunning = false
-    if (requestedMode === "tui") {
+    if (launchSupport.openTuiOnAutoStart) {
       try {
         uiAlreadyRunning = await isAnyOpenCodeUiRunningWindows({ port: project.port })
       } catch (err) {
@@ -474,14 +808,18 @@ export async function ensureOpenCodeRunning({ projectAlias, project, ocClient, l
       }
     }
 
-    // Always start the server in headless mode (this is what the connector needs).
-    const res = await startOpenCodeServeInNewWindowWindows({
-      directory: project.directory,
-      port: project.port,
-      windowStyle: "Minimized",
-    })
+    const res =
+      serverLaunchMode === "window"
+        ? await startOpenCodeServeInNewWindowWindows({
+            directory: project.directory,
+            port: project.port,
+            windowStyle: "Normal",
+          })
+        : startOpenCodeServeDetachedWindows({ directory: project.directory, port: project.port })
+    const proc = res.child || null
     pid = res.pid
-    startedMode = requestedMode === "tui" ? "serve+tui" : "serve"
+    if (!pid && proc?.pid) pid = proc.pid
+    startedMode = `${serverLaunchMode}+${launchSupport.openTuiOnAutoStart ? "tui" : "serve"}`
 
     // If it immediately exited (e.g. port conflict), don't block: health wait below will surface details.
     await delay(750)
@@ -493,17 +831,16 @@ export async function ensureOpenCodeRunning({ projectAlias, project, ocClient, l
       await killProcessWindows(pid)
     }
   } else {
-    if (requestedMode === "tui") {
-      throw new Error(
-        `autoStart startMode=tui is currently supported only on Windows (need a terminal launcher). Start opencode manually for '${projectAlias}'.`,
-      )
-    }
-    const { child } = startOpenCodeServeDetached({ directory: project.directory, port: project.port })
-    pid = child.pid
-    startedMode = "serve"
+    const res =
+      serverLaunchMode === "window"
+        ? await startOpenCodeServeInWindowPosix({ directory: project.directory, port: project.port, platform })
+        : startOpenCodeServeDetached({ directory: project.directory, port: project.port })
+    const child = res.child || null
+    pid = res.pid ?? child?.pid ?? null
+    startedMode = `${serverLaunchMode}+${launchSupport.openTuiOnAutoStart ? "tui" : "serve"}`
     stop = async () => {
       try {
-        process.kill(pid, "SIGTERM")
+        if (pid) process.kill(pid, "SIGTERM")
       } catch {}
     }
   }

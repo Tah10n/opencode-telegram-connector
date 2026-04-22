@@ -1,9 +1,31 @@
 {
   "name": "telegram-opencode-connector",
-  "description": "Telegram connector for opencode with concurrent per-thread bindings across multiple projects.",
+  "description": "Bridge Telegram chats/topics to opencode sessions with per-thread project bindings, message mirroring, and prompt handling.",
   "version": "0.1.0",
   "private": true,
   "license": "MIT",
+  "keywords": [
+    "telegram",
+    "bot",
+    "connector",
+    "opencode",
+    "cli"
+  ],
+  "files": [
+    "src",
+    "scripts/check-syntax.mjs",
+    "index.mjs",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "CODE_OF_CONDUCT.md",
+    "RELEASING.md",
+    ".env.example",
+    "projects.example.json",
+    "connector.config.example.mjs"
+  ],
   "type": "module",
   "engines": {
     "node": ">=20"
@@ -16,6 +38,7 @@
     "check": "node scripts/check-syntax.mjs",
     "lint": "npm run check",
     "test": "node --test",
+    "test:platform": "node --test test/launcher.test.js test/overview.test.js test/index.integration.test.js",
     "test:coverage": "node --test --experimental-test-coverage"
   }
 }

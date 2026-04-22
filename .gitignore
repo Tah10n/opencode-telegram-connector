@@ -1,6 +1,8 @@
 .env
 .env.*
 !.env.example
+connector.config.mjs
+!connector.config.example.mjs
 projects.json
 .data/
 .tmp/

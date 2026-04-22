@@ -23,6 +23,32 @@ async function makeTempDir() {
   return dir
 }
 
+function swapEnv(t, patch) {
+  const previous = new Map()
+  for (const key of Object.keys(patch)) previous.set(key, process.env[key])
+  for (const [key, value] of Object.entries(patch)) {
+    if (value == null) delete process.env[key]
+    else process.env[key] = value
+  }
+  t.after(() => {
+    for (const [key, value] of previous.entries()) {
+      if (value == null) delete process.env[key]
+      else process.env[key] = value
+    }
+  })
+}
+
+async function makeFakeLauncherDir(t, ...names) {
+  const dir = await makeTempDir()
+  for (const name of names) {
+    await fs.writeFile(path.join(dir, name), "", "utf8")
+  }
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true })
+  })
+  return dir
+}
+
 async function writeState(filePath, patch = {}) {
   const state = {
     ...defaultState(),
@@ -298,8 +324,8 @@ async function createHarness({
       baseUrl: "http://127.0.0.1:4312",
       directory: path.join(dir, "demo"),
       autoStart: false,
-      startMode: "tui",
-      openAttachOnNew: false,
+      openTuiOnAutoStart: true,
+      openAttachOnNewMode: "same-window",
       username: "",
       password: "",
       ...(projectPatch || {}),
@@ -365,6 +391,9 @@ async function createHarness({
     ocByAlias: ocClientsByAlias,
     ocCallsByAlias,
     connector,
+    hasSseHandler(projectAlias) {
+      return sseHandlers.has(projectAlias)
+    },
     async emitSse(projectAlias, evt) {
       const handler = sseHandlers.get(projectAlias)
       assert.ok(handler, `Missing SSE handler for ${projectAlias}`)
@@ -901,8 +930,8 @@ test("startConnector /use reports when a shared session link is not found", asyn
         baseUrl: "http://127.0.0.1:4313",
         directory: path.join(os.tmpdir(), `telegram-connector-other-${crypto.randomUUID()}`),
         autoStart: false,
-        startMode: "tui",
-        openAttachOnNew: false,
+        openTuiOnAutoStart: true,
+        openAttachOnNewMode: "same-window",
         username: "",
         password: "",
       },
@@ -954,8 +983,8 @@ test("startConnector rejects a shared session link from a different project", as
         baseUrl: "http://127.0.0.1:4313",
         directory: otherDir,
         autoStart: false,
-        startMode: "tui",
-        openAttachOnNew: false,
+        openTuiOnAutoStart: true,
+        openAttachOnNewMode: "same-window",
         username: "",
         password: "",
       },
@@ -1008,8 +1037,8 @@ test("startConnector /use keeps checking other projects when one lookup fails", 
         baseUrl: "http://127.0.0.1:4313",
         directory: brokenDir,
         autoStart: false,
-        startMode: "tui",
-        openAttachOnNew: false,
+        openTuiOnAutoStart: true,
+        openAttachOnNewMode: "same-window",
         username: "",
         password: "",
       },
@@ -1017,8 +1046,8 @@ test("startConnector /use keeps checking other projects when one lookup fails", 
         baseUrl: "http://127.0.0.1:4314",
         directory: otherDir,
         autoStart: false,
-        startMode: "tui",
-        openAttachOnNew: false,
+        openTuiOnAutoStart: true,
+        openAttachOnNewMode: "same-window",
         username: "",
         password: "",
       },
@@ -1076,8 +1105,8 @@ test("startConnector /use reports cross-project lookup failures honestly", async
         baseUrl: "http://127.0.0.1:4313",
         directory: brokenDir,
         autoStart: false,
-        startMode: "tui",
-        openAttachOnNew: false,
+        openTuiOnAutoStart: true,
+        openAttachOnNewMode: "same-window",
         username: "",
         password: "",
       },
@@ -2332,6 +2361,40 @@ test("startConnector completes multi-step question wizard flows", async () => {
   }
 })
 
+test("startConnector defers SSE startup until the initial auto-start settles", async () => {
+  let releaseStart = null
+  const startGate = new Promise((resolve) => {
+    releaseStart = resolve
+  })
+  const startCalls = []
+  const harness = await createHarness({
+    projectPatch: {
+      autoStart: true,
+      port: 4312,
+    },
+    ensureOpenCodeRunningImpl: async ({ projectAlias }) => {
+      startCalls.push(projectAlias)
+      await startGate
+      return { stop() {} }
+    },
+    ensureStartupSessionImpl: async ({ alias, startupSessionByProject }) => {
+      startupSessionByProject[alias] = "ses_startup"
+      return "ses_startup"
+    },
+  })
+
+  try {
+    await waitFor(() => startCalls.length === 1)
+    assert.equal(harness.hasSseHandler("demo"), false)
+
+    releaseStart()
+    await waitFor(() => harness.hasSseHandler("demo"))
+  } finally {
+    releaseStart?.()
+    await harness.connector.stop()
+  }
+})
+
 test("startConnector offers a start button on connect errors and recovers after start callback", async () => {
   const startCalls = []
   let promptAttempts = 0
@@ -3055,7 +3118,7 @@ test("startConnector validates permissions and questions independently during re
   }
 })
 
-test("startConnector opens an attach window after /new when openAttachOnNew is enabled on Windows", async () => {
+test("startConnector opens an attach window after /new when openAttachOnNewMode is new-window on Windows", async () => {
   const attachCalls = []
   const harness = await createHarness({
     statePatch: {
@@ -3068,7 +3131,7 @@ test("startConnector opens an attach window after /new when openAttachOnNew is e
       },
     },
     projectPatch: {
-      openAttachOnNew: true,
+      openAttachOnNewMode: "new-window",
     },
     ocOptions: {
       createSessionImpl: async (input) => ({ id: `ses_new:${input.title}` }),
@@ -3092,6 +3155,7 @@ test("startConnector opens an attach window after /new when openAttachOnNew is e
         directory: path.join(harness.dir, "demo"),
         baseUrl: "http://127.0.0.1:4312",
         sessionId: "ses_new:Demo title",
+        platform: "win32",
       },
     ])
     assert.deepEqual(state.bindings, {
@@ -3107,7 +3171,10 @@ test("startConnector opens an attach window after /new when openAttachOnNew is e
   }
 })
 
-test("startConnector skips attach window auto-open after /new on non-Windows platforms", async () => {
+test("startConnector opens an attach window after /new on Linux when openAttachOnNewMode is new-window", async (t) => {
+  const fakeBin = await makeFakeLauncherDir(t, "x-terminal-emulator")
+  swapEnv(t, { DISPLAY: ":0", WAYLAND_DISPLAY: undefined, PATH: fakeBin, OPENCODE_TERMINAL: undefined })
+
   const attachCalls = []
   const harness = await createHarness({
     statePatch: {
@@ -3120,7 +3187,7 @@ test("startConnector skips attach window auto-open after /new on non-Windows pla
       },
     },
     projectPatch: {
-      openAttachOnNew: true,
+      openAttachOnNewMode: "new-window",
     },
     ocOptions: {
       createSessionImpl: async () => ({ id: "ses_linux" }),
@@ -3134,8 +3201,54 @@ test("startConnector skips attach window auto-open after /new on non-Windows pla
 
   try {
     harness.tg.enqueue(makeMessageUpdate(801, "/new Linux title"))
+    await waitFor(() => attachCalls.length === 1)
     await waitFor(
       () => harness.tg.sentMessages.some((entry) => entry.text.includes("Created and switched to session: ses_linux") && entry.text.includes("Model: openai/gpt-5 medium")),
+    )
+    await harness.connector.stop()
+
+    assert.deepEqual(attachCalls, [
+      {
+        directory: path.join(harness.dir, "demo"),
+        baseUrl: "http://127.0.0.1:4312",
+        sessionId: "ses_linux",
+        platform: "linux",
+      },
+    ])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector does not open another attach window after /new when openAttachOnNewMode is same-window", async () => {
+  const attachCalls = []
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 820,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    projectPatch: {
+      openAttachOnNewMode: "same-window",
+    },
+    ocOptions: {
+      createSessionImpl: async () => ({ id: "ses_same_window" }),
+      getConfigImpl: async () => ({ model: "openai/gpt-5", default_agent: "build", agent: { build: { variant: "medium" } } }),
+    },
+    openAttachWindowWindowsImpl: async (args) => {
+      attachCalls.push(args)
+    },
+    platform: "win32",
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(821, "/new Same window title"))
+    await waitFor(
+      () => harness.tg.sentMessages.some((entry) => entry.text.includes("Created and switched to session: ses_same_window") && entry.text.includes("Model: openai/gpt-5 medium")),
     )
     await harness.connector.stop()
 

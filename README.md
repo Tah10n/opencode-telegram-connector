@@ -1,137 +1,191 @@
 # Telegram connector for opencode
 
-Small Node.js bridge that:
+[![Node.js >=20](https://img.shields.io/badge/node-%E2%89%A520-339933?logo=nodedotjs&logoColor=white)](#requirements)
+[![Module: ESM](https://img.shields.io/badge/module-ESM-f7df1e?logo=javascript&logoColor=111111)](#telegram-connector-for-opencode)
+[![License: MIT](https://img.shields.io/badge/license-MIT-1677ff.svg)](./LICENSE)
+[![Telegram Bot](https://img.shields.io/badge/Telegram-bot-26A5E4?logo=telegram&logoColor=white)](#telegram-commands)
+[![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-6f42c1)](#platform-notes)
+[![CI](https://img.shields.io/badge/CI-check%20%2B%20test-2ea44f)](./.github/workflows/ci.yml)
 
-- Reads Telegram updates in a single process/offset.
-- Routes each Telegram context `(chat_id, message_thread_id|null)` to `{ projectAlias, sessionId }`.
-- Mirrors **user + assistant text** from opencode sessions into the bound Telegram thread, with Telegram HTML formatting.
-- Lets you send messages from Telegram into the bound opencode session (optional prefix `TG_PREFIX`, default empty).
-- Lets you approve/deny opencode **permission** and answer **question** prompts via Telegram **buttons**.
+Run your opencode sessions from Telegram.
 
-Unlike bots that keep a single "current project" and force you to switch back and forth, this connector binds each Telegram chat/topic to its own `{ projectAlias, sessionId }`. That means you can keep **multiple projects active at the same time** in different chats or forum topics and continue each session independently.
+This Node.js connector binds each Telegram chat or forum topic to a specific `{ projectAlias, sessionId }`, so you can keep multiple projects active in parallel without manually switching context.
 
-## Key advantage
+## Highlights
 
-This connector is optimized for **parallel multi-project work**:
+- **Per-thread bindings** — each chat/topic keeps its own project and session.
+- **Telegram-first workflow** — send prompts from Telegram and get assistant replies back in the same thread.
+- **Prompt handling in chat** — approve or deny permission requests and answer questions with inline buttons.
+- **Multi-project friendly** — different chats/topics can stay bound to different projects at the same time.
+- **Optional local auto-start** — start local opencode servers and optionally open attach/TUI windows.
+- **Restart-safe state** — bindings, feed mode, model preference, and pending prompt state survive restarts.
 
-- one Telegram topic can stay bound to project A
-- another topic can stay bound to project B
-- each topic keeps its own opencode session binding
-- no manual global project switching is required between conversations
+## How it works
 
-## Prereqs
+1. Configure one or more opencode-backed projects.
+2. In Telegram, bind a chat/topic with `/bind`, `/new`, or `/use`.
+3. Send messages from Telegram to the bound opencode session.
+4. Receive assistant replies, changed-file cards, and prompt requests back in the same thread.
 
-- Node.js 20+.
-- A Telegram bot token (via @BotFather).
-- opencode installed and available on PATH.
+## Requirements
 
-## Setup
+- Node.js **20+**
+- A Telegram bot token
+- Reachable opencode endpoints for your configured projects
+- If you use `autoStart`, the `opencode` CLI must be installed and available on `PATH`
 
-1) Create `.env` (see `.env.example`).
+## Quick start
 
-2) Create `projects.json` (see `projects.example.json`).
+1. Install dependencies:
 
-3) (Optional) Let the connector auto-start opencode.
-
-Add `directory` + `port` + `autoStart:true` in `projects.json` (see `projects.example.json`).
-
-On Windows, `startMode: "tui"` will open a new window per project (`opencode . --port <port> --continue`) so the UI continues the last session. Startup health wait timeout is ~3 minutes.
-
-If you set `openAttachOnNew: true` for a project, then each `/new` in Telegram will also open a new `opencode attach <baseUrl> --session <newSessionId>` window for that project (old windows are kept).
-
-If you send a Telegram message while the project's server is down and the project has `autoStart:true`, the bot will offer a **Start** button that launches opencode for that project.
-
-Availability notifications stay scoped to the affected bound threads: if a project's health/SSE goes down, only threads bound to that project are notified, and they receive a single back-online notice when connectivity recovers.
-
-4) Start the connector:
-
-```powershell
-npm start
-# or: node src/cli.js
+```sh
+npm install
 ```
 
-5) Open Telegram, message your bot (e.g. `/start`).
+2. Copy `connector.config.example.mjs` to `connector.config.mjs`.
+3. Create `.env` from `.env.example`.
+4. Put your secrets in `.env`:
+   - `TELEGRAM_BOT_TOKEN`
+   - `TELEGRAM_ALLOWED_USER_ID`
+5. Define your projects in `connector.config.mjs`.
+6. Start the connector:
 
-## Commands (in Telegram)
+```sh
+npm start
+```
 
-- `/help`
-- `/bind <projectAlias>` (bind current thread to that project's startup session)
-- `/new [title]` (create a new session in this thread's project, bind to it, and show the thread's active model + source when available)
-- `/use <sessionId|shareLink>` (bind to an existing session in this thread's project; accepts `https://opncd.ai/share/<id>` and `https://opncd.ai/s/<id>`; cross-project share links are rejected with guidance)
-- `/sessions` (list recent sessions for this thread's current project, including the current thread model + source when available, and switch via buttons)
-- `/model [provider/model] [variant]` (show or change the current thread's model preference; `/model default` pins the thread to the project's configured default, `/model reset` returns to inherited behavior)
-- `/feed` (configure which updates are mirrored into this thread: Main, Main + changes, Verbose)
-- `/status` (show current binding, active model + source, feed mode, startup session, SSE status, and base URL)
-- `/bindings` (list all active chat/topic bindings; private chat only)
-- `/abort` (abort the current thread's running session)
-- `/sendlast` (re-send the latest assistant reply from the currently bound session)
-- `/projects` (show a higher-level overview of projects, startup sessions, SSE state, and active bindings)
-- `/unbind`
+7. In Telegram, send `/start`, then `/bind <projectAlias>`.
 
-## Notes
+Sanity check:
 
-- The bot only accepts messages from a single Telegram user id (`TELEGRAM_ALLOWED_USER_ID`).
-- On first start it **drains** old Telegram updates so it does not replay history.
-- State is stored in `./.data/state.json` by default (override with `STATE_FILE`).
-- Each bound Telegram thread/topic stays isolated: switching sessions, streaming previews, changed-file cards, and prompt recovery in one thread do not affect other threads.
-- Feed mode is stored per Telegram thread/topic and survives rebinds and restarts.
-- Model preference is also stored per Telegram thread/topic and survives `/use`, `/new`, and connector restarts.
-- `Main` shows only final assistant replies.
-- `Main + changes` shows final assistant replies plus first-class `Changed files` cards.
-- `Verbose` also includes streaming previews and non-echo user mirroring.
-- Internal compaction output and noisy intermediate model messages stay hidden by default in all feed modes.
-- Assistant replies stream into the bound Telegram thread while opencode is still generating output.
-- Very long assistant code/log output falls back to a `.txt` attachment instead of flooding the chat with many chunks.
-- `Changed files` cards support `Show diff` / `Back` and update the same Telegram message in place; if the diff is unavailable or too large, the bot falls back gracefully and may attach a `.txt` file.
-- Pending prompt state persists the minimal recovery data needed to continue Telegram flows after restart: pending permissions, in-progress question wizards, typed reject-note waits, and typed custom-answer waits.
-- Restart recovery validates permissions and questions independently against the live backend snapshot before replaying anything into Telegram.
-- If the backend confirms that a persisted permission/question is gone, the connector treats it as `stale`, drops the local recovery state, and does not replay it again.
-- If the backend is temporarily unavailable during recovery or while submitting a permission/question answer, the connector treats that as `retryable`: it keeps the pending state, does not silently auto-replay the action, and lets you retry from Telegram after the backend recovers.
-- Fatal boundary failures are surfaced to the user/operator instead of being retried blindly; the connector now normalizes Telegram/OpenCode boundary errors through a shared classification layer.
-- `/use <shareLink>` accepts both current OpenCode share links (`https://opncd.ai/share/<id>`) and older short links (`https://opncd.ai/s/<id>`).
-- When switching to an existing session, the connector shows the effective model for the current thread; in inherit mode it falls back to the most recent known session model when OpenCode history exposes it.
-- `/model` prefers inline buttons for common choices: inherit, project default, and common variants for the current/default model. Use `/model <provider/model> [variant]` as a typed fallback for anything else.
-- `Inherit` means the connector sends no explicit model override, so OpenCode keeps using the session's last model when available and otherwise falls back to the project default.
-- `Project default` means the connector resolves the project's configured default model/variant and sends that as a per-thread override on each prompt from that Telegram thread.
-- `Custom` means the connector sends the selected provider/model/variant on each prompt from that Telegram thread only; other threads and projects keep their own selections.
-- `/new` keeps the current thread's model preference when it creates and binds a new session, so the next prompt in that thread continues with the same override behavior.
-- `/sendlast` fetches the latest assistant reply for the currently bound session from OpenCode, so it still works after session switches or connector restarts.
-- `/new` reports the effective model for the current thread: custom override, project default override, or inherited/default behavior.
-- If `/use <shareLink>` points to a session from a different configured project, the bot refuses the bind and tells you to bind the correct project alias first.
-- When a project becomes unavailable, bound threads receive an unavailable notice and, for `autoStart:true` projects, a **Start** button; once the project is healthy again they receive a single back-online notice.
-- Mirrored messages are sent with `parse_mode=HTML`. Triple-backtick fences (```code```) are rendered as Telegram `<pre><code>` blocks.
-- Common markdown like `**bold**`, `*italic*`, `` `inline code` ``, `# headings`, `- bullets`, and `[links](https://example.com)` is converted (clickable links are http/https only).
+```sh
+npm run check
+```
 
-## Config
+## Minimal config example
 
-- `PROJECTS_FILE=./projects.json` (or `PROJECTS_JSON=...`)
-- `DEFAULT_PROJECT=...` (optional hint)
-- `STATE_FILE=...` (optional)
-- `TG_PREFIX=[TG] ` (optional)
-- `ECHO_FILTER_MODE=recent` (optional; default)
-- `OPENCODE_ALLOW_INSECURE_HTTP=1` (optional; allows Basic Auth over non-loopback http://)
+`connector.config.mjs` is the preferred configuration entrypoint.
+Legacy `PROJECTS_FILE` / `PROJECTS_JSON` setup is still supported if you need it.
 
-### projects.json fields
+```js
+export default {
+  telegram: {
+    botToken: process.env.TELEGRAM_BOT_TOKEN,
+    allowedUserId: Number(process.env.TELEGRAM_ALLOWED_USER_ID),
+  },
 
-Each project entry supports:
+  projects: {
+    pocket: {
+      directory: "./project-a",
+      port: 4100,
+      autoStart: true,
+      serverLaunchMode: "background",
+      openTuiOnAutoStart: true,
+      openAttachOnNewMode: "same-window",
+    },
 
-- `baseUrl` (required unless `port` is set)
-- `directory` (required if `autoStart:true`)
-- `port` (required if `autoStart:true`; also enables implicit baseUrl `http://127.0.0.1:<port>`)
-- `autoStart` (optional; default false)
-- `startMode`: `"tui"` or `"serve"` (optional; default `"tui"`)
-- `openAttachOnNew` (optional; Windows-only helper)
-- `username` / `password` or `usernameEnv` / `passwordEnv` (optional basic auth)
+    remote: {
+      baseUrl: "http://127.0.0.1:4200",
+    },
+  },
+}
+```
+
+## Telegram commands
+
+### Binding and sessions
+
+- `/start`, `/help` — show help.
+- `/bind <projectAlias>` — bind the current chat/topic to a project's startup session.
+- `/new [title]` — create and bind a new session.
+- `/use <sessionId|shareLink>` — bind an existing session. Supports `https://opncd.ai/share/<id>` and `https://opncd.ai/s/<id>`.
+- `/sessions` — list recent sessions and switch with buttons.
+- `/unbind` — remove the current binding.
+
+### Thread settings and control
+
+- `/model [provider/model] [variant]` — show or change the model for the current thread.
+- `/feed` — choose mirrored updates for the current thread.
+- `/status` — show the current binding, model, feed mode, SSE status, and base URL.
+- `/abort` — abort the active run in the current thread.
+- `/sendlast` — resend the latest assistant reply for the bound session.
+- `/cancel` — cancel the current Telegram-side flow.
+
+### Overview
+
+- `/projects` — show projects, startup sessions, SSE status, and active bindings.
+- `/bindings` — list all active bindings (**private chat only**).
+
+## Feed modes
+
+- `Main` — final assistant replies only.
+- `Main + changes` — final assistant replies and changed-file cards.
+- `Verbose` — final replies, streaming previews, user mirror, and changed-file cards.
+
+## Configuration overview
+
+### Global settings
+
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_ALLOWED_USER_ID`
+- `STATE_FILE` (default: `./.data/state.json`)
+- `TG_PREFIX`
+- `ECHO_FILTER_MODE`
+- `OPENCODE_ALLOW_INSECURE_HTTP=1`
+- `OPENCODE_TERMINAL` (Linux terminal launcher override)
+
+### Per-project fields
+
+- `baseUrl` or `port`
+- `directory` (required for `autoStart`)
+- `autoStart`
+- `serverLaunchMode`: `background` or `window`
+- `openTuiOnAutoStart`
+- `openAttachOnNewMode`: `same-window` or `new-window`
+- `username` / `password` or `usernameEnv` / `passwordEnv`
+- `displayName`
+
+### CLI flags
+
+- `--env-file <path>`
+- `--config-file <path>`
+- `--projects-file <path>`
+- `--projects-json <json>`
+- `--state-file <path>`
+
+## Platform notes
+
+- **Windows**, **macOS**, and **Linux desktop** environments support local auto-start and optional attach/TUI windows.
+- On Linux, the connector tries `OPENCODE_TERMINAL` first and then common terminal emulators from `PATH`.
+- In headless Linux/macOS environments, connecting to an already running opencode server still works, but opening a new terminal window requires an available GUI/terminal launcher.
+
+## Important behavior and limits
+
+- The bot accepts messages from a single Telegram user ID only.
+- The connector is designed to run as a **single instance** per bot token.
+- On first start, it drains old Telegram updates to avoid replaying history.
+- Feed mode is stored per Telegram thread/topic; the default is `Main + changes`.
+- Large replies or diffs may be delivered as `.txt` attachments instead of many chat messages.
+- Basic Auth over non-loopback `http://` is blocked unless `OPENCODE_ALLOW_INSECURE_HTTP=1` is set.
+
+## Useful local commands
+
+```sh
+npm run check
+npm test
+npm run test:coverage
+```
 
 ## Viewing the same session in opencode
 
-Each Telegram thread is bound to a `{ projectAlias, sessionId }`.
+Use `/status` to see the current binding, then attach from a terminal:
 
-- See current binding: `/status`
-- See each project's startup session: `/projects`
-
-To view the same session in a terminal UI, attach:
-
-```powershell
+```sh
 opencode attach <baseUrl> --session <sessionId>
 ```
+
+## More docs
+
+- [CONTRIBUTING.md](./CONTRIBUTING.md)
+- [SECURITY.md](./SECURITY.md)
+- [CHANGELOG.md](./CHANGELOG.md)
