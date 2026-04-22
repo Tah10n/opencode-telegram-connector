@@ -2,6 +2,12 @@ import { normalizeFeedMode } from "../state/store.js"
 import { normalizeModelReference } from "../model-selection.js"
 import { classifyBoundaryError, isRetryableBoundaryError, isStaleBoundaryError } from "../boundary-errors.js"
 
+async function defaultBuildSessionSwitchText(_projectAlias, sessionId) {
+  return `Switched to session: ${sessionId}`
+}
+
+function ignoreError() {}
+
 export function createCallbackHandlers(runtime) {
   const {
     tg,
@@ -29,13 +35,13 @@ export function createCallbackHandlers(runtime) {
     applyWizardState,
     persistQuestionWizard,
     finishQuestionWizard,
-    buildSessionSwitchText = async (projectAlias, sessionId) => `Switched to session: ${sessionId}`,
+    buildSessionSwitchText = defaultBuildSessionSwitchText,
     setThreadModelPreference,
     formatProjectUnavailable,
   } = runtime
 
   async function answerCallbackQuery(callbackQueryId, text) {
-    await tg.answerCallbackQuery(callbackQueryId, text).catch(() => {})
+    await tg.answerCallbackQuery(callbackQueryId, text).catch(ignoreError)
   }
 
   async function handleTelegramCallback(callbackQuery) {
@@ -78,7 +84,7 @@ export function createCallbackHandlers(runtime) {
           await bindCtxToSession(ctxMeta, projectAlias, targetSessionId)
         } catch (err) {
           await answerCallbackQuery(callbackQuery.id, "Unavailable")
-          await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err)).catch(() => {})
+          await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err)).catch(ignoreError)
           return
         }
 
@@ -88,7 +94,7 @@ export function createCallbackHandlers(runtime) {
           editMessageId: msg?.message_id,
         }).catch(async (err) => {
           runtime.logger?.error?.("Failed to refresh sessions list:", err?.message || String(err))
-          await sendToThread(ctxMeta, await buildSessionSwitchText(projectAlias, targetSessionId, { ctxKey: ctxMeta.ctxKey })).catch(() => {})
+          await sendToThread(ctxMeta, await buildSessionSwitchText(projectAlias, targetSessionId, { ctxKey: ctxMeta.ctxKey })).catch(ignoreError)
         })
         return
       }
@@ -118,7 +124,7 @@ export function createCallbackHandlers(runtime) {
         const mode = normalizeFeedMode(rawMode)
         store.setFeedMode(ctxMeta.ctxKey, mode)
         await answerCallbackQuery(callbackQuery.id, `Feed: ${feedModeLabel(mode)}`)
-        await renderFeedSettings(ctxMeta, { editMessageId: msg?.message_id }).catch(() => {})
+        await renderFeedSettings(ctxMeta, { editMessageId: msg?.message_id }).catch(ignoreError)
         return
       }
 
@@ -133,16 +139,16 @@ export function createCallbackHandlers(runtime) {
         if (action === "close") {
           await answerCallbackQuery(callbackQuery.id, "Closed")
           if (typeof tg.deleteMessage === "function") {
-            await tg.deleteMessage(ctxMeta.chatId, msg?.message_id).catch(() => {})
+            await tg.deleteMessage(ctxMeta.chatId, msg?.message_id).catch(ignoreError)
           } else if (typeof tg.editMessageReplyMarkup === "function") {
-            await tg.editMessageReplyMarkup(ctxMeta.chatId, msg?.message_id, null).catch(() => {})
+            await tg.editMessageReplyMarkup(ctxMeta.chatId, msg?.message_id, null).catch(ignoreError)
           }
           return
         }
 
         if (action === "back") {
           await answerCallbackQuery(callbackQuery.id, "Back")
-          await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(() => {})
+          await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(ignoreError)
           return
         }
 
@@ -155,7 +161,7 @@ export function createCallbackHandlers(runtime) {
             const result = await setThreadModelPreference(ctxMeta, binding, { mode: "project-default" })
             if (!result?.ok) {
               await answerCallbackQuery(callbackQuery.id, result?.callbackText || "Unavailable")
-              await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(() => {})
+              await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(ignoreError)
               return
             }
             await answerCallbackQuery(callbackQuery.id, result.callbackText || "Model: project default")
@@ -163,7 +169,7 @@ export function createCallbackHandlers(runtime) {
             await answerCallbackQuery(callbackQuery.id, "Invalid")
             return
           }
-          await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(() => {})
+          await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(ignoreError)
           return
         }
 
@@ -174,7 +180,7 @@ export function createCallbackHandlers(runtime) {
             return
           }
           await answerCallbackQuery(callbackQuery.id, "Pick variant")
-          await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id, selectedModelKey: modelKey }).catch(() => {})
+          await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id, selectedModelKey: modelKey }).catch(ignoreError)
           return
         }
 
@@ -192,7 +198,7 @@ export function createCallbackHandlers(runtime) {
           const variant = variantToken === "~" ? "" : variantToken
           const result = await setThreadModelPreference(ctxMeta, binding, { mode: "custom", model: modelKey, variant })
           await answerCallbackQuery(callbackQuery.id, result?.callbackText || (variant ? `Model: ${modelKey} ${variant}` : `Model: ${modelKey}`))
-          await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(() => {})
+          await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(ignoreError)
           return
         }
 
@@ -210,9 +216,7 @@ export function createCallbackHandlers(runtime) {
           return
         }
         await answerCallbackQuery(callbackQuery.id)
-        await renderChangedFilesView(ctxMeta, projectAlias, sessionId, opencodeMessageId, action, { editMessageId: msg?.message_id }).catch(
-          () => {},
-        )
+        await renderChangedFilesView(ctxMeta, projectAlias, sessionId, opencodeMessageId, action, { editMessageId: msg?.message_id }).catch(ignoreError)
         return
       }
 
@@ -237,7 +241,7 @@ export function createCallbackHandlers(runtime) {
             }
             if (isRetryableBoundaryError(err, { source: "opencode", pathname: `/permission/${permissionId}/reply`, method: "POST" })) {
               await answerCallbackQuery(callbackQuery.id, "Temporarily unavailable")
-              await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(() => {})
+              await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(ignoreError)
               return
             }
             throw err
@@ -291,7 +295,7 @@ export function createCallbackHandlers(runtime) {
             }
             if (isRetryableBoundaryError(err, { source: "opencode", pathname: `/question/${questionId}/reject`, method: "POST" })) {
               await answerCallbackQuery(callbackQuery.id, "Temporarily unavailable")
-              await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(() => {})
+              await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(ignoreError)
               return
             }
             throw err
@@ -366,7 +370,7 @@ export function createCallbackHandlers(runtime) {
               result?.outcome === "stale" ? "No longer active" : result?.outcome === "retryable" ? "Temporarily unavailable" : "Selected",
             )
             if (result?.outcome === "retryable") {
-              await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(() => {})
+              await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(ignoreError)
             }
             return
           } else {
@@ -418,7 +422,7 @@ export function createCallbackHandlers(runtime) {
               result?.outcome === "stale" ? "No longer active" : result?.outcome === "retryable" ? "Temporarily unavailable" : "Done",
             )
             if (result?.outcome === "retryable") {
-              await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(() => {})
+              await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(ignoreError)
             }
             return
           } else {
@@ -444,11 +448,11 @@ export function createCallbackHandlers(runtime) {
       }
       if (classification.retryable) {
         await answerCallbackQuery(callbackQuery.id, "Temporarily unavailable")
-        await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(() => {})
+        await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(ignoreError)
         return
       }
       await answerCallbackQuery(callbackQuery.id, "Action failed")
-      await sendToThread(ctxMeta, "Action failed. Please try again.").catch(() => {})
+      await sendToThread(ctxMeta, "Action failed. Please try again.").catch(ignoreError)
     }
   }
 

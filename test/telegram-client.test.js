@@ -8,6 +8,11 @@ test("splitTelegramText keeps short lines and splits oversized lines", () => {
   assert.deepEqual(chunks, ["short", "xxxxx", "x"])
 })
 
+test("splitTelegramText carries a short next line into a fresh chunk", () => {
+  const chunks = splitTelegramText("aa\nbbb", 3)
+  assert.deepEqual(chunks, ["aa", "bbb"])
+})
+
 test("TelegramClient call and callMultipart return Telegram results and surface API errors", async () => {
   const originalFetch = globalThis.fetch
   const calls = []
@@ -85,6 +90,93 @@ test("TelegramClient getUpdates forwards params and timeout metadata", async () 
     params: { offset: 10, timeout: 30, allowed_updates: ["message"] },
     options: { timeoutMs: 40_000, signal },
   })
+})
+
+test("TelegramClient wrappers forward getMe, setMyCommands, and deleteMessage", async () => {
+  const client = new TelegramClient("token")
+  const calls = []
+  client.call = async (method, params, options) => {
+    calls.push({ method, params, options })
+    return { ok: true }
+  }
+
+  await client.getMe()
+  await client.setMyCommands([{ command: "start", description: "Start" }], {
+    scope: { type: "all_private_chats" },
+    language_code: "ru",
+  })
+  await client.deleteMessage(100, 200)
+
+  assert.deepEqual(calls, [
+    { method: "getMe", params: null, options: { timeoutMs: 15_000 } },
+    {
+      method: "setMyCommands",
+      params: {
+        commands: [{ command: "start", description: "Start" }],
+        scope: { type: "all_private_chats" },
+        language_code: "ru",
+      },
+      options: { timeoutMs: 15_000 },
+    },
+    { method: "deleteMessage", params: { chat_id: 100, message_id: 200 }, options: { timeoutMs: 20_000 } },
+  ])
+})
+
+test("TelegramClient callMultipart returns Telegram results on success", async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    json: async () => ({ ok: true, result: { uploaded: true } }),
+  })
+
+  try {
+    const client = new TelegramClient("token", { baseUrl: "https://api.example.test/bot" })
+    const formData = new FormData()
+    formData.set("probe", "1")
+    assert.deepEqual(await client.callMultipart("sendDocument", formData, { timeoutMs: 5 }), { uploaded: true })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("TelegramClient wraps timeout aborts and multipart fetch failures as boundary errors", async () => {
+  const originalFetch = globalThis.fetch
+  let callCount = 0
+  globalThis.fetch = async (_url, init) => {
+    callCount += 1
+    if (callCount === 1) {
+      return await new Promise((_, reject) => {
+        init.signal.addEventListener("abort", () => reject(new DOMException("timed out", "AbortError")), { once: true })
+      })
+    }
+    throw new Error("multipart down")
+  }
+
+  try {
+    const client = new TelegramClient("token", { baseUrl: "https://api.example.test/bot" })
+    await assert.rejects(async () => client.call("getMe", { probe: true }, { timeoutMs: 1 }), (err) => {
+      const classification = classifyBoundaryError(err)
+      assert.equal(err.isBoundaryError, true)
+      assert.equal(err.source, "telegram")
+      assert.equal(err.pathname, "/getMe")
+      assert.equal(classification.retryable, true)
+      return true
+    })
+
+    const formData = new FormData()
+    formData.set("probe", "1")
+    await assert.rejects(async () => client.callMultipart("sendDocument", formData, { timeoutMs: 5 }), (err) => {
+      assert.equal(err.isBoundaryError, true)
+      assert.equal(err.source, "telegram")
+      assert.equal(err.pathname, "/sendDocument")
+      assert.match(err.message, /multipart down/)
+      return true
+    })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })
 
 test("TelegramClient sendMessage splits long output and keeps reply markup on the last chunk", async () => {

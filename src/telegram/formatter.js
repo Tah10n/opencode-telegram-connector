@@ -46,31 +46,6 @@ export function formatInlineMarkdownToHtml(text) {
   return out
 }
 
-function splitHtmlIntoBalancedChunks(html, maxLen = 3900) {
-  const s = String(html ?? "")
-  if (s.length <= maxLen) return [s]
-  // Naive chunking on \n first, then hard split.
-  const lines = s.split("\n")
-  const chunks = []
-  let cur = ""
-  for (const line of lines) {
-    const add = (cur ? "\n" : "") + line
-    if ((cur + add).length <= maxLen) {
-      cur += add
-      continue
-    }
-    if (cur) chunks.push(cur)
-    cur = ""
-    if (line.length > maxLen) {
-      for (let i = 0; i < line.length; i += maxLen) chunks.push(line.slice(i, i + maxLen))
-    } else {
-      cur = line
-    }
-  }
-  if (cur) chunks.push(cur)
-  return chunks
-}
-
 function splitPlainText(text, maxLen) {
   const s = String(text ?? "")
   if (s.length <= maxLen) return [s]

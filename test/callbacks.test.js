@@ -211,6 +211,15 @@ test("createCallbackHandlers rejects invalid callback payloads", async () => {
   assert.deepEqual(callbackAnswers, [{ callbackQueryId: "cb_1", text: "Invalid" }])
 })
 
+test("createCallbackHandlers rejects unknown callback kinds", async () => {
+  const { runtime, callbackAnswers } = makeRuntime()
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("weird|payload"))
+
+  assert.deepEqual(callbackAnswers, [{ callbackQueryId: "cb_1", text: "Invalid" }])
+})
+
 test("createCallbackHandlers switches sessions and refreshes the sessions list", async () => {
   const { runtime, callbackAnswers, bindCalls, sessionListCalls } = makeRuntime({
     storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
@@ -240,6 +249,57 @@ test("createCallbackHandlers switches sessions and refreshes the sessions list",
       options: { binding: { projectAlias: "demo", sessionId: "ses_next" }, editMessageId: 900 },
     },
   ])
+})
+
+test("createCallbackHandlers falls back to a switch message when refreshing sessions fails", async () => {
+  const { runtime, callbackAnswers, bindCalls, sentMessages, loggerErrors } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    ocByAlias: {
+      demo: {
+        async getSession(sessionId) {
+          return { id: sessionId }
+        },
+      },
+    },
+    renderSessionsList: async () => {
+      throw new Error("refresh failed")
+    },
+    buildSessionSwitchText: async () => "Switched fallback",
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("s|demo|ses_next"))
+
+  assert.equal(callbackAnswers.at(-1)?.text, "Switched")
+  assert.equal(bindCalls.at(-1)?.sessionId, "ses_next")
+  assert.equal(sentMessages.at(-1)?.text, "Switched fallback")
+  assert.match(loggerErrors.at(-1) || "", /Failed to refresh sessions list: refresh failed/)
+})
+
+test("createCallbackHandlers swallows fallback send failures after a session switch", async () => {
+  const { runtime, callbackAnswers, bindCalls, loggerErrors } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    ocByAlias: {
+      demo: {
+        async getSession(sessionId) {
+          return { id: sessionId }
+        },
+      },
+    },
+    renderSessionsList: async () => {
+      throw new Error("refresh failed")
+    },
+    sendToThread: async () => {
+      throw new Error("send failed")
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("s|demo|ses_next"))
+
+  assert.equal(callbackAnswers.at(-1)?.text, "Switched")
+  assert.equal(bindCalls.at(-1)?.sessionId, "ses_next")
+  assert.match(loggerErrors.at(-1) || "", /Failed to refresh sessions list: refresh failed/)
 })
 
 test("createCallbackHandlers reports unavailable target sessions", async () => {
@@ -500,6 +560,28 @@ test("createCallbackHandlers degrades transient permission callback failures wit
   assert.equal(loggerErrors.length, 0)
 })
 
+test("createCallbackHandlers handles permission guard branches and fatal callback failures", async () => {
+  const { runtime, callbackAnswers, sentMessages, deletedPermissions, loggerErrors } = makeRuntime({
+    ocByAlias: {
+      demo: {
+        async replyPermission() {
+          throw new Error("boom")
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("p|missing|perm_1|once"))
+  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_1|weird"))
+  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_1|once"))
+
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Unknown project", "Invalid", "Action failed"])
+  assert.deepEqual(deletedPermissions, [])
+  assert.equal(sentMessages.at(-1)?.text, "Action failed. Please try again.")
+  assert.match(loggerErrors.at(-1) || "", /Callback handler error: boom/)
+})
+
 test("createCallbackHandlers rejects stale and successful question callbacks", async () => {
   const wizard = makeWizard()
   const { runtime, callbackAnswers, clearedQuestionIds, customStateCalls, questionWizards } = makeRuntime({
@@ -639,6 +721,109 @@ test("createCallbackHandlers handles single-choice and multi-choice question ste
   assert.equal(sendQuestionStepCalls[1].wizard.index, 1)
   assert.equal(persistedWizards.length, 3)
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Selected", undefined, "Done"])
+})
+
+test("createCallbackHandlers rejects invalid question callback shapes and options", async () => {
+  const singleWizard = makeWizard({ id: "q_single", questions: [{ header: "Pick one", question: "Pick", options: [{ label: "lint" }] }] })
+  const multiWizard = makeWizard({
+    id: "q_multi",
+    questions: [{ header: "Checks", question: "Pick", multiple: true, options: [{ label: "lint" }, { label: "test" }] }],
+  })
+  const { runtime, callbackAnswers, persistedWizards, finishCalls, sendQuestionStepCalls } = makeRuntime({
+    getWizard: (_projectAlias, questionId) => {
+      if (questionId === "q_single") return singleWizard
+      if (questionId === "q_multi") return multiWizard
+      return null
+    },
+    ocByAlias: { demo: {} },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("q|missing|q_1|reject"))
+  await handlers.handleTelegramCallback(makeCallback("q|demo|q_single"))
+  await handlers.handleTelegramCallback(makeCallback("q|demo|q_single|0|t|0"))
+  await handlers.handleTelegramCallback(makeCallback("q|demo|q_multi|0|t|99"))
+  await handlers.handleTelegramCallback(makeCallback("q|demo|q_single|0|done"))
+
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Unknown project", "Invalid", "Invalid", "Invalid", "Invalid"])
+  assert.deepEqual(persistedWizards, [])
+  assert.deepEqual(finishCalls, [])
+  assert.deepEqual(sendQuestionStepCalls, [])
+})
+
+test("createCallbackHandlers reports retryable completion for multi-choice questions", async () => {
+  const wizard = makeWizard({
+    id: "q_multi_retry",
+    questions: [{ header: "Checks", question: "Pick", multiple: true, options: [{ label: "lint" }, { label: "test" }] }],
+    selectedByIndex: { 0: ["lint", "test"] },
+  })
+  const { runtime, callbackAnswers, sentMessages, persistedWizards, finishCalls } = makeRuntime({
+    getWizard: () => wizard,
+    ocByAlias: { demo: {} },
+    finishQuestionWizard: async (currentWizard) => {
+      finishCalls.push(cloneWizardState(currentWizard))
+      return { outcome: "retryable" }
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("q|demo|q_multi_retry|0|done"))
+
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Temporarily unavailable"])
+  assert.equal(sentMessages.at(-1)?.text, "Action is temporarily unavailable. Please try again.")
+  assert.equal(persistedWizards.length, 1)
+  assert.deepEqual(finishCalls, [
+    {
+      ...wizard,
+      answers: [["lint", "test"]],
+      selectedByIndex: { 0: ["lint", "test"] },
+      messageIdByIndex: {},
+    },
+  ])
+})
+
+test("createCallbackHandlers maps stale, retryable, and fatal outer callback errors", async () => {
+  const { runtime, callbackAnswers, sentMessages, loggerErrors } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    setThreadModelPreference: async (_ctxMeta, _binding, value) => {
+      if (!value) {
+        throw makeBoundaryError({
+          source: "opencode",
+          operation: "POST /model",
+          method: "POST",
+          pathname: "/session/ses_current",
+          kind: "stale",
+          outcome: "stale",
+          status: 404,
+          message: "stale",
+        })
+      }
+      if (value.mode === "custom") {
+        throw makeBoundaryError({
+          source: "opencode",
+          operation: "POST /model",
+          method: "POST",
+          pathname: "/model",
+          kind: "network",
+          outcome: "retryable",
+          message: "retry later",
+        })
+      }
+      throw new Error("unexpected")
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("m|set|inherit"))
+  await handlers.handleTelegramCallback(makeCallback("m|apply|openai/gpt-5|xhigh"))
+  await handlers.handleTelegramCallback(makeCallback("m|set|project-default"))
+
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["No longer active", "Temporarily unavailable", "Action failed"])
+  assert.deepEqual(sentMessages.map((entry) => entry.text), [
+    "Action is temporarily unavailable. Please try again.",
+    "Action failed. Please try again.",
+  ])
+  assert.equal(loggerErrors.length, 3)
 })
 
 test("createCallbackHandlers answers not-found, out-of-date, and unsupported question callbacks", async () => {

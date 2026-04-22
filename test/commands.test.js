@@ -218,6 +218,26 @@ test("createCommandHandlers handleBindings renders sorted bindings in private ch
   )
 })
 
+test("createCommandHandlers handleBindings rejects non-private chats", async () => {
+  const { runtime, sent } = makeRuntime()
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleBindings({ chatId: 100, chatType: "supergroup", threadIdOr0: 11, ctxKey: "100:11" })
+
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].text, "Use /bindings only in a private chat with the bot. Bindings contain sensitive session IDs.")
+})
+
+test("createCommandHandlers handleBindings reports when there are no bindings", async () => {
+  const { runtime, sent } = makeRuntime({ storeState: { bindings: {} } })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleBindings({ chatId: 100, chatType: "private", threadIdOr0: 11, ctxKey: "100:11" })
+
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].text, "No bindings.")
+})
+
 test("createCommandHandlers handleAbort without binding returns guidance", async () => {
   const { runtime, sent } = makeRuntime()
   const handlers = createCommandHandlers(runtime)
@@ -226,6 +246,90 @@ test("createCommandHandlers handleAbort without binding returns guidance", async
 
   assert.equal(sent.length, 1)
   assert.equal(sent[0].text, "Not bound. Use /bind <projectAlias> first.")
+})
+
+test("createCommandHandlers handleAbort reports when there is no active run", async () => {
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    ocByAlias: {
+      demo: {
+        async abortSession(sessionId) {
+          assert.equal(sessionId, "ses_current")
+          return false
+        },
+      },
+    },
+    markProjectUp() {},
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleAbort({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" })
+
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].text, "No active run to abort for session: ses_current")
+})
+
+test("createCommandHandlers handleSendLast reports unknown projects and missing assistant replies", async () => {
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: {
+        "100:7": { projectAlias: "missing", sessionId: "ses_current" },
+        "100:8": { projectAlias: "demo", sessionId: "ses_other" },
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async listMessages(sessionId) {
+          assert.equal(sessionId, "ses_other")
+          return []
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleSendLast({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" })
+  await handlers.handleSendLast({ chatId: 100, threadIdOr0: 8, ctxKey: "100:8" })
+
+  assert.equal(sent[0].text, "Unknown project: missing")
+  assert.equal(sent[1].text, "No assistant message yet.")
+})
+
+test("createCommandHandlers handleSendLast fetches the final assistant text when list data is incomplete", async () => {
+  const delivered = []
+  const lastAssistantBySession = new Map()
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    ocByAlias: {
+      demo: {
+        async listMessages(sessionId) {
+          assert.equal(sessionId, "ses_current")
+          return [{ info: { id: "msg_1", role: "assistant" } }]
+        },
+        async getMessage(sessionId, messageId) {
+          assert.equal(sessionId, "ses_current")
+          assert.equal(messageId, "msg_1")
+          return { info: { id: "msg_1", role: "assistant" }, text: "final text" }
+        },
+      },
+    },
+    extractAssistantDisplayText: (_projectAlias, msg) => msg?.text || "",
+    deliverAssistantText: async (...args) => {
+      delivered.push(args)
+    },
+    lastAssistantBySession,
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleSendLast({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" })
+
+  assert.equal(sent.length, 0)
+  assert.deepEqual(delivered, [[{ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "demo", "ses_current", "msg_1", "final text"]])
+  assert.deepEqual(lastAssistantBySession.get("demo:ses_current"), {
+    messageId: "msg_1",
+    sessionId: "ses_current",
+    text: "final text",
+  })
 })
 
 test("createCommandHandlers clears stale awaiting custom-answer state", async () => {
@@ -261,6 +365,19 @@ test("createCommandHandlers clears stale awaiting custom-answer state", async ()
   assert.equal(awaitingCustomAnswer.has("100:7"), false)
   assert.equal(sent[0].text, "Question is no longer active.")
   assert.equal(sent[1].text, "Not bound. Use /bind <projectAlias>.")
+})
+
+test("createCommandHandlers handleBindCommand validates arguments and current bindings", async () => {
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleBindCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, [])
+  await handlers.handleBindCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, ["demo"])
+
+  assert.equal(sent[0].text, "Usage: /bind <projectAlias>")
+  assert.equal(sent[1].text, "Already bound: demo / ses_current")
 })
 
 test("createCommandHandlers handleBindCommand refreshes a stale startup session", async () => {
@@ -307,6 +424,25 @@ test("createCommandHandlers handleBindCommand refreshes a stale startup session"
   assert.equal(startupSessionByProject.demo, "ses_fresh")
   assert.equal(sent.length, 1)
   assert.equal(sent[0].text, "Bound to project 'demo' (startup session): ses_fresh")
+})
+
+test("createCommandHandlers handleUnbind reports whether a binding existed", async () => {
+  let calls = 0
+  const { runtime, sent } = makeRuntime({
+    store: {
+      unbind() {
+        calls += 1
+        return calls === 1
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleUnbind({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" })
+  await handlers.handleUnbind({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" })
+
+  assert.equal(sent[0].text, "Unbound.")
+  assert.equal(sent[1].text, "Not bound.")
 })
 
 test("createCommandHandlers handleProjects refreshes startup sessions without waiting for auto-start", async () => {
@@ -402,6 +538,146 @@ test("createCommandHandlers renderSessionsList shows the current model when avai
   assert.equal(sent.length, 1)
   assert.match(sent[0].text, /Current: ses_current/)
   assert.match(sent[0].text, /Current model: openai\/gpt-5 xhigh \(Inherited from session history\)/)
+})
+
+test("createCommandHandlers renderModelSettings edits the message for project-default model selection", async () => {
+  const editCalls = []
+  const { runtime } = makeRuntime({
+    storeState: {
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } },
+      modelPrefsByContext: { "100:7": { mode: "project-default" } },
+    },
+    tg: {
+      async editMessageText(chatId, messageId, text, replyMarkup) {
+        editCalls.push({ chatId, messageId, text, replyMarkup })
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async getConfig() {
+          return { model: "openai/gpt-5" }
+        },
+        async listMessages() {
+          return []
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderModelSettings(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    { editMessageId: 123, selectedModelKey: "openai/gpt-5" },
+  )
+
+  assert.equal(editCalls.length, 1)
+  assert.equal(editCalls[0].chatId, 100)
+  assert.equal(editCalls[0].messageId, 123)
+  assert.match(editCalls[0].text, /Mode: Project default override/)
+  assert.match(editCalls[0].text, /Active: openai\/gpt-5/)
+  assert.match(editCalls[0].text, /Source: Thread project default override/)
+  assert.match(editCalls[0].text, /Pick a variant for: openai\/gpt-5/)
+  assert.match(editCalls[0].text, /Use 'No variant' to keep only provider\/model\./)
+  const labels = editCalls[0].replyMarkup.inline_keyboard.flat().map((button) => button.text)
+  assert.ok(labels.includes("✓ Project default"))
+  assert.ok(labels.includes("No variant"))
+  assert.ok(labels.includes("xhigh"))
+  assert.ok(labels.includes("Back"))
+  assert.ok(labels.includes("Close"))
+})
+
+test("createCommandHandlers handleModelCommand covers no-binding, reset, and invalid model branches", async () => {
+  const storeState = {
+    bindings: {},
+    modelPrefsByContext: { "100:7": { mode: "custom", model: { providerID: "openai", modelID: "gpt-5" }, variant: "xhigh" } },
+  }
+  const { runtime, sent } = makeRuntime({
+    storeState,
+    ocByAlias: {
+      demo: {
+        async getConfig() {
+          return { model: "openai/gpt-5" }
+        },
+        async listMessages() {
+          return []
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderModelSettings({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" })
+  await handlers.handleModelCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, [])
+
+  storeState.bindings["100:7"] = { projectAlias: "demo", sessionId: "ses_current" }
+
+  await handlers.handleModelCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, [])
+  await handlers.handleModelCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, ["reset"])
+  await handlers.handleModelCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, ["bad-model"]) 
+
+  assert.equal(sent[0].text, "Not bound. Use /bind <projectAlias> first.")
+  assert.equal(sent[1].text, "Not bound. Use /bind <projectAlias> first.")
+  assert.match(sent[2].text, /Model for this thread:/)
+  assert.match(sent[3].text, /Mode: Inherit/)
+  assert.equal(sent[4].text, "Usage: /model\n/model default\n/model reset\n/model <provider/model> \[variant\]")
+  assert.deepEqual(storeState.modelPrefsByContext, {})
+})
+
+test("createCommandHandlers advances awaiting custom-answer wizards to the next step", async () => {
+  const awaitingCustomAnswer = new Map([["100:7", { projectAlias: "demo", requestId: "q_1", qIndex: 0 }]])
+  const wizard = {
+    projectAlias: "demo",
+    id: "q_1",
+    index: 0,
+    request: {
+      questions: [
+        { header: "First", question: "one" },
+        { header: "Second", question: "two" },
+      ],
+    },
+    answers: [[], []],
+  }
+  const applyCalls = []
+  const persistCalls = []
+  const customStateCalls = []
+  const stepCalls = []
+  const { runtime, sent } = makeRuntime({
+    awaitingCustomAnswer,
+    getWizard: () => wizard,
+    applyWizardState: (target, nextWizard) => {
+      applyCalls.push({ target, nextWizard })
+      target.index = nextWizard.index
+      target.answers = nextWizard.answers
+    },
+    persistQuestionWizard: (nextWizard) => {
+      persistCalls.push(nextWizard)
+    },
+    sendCurrentQuestionStep: async (nextWizard) => {
+      stepCalls.push(nextWizard)
+    },
+    setAwaitingCustomAnswerState: (ctxKey, value) => {
+      customStateCalls.push({ ctxKey, value })
+      if (value) awaitingCustomAnswer.set(ctxKey, value)
+      else awaitingCustomAnswer.delete(ctxKey)
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_thread_id: 7,
+    text: "next answer",
+  })
+
+  assert.equal(sent.length, 0)
+  assert.equal(stepCalls.length, 1)
+  assert.equal(stepCalls[0].index, 1)
+  assert.deepEqual(stepCalls[0].answers, [["next answer"], []])
+  assert.equal(applyCalls.length, 1)
+  assert.equal(persistCalls.length, 1)
+  assert.deepEqual(customStateCalls, [{ ctxKey: "100:7", value: null }])
+  assert.equal(awaitingCustomAnswer.has("100:7"), false)
 })
 
 test("createCommandHandlers handleModelCommand stores a custom per-thread override", async () => {
@@ -508,4 +784,92 @@ test("createCommandHandlers handleTelegramMessage forwards the custom model over
       options: { model: { providerID: "openai", modelID: "gpt-5" }, variant: "xhigh" },
     },
   ])
+})
+
+test("createCommandHandlers handleTelegramMessage serves help and unknown commands", async () => {
+  const { runtime, sent } = makeRuntime()
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "private" },
+    from: { id: 42 },
+    text: "/help",
+  })
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "private" },
+    from: { id: 42 },
+    text: "/wat",
+  })
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "private" },
+    from: { id: 42 },
+    text: "/cancel",
+  })
+
+  assert.match(sent[0].text, /^Commands:/)
+  assert.match(sent[0].text, /\/bind <projectAlias>/)
+  assert.equal(sent[1].text, "Unknown command. Use /help.")
+  assert.equal(sent[2].text, "Nothing to cancel.")
+})
+
+test("createCommandHandlers handleTelegramMessage prompts for bind alias and can cancel it", async () => {
+  const { runtime, sent } = makeRuntime()
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "private" },
+    from: { id: 42 },
+    text: "/bind",
+  })
+  assert.equal(runtime.bindAliasAwaiting.has("100:0"), true)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "private" },
+    from: { id: 42 },
+    text: "/cancel",
+  })
+
+  assert.equal(sent[0].text, "Send project alias (or /projects to list). You can /cancel.")
+  assert.equal(sent[1].text, "Cancelled.")
+  assert.equal(runtime.bindAliasAwaiting.has("100:0"), false)
+})
+
+test("createCommandHandlers handleTelegramMessage binds after receiving a plain-text alias", async () => {
+  const bindCalls = []
+  const { runtime, sent } = makeRuntime({
+    ocByAlias: {
+      demo: {
+        async createSession(input) {
+          assert.deepEqual(input, {})
+          return { id: "ses_created" }
+        },
+      },
+    },
+    bindCtxToSession: async (ctxMeta, alias, sessionId) => {
+      bindCalls.push({ ctxMeta, alias, sessionId })
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "private" },
+    from: { id: 42 },
+    text: "/bind",
+  })
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "private" },
+    from: { id: 42 },
+    text: "demo extra words",
+  })
+
+  assert.deepEqual(bindCalls, [
+    {
+      ctxMeta: { chatId: 100, threadIdOr0: 0, ctxKey: "100:0" },
+      alias: "demo",
+      sessionId: "ses_created",
+    },
+  ])
+  assert.equal(sent[0].text, "Send project alias (or /projects to list). You can /cancel.")
+  assert.equal(sent[1].text, "Bound to project 'demo' with new session: ses_created")
+  assert.equal(runtime.bindAliasAwaiting.has("100:0"), false)
 })
