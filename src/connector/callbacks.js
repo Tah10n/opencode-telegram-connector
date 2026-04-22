@@ -26,6 +26,7 @@ export function createCallbackHandlers(runtime) {
     applyWizardState,
     persistQuestionWizard,
     finishQuestionWizard,
+    buildSessionSwitchText = async (projectAlias, sessionId) => `Switched to session: ${sessionId}`,
     isMissingPromptError = () => false,
     formatProjectUnavailable,
   } = runtime
@@ -84,7 +85,7 @@ export function createCallbackHandlers(runtime) {
           editMessageId: msg?.message_id,
         }).catch(async (err) => {
           runtime.logger?.error?.("Failed to refresh sessions list:", err?.message || String(err))
-          await sendToThread(ctxMeta, `Switched to session: ${targetSessionId}`).catch(() => {})
+          await sendToThread(ctxMeta, await buildSessionSwitchText(projectAlias, targetSessionId)).catch(() => {})
         })
         return
       }

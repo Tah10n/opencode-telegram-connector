@@ -12,9 +12,10 @@ export function normalizeShareUrl(input) {
     if (url.protocol !== "http:" && url.protocol !== "https:") return ""
 
     const pathname = normalizePathname(url.pathname)
-    if (!/^\/s\/[^/]+$/i.test(pathname)) return ""
+    const match = pathname.match(/^\/(?:s|share)\/([^/]+)$/i)
+    if (!match) return ""
 
-    url.pathname = pathname
+    url.pathname = `/share/${match[1]}`
     url.search = ""
     url.hash = ""
     return url.toString()

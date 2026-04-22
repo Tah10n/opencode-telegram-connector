@@ -65,12 +65,14 @@ test("OpenCodeClient convenience methods call the expected endpoints", async () 
   }
 
   await client.health()
+  await client.getConfig({ directory: "C:/repo" })
   await client.listSessions({ directory: "C:/repo", limit: 5 })
   await client.getSession("ses_1")
   await client.createSession({ title: "demo" })
   await client.abortSession("ses_1")
   await client.promptAsync("ses_1", "hello")
   await client.getMessage("ses_1", "msg_1")
+  await client.listMessages("ses_1", { limit: 20 })
   await client.replyPermission("perm_1", { reply: "reject", message: "no" })
   await client.replyQuestion("q_1", [["lint"]])
   await client.rejectQuestion("q_1")
@@ -79,12 +81,14 @@ test("OpenCodeClient convenience methods call the expected endpoints", async () 
 
   assert.deepEqual(calls, [
     { pathname: "/global/health", options: undefined },
+    { pathname: "/config", options: { query: { directory: "C:/repo" } } },
     { pathname: "/session", options: { query: { directory: "C:/repo", limit: 5 } } },
     { pathname: "/session/ses_1", options: undefined },
     { pathname: "/session", options: { method: "POST", json: { title: "demo" } } },
     { pathname: "/session/ses_1/abort", options: { method: "POST" } },
     { pathname: "/session/ses_1/prompt_async", options: { method: "POST", json: { parts: [{ type: "text", text: "hello" }] } } },
     { pathname: "/session/ses_1/message/msg_1", options: undefined },
+    { pathname: "/session/ses_1/message", options: { query: { limit: 20 } } },
     { pathname: "/permission/perm_1/reply", options: { method: "POST", json: { reply: "reject", message: "no" } } },
     { pathname: "/question/q_1/reply", options: { method: "POST", json: { answers: [["lint"]] } } },
     { pathname: "/question/q_1/reject", options: { method: "POST" } },

@@ -88,6 +88,141 @@ export function createCommandHandlers(runtime) {
     }
   }
 
+  function normalizeEpochMs(value) {
+    if (typeof value === "number" && Number.isFinite(value)) return value < 1e12 ? value * 1000 : value
+    if (typeof value === "string") {
+      const parsed = Date.parse(value)
+      return Number.isFinite(parsed) ? parsed : null
+    }
+    return null
+  }
+
+  function compareMessageRecency(a, b) {
+    const aTime = sessionModelTimestamp(a)
+    const bTime = sessionModelTimestamp(b)
+    if (aTime != null && bTime != null) return bTime - aTime
+    if (aTime != null) return -1
+    if (bTime != null) return 1
+    return 0
+  }
+
+  function sessionModelLabelFromMessage(message) {
+    const info = message?.info || message || {}
+    const provider = String(info?.providerID || info?.providerId || info?.model?.providerID || info?.model?.providerId || "").trim()
+    const model = String(info?.modelID || info?.modelId || info?.model?.modelID || info?.model?.modelId || "").trim()
+    const variant = String(info?.variant || info?.model?.variant || "").trim()
+    let base = ""
+    if (provider && model) {
+      base = model.toLowerCase().startsWith(`${provider.toLowerCase()}/`) ? model : `${provider}/${model}`
+    } else {
+      base = model || provider || ""
+    }
+    return variant && base ? `${base} ${variant}` : base
+  }
+
+  function sessionModelTimestamp(message) {
+    const time = message?.info?.time || message?.time || {}
+    return (
+      normalizeEpochMs(time.completed) ?? normalizeEpochMs(time.updated) ?? normalizeEpochMs(time.created) ?? normalizeEpochMs(time.started) ?? null
+    )
+  }
+
+  async function resolveSessionModelLabel(projectAlias, sessionId) {
+    const oc = ocByAlias[projectAlias]
+    if (!oc?.listMessages || !sessionId) return null
+    const messages = await oc.listMessages(sessionId).catch(() => null)
+    if (!Array.isArray(messages) || messages.length === 0) return null
+
+    let best = null
+    for (const message of messages) {
+      const label = sessionModelLabelFromMessage(message)
+      if (!label) continue
+      const timestamp = sessionModelTimestamp(message)
+      if (!best || (timestamp != null && (best.timestamp == null || timestamp > best.timestamp))) {
+        best = { label, timestamp }
+      }
+    }
+    return best?.label || null
+  }
+
+  async function buildSessionSwitchText(projectAlias, sessionId) {
+    const modelLabel = await resolveSessionModelLabel(projectAlias, sessionId)
+    return modelLabel ? `Switched to session: ${sessionId}\nModel: ${modelLabel}` : `Switched to session: ${sessionId}`
+  }
+
+  function configuredModelLabel(value, variant) {
+    const rawVariant = String(variant || "").trim()
+    let base = ""
+    if (typeof value === "string") {
+      base = value.trim()
+    } else if (value && typeof value === "object") {
+      const provider = String(value.providerID || value.providerId || value.provider || "").trim()
+      const model = String(value.modelID || value.modelId || value.model || "").trim()
+      if (provider && model) base = model.toLowerCase().startsWith(`${provider.toLowerCase()}/`) ? model : `${provider}/${model}`
+      else base = model || provider || ""
+    }
+    if (!base) return ""
+    return rawVariant ? `${base} ${rawVariant}` : base
+  }
+
+  async function resolveConfiguredSessionModelLabel(projectAlias) {
+    const oc = ocByAlias[projectAlias]
+    const directory = projects?.[projectAlias]?.directory
+    if (!oc?.getConfig) return null
+    const configInfo = await oc.getConfig({ directory }).catch(() => null)
+    if (!configInfo || typeof configInfo !== "object") return null
+
+    const defaultAgentName = String(configInfo.default_agent || configInfo.defaultAgent || "").trim()
+    const agentMap = configInfo.agent && typeof configInfo.agent === "object" ? configInfo.agent : configInfo.agents
+    const agentConfig =
+      defaultAgentName && agentMap && typeof agentMap === "object" && agentMap[defaultAgentName] && typeof agentMap[defaultAgentName] === "object"
+        ? agentMap[defaultAgentName]
+        : null
+
+    const effectiveModel = agentConfig?.model ?? configInfo.model
+    const effectiveVariant = agentConfig?.variant ?? configInfo.variant
+    return configuredModelLabel(effectiveModel, effectiveVariant) || null
+  }
+
+  async function buildNewSessionText(projectAlias, sessionId) {
+    const modelLabel = await resolveConfiguredSessionModelLabel(projectAlias)
+    return modelLabel ? `Created and switched to session: ${sessionId}\nModel: ${modelLabel}` : `Created and switched to session: ${sessionId}`
+  }
+
+  async function resolveLatestAssistantReply(projectAlias, sessionId) {
+    const oc = ocByAlias[projectAlias]
+    if (!oc?.listMessages || !sessionId) return null
+    const messages = await oc.listMessages(sessionId).catch(() => null)
+    if (!Array.isArray(messages) || messages.length === 0) return null
+
+    const candidates = messages
+      .filter((message) => {
+        const info = message?.info || message || {}
+        if (info?.role !== "assistant") return false
+        if (!runtime.mirrorCompaction && (info?.mode === "compaction" || info?.agent === "compaction")) return false
+        return true
+      })
+      .sort(compareMessageRecency)
+
+    for (const candidate of candidates) {
+      const info = candidate?.info || candidate || {}
+      const messageId = String(info?.id || "").trim()
+      let message = candidate
+      let text = extractAssistantDisplayText(projectAlias, message)
+      if ((!text || !text.trim()) && messageId) {
+        const fetched = await oc.getMessage(sessionId, messageId).catch(() => null)
+        if (fetched) {
+          message = fetched
+          text = extractAssistantDisplayText(projectAlias, message)
+        }
+      }
+      if (!text || !text.trim()) continue
+      return { messageId: messageId || "sendlast", sessionId, text }
+    }
+
+    return null
+  }
+
   function sessionsKeyboard(projectAlias, sessions, { currentSessionId, startupSessionId, limit = 10 } = {}) {
     const normalized = normalizeSessionsList(sessions).slice(0, limit)
     if (!normalized.length) return null
@@ -104,9 +239,11 @@ export function createCommandHandlers(runtime) {
   async function renderSessionsList(ctxMeta, { binding, editMessageId } = {}) {
     const oc = ocByAlias[binding.projectAlias]
     const sessions = await oc.listSessions({ directory: projects?.[binding.projectAlias]?.directory, limit: 10 })
+    const currentSessionModelLabel = await resolveSessionModelLabel(binding.projectAlias, binding.sessionId)
     runtime.markProjectUp(binding.projectAlias)
     const text = formatSessionsListText(binding.projectAlias, sessions, {
       currentSessionId: binding.sessionId,
+      currentSessionModelLabel,
       startupSessionId: startupSessionByProject[binding.projectAlias],
     })
     const replyMarkup = sessionsKeyboard(binding.projectAlias, sessions, {
@@ -162,7 +299,7 @@ export function createCommandHandlers(runtime) {
       const created = await oc.createSession({ title: title || undefined })
       if (created?.id) logger.info(`[${binding.projectAlias}] /new created session:`, created.id)
       await bindCtxToSession(ctxMeta, binding.projectAlias, created.id)
-      await sendToThread(ctxMeta, `Created and switched to session: ${created.id}`)
+      await sendToThread(ctxMeta, await buildNewSessionText(binding.projectAlias, created.id))
 
       const p = projects[binding.projectAlias]
       if (p?.openAttachOnNew === true) {
@@ -186,7 +323,10 @@ export function createCommandHandlers(runtime) {
       return
     }
     if (sessionRef.type === "invalid-link") {
-      await sendToThread(ctxMeta, "Unsupported link. Use an OpenCode share link like https://opncd.ai/s/<share-id> or a raw session id.")
+      await sendToThread(
+        ctxMeta,
+        "Unsupported link. Use an OpenCode share link like https://opncd.ai/share/<share-id> (or https://opncd.ai/s/<share-id>) or a raw session id.",
+      )
       return
     }
     const binding = store.getBinding(ctxMeta.ctxKey)
@@ -251,7 +391,7 @@ export function createCommandHandlers(runtime) {
 
       await oc.getSession(targetSessionId)
       await bindCtxToSession(ctxMeta, binding.projectAlias, targetSessionId)
-      await sendToThread(ctxMeta, `Switched to session: ${targetSessionId}`)
+      await sendToThread(ctxMeta, await buildSessionSwitchText(binding.projectAlias, targetSessionId))
     } catch (err) {
       await sendToThread(ctxMeta, formatProjectUnavailable(binding.projectAlias, err)).catch(() => {})
     }
@@ -357,6 +497,13 @@ export function createCommandHandlers(runtime) {
       return
     }
     const sk = sessionKey(binding.projectAlias, binding.sessionId)
+    const latest = await resolveLatestAssistantReply(binding.projectAlias, binding.sessionId)
+    if (latest) {
+      lastAssistantBySession.set(sk, latest)
+      await deliverAssistantText(ctxMeta, binding.projectAlias, latest.sessionId, latest.messageId, latest.text)
+      return
+    }
+
     const last = lastAssistantBySession.get(sk)
     const messageId = last?.messageId
     const messageSessionId = last?.sessionId || binding.sessionId
@@ -542,5 +689,6 @@ export function createCommandHandlers(runtime) {
     handleProjects,
     handleUnbind,
     handleTelegramMessage,
+    buildSessionSwitchText,
   }
 }

@@ -315,3 +315,77 @@ test("createCommandHandlers handleProjects refreshes startup sessions without wa
   assert.equal(sent.length, 1)
   assert.match(sent[0].text, /^Projects:/)
 })
+
+test("createCommandHandlers handleNewCommand reports configured model and variant", async () => {
+  const bindCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    ocByAlias: {
+      demo: {
+        async createSession(input) {
+          assert.deepEqual(input, { title: "Demo title" })
+          return { id: "ses_new" }
+        },
+        async getConfig(input) {
+          assert.deepEqual(input, { directory: undefined })
+          return {
+            model: "openai/gpt-5",
+            default_agent: "build",
+            agent: {
+              build: {
+                variant: "xhigh",
+              },
+            },
+          }
+        },
+      },
+    },
+    bindCtxToSession: async (ctxMeta, alias, sessionId) => {
+      bindCalls.push({ ctxMeta, alias, sessionId })
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleNewCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "Demo title")
+
+  assert.deepEqual(bindCalls, [
+    {
+      ctxMeta: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+      alias: "demo",
+      sessionId: "ses_new",
+    },
+  ])
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].text, "Created and switched to session: ses_new\nModel: openai/gpt-5 xhigh")
+})
+
+test("createCommandHandlers renderSessionsList shows the current model when available", async () => {
+  const { runtime, sent } = makeRuntime({
+    startupSessionByProject: { demo: "ses_startup" },
+    ocByAlias: {
+      demo: {
+        async listSessions() {
+          return [
+            { id: "ses_current", title: "Current session" },
+            { id: "ses_startup", title: "Startup session" },
+          ]
+        },
+        async listMessages(sessionId) {
+          assert.equal(sessionId, "ses_current")
+          return [{ info: { role: "assistant", providerID: "openai", modelID: "gpt-5", variant: "xhigh", time: { completed: "2026-01-01T00:00:00.000Z" } } }]
+        },
+      },
+    },
+    markProjectUp: () => {},
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderSessionsList(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    { binding: { projectAlias: "demo", sessionId: "ses_current" } },
+  )
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Current: ses_current/)
+  assert.match(sent[0].text, /Current model: openai\/gpt-5 xhigh/)
+})

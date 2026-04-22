@@ -75,6 +75,10 @@ export class OpenCodeClient {
     return this.request("/global/health")
   }
 
+  getConfig({ directory } = {}) {
+    return this.request(`/config`, { query: { directory } })
+  }
+
   listSessions({ directory, limit } = {}) {
     return this.request("/session", { query: { directory, limit } })
   }
@@ -100,6 +104,10 @@ export class OpenCodeClient {
 
   getMessage(sessionId, messageId) {
     return this.request(`/session/${sessionId}/message/${messageId}`)
+  }
+
+  listMessages(sessionId, { limit } = {}) {
+    return this.request(`/session/${sessionId}/message`, { query: { limit } })
   }
 
   replyPermission(permissionId, { reply, message }) {

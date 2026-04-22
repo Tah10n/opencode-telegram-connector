@@ -15,14 +15,20 @@ test("parseSessionReference keeps raw session ids", () => {
 })
 
 test("normalizeShareUrl strips query, hash, and trailing slash", () => {
-  assert.equal(normalizeShareUrl("https://opncd.ai/s/abc123/?utm_source=tg#fragment"), "https://opncd.ai/s/abc123")
+  assert.equal(normalizeShareUrl("https://opncd.ai/s/abc123/?utm_source=tg#fragment"), "https://opncd.ai/share/abc123")
+  assert.equal(normalizeShareUrl("https://opncd.ai/share/abc123/?utm_source=tg#fragment"), "https://opncd.ai/share/abc123")
 })
 
 test("parseSessionReference recognizes share links", () => {
   assert.deepEqual(parseSessionReference("https://opncd.ai/s/abc123?x=1"), {
     type: "share-link",
     raw: "https://opncd.ai/s/abc123?x=1",
-    shareUrl: "https://opncd.ai/s/abc123",
+    shareUrl: "https://opncd.ai/share/abc123",
+  })
+  assert.deepEqual(parseSessionReference("https://opncd.ai/share/abc123?x=1"), {
+    type: "share-link",
+    raw: "https://opncd.ai/share/abc123?x=1",
+    shareUrl: "https://opncd.ai/share/abc123",
   })
 })
 
@@ -39,14 +45,14 @@ test("findSessionByShareUrl matches normalized shared session urls", () => {
       { id: "ses_1" },
       { id: "ses_2", share: { url: "https://opncd.ai/s/abc123/" } },
     ],
-    "https://opncd.ai/s/abc123?from=telegram",
+    "https://opncd.ai/share/abc123?from=telegram",
   )
 
   assert.deepEqual(match, { id: "ses_2", share: { url: "https://opncd.ai/s/abc123/" } })
 })
 
 test("findSessionByShareUrl returns null when there is no matching shared session", () => {
-  const match = findSessionByShareUrl([{ id: "ses_1", share: { url: "https://opncd.ai/s/abc123" } }], "https://opncd.ai/s/missing")
+  const match = findSessionByShareUrl([{ id: "ses_1", share: { url: "https://opncd.ai/share/abc123" } }], "https://opncd.ai/s/missing")
 
   assert.equal(match, null)
 })

@@ -48,12 +48,13 @@ export function formatSessionButtonLabel(session, { currentSessionId, startupSes
   return `${prefix}${label}`
 }
 
-export function formatSessionsListText(projectAlias, sessions, { currentSessionId, startupSessionId, limit = 10 } = {}) {
+export function formatSessionsListText(projectAlias, sessions, { currentSessionId, currentSessionModelLabel, startupSessionId, limit = 10 } = {}) {
   const safeProjectAlias = String(projectAlias || "").trim() || "(unknown)"
   const normalized = normalizeSessionsList(sessions)
 
   const lines = [`Sessions for '${safeProjectAlias}':`]
   if (currentSessionId) lines.push(`Current: ${currentSessionId}`)
+  if (currentSessionModelLabel) lines.push(`Current model: ${currentSessionModelLabel}`)
   if (startupSessionId && startupSessionId !== currentSessionId) lines.push(`Startup: ${startupSessionId}`)
   lines.push("")
 

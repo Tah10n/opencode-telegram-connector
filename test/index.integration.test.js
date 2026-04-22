@@ -162,12 +162,14 @@ function createFakeOpenCodeClient({
   startupSessions = [{ id: "ses_startup" }],
   messagesById = {},
   healthImpl,
+  getConfigImpl,
   listSessionsImpl,
   getSessionImpl,
   createSessionImpl,
   abortSessionImpl,
   promptAsyncImpl,
   getMessageImpl,
+  listMessagesImpl,
   replyPermissionImpl,
   listPermissionsImpl,
   listQuestionsImpl,
@@ -176,12 +178,14 @@ function createFakeOpenCodeClient({
 } = {}) {
   const calls = {
     health: 0,
+    getConfig: [],
     listSessions: [],
     getSession: [],
     createSession: [],
     abortSession: [],
     promptAsync: [],
     getMessage: [],
+    listMessages: [],
     replyPermission: [],
     listPermissions: 0,
     listQuestions: 0,
@@ -194,6 +198,10 @@ function createFakeOpenCodeClient({
     async health() {
       calls.health += 1
       return healthImpl ? healthImpl() : { ok: true }
+    },
+    async getConfig(input = {}) {
+      calls.getConfig.push(input)
+      return getConfigImpl ? getConfigImpl(input) : { model: "openai/gpt-5" }
     },
     async listSessions(input = {}) {
       calls.listSessions.push(input)
@@ -218,6 +226,10 @@ function createFakeOpenCodeClient({
     async getMessage(sessionId, messageId) {
       calls.getMessage.push({ sessionId, messageId })
       return getMessageImpl ? getMessageImpl(sessionId, messageId) : (messagesById[messageId] ?? null)
+    },
+    async listMessages(sessionId, input = {}) {
+      calls.listMessages.push({ sessionId, input })
+      return listMessagesImpl ? listMessagesImpl(sessionId, input) : []
     },
     async replyPermission(permissionId, payload) {
       calls.replyPermission.push({ permissionId, payload })
@@ -431,6 +443,44 @@ test("startConnector mirrors assistant SSE output and /sendlast replays the late
       { sessionId: "ses_1", messageId: "msg_assistant" },
       { sessionId: "ses_1", messageId: "msg_assistant" },
     ])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector /sendlast fetches the latest assistant reply from the current session when SSE cache is empty", async () => {
+  const olderAt = new Date(Date.now() + 60_000).toISOString()
+  const newerAt = new Date(Date.now() + 61_000).toISOString()
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 202,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    ocOptions: {
+      listMessagesImpl: async (sessionId) => {
+        assert.equal(sessionId, "ses_1")
+        return [
+          { info: { id: "user_latest", role: "user", time: { completed: new Date(Date.now() + 62_000).toISOString() } }, parts: [{ type: "text", text: "follow-up" }] },
+          { info: { id: "assistant_old", role: "assistant", time: { completed: olderAt } }, parts: [{ type: "text", text: "Old answer" }] },
+          { id: "assistant_new", role: "assistant", time: { completed: newerAt }, parts: [{ type: "text", text: "Fresh **answer**" }] },
+        ]
+      },
+    },
+    initialUpdates: [makeMessageUpdate(202, "/sendlast")],
+  })
+
+  try {
+    await waitFor(() => harness.tg.sentHtmlBlocks.length >= 1)
+    await harness.connector.stop()
+
+    assert.equal(harness.tg.sentHtmlBlocks[0].blocks[0].html, "Fresh <b>answer</b>")
+    assert.deepEqual(harness.ocCalls.listMessages, [{ sessionId: "ses_1", input: {} }])
+    assert.deepEqual(harness.ocCalls.getMessage, [])
   } finally {
     await harness.connector.stop()
   }
@@ -728,7 +778,7 @@ test("startConnector /use share link requires an existing binding", async () => 
   const harness = await createHarness()
 
   try {
-    harness.tg.enqueue(makeMessageUpdate(231, "/use https://opncd.ai/s/abc123"))
+    harness.tg.enqueue(makeMessageUpdate(231, "/use https://opncd.ai/share/abc123"))
 
     await waitFor(() => harness.tg.sentMessages.length >= 1)
 
@@ -759,7 +809,9 @@ test("startConnector /use rejects unsupported links", async () => {
 
     assert.ok(
       harness.tg.sentMessages.some((entry) =>
-        entry.text.startsWith("Unsupported link. Use an OpenCode share link like https://opncd.ai/s/<share-id> or a raw session id."),
+        entry.text.startsWith(
+          "Unsupported link. Use an OpenCode share link like https://opncd.ai/share/<share-id> (or https://opncd.ai/s/<share-id>) or a raw session id.",
+        ),
       ),
     )
     assert.deepEqual(harness.ocCalls.getSession, [])
@@ -769,6 +821,7 @@ test("startConnector /use rejects unsupported links", async () => {
 })
 
 test("startConnector /use accepts a shared session link for the current project", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
   const harness = await createHarness({
     statePatch: {
       updateOffset: 250,
@@ -782,13 +835,18 @@ test("startConnector /use accepts a shared session link for the current project"
     ocOptions: {
       listSessionsImpl: () => [
         { id: "ses_current", title: "Current" },
-        { id: "ses_shared", title: "Shared", share: { url: "https://opncd.ai/s/abc123/" } },
+        { id: "ses_shared", title: "Shared", share: { url: "https://opncd.ai/share/abc123/" } },
       ],
+      listMessagesImpl: async (sessionId) => {
+        return sessionId === "ses_shared"
+          ? [{ info: { role: "assistant", providerID: "openai", modelID: "gpt-5", variant: "xhigh", time: { completed: completedAt } } }]
+          : []
+      },
     },
   })
 
   try {
-    harness.tg.enqueue(makeMessageUpdate(251, "/use https://opncd.ai/s/abc123?utm_source=tg"))
+    harness.tg.enqueue(makeMessageUpdate(251, "/use https://opncd.ai/share/abc123?utm_source=tg"))
 
     await waitFor(() => harness.ocCalls.getSession.includes("ses_shared"))
     await delay(30)
@@ -803,7 +861,9 @@ test("startConnector /use accepts a shared session link for the current project"
         (call) => call?.directory === path.join(harness.dir, "demo") && !Object.hasOwn(call, "limit"),
       ),
     )
-    assert.ok(harness.tg.sentMessages.some((entry) => entry.text.includes("Switched to session: ses_shared")))
+    assert.ok(
+      harness.tg.sentMessages.some((entry) => entry.text.includes("Switched to session: ses_shared") && entry.text.includes("Model: openai/gpt-5 xhigh")),
+    )
   } finally {
     await harness.connector.stop()
   }
@@ -2773,6 +2833,7 @@ test("startConnector opens an attach window after /new when openAttachOnNew is e
     },
     ocOptions: {
       createSessionImpl: async (input) => ({ id: `ses_new:${input.title}` }),
+      getConfigImpl: async () => ({ model: "openai/gpt-5", default_agent: "build", agent: { build: { variant: "xhigh" } } }),
     },
     openAttachWindowWindowsImpl: async (args) => {
       attachCalls.push(args)
@@ -2783,6 +2844,7 @@ test("startConnector opens an attach window after /new when openAttachOnNew is e
   try {
     harness.tg.enqueue(makeMessageUpdate(701, "/new Demo title"))
     await waitFor(() => attachCalls.length === 1)
+    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("Created and switched to session: ses_new:Demo title")))
     await harness.connector.stop()
 
     const state = await readState(harness.stateFile)
@@ -2796,6 +2858,11 @@ test("startConnector opens an attach window after /new when openAttachOnNew is e
     assert.deepEqual(state.bindings, {
       "100:7": { projectAlias: "demo", sessionId: "ses_new:Demo title" },
     })
+    assert.ok(
+      harness.tg.sentMessages.some(
+        (entry) => entry.text.includes("Created and switched to session: ses_new:Demo title") && entry.text.includes("Model: openai/gpt-5 xhigh"),
+      ),
+    )
   } finally {
     await harness.connector.stop()
   }
@@ -2818,6 +2885,7 @@ test("startConnector skips attach window auto-open after /new on non-Windows pla
     },
     ocOptions: {
       createSessionImpl: async () => ({ id: "ses_linux" }),
+      getConfigImpl: async () => ({ model: "openai/gpt-5", default_agent: "build", agent: { build: { variant: "medium" } } }),
     },
     openAttachWindowWindowsImpl: async (args) => {
       attachCalls.push(args)
@@ -2827,7 +2895,9 @@ test("startConnector skips attach window auto-open after /new on non-Windows pla
 
   try {
     harness.tg.enqueue(makeMessageUpdate(801, "/new Linux title"))
-    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text === "Created and switched to session: ses_linux"))
+    await waitFor(
+      () => harness.tg.sentMessages.some((entry) => entry.text.includes("Created and switched to session: ses_linux") && entry.text.includes("Model: openai/gpt-5 medium")),
+    )
     await harness.connector.stop()
 
     assert.deepEqual(attachCalls, [])
