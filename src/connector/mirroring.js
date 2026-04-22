@@ -29,9 +29,11 @@ export function createMirroringHandlers(runtime) {
     logSseDebug,
     eventStartedAfterLaunch,
     sleep,
+    abortSignal,
   } = runtime
 
   const pause = typeof sleep === "function" ? sleep : (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+  const isStopping = () => abortSignal?.aborted === true
 
   function ensureForwardedSets(sk) {
     let s = forwardedBySession.get(sk)
@@ -283,6 +285,7 @@ export function createMirroringHandlers(runtime) {
   }
 
   async function handleMessageUpdated({ projectAlias, props }) {
+    if (isStopping()) return
     const sessionId = props.sessionID
     const info = props.info
     if (!sessionId || !info?.id || !info?.role) return
@@ -378,6 +381,7 @@ export function createMirroringHandlers(runtime) {
         return
       }
       const msg = await oc.getMessage(sessionId, info.id).catch(() => null)
+      if (isStopping()) return
       if (!eventStartedAfterLaunch(msg?.info || info, { allowCompletedAfterStart: true })) {
         logSseDebug(projectAlias, sessionId, `drop=assistant_preview_before_start msg=${info.id}`)
         return
@@ -414,18 +418,22 @@ export function createMirroringHandlers(runtime) {
       return
     }
 
-    const existing = assistantDebounce.get(info.id)
+    const debounceKey = `${sk}:${info.id}`
+    const existing = assistantDebounce.get(debounceKey)
     if (existing) clearTimeout(existing)
     const t = setTimeout(() => {
-      assistantDebounce.delete(info.id)
+      assistantDebounce.delete(debounceKey)
+      if (isStopping()) return
       if (sets.assistant.has(info.id)) {
         logSseDebug(projectAlias, sessionId, `drop=assistant_already_forwarded msg=${info.id}`)
         return
       }
       void (async () => {
+        if (isStopping()) return
         const previewState = assistantPreviewBySession.get(boundKey)
         const replaceMessageId = previewState?.messageId === info.id ? previewState.telegramMessageId : undefined
         const msg = await getAssistantMessageWithRetry(oc, sessionId, info.id)
+        if (isStopping()) return
         if (!msg) {
           if (replaceMessageId) {
             await tg
@@ -471,11 +479,13 @@ export function createMirroringHandlers(runtime) {
         let visibleOutputSent = false
 
         if (hasAssistantText) {
+          if (isStopping()) return
           await deliverAssistantText(routeCtx, projectAlias, sessionId, info.id, text, { replaceMessageId })
           visibleOutputSent = true
         }
 
         if (allowChangedFiles) {
+          if (isStopping()) return
           await deliverChangedFilesSummary(routeCtx, projectAlias, sessionId, info.id, msg, {
             replaceMessageId: !hasAssistantText ? replaceMessageId : undefined,
           })
@@ -498,7 +508,7 @@ export function createMirroringHandlers(runtime) {
         logSseDebug(projectAlias, sessionId, `send=assistant msg=${info.id} thread=${route.threadIdOr0 || 0}`)
       })().catch(() => {})
     }, 250)
-    assistantDebounce.set(info.id, t)
+    assistantDebounce.set(debounceKey, t)
   }
 
   return {

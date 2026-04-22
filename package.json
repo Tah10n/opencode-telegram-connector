@@ -15,6 +15,7 @@
     "start": "node src/cli.js",
     "check": "node scripts/check-syntax.mjs",
     "lint": "npm run check",
-    "test": "node --test"
+    "test": "node --test",
+    "test:coverage": "node --test --experimental-test-coverage"
   }
 }

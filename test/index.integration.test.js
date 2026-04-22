@@ -1669,6 +1669,16 @@ test("startConnector restores pending permission reject-note flows after restart
         questionWizards: {},
       },
     },
+    ocOptions: {
+      listPermissionsImpl: async () => [
+        {
+          id: "perm_1",
+          sessionID: "ses_1",
+          permission: "shell",
+          patterns: ["npm test"],
+        },
+      ],
+    },
   })
 
   try {
@@ -1725,6 +1735,14 @@ test("startConnector retries reject-note input after a transient permission repl
       },
     },
     ocOptions: {
+      listPermissionsImpl: async () => [
+        {
+          id: "perm_retry",
+          sessionID: "ses_1",
+          permission: "shell",
+          patterns: ["npm test"],
+        },
+      ],
       replyPermissionImpl: async () => {
         replyAttempts += 1
         if (replyAttempts === 1) throw new Error("temporary permission failure")
@@ -1801,6 +1819,9 @@ test("startConnector restores pending question custom-answer flows after restart
           },
         },
       },
+    },
+    ocOptions: {
+      listQuestionsImpl: async () => [request],
     },
   })
 
@@ -1978,6 +1999,7 @@ test("startConnector restores final question submission after a restart during r
       },
     },
     ocOptions: {
+      listQuestionsImpl: async () => [request],
       replyQuestionImpl: async () => {
         throw new Error("temporary question failure")
       },
@@ -2001,6 +2023,9 @@ test("startConnector restores final question submission after a restart during r
 
   const secondHarness = await createHarness({
     statePatch: persistedState,
+    ocOptions: {
+      listQuestionsImpl: async () => [request],
+    },
   })
 
   try {
@@ -2282,6 +2307,452 @@ test("startConnector replays remaining updates after a mid-batch Telegram handle
     assert.ok(harness.tg.getUpdatesCalls.some((call) => call?.timeout === 30 && call?.offset === 601))
   } finally {
     await harness.connector.stop()
+  }
+})
+
+test("startConnector finalizes assistant replies independently when sessions reuse the same message id", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 650,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+        "100:9": { projectAlias: "demo", sessionId: "ses_2" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+        "demo:ses_2": { chatId: 100, threadIdOr0: 9 },
+      },
+    },
+    ocOptions: {
+      getMessageImpl: async (sessionId, messageId) => ({
+        info: { id: messageId, role: "assistant", time: { created: completedAt, completed: completedAt } },
+        parts: [{ type: "text", text: sessionId === "ses_1" ? "First reply" : "Second reply" }],
+      }),
+    },
+  })
+
+  try {
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_1", info: { id: "msg_same", role: "assistant", time: { completed: completedAt } } },
+    })
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_2", info: { id: "msg_same", role: "assistant", time: { completed: completedAt } } },
+    })
+
+    await waitFor(() => harness.tg.sentHtmlBlocks.length === 2)
+
+    const delivered = harness.tg.sentHtmlBlocks.map((entry) => ({
+      threadId: entry.options.message_thread_id,
+      text: entry.blocks[0]?.html,
+    }))
+
+    assert.ok(delivered.some((entry) => entry.threadId === 7 && entry.text === "First reply"))
+    assert.ok(delivered.some((entry) => entry.threadId === 9 && entry.text === "Second reply"))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector stop cancels pending assistant finalization timers", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 660,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    messagesById: {
+      msg_stop: {
+        info: { id: "msg_stop", role: "assistant", time: { created: completedAt, completed: completedAt } },
+        parts: [{ type: "text", text: "Should not be delivered after stop" }],
+      },
+    },
+  })
+
+  try {
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_1", info: { id: "msg_stop", role: "assistant", time: { completed: completedAt } } },
+    })
+
+    await harness.connector.stop()
+    await delay(350)
+
+    assert.equal(harness.tg.sentHtmlBlocks.length, 0)
+    assert.equal(harness.tg.sentMessages.length, 0)
+    assert.equal(harness.tg.sentDocuments.length, 0)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector clears stale permission callbacks without blocking later updates", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 670,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+      pendingPrompts: {
+        permissions: {
+          "demo:perm_stale": {
+            projectAlias: "demo",
+            permissionId: "perm_stale",
+            sessionID: "ses_1",
+            permission: "shell",
+            patterns: ["npm test"],
+            ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+            createdAt: Date.now(),
+          },
+        },
+        rejectNotes: {},
+        customAnswers: {},
+        questionWizards: {},
+      },
+    },
+    ocOptions: {
+      replyPermissionImpl: async () => {
+        throw new Error("POST /permission/perm_stale/reply failed: 404 not found")
+      },
+    },
+    initialUpdates: [[makeCallbackUpdate(670, "p|demo|perm_stale|once"), makeMessageUpdate(671, "hello after stale permission")]],
+  })
+
+  try {
+    await waitFor(() => harness.ocCalls.promptAsync.length === 1)
+    await harness.connector.stop()
+
+    assert.deepEqual(harness.ocCalls.replyPermission, [{ permissionId: "perm_stale", payload: { reply: "once" } }])
+    assert.deepEqual(harness.ocCalls.promptAsync, [{ sessionId: "ses_1", text: "[TG] hello after stale permission" }])
+    assert.ok(harness.tg.callbackAnswers.some((entry) => entry.callbackQueryId === "cb_670" && entry.text === "No longer active"))
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.pendingPrompts.permissions, {})
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector transient callback failures do not block later updates", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 675,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+      pendingPrompts: {
+        permissions: {
+          "demo:perm_retry": {
+            projectAlias: "demo",
+            permissionId: "perm_retry",
+            sessionID: "ses_1",
+            permission: "shell",
+            patterns: ["npm test"],
+            ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+            createdAt: Date.now(),
+          },
+        },
+        rejectNotes: {},
+        customAnswers: {},
+        questionWizards: {},
+      },
+    },
+    ocOptions: {
+      replyPermissionImpl: async () => {
+        throw new Error("temporary permission failure")
+      },
+    },
+    initialUpdates: [[makeCallbackUpdate(675, "p|demo|perm_retry|once"), makeMessageUpdate(676, "hello after callback failure")]],
+  })
+
+  try {
+    await waitFor(() => harness.ocCalls.promptAsync.length === 1)
+    await harness.connector.stop()
+
+    assert.deepEqual(harness.ocCalls.replyPermission, [{ permissionId: "perm_retry", payload: { reply: "once" } }])
+    assert.deepEqual(harness.ocCalls.promptAsync, [{ sessionId: "ses_1", text: "[TG] hello after callback failure" }])
+    assert.ok(harness.tg.callbackAnswers.some((entry) => entry.callbackQueryId === "cb_675" && entry.text === "Action failed"))
+    assert.ok(harness.tg.sentMessages.some((entry) => entry.text === "Action failed. Please try again."))
+
+    const state = await readState(harness.stateFile)
+    assert.equal(state.updateOffset, 677)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector clears stale custom-answer submissions without blocking later updates", async () => {
+  const request = {
+    id: "q_stale",
+    sessionID: "ses_1",
+    questions: [
+      {
+        header: "Reason",
+        question: "Why do you want this?",
+        custom: true,
+        options: [],
+      },
+    ],
+  }
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 680,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+      pendingPrompts: {
+        permissions: {},
+        rejectNotes: {},
+        customAnswers: {
+          "100:7": { projectAlias: "demo", requestId: "q_stale", qIndex: 0 },
+        },
+        questionWizards: {
+          "demo:q_stale": {
+            projectAlias: "demo",
+            id: "q_stale",
+            sessionID: "ses_1",
+            request,
+            index: 0,
+            answers: [[]],
+            selectedByIndex: {},
+            createdAt: Date.now(),
+            ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+          },
+        },
+      },
+    },
+    ocOptions: {
+      listQuestionsImpl: async () => [request],
+      replyQuestionImpl: async () => {
+        throw new Error("POST /question/q_stale/reply failed: 404 not found")
+      },
+    },
+    initialUpdates: [[makeMessageUpdate(680, "too late"), makeMessageUpdate(681, "hello after stale question")]],
+  })
+
+  try {
+    await waitFor(() => harness.ocCalls.promptAsync.length === 1)
+    await harness.connector.stop()
+
+    assert.deepEqual(harness.ocCalls.replyQuestion, [{ questionId: "q_stale", answers: [["too late"]] }])
+    assert.deepEqual(harness.ocCalls.promptAsync, [{ sessionId: "ses_1", text: "[TG] hello after stale question" }])
+    assert.ok(harness.tg.sentMessages.some((entry) => entry.text === "Question is no longer active."))
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.pendingPrompts.questionWizards, {})
+    assert.deepEqual(state.pendingPrompts.customAnswers, {})
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector drops stale persisted prompts before replaying restart recovery", async () => {
+  const request = {
+    id: "q_stale_restore",
+    sessionID: "ses_1",
+    questions: [
+      {
+        header: "Reason",
+        question: "Why do you want this?",
+        custom: true,
+        options: [],
+      },
+    ],
+  }
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 690,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+      pendingPrompts: {
+        permissions: {
+          "demo:perm_stale": {
+            projectAlias: "demo",
+            permissionId: "perm_stale",
+            sessionID: "ses_1",
+            permission: "shell",
+            patterns: ["npm test"],
+            ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+            createdAt: Date.now(),
+          },
+        },
+        rejectNotes: {
+          "100:7": { projectAlias: "demo", permissionId: "perm_stale" },
+        },
+        customAnswers: {
+          "100:7": { projectAlias: "demo", requestId: "q_stale_restore", qIndex: 0 },
+        },
+        questionWizards: {
+          "demo:q_stale_restore": {
+            projectAlias: "demo",
+            id: "q_stale_restore",
+            sessionID: "ses_1",
+            request,
+            index: 0,
+            answers: [[]],
+            selectedByIndex: {},
+            createdAt: Date.now(),
+            ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+          },
+        },
+      },
+    },
+    ocOptions: {
+      listPermissionsImpl: async () => [],
+      listQuestionsImpl: async () => [],
+    },
+  })
+
+  try {
+    await delay(50)
+    await harness.connector.stop()
+
+    assert.equal(harness.tg.sentHtmlBlocks.length, 0)
+    assert.equal(harness.tg.sentMessages.length, 0)
+    assert.ok(harness.ocCalls.listPermissions >= 1)
+    assert.ok(harness.ocCalls.listQuestions >= 1)
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.pendingPrompts.permissions, {})
+    assert.deepEqual(state.pendingPrompts.rejectNotes, {})
+    assert.deepEqual(state.pendingPrompts.questionWizards, {})
+    assert.deepEqual(state.pendingPrompts.customAnswers, {})
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector validates permissions and questions independently during restart recovery", async () => {
+  const permissionHarness = await createHarness({
+    statePatch: {
+      updateOffset: 695,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+      pendingPrompts: {
+        permissions: {
+          "demo:perm_partial": {
+            projectAlias: "demo",
+            permissionId: "perm_partial",
+            sessionID: "ses_1",
+            permission: "shell",
+            patterns: ["npm test"],
+            ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+            createdAt: Date.now(),
+          },
+        },
+        rejectNotes: {
+          "100:7": { projectAlias: "demo", permissionId: "perm_partial" },
+        },
+        customAnswers: {},
+        questionWizards: {},
+      },
+    },
+    ocOptions: {
+      listPermissionsImpl: async () => [],
+      listQuestionsImpl: async () => {
+        throw new Error("temporary question poll failure")
+      },
+    },
+  })
+
+  try {
+    await delay(40)
+    await permissionHarness.connector.stop()
+
+    const state = await readState(permissionHarness.stateFile)
+    assert.deepEqual(state.pendingPrompts.permissions, {})
+    assert.deepEqual(state.pendingPrompts.rejectNotes, {})
+    assert.equal(permissionHarness.tg.sentHtmlBlocks.length, 0)
+    assert.equal(permissionHarness.tg.sentMessages.length, 0)
+  } finally {
+    await permissionHarness.connector.stop()
+  }
+
+  const request = {
+    id: "q_partial",
+    sessionID: "ses_1",
+    questions: [
+      {
+        header: "Reason",
+        question: "Why do you want this?",
+        custom: true,
+        options: [],
+      },
+    ],
+  }
+  const questionHarness = await createHarness({
+    statePatch: {
+      updateOffset: 696,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+      pendingPrompts: {
+        permissions: {},
+        rejectNotes: {},
+        customAnswers: {
+          "100:7": { projectAlias: "demo", requestId: "q_partial", qIndex: 0 },
+        },
+        questionWizards: {
+          "demo:q_partial": {
+            projectAlias: "demo",
+            id: "q_partial",
+            sessionID: "ses_1",
+            request,
+            index: 0,
+            answers: [[]],
+            selectedByIndex: {},
+            createdAt: Date.now(),
+            ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+          },
+        },
+      },
+    },
+    ocOptions: {
+      listPermissionsImpl: async () => {
+        throw new Error("temporary permission poll failure")
+      },
+      listQuestionsImpl: async () => [],
+    },
+  })
+
+  try {
+    await delay(40)
+    await questionHarness.connector.stop()
+
+    const state = await readState(questionHarness.stateFile)
+    assert.deepEqual(state.pendingPrompts.questionWizards, {})
+    assert.deepEqual(state.pendingPrompts.customAnswers, {})
+    assert.equal(questionHarness.tg.sentHtmlBlocks.length, 0)
+    assert.equal(questionHarness.tg.sentMessages.length, 0)
+  } finally {
+    await questionHarness.connector.stop()
   }
 })
 

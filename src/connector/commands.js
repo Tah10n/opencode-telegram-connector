@@ -65,6 +65,7 @@ export function createCommandHandlers(runtime) {
     sendCurrentQuestionStep,
     setRejectNoteAwaitingState,
     setAwaitingCustomAnswerState,
+    isMissingPromptError = () => false,
   } = runtime
 
   async function resolveStartupSession(alias, { forceRefresh = false } = {}) {
@@ -417,7 +418,6 @@ export function createCommandHandlers(runtime) {
       if (nextIndex >= wizard.request.questions.length) {
         persistQuestionWizard(nextWizard)
         await finishQuestionWizard(nextWizard)
-        setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
       } else {
         nextWizard.index = nextIndex
         await sendCurrentQuestionStep(nextWizard)
@@ -431,7 +431,15 @@ export function createCommandHandlers(runtime) {
     const awaiting = rejectNoteAwaiting.get(ctxMeta.ctxKey)
     if (awaiting) {
       const oc = ocByAlias[awaiting.projectAlias]
-      await oc.replyPermission(awaiting.permissionId, { reply: "reject", message: text })
+      try {
+        await oc.replyPermission(awaiting.permissionId, { reply: "reject", message: text })
+      } catch (err) {
+        if (!isMissingPromptError(err)) throw err
+        store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId)
+        setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
+        await sendToThread(ctxMeta, "Permission request is no longer active.").catch(() => {})
+        return
+      }
       store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId)
       setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
       await sendToThread(ctxMeta, "Rejection note sent.").catch(() => {})

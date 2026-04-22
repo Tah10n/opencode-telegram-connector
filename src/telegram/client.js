@@ -39,15 +39,15 @@ export class TelegramClient {
     this.baseUrl = baseUrl || `https://api.telegram.org/bot${token}`
   }
 
-  async call(method, params, { timeoutMs } = {}) {
+  async call(method, params, { timeoutMs, signal } = {}) {
     const url = `${this.baseUrl}/${method}`
-    const { signal, cancel } = makeTimeoutSignal(timeoutMs)
+    const timeout = makeTimeoutSignal(timeoutMs)
     const res = await fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      signal,
+      signal: signal || timeout.signal,
       body: params ? JSON.stringify(params) : "{}",
-    }).finally(cancel)
+    }).finally(timeout.cancel)
     const json = await res.json().catch(() => null)
     if (!res.ok || !json || json.ok !== true) {
       const msg = json?.description || res.statusText || "Telegram API error"
@@ -56,14 +56,14 @@ export class TelegramClient {
     return json.result
   }
 
-  async callMultipart(method, formData, { timeoutMs } = {}) {
+  async callMultipart(method, formData, { timeoutMs, signal } = {}) {
     const url = `${this.baseUrl}/${method}`
-    const { signal, cancel } = makeTimeoutSignal(timeoutMs)
+    const timeout = makeTimeoutSignal(timeoutMs)
     const res = await fetch(url, {
       method: "POST",
       body: formData,
-      signal,
-    }).finally(cancel)
+      signal: signal || timeout.signal,
+    }).finally(timeout.cancel)
     const json = await res.json().catch(() => null)
     if (!res.ok || !json || json.ok !== true) {
       const msg = json?.description || res.statusText || "Telegram API error"
@@ -77,9 +77,10 @@ export class TelegramClient {
   }
 
   getUpdates(input) {
-    const timeoutSec = typeof input?.timeout === "number" ? input.timeout : 0
+    const { signal, ...params } = input || {}
+    const timeoutSec = typeof params?.timeout === "number" ? params.timeout : 0
     const timeoutMs = Math.max(10_000, (timeoutSec + 10) * 1000)
-    return this.call("getUpdates", input, { timeoutMs })
+    return this.call("getUpdates", params, { timeoutMs, signal })
   }
 
   setMyCommands(commands, options = {}) {

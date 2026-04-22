@@ -41,6 +41,8 @@ If you set `openAttachOnNew: true` for a project, then each `/new` in Telegram w
 
 If you send a Telegram message while the project's server is down and the project has `autoStart:true`, the bot will offer a **Start** button that launches opencode for that project.
 
+Availability notifications stay scoped to the affected bound threads: if a project's health/SSE goes down, only threads bound to that project are notified, and they receive a single back-online notice when connectivity recovers.
+
 4) Start the connector:
 
 ```powershell
@@ -55,13 +57,13 @@ npm start
 - `/help`
 - `/bind <projectAlias>` (bind current thread to that project's startup session)
 - `/new [title]` (create a new session in this thread's project and bind)
-- `/use <sessionId|shareLink>` (bind to an existing session in this thread's project)
+- `/use <sessionId|shareLink>` (bind to an existing session in this thread's project; cross-project share links are rejected with guidance)
 - `/sessions` (list recent sessions for this thread's current project and switch via buttons)
 - `/feed` (configure which updates are mirrored into this thread: Main, Main + changes, Verbose)
-- `/status` (show current binding, startup session, SSE status, and base URL)
+- `/status` (show current binding, feed mode, startup session, SSE status, and base URL)
 - `/bindings` (list all active chat/topic bindings; private chat only)
 - `/abort` (abort the current thread's running session)
-- `/projects` (list project aliases)
+- `/projects` (show a higher-level overview of projects, startup sessions, SSE state, and active bindings)
 - `/unbind`
 
 ## Notes
@@ -69,14 +71,18 @@ npm start
 - The bot only accepts messages from a single Telegram user id (`TELEGRAM_ALLOWED_USER_ID`).
 - On first start it **drains** old Telegram updates so it does not replay history.
 - State is stored in `./.data/state.json` by default (override with `STATE_FILE`).
+- Each bound Telegram thread/topic stays isolated: switching sessions, streaming previews, changed-file cards, and prompt recovery in one thread do not affect other threads.
 - Feed mode is stored per Telegram thread/topic and survives rebinds and restarts.
 - `Main` shows only final assistant replies.
 - `Main + changes` shows final assistant replies plus first-class `Changed files` cards.
 - `Verbose` also includes streaming previews and non-echo user mirroring.
+- Internal compaction output and noisy intermediate model messages stay hidden by default in all feed modes.
 - Assistant replies stream into the bound Telegram thread while opencode is still generating output.
 - Very long assistant code/log output falls back to a `.txt` attachment instead of flooding the chat with many chunks.
-- `Changed files` cards support `Show diff` / `Back`; if the diff is unavailable or too large, the bot falls back gracefully and may attach a `.txt` file.
-- Pending permission/question flows are restored after restart so you can continue approving or answering from Telegram.
+- `Changed files` cards support `Show diff` / `Back` and update the same Telegram message in place; if the diff is unavailable or too large, the bot falls back gracefully and may attach a `.txt` file.
+- Pending permission/question flows are restored after restart so you can continue approving or answering from Telegram; stale prompts/questions are dropped instead of being replayed forever when the backend no longer exposes them.
+- If `/use <shareLink>` points to a session from a different configured project, the bot refuses the bind and tells you to bind the correct project alias first.
+- When a project becomes unavailable, bound threads receive an unavailable notice and, for `autoStart:true` projects, a **Start** button; once the project is healthy again they receive a single back-online notice.
 - Mirrored messages are sent with `parse_mode=HTML`. Triple-backtick fences (```code```) are rendered as Telegram `<pre><code>` blocks.
 - Common markdown like `**bold**`, `*italic*`, `` `inline code` ``, `# headings`, `- bullets`, and `[links](https://example.com)` is converted (clickable links are http/https only).
 

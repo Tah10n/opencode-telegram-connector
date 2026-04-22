@@ -314,7 +314,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const TEXT_ATTACHMENT_THRESHOLD = 12_000
   // Bound the amount of per-session state we keep.
   const forwardedBySession = new LruMap(2000) // sessionKey -> {user:LruSet, assistant:LruSet, changes:LruSet}
-  const assistantDebounce = new Map() // msgId -> timeout
+  const assistantDebounce = new Map() // `${projectAlias}:${sessionId}:${msgId}` -> timeout
   const assistantPreviewBySession = new Map() // bound sessionKey -> { messageId, telegramMessageId, lastPreviewHtml, lastPreviewAt }
   const recentTgPromptsBySession = new LruMap(2000) // sessionKey -> LruSet(hash)
   const lastAssistantBySession = new LruMap(2000) // sessionKey -> { messageId, sessionId, text }
@@ -390,6 +390,20 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
 
   const abortController = new AbortController()
 
+  async function sleepWithAbort(ms) {
+    if (abortController.signal.aborted) return
+    let onAbort = null
+    const abortPromise = new Promise((resolve) => {
+      onAbort = () => resolve()
+      abortController.signal.addEventListener("abort", onAbort, { once: true })
+    })
+    try {
+      await Promise.race([sleep(ms), abortPromise])
+    } finally {
+      if (onAbort) abortController.signal.removeEventListener("abort", onAbort)
+    }
+  }
+
   const wizardGcTimer = setInterval(() => {
     const t = Date.now()
     for (const [k, w] of questionWizards.entries()) {
@@ -435,6 +449,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     mirrorCompaction,
     normalizeEpochMs,
     sleep,
+    abortSignal: abortController.signal,
   })
   const {
     ensureRecentPromptSet,
@@ -615,14 +630,16 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     while (true) {
       if (abortController.signal.aborted) return
       const updates = await tg
-        .getUpdates({ offset, timeout: 0, limit: 100, allowed_updates: ["message", "callback_query"] })
+        .getUpdates({ offset, timeout: 0, limit: 100, allowed_updates: ["message", "callback_query"], signal: abortController.signal })
         .catch((err) => {
+          if (abortController.signal.aborted) return null
           logger.error("Backlog drain error:", err?.message || String(err))
           return null
         })
 
+      if (abortController.signal.aborted) return
       if (!Array.isArray(updates)) {
-        await sleep(backoff)
+        await sleepWithAbort(backoff)
         backoff = Math.min(30_000, backoff * 2)
         continue
       }
@@ -630,7 +647,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       backoff = 1000
       if (updates.length === 0) break
       offset = updates[updates.length - 1].update_id + 1
-      await sleep(200)
+      await sleepWithAbort(200)
     }
     store.setUpdateOffset(offset)
     logger.info("Telegram backlog drained. Starting from offset:", offset)
@@ -642,14 +659,16 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     while (!abortController.signal.aborted) {
       const offset = store.get().updateOffset ?? 0
       const updates = await tg
-        .getUpdates({ offset, timeout: 30, limit: 100, allowed_updates: ["message", "callback_query"] })
+        .getUpdates({ offset, timeout: 30, limit: 100, allowed_updates: ["message", "callback_query"], signal: abortController.signal })
         .catch((err) => {
+          if (abortController.signal.aborted) return null
           logger.error("getUpdates error:", err?.message || String(err))
           return null
         })
+      if (abortController.signal.aborted) break
       if (!Array.isArray(updates)) {
         // Avoid a tight loop on network/API errors.
-        await sleep(backoff)
+        await sleepWithAbort(backoff)
         backoff = Math.min(30_000, backoff * 2)
         continue
       }
@@ -673,7 +692,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         if (ok) {
           store.setUpdateOffset(u.update_id + 1)
         } else {
-          await sleep(1000)
+          await sleepWithAbort(1000)
           break
         }
       }
@@ -705,7 +724,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   }
 
   // Periodic prompt poll (helps when SSE is down).
-  void (async () => {
+  const promptPollPromise = (async () => {
     while (!abortController.signal.aborted) {
       for (const alias of Object.keys(projects)) {
         await ensureBaselineLoaded(alias)
@@ -727,19 +746,22 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
           }
         }
       }
-      await sleep(15_000)
+      await sleepWithAbort(15_000)
     }
   })()
 
-  void telegramLoop()
+  const telegramLoopPromise = telegramLoop()
 
   const stop = async () => {
     abortController.abort()
     clearInterval(wizardGcTimer)
+    for (const timer of assistantDebounce.values()) clearTimeout(timer)
+    assistantDebounce.clear()
     for (const s of sseLoops) s.stop?.()
     for (const h of autoStarted.values()) {
       await Promise.resolve(h.stop?.()).catch(() => {})
     }
+    await Promise.allSettled([telegramLoopPromise, promptPollPromise])
     await store.flush().catch(() => {})
   }
 
