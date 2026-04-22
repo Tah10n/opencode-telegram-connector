@@ -3,6 +3,7 @@ import assert from "node:assert/strict"
 import { setTimeout as delay } from "node:timers/promises"
 import { ReadableStream } from "node:stream/web"
 import { startOpenCodeSseLoop } from "../src/opencode/sse.js"
+import { classifyBoundaryError } from "../src/boundary-errors.js"
 
 function makeLogger() {
   return { info() {}, error() {}, warn() {}, debug() {} }
@@ -103,6 +104,8 @@ test("startOpenCodeSseLoop reports disconnects only after a failed health check"
       onError: async ({ projectAlias, err }) => {
         assert.equal(projectAlias, "demo")
         assert.match(err.message, /SSE disconnected/)
+        assert.equal(err.isBoundaryError, true)
+        assert.equal(classifyBoundaryError(err).retryable, true)
         loop.stop()
         abortController.abort()
         clearTimeout(timeout)

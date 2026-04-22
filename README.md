@@ -83,7 +83,11 @@ npm start
 - Assistant replies stream into the bound Telegram thread while opencode is still generating output.
 - Very long assistant code/log output falls back to a `.txt` attachment instead of flooding the chat with many chunks.
 - `Changed files` cards support `Show diff` / `Back` and update the same Telegram message in place; if the diff is unavailable or too large, the bot falls back gracefully and may attach a `.txt` file.
-- Pending permission/question flows are restored after restart so you can continue approving or answering from Telegram; stale prompts/questions are dropped instead of being replayed forever when the backend no longer exposes them.
+- Pending prompt state persists the minimal recovery data needed to continue Telegram flows after restart: pending permissions, in-progress question wizards, typed reject-note waits, and typed custom-answer waits.
+- Restart recovery validates permissions and questions independently against the live backend snapshot before replaying anything into Telegram.
+- If the backend confirms that a persisted permission/question is gone, the connector treats it as `stale`, drops the local recovery state, and does not replay it again.
+- If the backend is temporarily unavailable during recovery or while submitting a permission/question answer, the connector treats that as `retryable`: it keeps the pending state, does not silently auto-replay the action, and lets you retry from Telegram after the backend recovers.
+- Fatal boundary failures are surfaced to the user/operator instead of being retried blindly; the connector now normalizes Telegram/OpenCode boundary errors through a shared classification layer.
 - `/use <shareLink>` accepts both current OpenCode share links (`https://opncd.ai/share/<id>`) and older short links (`https://opncd.ai/s/<id>`).
 - When switching to an existing session, the connector shows the effective model for the current thread; in inherit mode it falls back to the most recent known session model when OpenCode history exposes it.
 - `/model` prefers inline buttons for common choices: inherit, project default, and common variants for the current/default model. Use `/model <provider/model> [variant]` as a typed fallback for anything else.

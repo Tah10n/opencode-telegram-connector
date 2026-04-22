@@ -1,6 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { TelegramClient, makeInlineKeyboard, splitTelegramText } from "../src/telegram/client.js"
+import { classifyBoundaryError } from "../src/boundary-errors.js"
 
 test("splitTelegramText keeps short lines and splits oversized lines", () => {
   const chunks = splitTelegramText(`short\n${"x".repeat(6)}`, 5)
@@ -19,20 +20,50 @@ test("TelegramClient call and callMultipart return Telegram results and surface 
     }
   }
 
-  try {
-    const client = new TelegramClient("token", { baseUrl: "https://api.example.test/bot" })
-    assert.deepEqual(await client.call("getMe", { probe: true }, { timeoutMs: 5, signal: "external-signal" }), { ok: true })
+    try {
+      const client = new TelegramClient("token", { baseUrl: "https://api.example.test/bot" })
+      assert.deepEqual(await client.call("getMe", { probe: true }, { timeoutMs: 5, signal: "external-signal" }), { ok: true })
 
-    const formData = new FormData()
-    formData.set("probe", "1")
-    await assert.rejects(() => client.callMultipart("sendDocument", formData, { timeoutMs: 5 }), /sendDocument failed: broken/)
+      const formData = new FormData()
+      formData.set("probe", "1")
+      await assert.rejects(async () => client.callMultipart("sendDocument", formData, { timeoutMs: 5 }), (err) => {
+        assert.match(err.message, /sendDocument failed: broken/)
+        assert.equal(err.isBoundaryError, true)
+        assert.equal(err.source, "telegram")
+        assert.equal(err.status, null)
+        assert.equal(classifyBoundaryError(err).fatal, true)
+        return true
+      })
 
-    assert.equal(calls[0].url, "https://api.example.test/bot/getMe")
+      assert.equal(calls[0].url, "https://api.example.test/bot/getMe")
     assert.equal(calls[0].init.method, "POST")
     assert.equal(calls[0].init.headers["content-type"], "application/json")
     assert.equal(calls[0].init.body, JSON.stringify({ probe: true }))
     assert.equal(calls[0].init.signal, "external-signal")
     assert.equal(calls[1].url, "https://api.example.test/bot/sendDocument")
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("TelegramClient classifies rate limits as retryable boundary errors", async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => ({
+    ok: false,
+    status: 429,
+    statusText: "Too Many Requests",
+    json: async () => ({ ok: false, description: "rate limited" }),
+  })
+
+  try {
+    const client = new TelegramClient("token", { baseUrl: "https://api.example.test/bot" })
+    await assert.rejects(async () => client.call("sendMessage", { text: "hi" }), (err) => {
+      const classification = classifyBoundaryError(err)
+      assert.equal(err.isBoundaryError, true)
+      assert.equal(err.status, 429)
+      assert.equal(classification.retryable, true)
+      return true
+    })
   } finally {
     globalThis.fetch = originalFetch
   }

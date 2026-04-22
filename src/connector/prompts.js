@@ -1,6 +1,7 @@
 import { makeInlineKeyboard } from "../telegram/client.js"
 import { escapeHtml } from "../telegram/formatter.js"
 import { ctxKeyFrom } from "../telegram/routing.js"
+import { isRetryableBoundaryError, isStaleBoundaryError } from "../boundary-errors.js"
 
 export function createPromptHandlers(runtime) {
   const {
@@ -23,38 +24,6 @@ export function createPromptHandlers(runtime) {
 
   const wizardKey = (projectAlias, requestId) => `${projectAlias}:${requestId}`
   const getWizard = (projectAlias, requestId) => questionWizards.get(wizardKey(projectAlias, requestId)) || null
-  const livePromptSnapshotByProject = new Map()
-
-  function isMissingPromptError(err) {
-    const message = String(err?.message || err || "")
-    return /\b404\b/.test(message) || /not found/i.test(message)
-  }
-
-  async function getLivePromptSnapshot(projectAlias) {
-    if (!projectAlias || !ocByAlias[projectAlias]) return null
-    let promise = livePromptSnapshotByProject.get(projectAlias)
-    if (!promise) {
-      const oc = ocByAlias[projectAlias]
-      promise = Promise.all([oc.listPermissions().catch(() => null), oc.listQuestions().catch(() => null)]).then(([permissions, questions]) => {
-        const permissionIds = Array.isArray(permissions)
-          ? new Set(permissions.map((entry) => entry?.id).filter((id) => typeof id === "string" && id))
-          : null
-        const questionsById = Array.isArray(questions)
-          ? new Map(
-              questions
-                .filter((entry) => typeof entry?.id === "string" && entry.id)
-                .map((entry) => [entry.id, entry]),
-            )
-          : null
-        if (!permissionIds && !questionsById) return null
-        markProjectUp(projectAlias)
-        return { permissionIds, questionsById }
-      })
-      livePromptSnapshotByProject.set(projectAlias, promise)
-    }
-    return promise
-  }
-
   function persistQuestionWizard(wizard) {
     store.setQuestionWizard(wizardKey(wizard.projectAlias, wizard.request.id), wizard)
   }
@@ -232,118 +201,28 @@ export function createPromptHandlers(runtime) {
     )
   }
 
-  async function restorePendingPromptState() {
-    const pending = store.getPendingPrompts?.() || store.get().pendingPrompts || {}
-
-    for (const entry of Object.values(pending.permissions || {})) {
-      const ctx = entry?.ctx
-      if (!entry?.projectAlias || !entry?.permissionId || !ctx?.chatId || !ctx?.ctxKey) continue
-      const live = await getLivePromptSnapshot(entry.projectAlias).catch(() => null)
-      if (live?.permissionIds && !live.permissionIds.has(entry.permissionId)) {
-        store.deletePendingPermission(entry.projectAlias, entry.permissionId)
-        continue
-      }
-      prompted[entry.projectAlias]?.permission.add(entry.permissionId)
-      await sendPermissionPrompt(
-        entry.projectAlias,
-        {
-          id: entry.permissionId,
-          sessionID: entry.sessionID,
-          permission: entry.permission,
-          patterns: Array.isArray(entry.patterns) ? entry.patterns : [],
-        },
-        ctx,
-      ).catch(() => {})
-    }
-
-    for (const snapshot of Object.values(pending.questionWizards || {})) {
-      const ctx = snapshot?.ctx
-      if (!snapshot?.projectAlias || !snapshot?.id || !ctx?.chatId || !ctx?.ctxKey) continue
-      const live = await getLivePromptSnapshot(snapshot.projectAlias).catch(() => null)
-      const liveQuestion = live?.questionsById?.get(snapshot.id)
-      if (live?.questionsById && !liveQuestion) {
-        clearPersistedQuestionWizard(snapshot.projectAlias, snapshot.id)
-        continue
-      }
-      prompted[snapshot.projectAlias]?.question.add(snapshot.id)
-      const wizard = {
-        projectAlias: snapshot.projectAlias,
-        id: snapshot.id,
-        sessionID: snapshot.sessionID,
-        request: liveQuestion || snapshot.request,
-        index: Number.isInteger(snapshot.index) ? snapshot.index : 0,
-        answers: Array.isArray(snapshot.answers) ? snapshot.answers.map((entry) => (Array.isArray(entry) ? [...entry] : [])) : [],
-        selectedByIndex:
-          snapshot.selectedByIndex && typeof snapshot.selectedByIndex === "object"
-            ? Object.fromEntries(
-                Object.entries(snapshot.selectedByIndex).map(([idx, selected]) => [idx, Array.isArray(selected) ? [...selected] : []]),
-              )
-            : {},
-        messageIdByIndex: {},
-        createdAt: typeof snapshot.createdAt === "number" ? snapshot.createdAt : Date.now(),
-        ctx,
-      }
-      questionWizards.set(wizardKey(wizard.projectAlias, wizard.id), wizard)
-      await sendBlocksToThread(wizard.ctx, [
-        { type: "text", html: `<b>Question request resumed</b>\n<code>${escapeHtml(wizard.id)}</code>\n\n${escapeHtml(`Project: ${wizard.projectAlias}`)}` },
-      ]).catch(() => {})
-      await sendCurrentQuestionStep(wizard).catch(() => {})
-    }
-
-    for (const [ctxKey, value] of Object.entries(pending.rejectNotes || {})) {
-      if (!value?.projectAlias || !value?.permissionId) continue
-      const live = await getLivePromptSnapshot(value.projectAlias).catch(() => null)
-      if (live?.permissionIds && !live.permissionIds.has(value.permissionId)) {
-        setRejectNoteAwaitingState(ctxKey, null)
-        continue
-      }
-      setRejectNoteAwaitingState(ctxKey, value)
-      const bindingCtx = parseCtxKey(ctxKey)
-      if (bindingCtx?.chatId) await sendRejectNotePrompt(bindingCtx, value.projectAlias, value.permissionId, { resumed: true }).catch(() => {})
-    }
-
-    for (const [ctxKey, value] of Object.entries(pending.customAnswers || {})) {
-      if (!value?.projectAlias || !value?.requestId || !Number.isInteger(value?.qIndex)) continue
-      const live = await getLivePromptSnapshot(value.projectAlias).catch(() => null)
-      if (live?.questionsById && !live.questionsById.has(value.requestId)) {
-        setAwaitingCustomAnswerState(ctxKey, null)
-        continue
-      }
-      const wizard = getWizard(value.projectAlias, value.requestId)
-      const question = wizard?.request?.questions?.[value.qIndex]
-      if (!wizard || !question) {
-        setAwaitingCustomAnswerState(ctxKey, null)
-        continue
-      }
-
-      setAwaitingCustomAnswerState(ctxKey, value)
-      const label = wizard?.request?.questions?.[value.qIndex]?.header || "question"
-      const bindingCtx = parseCtxKey(ctxKey)
-      if (bindingCtx?.chatId) {
-        await sendQuestionCustomAnswerPrompt(bindingCtx, value.projectAlias, value.requestId, value.qIndex, label, { resumed: true }).catch(
-          () => {},
-        )
-      }
-    }
-  }
-
   async function finishQuestionWizard(wizard) {
     const oc = ocByAlias[wizard.projectAlias]
     try {
       await oc.replyQuestion(wizard.request.id, wizard.answers)
     } catch (err) {
-      if (!isMissingPromptError(err)) throw err
-      questionWizards.delete(wizardKey(wizard.projectAlias, wizard.request.id))
-      clearPersistedQuestionWizard(wizard.projectAlias, wizard.request.id)
-      setAwaitingCustomAnswerState(wizard.ctx.ctxKey, null)
-      await sendToThread(wizard.ctx, "Question is no longer active.").catch(() => {})
-      return { stale: true }
+      if (isStaleBoundaryError(err, { source: "opencode", pathname: `/question/${wizard.request.id}/reply`, method: "POST" })) {
+        questionWizards.delete(wizardKey(wizard.projectAlias, wizard.request.id))
+        clearPersistedQuestionWizard(wizard.projectAlias, wizard.request.id)
+        setAwaitingCustomAnswerState(wizard.ctx.ctxKey, null)
+        await sendToThread(wizard.ctx, "Question is no longer active.").catch(() => {})
+        return { outcome: "stale", stale: true }
+      }
+      if (isRetryableBoundaryError(err, { source: "opencode", pathname: `/question/${wizard.request.id}/reply`, method: "POST" })) {
+        return { outcome: "retryable", retryable: true }
+      }
+      throw err
     }
     questionWizards.delete(wizardKey(wizard.projectAlias, wizard.request.id))
     clearPersistedQuestionWizard(wizard.projectAlias, wizard.request.id)
     setAwaitingCustomAnswerState(wizard.ctx.ctxKey, null)
     await sendToThread(wizard.ctx, `Answered: ${wizard.request.id}`).catch(() => {})
-    return { stale: false }
+    return { outcome: "ok", stale: false }
   }
 
   async function ensureBaselineLoaded(projectAlias) {
@@ -436,7 +315,6 @@ export function createPromptHandlers(runtime) {
     getWizard,
     persistQuestionWizard,
     clearPersistedQuestionWizard,
-    isMissingPromptError,
     setRejectNoteAwaitingState,
     setAwaitingCustomAnswerState,
     cloneWizardState,
@@ -447,7 +325,6 @@ export function createPromptHandlers(runtime) {
     sendPermissionPrompt,
     sendRejectNotePrompt,
     sendQuestionCustomAnswerPrompt,
-    restorePendingPromptState,
     finishQuestionWizard,
     ensureBaselineLoaded,
     handlePermissionAsked,

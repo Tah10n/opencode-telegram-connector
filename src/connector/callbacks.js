@@ -1,5 +1,6 @@
 import { normalizeFeedMode } from "../state/store.js"
 import { normalizeModelReference } from "../model-selection.js"
+import { classifyBoundaryError, isRetryableBoundaryError, isStaleBoundaryError } from "../boundary-errors.js"
 
 export function createCallbackHandlers(runtime) {
   const {
@@ -30,7 +31,6 @@ export function createCallbackHandlers(runtime) {
     finishQuestionWizard,
     buildSessionSwitchText = async (projectAlias, sessionId) => `Switched to session: ${sessionId}`,
     setThreadModelPreference,
-    isMissingPromptError = () => false,
     formatProjectUnavailable,
   } = runtime
 
@@ -229,11 +229,18 @@ export function createCallbackHandlers(runtime) {
           try {
             await oc.replyPermission(permissionId, { reply: action })
           } catch (err) {
-            if (!isMissingPromptError(err)) throw err
-            store.deletePendingPermission(projectAlias, permissionId)
-            setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
-            await answerCallbackQuery(callbackQuery.id, "No longer active")
-            return
+            if (isStaleBoundaryError(err, { source: "opencode", pathname: `/permission/${permissionId}/reply`, method: "POST" })) {
+              store.deletePendingPermission(projectAlias, permissionId)
+              setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
+              await answerCallbackQuery(callbackQuery.id, "No longer active")
+              return
+            }
+            if (isRetryableBoundaryError(err, { source: "opencode", pathname: `/permission/${permissionId}/reply`, method: "POST" })) {
+              await answerCallbackQuery(callbackQuery.id, "Temporarily unavailable")
+              await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(() => {})
+              return
+            }
+            throw err
           }
           store.deletePendingPermission(projectAlias, permissionId)
           setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
@@ -275,19 +282,22 @@ export function createCallbackHandlers(runtime) {
           try {
             await oc.rejectQuestion(questionId)
           } catch (err) {
-            if (!isMissingPromptError(err)) throw err
-            if (wizard) {
+            if (isStaleBoundaryError(err, { source: "opencode", pathname: `/question/${questionId}/reject`, method: "POST" })) {
               runtime.questionWizards.delete(`${projectAlias}:${questionId}`)
               clearPersistedQuestionWizard(projectAlias, questionId)
+              setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
+              await answerCallbackQuery(callbackQuery.id, "No longer active")
+              return
             }
-            setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
-            await answerCallbackQuery(callbackQuery.id, "No longer active")
-            return
+            if (isRetryableBoundaryError(err, { source: "opencode", pathname: `/question/${questionId}/reject`, method: "POST" })) {
+              await answerCallbackQuery(callbackQuery.id, "Temporarily unavailable")
+              await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(() => {})
+              return
+            }
+            throw err
           }
-          if (wizard) {
-            runtime.questionWizards.delete(`${projectAlias}:${questionId}`)
-            clearPersistedQuestionWizard(projectAlias, questionId)
-          }
+          runtime.questionWizards.delete(`${projectAlias}:${questionId}`)
+          clearPersistedQuestionWizard(projectAlias, questionId)
           setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
           await answerCallbackQuery(callbackQuery.id, "Rejected")
           return
@@ -348,9 +358,16 @@ export function createCallbackHandlers(runtime) {
           nextWizard.answers[qIndex] = [label]
           const nextIndex = qIndex + 1
           if (nextIndex >= req.questions.length) {
-            persistQuestionWizard(nextWizard)
-            const result = await finishQuestionWizard(nextWizard)
-            await answerCallbackQuery(callbackQuery.id, result?.stale ? "No longer active" : "Selected")
+            applyWizardState(wizard, nextWizard)
+            persistQuestionWizard(wizard)
+            const result = await finishQuestionWizard(wizard)
+            await answerCallbackQuery(
+              callbackQuery.id,
+              result?.outcome === "stale" ? "No longer active" : result?.outcome === "retryable" ? "Temporarily unavailable" : "Selected",
+            )
+            if (result?.outcome === "retryable") {
+              await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(() => {})
+            }
             return
           } else {
             nextWizard.index = nextIndex
@@ -393,9 +410,16 @@ export function createCallbackHandlers(runtime) {
           nextWizard.answers[qIndex] = selected
           const nextIndex = qIndex + 1
           if (nextIndex >= req.questions.length) {
-            persistQuestionWizard(nextWizard)
-            const result = await finishQuestionWizard(nextWizard)
-            await answerCallbackQuery(callbackQuery.id, result?.stale ? "No longer active" : "Done")
+            applyWizardState(wizard, nextWizard)
+            persistQuestionWizard(wizard)
+            const result = await finishQuestionWizard(wizard)
+            await answerCallbackQuery(
+              callbackQuery.id,
+              result?.outcome === "stale" ? "No longer active" : result?.outcome === "retryable" ? "Temporarily unavailable" : "Done",
+            )
+            if (result?.outcome === "retryable") {
+              await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(() => {})
+            }
             return
           } else {
             nextWizard.index = nextIndex
@@ -413,6 +437,16 @@ export function createCallbackHandlers(runtime) {
       await answerCallbackQuery(callbackQuery.id, "Invalid")
     } catch (err) {
       runtime.logger?.error?.("Callback handler error:", err?.message || String(err))
+      const classification = classifyBoundaryError(err)
+      if (classification.stale) {
+        await answerCallbackQuery(callbackQuery.id, "No longer active")
+        return
+      }
+      if (classification.retryable) {
+        await answerCallbackQuery(callbackQuery.id, "Temporarily unavailable")
+        await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(() => {})
+        return
+      }
       await answerCallbackQuery(callbackQuery.id, "Action failed")
       await sendToThread(ctxMeta, "Action failed. Please try again.").catch(() => {})
     }

@@ -67,7 +67,7 @@ function makeRuntime(overrides = {}) {
     extractAssistantDisplayText: () => "",
     lastAssistantBySession: new Map(),
     canAutoStartProject: () => false,
-    isLikelyConnectError: () => false,
+    isRetryableProjectError: () => false,
     startServerKeyboard: () => null,
     ensureRecentPromptSet: () => ({ add() {} }),
     hashTextForEcho: () => "hash",

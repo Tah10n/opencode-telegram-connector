@@ -49,6 +49,8 @@ test("createOverviewHelpers sends unavailable and recovered notices only to thre
   helpers.markProjectUp("demo")
   await new Promise((resolve) => setImmediate(resolve))
 
+  assert.equal(helpers.isRetryableProjectError(new Error("fetch failed")), true)
+
   assert.equal(sent.length, 4)
   assert.deepEqual(
     sent.map((entry) => entry.ctx.ctxKey),

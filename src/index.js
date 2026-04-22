@@ -5,6 +5,7 @@ import { createCommandHandlers } from "./connector/commands.js"
 import { createMirroringHandlers } from "./connector/mirroring.js"
 import { createOverviewHelpers } from "./connector/overview.js"
 import { createPromptHandlers } from "./connector/prompts.js"
+import { createPromptRecovery } from "./connector/prompt-recovery.js"
 import { TelegramClient, makeInlineKeyboard } from "./telegram/client.js"
 import { formatMarkdownToTelegramHtmlBlocks, escapeHtml } from "./telegram/formatter.js"
 import { ctxKeyFrom, threadIdOr0FromMessage } from "./telegram/routing.js"
@@ -344,7 +345,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const {
     buildProjectsOverviewText,
     canAutoStartProject,
-    isLikelyConnectError,
+    isRetryableProjectError,
     formatProjectUnavailable,
     startServerKeyboard,
     notifyProjectUnavailable,
@@ -382,12 +383,29 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     sendCurrentQuestionStep,
     sendRejectNotePrompt,
     sendQuestionCustomAnswerPrompt,
-    restorePendingPromptState,
     finishQuestionWizard,
     ensureBaselineLoaded,
     handlePermissionAsked,
     handleQuestionAsked,
   } = promptHandlers
+
+  const { restorePendingPromptState } = createPromptRecovery({
+    store,
+    ocByAlias,
+    prompted,
+    questionWizards,
+    wizardKey: promptHandlers.wizardKey,
+    parseCtxKey,
+    sendBlocksToThread,
+    sendPermissionPrompt: promptHandlers.sendPermissionPrompt,
+    sendCurrentQuestionStep,
+    sendRejectNotePrompt,
+    sendQuestionCustomAnswerPrompt,
+    clearPersistedQuestionWizard,
+    setRejectNoteAwaitingState,
+    setAwaitingCustomAnswerState,
+    markProjectUp,
+  })
 
   const abortController = new AbortController()
 
@@ -701,9 +719,21 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   }
 
   if (recoverPendingPromptsOnStartup) {
-    await restorePendingPromptState().catch((err) => {
-      logger.error("Failed to restore pending prompts:", err?.message || String(err))
-    })
+    await restorePendingPromptState()
+      .then((summary) => {
+        if (!summary) return
+        const totals = summary.totals || {}
+        logger.info(
+          "Pending prompt recovery:",
+          `restored=${totals.restored || 0}`,
+          `stale=${totals.stale || 0}`,
+          `retryable=${totals.retryable || 0}`,
+          `fatal=${totals.fatal || 0}`,
+        )
+      })
+      .catch((err) => {
+        logger.error("Failed to restore pending prompts:", err?.message || String(err))
+      })
   }
 
   const sseLoops = []

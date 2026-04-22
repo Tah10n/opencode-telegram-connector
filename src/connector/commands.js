@@ -15,6 +15,7 @@ import {
   normalizeVariant,
   pickMostRecentSessionModelInfo,
 } from "../model-selection.js"
+import { isRetryableBoundaryError, isStaleBoundaryError } from "../boundary-errors.js"
 
 function helpText() {
   return [
@@ -62,7 +63,7 @@ export function createCommandHandlers(runtime) {
     extractAssistantDisplayText,
     lastAssistantBySession,
     canAutoStartProject,
-    isLikelyConnectError,
+    isRetryableProjectError,
     startServerKeyboard,
     ensureRecentPromptSet,
     hashTextForEcho,
@@ -81,7 +82,6 @@ export function createCommandHandlers(runtime) {
     sendCurrentQuestionStep,
     setRejectNoteAwaitingState,
     setAwaitingCustomAnswerState,
-    isMissingPromptError = () => false,
   } = runtime
 
   async function resolveStartupSession(alias, { forceRefresh = false } = {}) {
@@ -796,8 +796,13 @@ export function createCommandHandlers(runtime) {
       nextWizard.answers[awaitingQ.qIndex] = [text]
       const nextIndex = awaitingQ.qIndex + 1
       if (nextIndex >= wizard.request.questions.length) {
-        persistQuestionWizard(nextWizard)
-        await finishQuestionWizard(nextWizard)
+        applyWizardState(wizard, nextWizard)
+        persistQuestionWizard(wizard)
+        const result = await finishQuestionWizard(wizard)
+        if (result?.outcome === "retryable") {
+          await sendToThread(ctxMeta, "Question answer is temporarily unavailable. Send the answer again or /cancel.").catch(() => {})
+          return
+        }
       } else {
         nextWizard.index = nextIndex
         await sendCurrentQuestionStep(nextWizard)
@@ -814,11 +819,17 @@ export function createCommandHandlers(runtime) {
       try {
         await oc.replyPermission(awaiting.permissionId, { reply: "reject", message: text })
       } catch (err) {
-        if (!isMissingPromptError(err)) throw err
-        store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId)
-        setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
-        await sendToThread(ctxMeta, "Permission request is no longer active.").catch(() => {})
-        return
+        if (isStaleBoundaryError(err, { source: "opencode", pathname: `/permission/${awaiting.permissionId}/reply`, method: "POST" })) {
+          store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId)
+          setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
+          await sendToThread(ctxMeta, "Permission request is no longer active.").catch(() => {})
+          return
+        }
+        if (isRetryableBoundaryError(err, { source: "opencode", pathname: `/permission/${awaiting.permissionId}/reply`, method: "POST" })) {
+          await sendToThread(ctxMeta, "Permission reply is temporarily unavailable. Send the note again or /cancel.").catch(() => {})
+          return
+        }
+        throw err
       }
       store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId)
       setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
@@ -905,7 +916,7 @@ export function createCommandHandlers(runtime) {
       await oc.promptAsync(binding.sessionId, promptText, promptOverride || undefined)
     } catch (err) {
       const alias = binding.projectAlias
-      const withButton = isLikelyConnectError(err) && canAutoStartProject(alias, { platform })
+      const withButton = isRetryableProjectError(err) && canAutoStartProject(alias, { platform })
       await sendToThread(ctxMeta, formatProjectUnavailable(alias, err), withButton ? startServerKeyboard(alias) : null).catch(() => {})
     }
   }

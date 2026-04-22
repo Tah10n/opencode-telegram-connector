@@ -1,4 +1,12 @@
 import { setTimeout as delay } from "node:timers/promises"
+import {
+  boundaryErrorFromException,
+  boundaryErrorFromHttpResponse,
+  isAbortBoundaryError,
+  isDisconnectBoundaryError,
+  isRetryableBoundaryError,
+  makeBoundaryError,
+} from "../boundary-errors.js"
 
 function readIntEnv(name, fallback) {
   const raw = process.env?.[name]
@@ -81,7 +89,16 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
         })
         if (!res.ok) {
           const text = await res.text().catch(() => "")
-          throw new Error(`SSE ${res.status}: ${text || res.statusText}`)
+          throw boundaryErrorFromHttpResponse({
+            source: "opencode",
+            operation: "GET /event",
+            method: "GET",
+            pathname: "/event",
+            status: res.status,
+            statusText: res.statusText,
+            bodyText: text,
+            message: `SSE ${res.status}: ${text || res.statusText}`,
+          })
         }
         logger?.info?.(`[${projectAlias}] SSE connected`)
         try {
@@ -123,21 +140,38 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
           if (eventBytes > MAX_EVENT_BYTES || lines.length >= MAX_EVENT_LINES) {
             lines = []
             eventBytes = 0
-            throw new Error(`SSE event exceeded limit (${Math.round(MAX_EVENT_BYTES / 1024 / 1024)}MB)`) 
+            throw makeBoundaryError({
+              source: "opencode",
+              operation: "GET /event",
+              method: "GET",
+              pathname: "/event",
+              kind: "protocol",
+              outcome: "fatal",
+              message: `SSE event exceeded limit (${Math.round(MAX_EVENT_BYTES / 1024 / 1024)}MB)`,
+            })
           }
           lines.push(line)
         }
-        throw new Error("SSE disconnected")
+        throw makeBoundaryError({
+          source: "opencode",
+          operation: "GET /event",
+          method: "GET",
+          pathname: "/event",
+          kind: "disconnect",
+          outcome: "retryable",
+          message: "SSE disconnected",
+        })
       } catch (err) {
         if (stopped || abortSignal?.aborted) break
-        const msg = err?.message || String(err)
-        const lower = msg.toLowerCase()
-        const isAbort = err?.name === "AbortError" || lower.includes("abort")
-        const isTransientDisconnect =
-          lower.includes("terminated") ||
-          lower.includes("disconnected") ||
-          lower.includes("econnreset") ||
-          lower.includes("socket")
+        const normalized = boundaryErrorFromException(err, {
+          source: "opencode",
+          operation: "GET /event",
+          method: "GET",
+          pathname: "/event",
+        })
+        const msg = normalized.message
+        const isAbort = isAbortBoundaryError(normalized)
+        const isTransientDisconnect = isDisconnectBoundaryError(normalized)
 
         if (isAbort) {
           // Normal: stop/idle-timeout abort.
@@ -152,14 +186,18 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
               await ocClient.health()
             } catch {
               try {
-                await onError?.({ projectAlias, err })
+                await onError?.({ projectAlias, err: normalized })
               } catch {}
             }
           }
         } else {
-          logger?.error?.("SSE error:", projectAlias, msg)
+          if (isRetryableBoundaryError(normalized)) {
+            logger?.info?.("SSE retryable error:", projectAlias, msg)
+          } else {
+            logger?.error?.("SSE error:", projectAlias, msg)
+          }
           try {
-            await onError?.({ projectAlias, err })
+            await onError?.({ projectAlias, err: normalized })
           } catch {}
         }
         await delay(backoff)

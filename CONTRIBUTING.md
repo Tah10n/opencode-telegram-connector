@@ -32,6 +32,8 @@ npm run test:coverage
 - Keep dependencies light unless they provide clear value.
 - Preserve safe handling around auth, local state, and insecure HTTP restrictions.
 - Treat per-thread routing, restart recovery, and feed semantics as core behavior: changes here should come with focused tests.
+- Keep Telegram/OpenCode boundary failures normalized through `src/boundary-errors.js`; avoid scattering new string-matching heuristics across handlers.
+- Preserve the recovery contract when touching prompt flows: `stale` clears local pending state, `retryable` keeps it for manual retry, and `fatal` must be surfaced explicitly.
 
 ## Pull requests
 

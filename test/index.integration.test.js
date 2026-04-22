@@ -6,6 +6,7 @@ import path from "node:path"
 import crypto from "node:crypto"
 import { setTimeout as delay } from "node:timers/promises"
 import { startConnector } from "../src/index.js"
+import { makeBoundaryError } from "../src/boundary-errors.js"
 import { defaultState } from "../src/state/store.js"
 
 function makeLogger() {
@@ -1817,7 +1818,17 @@ test("startConnector retries reject-note input after a transient permission repl
       ],
       replyPermissionImpl: async () => {
         replyAttempts += 1
-        if (replyAttempts === 1) throw new Error("temporary permission failure")
+        if (replyAttempts === 1) {
+          throw makeBoundaryError({
+            source: "opencode",
+            operation: "POST /permission/perm_retry/reply",
+            method: "POST",
+            pathname: "/permission/perm_retry/reply",
+            kind: "network",
+            outcome: "retryable",
+            message: "temporary permission failure",
+          })
+        }
         return { ok: true }
       },
     },
@@ -1911,6 +1922,94 @@ test("startConnector restores pending question custom-answer flows after restart
     assert.deepEqual(harness.ocCalls.replyQuestion, [
       { questionId: "q_restore", answers: [["lint"], ["because restarts happen"]] },
     ])
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.pendingPrompts.questionWizards, {})
+    assert.deepEqual(state.pendingPrompts.customAnswers, {})
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector keeps retryable custom-answer recovery usable without another restart", async () => {
+  const request = {
+    id: "q_retry_live",
+    sessionID: "ses_1",
+    questions: [
+      {
+        header: "Checks",
+        question: "Which checks should run?",
+        multiple: true,
+        options: [{ label: "lint" }, { label: "test" }],
+      },
+      {
+        header: "Reason",
+        question: "Why do you want this?",
+        custom: true,
+        options: [],
+      },
+    ],
+  }
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 371,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+      pendingPrompts: {
+        permissions: {},
+        rejectNotes: {},
+        customAnswers: {
+          "100:7": { projectAlias: "demo", requestId: "q_retry_live", qIndex: 1 },
+        },
+        questionWizards: {
+          "demo:q_retry_live": {
+            projectAlias: "demo",
+            id: "q_retry_live",
+            sessionID: "ses_1",
+            request,
+            index: 1,
+            answers: [["lint"], []],
+            selectedByIndex: { 0: ["lint"] },
+            createdAt: Date.now(),
+            ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+          },
+        },
+      },
+    },
+    ocOptions: {
+      listQuestionsImpl: async () => {
+        throw makeBoundaryError({
+          source: "opencode",
+          operation: "GET /question",
+          method: "GET",
+          pathname: "/question",
+          kind: "network",
+          outcome: "retryable",
+          message: "temporary question poll failure",
+        })
+      },
+      replyQuestionImpl: async () => ({ ok: true }),
+    },
+  })
+
+  try {
+    await delay(30)
+    assert.equal(harness.tg.sentHtmlBlocks.length, 0)
+    assert.equal(harness.tg.sentMessages.length, 0)
+
+    await harness.emitSse("demo", { type: "question.asked", properties: request })
+    harness.tg.enqueue(makeMessageUpdate(372, "because the backend recovered"))
+    await waitFor(() => harness.ocCalls.replyQuestion.length === 1)
+    await harness.connector.stop()
+
+    assert.deepEqual(harness.ocCalls.replyQuestion, [
+      { questionId: "q_retry_live", answers: [["lint"], ["because the backend recovered"]] },
+    ])
+    assert.ok(harness.tg.sentMessages.some((entry) => entry.text === "Answered: q_retry_live"))
 
     const state = await readState(harness.stateFile)
     assert.deepEqual(state.pendingPrompts.questionWizards, {})
@@ -2073,7 +2172,15 @@ test("startConnector restores final question submission after a restart during r
     ocOptions: {
       listQuestionsImpl: async () => [request],
       replyQuestionImpl: async () => {
-        throw new Error("temporary question failure")
+        throw makeBoundaryError({
+          source: "opencode",
+          operation: "POST /question/q_restart/reply",
+          method: "POST",
+          pathname: "/question/q_restart/reply",
+          kind: "network",
+          outcome: "retryable",
+          message: "temporary question failure",
+        })
       },
     },
     initialUpdates: [[firstAnswer]],
@@ -2297,10 +2404,26 @@ test("startConnector sends one reconnected notice after project recovery", async
     },
     ocOptions: {
       listPermissionsImpl: async () => {
-        throw new Error("temporary permission poll failure")
+        throw makeBoundaryError({
+          source: "opencode",
+          operation: "GET /permission",
+          method: "GET",
+          pathname: "/permission",
+          kind: "network",
+          outcome: "retryable",
+          message: "temporary permission poll failure",
+        })
       },
       listQuestionsImpl: async () => {
-        throw new Error("temporary question poll failure")
+        throw makeBoundaryError({
+          source: "opencode",
+          operation: "GET /question",
+          method: "GET",
+          pathname: "/question",
+          kind: "network",
+          outcome: "retryable",
+          message: "temporary question poll failure",
+        })
       },
     },
   })
@@ -2544,7 +2667,15 @@ test("startConnector transient callback failures do not block later updates", as
     },
     ocOptions: {
       replyPermissionImpl: async () => {
-        throw new Error("temporary permission failure")
+        throw makeBoundaryError({
+          source: "opencode",
+          operation: "POST /permission/perm_retry/reply",
+          method: "POST",
+          pathname: "/permission/perm_retry/reply",
+          kind: "network",
+          outcome: "retryable",
+          message: "temporary permission failure",
+        })
       },
     },
     initialUpdates: [[makeCallbackUpdate(675, "p|demo|perm_retry|once"), makeMessageUpdate(676, "hello after callback failure")]],
@@ -2556,8 +2687,8 @@ test("startConnector transient callback failures do not block later updates", as
 
     assert.deepEqual(harness.ocCalls.replyPermission, [{ permissionId: "perm_retry", payload: { reply: "once" } }])
     assert.deepEqual(harness.ocCalls.promptAsync, [{ sessionId: "ses_1", text: "[TG] hello after callback failure" }])
-    assert.ok(harness.tg.callbackAnswers.some((entry) => entry.callbackQueryId === "cb_675" && entry.text === "Action failed"))
-    assert.ok(harness.tg.sentMessages.some((entry) => entry.text === "Action failed. Please try again."))
+    assert.ok(harness.tg.callbackAnswers.some((entry) => entry.callbackQueryId === "cb_675" && entry.text === "Temporarily unavailable"))
+    assert.ok(harness.tg.sentMessages.some((entry) => entry.text === "Action is temporarily unavailable. Please try again."))
 
     const state = await readState(harness.stateFile)
     assert.equal(state.updateOffset, 677)
@@ -2709,6 +2840,102 @@ test("startConnector drops stale persisted prompts before replaying restart reco
     assert.deepEqual(state.pendingPrompts.rejectNotes, {})
     assert.deepEqual(state.pendingPrompts.questionWizards, {})
     assert.deepEqual(state.pendingPrompts.customAnswers, {})
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector keeps pending prompts when restart recovery hits retryable backend errors", async () => {
+  const request = {
+    id: "q_retry_restore",
+    sessionID: "ses_1",
+    questions: [
+      {
+        header: "Reason",
+        question: "Why do you want this?",
+        custom: true,
+        options: [],
+      },
+    ],
+  }
+  const pendingPrompts = {
+    permissions: {
+      "demo:perm_retry": {
+        projectAlias: "demo",
+        permissionId: "perm_retry",
+        sessionID: "ses_1",
+        permission: "shell",
+        patterns: ["npm test"],
+        ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+        createdAt: Date.now(),
+      },
+    },
+    rejectNotes: {
+      "100:7": { projectAlias: "demo", permissionId: "perm_retry" },
+    },
+    customAnswers: {
+      "100:7": { projectAlias: "demo", requestId: "q_retry_restore", qIndex: 0 },
+    },
+    questionWizards: {
+      "demo:q_retry_restore": {
+        projectAlias: "demo",
+        id: "q_retry_restore",
+        sessionID: "ses_1",
+        request,
+        index: 0,
+        answers: [[]],
+        selectedByIndex: {},
+        createdAt: Date.now(),
+        ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+      },
+    },
+  }
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 692,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+      pendingPrompts,
+    },
+    ocOptions: {
+      listPermissionsImpl: async () => {
+        throw makeBoundaryError({
+          source: "opencode",
+          operation: "GET /permission",
+          method: "GET",
+          pathname: "/permission",
+          kind: "network",
+          outcome: "retryable",
+          message: "temporary permission poll failure",
+        })
+      },
+      listQuestionsImpl: async () => {
+        throw makeBoundaryError({
+          source: "opencode",
+          operation: "GET /question",
+          method: "GET",
+          pathname: "/question",
+          kind: "network",
+          outcome: "retryable",
+          message: "temporary question poll failure",
+        })
+      },
+    },
+  })
+
+  try {
+    await delay(40)
+    await harness.connector.stop()
+
+    assert.equal(harness.tg.sentHtmlBlocks.length, 0)
+    assert.equal(harness.tg.sentMessages.length, 0)
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.pendingPrompts, pendingPrompts)
   } finally {
     await harness.connector.stop()
   }

@@ -1,5 +1,6 @@
 import { makeInlineKeyboard } from "../telegram/client.js"
 import { sanitizeBaseUrlForDisplay } from "../url-utils.js"
+import { isRetryableBoundaryError, normalizeBoundaryError } from "../boundary-errors.js"
 
 export function buildProjectsOverviewText({
   projects,
@@ -57,20 +58,13 @@ export function createOverviewHelpers({ projects, store, startInProgress, parseC
     return p.startMode === "serve"
   }
 
-  function isLikelyConnectError(err) {
-    const msg = (err?.message || String(err || "")).toLowerCase()
-    return (
-      msg.includes("econnrefused") ||
-      msg.includes("fetch failed") ||
-      msg.includes("socket") ||
-      msg.includes("network") ||
-      msg.includes("timed out")
-    )
+  function isRetryableProjectError(err) {
+    return isRetryableBoundaryError(err, { source: "opencode" })
   }
 
   function formatProjectUnavailable(projectAlias, err) {
     const baseUrl = sanitizeBaseUrlForDisplay(projects?.[projectAlias]?.baseUrl)
-    const msg = err?.message || String(err)
+    const msg = normalizeBoundaryError(err, { source: "opencode" }).message
     return `Project '${projectAlias}' is unavailable. Start opencode at ${baseUrl}.\n\n${msg}`
   }
 
@@ -153,7 +147,7 @@ export function createOverviewHelpers({ projects, store, startInProgress, parseC
         hiddenBindingsLabel: input.hiddenBindingsLabel,
       }),
     canAutoStartProject,
-    isLikelyConnectError,
+    isRetryableProjectError,
     formatProjectUnavailable,
     startServerKeyboard,
     notifyProjectUnavailable,

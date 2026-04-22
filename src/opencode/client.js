@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer"
+import { boundaryErrorFromException, boundaryErrorFromHttpResponse } from "../boundary-errors.js"
 
 function basicAuthHeader(username, password) {
   const token = Buffer.from(`${username}:${password}`, "utf8").toString("base64")
@@ -8,8 +9,12 @@ function basicAuthHeader(username, password) {
 function makeTimeoutSignal(timeoutMs = 30_000) {
   if (!timeoutMs) return { signal: undefined, cancel: () => {} }
   const ctrl = new AbortController()
-  const t = setTimeout(() => ctrl.abort(), timeoutMs)
-  return { signal: ctrl.signal, cancel: () => clearTimeout(t) }
+  let didTimeout = false
+  const t = setTimeout(() => {
+    didTimeout = true
+    ctrl.abort()
+  }, timeoutMs)
+  return { signal: ctrl.signal, cancel: () => clearTimeout(t), didTimeout: () => didTimeout }
 }
 
 export class OpenCodeClient {
@@ -54,15 +59,40 @@ export class OpenCodeClient {
       }
     }
     const t = makeTimeoutSignal(timeoutMs)
-    const res = await fetch(url, {
-      method,
-      headers: this.headers(json ? { "content-type": "application/json" } : undefined),
-      signal: signal || t.signal,
-      body: json ? JSON.stringify(json) : undefined,
-    }).finally(t.cancel)
+    let res
+    try {
+      res = await fetch(url, {
+        method,
+        headers: this.headers(json ? { "content-type": "application/json" } : undefined),
+        signal: signal || t.signal,
+        body: json ? JSON.stringify(json) : undefined,
+      })
+    } catch (err) {
+      throw boundaryErrorFromException(err, {
+        source: "opencode",
+        operation: `${method} ${url.pathname}`,
+        method,
+        pathname: url.pathname,
+        didTimeout: t.didTimeout?.() === true,
+      })
+    } finally {
+      t.cancel()
+    }
+
     if (res.status === 204) return null
     const text = await res.text()
-    if (!res.ok) throw new Error(`${method} ${url.pathname} failed: ${res.status} ${text || res.statusText}`)
+    if (!res.ok) {
+      throw boundaryErrorFromHttpResponse({
+        source: "opencode",
+        operation: `${method} ${url.pathname}`,
+        method,
+        pathname: url.pathname,
+        status: res.status,
+        statusText: res.statusText,
+        bodyText: text,
+        message: `${method} ${url.pathname} failed: ${res.status} ${text || res.statusText}`,
+      })
+    }
     if (!text) return null
     try {
       return JSON.parse(text)

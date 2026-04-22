@@ -1,6 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { createCallbackHandlers } from "../src/connector/callbacks.js"
+import { makeBoundaryError } from "../src/boundary-errors.js"
 
 function makeCallback(data, overrides = {}) {
   const threadIdOr0 = overrides.threadIdOr0 ?? 7
@@ -171,7 +172,6 @@ function makeRuntime(overrides = {}) {
     sendCurrentQuestionStep: async (wizard, options) => {
       sendQuestionStepCalls.push({ wizard: cloneWizardState(wizard), options })
     },
-    isMissingPromptError: runtimeOverrides.isMissingPromptError || (() => false),
     formatProjectUnavailable: (alias, err) => `Project '${alias}' is unavailable: ${err?.message || String(err)}`,
     logger: { error: (...args) => loggerErrors.push(args.map((arg) => String(arg)).join(" ")) },
     questionWizards,
@@ -435,12 +435,20 @@ test("createCallbackHandlers resolves permission callbacks including stale and r
     ocByAlias: {
       demo: {
         async replyPermission(permissionId) {
-          if (permissionId === "perm_stale") throw new Error("missing")
+          if (permissionId === "perm_stale") {
+            throw makeBoundaryError({
+              source: "opencode",
+              operation: `POST /permission/${permissionId}/reply`,
+              method: "POST",
+              pathname: `/permission/${permissionId}/reply`,
+              status: 404,
+              message: "missing",
+            })
+          }
           return { ok: true }
         },
       },
     },
-    isMissingPromptError: (err) => String(err?.message) === "missing",
   })
   const handlers = createCallbackHandlers(runtime)
 
@@ -470,7 +478,15 @@ test("createCallbackHandlers degrades transient permission callback failures wit
     ocByAlias: {
       demo: {
         async replyPermission() {
-          throw new Error("temporary failure")
+          throw makeBoundaryError({
+            source: "opencode",
+            operation: "POST /permission/perm_retry/reply",
+            method: "POST",
+            pathname: "/permission/perm_retry/reply",
+            kind: "network",
+            outcome: "retryable",
+            message: "temporary failure",
+          })
         },
       },
     },
@@ -479,9 +495,9 @@ test("createCallbackHandlers degrades transient permission callback failures wit
 
   await handlers.handleTelegramCallback(makeCallback("p|demo|perm_retry|always"))
 
-  assert.equal(callbackAnswers.at(-1)?.text, "Action failed")
-  assert.equal(sentMessages.at(-1)?.text, "Action failed. Please try again.")
-  assert.ok(loggerErrors.some((entry) => /Callback handler error: temporary failure/.test(entry)))
+  assert.equal(callbackAnswers.at(-1)?.text, "Temporarily unavailable")
+  assert.equal(sentMessages.at(-1)?.text, "Action is temporarily unavailable. Please try again.")
+  assert.equal(loggerErrors.length, 0)
 })
 
 test("createCallbackHandlers rejects stale and successful question callbacks", async () => {
@@ -492,12 +508,20 @@ test("createCallbackHandlers rejects stale and successful question callbacks", a
     ocByAlias: {
       demo: {
         async rejectQuestion(questionId) {
-          if (questionId === "q_stale") throw new Error("missing")
+          if (questionId === "q_stale") {
+            throw makeBoundaryError({
+              source: "opencode",
+              operation: `POST /question/${questionId}/reject`,
+              method: "POST",
+              pathname: `/question/${questionId}/reject`,
+              status: 404,
+              message: "missing",
+            })
+          }
           return { ok: true }
         },
       },
     },
-    isMissingPromptError: (err) => String(err?.message) === "missing",
   })
   const handlers = createCallbackHandlers(runtime)
 
@@ -514,6 +538,25 @@ test("createCallbackHandlers rejects stale and successful question callbacks", a
     { ctxKey: "100:7", value: null },
   ])
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["No longer active", "Rejected"])
+})
+
+test("createCallbackHandlers clears persisted question state even without an in-memory wizard", async () => {
+  const { runtime, callbackAnswers, clearedQuestionIds } = makeRuntime({
+    getWizard: () => null,
+    ocByAlias: {
+      demo: {
+        async rejectQuestion() {
+          return { ok: true }
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("q|demo|q_missing_mem|reject"))
+
+  assert.deepEqual(clearedQuestionIds, [{ projectAlias: "demo", questionId: "q_missing_mem" }])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Rejected"])
 })
 
 test("createCallbackHandlers starts and cancels custom-answer question flows", async () => {
