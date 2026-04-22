@@ -162,6 +162,43 @@ test("ensureStartupSession waits for start before retrying after early null resu
 
   assert.equal(later, "sess-ready")
   assert.equal(startupSessionByProject.demo, "sess-ready")
-  assert.equal(listCalls, 2)
-  assert.equal(createCalls, 1)
+  assert.equal(listCalls, 1)
+  assert.equal(createCalls, 0)
+})
+
+test("ensureStartupSession does not wait for auto-start when waitForStart is false", async () => {
+  const startInProgress = new Map([["demo", new Promise(() => {})]])
+  const startupSessionByProject = {}
+  const startupSessionInProgress = new Map()
+  let listCalls = 0
+  let createCalls = 0
+  const ocByAlias = {
+    demo: {
+      async listSessions() {
+        listCalls += 1
+        return [{ id: "sess-latest" }]
+      },
+      async createSession() {
+        createCalls += 1
+        return { id: "sess-created" }
+      },
+    },
+  }
+
+  const result = await Promise.race([
+    ensureStartupSession({
+      alias: "demo",
+      startInProgress,
+      startupSessionByProject,
+      startupSessionInProgress,
+      ocByAlias,
+      logger: makeLogger(),
+      waitForStart: false,
+    }),
+    delay(50).then(() => "timeout"),
+  ])
+
+  assert.equal(result, null)
+  assert.equal(listCalls, 0)
+  assert.equal(createCalls, 0)
 })

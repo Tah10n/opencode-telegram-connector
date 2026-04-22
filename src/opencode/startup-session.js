@@ -8,6 +8,10 @@ export async function ensureStartupSession({
   waitForStart = true,
   forceRefresh = false,
 }) {
+  if (!waitForStart && startInProgress.has(alias)) {
+    return startupSessionByProject[alias] || null
+  }
+
   if (waitForStart && startInProgress.has(alias)) {
     await startInProgress.get(alias).catch(() => {})
   }

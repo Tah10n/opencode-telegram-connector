@@ -259,6 +259,8 @@ async function createHarness({
   openAttachWindowWindowsImpl,
   platform,
   delayImpl = shortDelay,
+  wizardTtlMs,
+  wizardGcIntervalMs,
 } = {}) {
   const dir = await makeTempDir()
   const stateFile = path.join(dir, "state.json")
@@ -323,6 +325,8 @@ async function createHarness({
       ...(ensureStartupSessionImpl ? { ensureStartupSession: ensureStartupSessionImpl } : {}),
       ...(openAttachWindowWindowsImpl ? { openAttachWindowWindows: openAttachWindowWindowsImpl } : {}),
       ...(platform ? { platform } : {}),
+      ...(wizardTtlMs != null ? { wizardTtlMs } : {}),
+      ...(wizardGcIntervalMs != null ? { wizardGcIntervalMs } : {}),
       delay: delayImpl,
     },
   })
@@ -559,6 +563,54 @@ test("startConnector falls back to a .txt attachment for very long assistant out
     assert.equal(harness.tg.sentDocuments[0].options.message_thread_id, 7)
     assert.match(harness.tg.sentDocuments[0].filename, /demo-ses_1-msg_long\.txt/)
     assert.match(String(harness.tg.sentDocuments[0].contents), /line 0: x{20}/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector retries fetching final assistant content after a transient getMessage failure", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  let finalFetchAttempts = 0
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 206,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    ocOptions: {
+      getMessageImpl: async (sessionId, messageId) => {
+        if (messageId !== "msg_retry") return null
+        finalFetchAttempts += 1
+        if (finalFetchAttempts === 1) throw new Error("temporary final fetch failure")
+        return {
+          info: { id: "msg_retry", role: "assistant", time: { created: completedAt, completed: completedAt } },
+          parts: [{ type: "text", text: "Hello after retry" }],
+        }
+      },
+    },
+  })
+
+  try {
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: {
+        sessionID: "ses_1",
+        info: { id: "msg_retry", role: "assistant", time: { completed: completedAt } },
+      },
+    })
+
+    await waitFor(() => harness.tg.sentHtmlBlocks.length >= 1)
+
+    assert.equal(finalFetchAttempts, 2)
+    assert.equal(harness.tg.sentHtmlBlocks[0].blocks[0].html, "Hello after retry")
+    assert.equal(
+      harness.tg.sentMessages.some((entry) => /final content could not be fetched yet/i.test(entry.text)),
+      false,
+    )
   } finally {
     await harness.connector.stop()
   }
@@ -1142,6 +1194,39 @@ test("startConnector /feed shows the current mode and updates it via callbacks",
     assert.deepEqual(state.feedByContext, {
       "100:11": { mode: "verbose" },
     })
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector /projects hides binding scopes in group chats", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 296,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_current" },
+        "100:11": { projectAlias: "demo", sessionId: "ses_topic" },
+      },
+      sessionIndex: {
+        "demo:ses_current": { chatId: 100, threadIdOr0: 7 },
+        "demo:ses_topic": { chatId: 100, threadIdOr0: 11 },
+      },
+    },
+    ensureStartupSessionImpl: async ({ alias, startupSessionByProject }) => {
+      startupSessionByProject[alias] = "ses_startup"
+      return "ses_startup"
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(297, "/projects", { threadIdOr0: 7 }))
+
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+
+    const text = harness.tg.sentMessages.at(-1)?.text || ""
+    assert.match(text, /^Projects:/)
+    assert.match(text, /Bindings: hidden outside private chat/)
+    assert.doesNotMatch(text, /chat 100\/main|chat 100\/topic 11/)
   } finally {
     await harness.connector.stop()
   }
@@ -1736,6 +1821,112 @@ test("startConnector restores pending question custom-answer flows after restart
 
     const state = await readState(harness.stateFile)
     assert.deepEqual(state.pendingPrompts.questionWizards, {})
+    assert.deepEqual(state.pendingPrompts.customAnswers, {})
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector drops orphaned custom-answer recovery state on restart", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 370,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+      pendingPrompts: {
+        permissions: {},
+        rejectNotes: {},
+        customAnswers: {
+          "100:7": { projectAlias: "demo", requestId: "q_missing", qIndex: 0 },
+        },
+        questionWizards: {},
+      },
+    },
+  })
+
+  try {
+    await delay(30)
+    harness.tg.enqueue(makeMessageUpdate(371, "normal prompt after restart"))
+    await waitFor(() => harness.ocCalls.promptAsync.length === 1)
+    await harness.connector.stop()
+
+    assert.deepEqual(harness.ocCalls.promptAsync, [{ sessionId: "ses_1", text: "[TG] normal prompt after restart" }])
+    assert.equal(
+      harness.tg.sentMessages.some((entry) => entry.text === "Question is no longer active."),
+      false,
+    )
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.pendingPrompts.customAnswers, {})
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector expires stale custom-answer wizards and allows the pending question to be delivered again", async () => {
+  const request = {
+    id: "q_expire",
+    sessionID: "ses_1",
+    questions: [
+      {
+        header: "Reason",
+        question: "Why do you want this?",
+        custom: true,
+        options: [],
+      },
+    ],
+  }
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 371,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+      pendingPrompts: {
+        permissions: {},
+        rejectNotes: {},
+        customAnswers: {
+          "100:7": { projectAlias: "demo", requestId: "q_expire", qIndex: 0 },
+        },
+        questionWizards: {
+          "demo:q_expire": {
+            projectAlias: "demo",
+            id: "q_expire",
+            sessionID: "ses_1",
+            request,
+            index: 0,
+            answers: [[]],
+            selectedByIndex: {},
+            createdAt: Date.now() - 10_000,
+            ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+          },
+        },
+      },
+    },
+    ocOptions: {
+      listQuestionsImpl: async () => [request],
+    },
+    wizardTtlMs: 1,
+    wizardGcIntervalMs: 2,
+  })
+
+  try {
+    await waitFor(() => harness.tg.sentHtmlBlocks.length >= 2 && harness.tg.sentMessages.length >= 3)
+    await harness.connector.stop()
+
+    assert.match(harness.tg.sentHtmlBlocks[0].blocks[0].html, /Question request resumed/)
+    assert.match(harness.tg.sentMessages[1].text, /Resumed\. Send your answer for: Reason/)
+    assert.match(harness.tg.sentHtmlBlocks[1].blocks[0].html, /Question request/)
+    assert.doesNotMatch(harness.tg.sentHtmlBlocks[1].blocks[0].html, /resumed/i)
+
+    const state = await readState(harness.stateFile)
     assert.deepEqual(state.pendingPrompts.customAnswers, {})
   } finally {
     await harness.connector.stop()
