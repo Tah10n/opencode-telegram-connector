@@ -3,6 +3,18 @@ import { parseSessionReference, findSessionByShareUrl } from "../session-ref.js"
 import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "../session-list.js"
 import { sanitizeBaseUrlForDisplay } from "../url-utils.js"
 import { sessionKey } from "../state/store.js"
+import {
+  collectModelCandidates,
+  commonVariantsForModel,
+  configuredModelInfo,
+  formatModelLabel,
+  modelKeyOf,
+  modelSourceLabel,
+  normalizeModelPreference,
+  normalizeModelReference,
+  normalizeVariant,
+  pickMostRecentSessionModelInfo,
+} from "../model-selection.js"
 
 function helpText() {
   return [
@@ -11,6 +23,10 @@ function helpText() {
     "/new [title]",
     "/use <sessionId|shareLink>",
     "/sessions",
+    "/model",
+    "/model default",
+    "/model reset",
+    "/model <provider/model> [variant]",
     "/feed",
     "/status",
     "/bindings (private chat only)",
@@ -106,20 +122,6 @@ export function createCommandHandlers(runtime) {
     return 0
   }
 
-  function sessionModelLabelFromMessage(message) {
-    const info = message?.info || message || {}
-    const provider = String(info?.providerID || info?.providerId || info?.model?.providerID || info?.model?.providerId || "").trim()
-    const model = String(info?.modelID || info?.modelId || info?.model?.modelID || info?.model?.modelId || "").trim()
-    const variant = String(info?.variant || info?.model?.variant || "").trim()
-    let base = ""
-    if (provider && model) {
-      base = model.toLowerCase().startsWith(`${provider.toLowerCase()}/`) ? model : `${provider}/${model}`
-    } else {
-      base = model || provider || ""
-    }
-    return variant && base ? `${base} ${variant}` : base
-  }
-
   function sessionModelTimestamp(message) {
     const time = message?.info?.time || message?.time || {}
     return (
@@ -127,66 +129,287 @@ export function createCommandHandlers(runtime) {
     )
   }
 
-  async function resolveSessionModelLabel(projectAlias, sessionId) {
+  function getModelPreference(ctxKey) {
+    return normalizeModelPreference(store.getModelPreference?.(ctxKey))
+  }
+
+  function setModelPreference(ctxKey, value) {
+    store.setModelPreference?.(ctxKey, value)
+  }
+
+  async function resolveSessionModelInfo(projectAlias, sessionId) {
     const oc = ocByAlias[projectAlias]
     if (!oc?.listMessages || !sessionId) return null
     const messages = await oc.listMessages(sessionId).catch(() => null)
-    if (!Array.isArray(messages) || messages.length === 0) return null
-
-    let best = null
-    for (const message of messages) {
-      const label = sessionModelLabelFromMessage(message)
-      if (!label) continue
-      const timestamp = sessionModelTimestamp(message)
-      if (!best || (timestamp != null && (best.timestamp == null || timestamp > best.timestamp))) {
-        best = { label, timestamp }
-      }
-    }
-    return best?.label || null
+    return pickMostRecentSessionModelInfo(messages)
   }
 
-  async function buildSessionSwitchText(projectAlias, sessionId) {
-    const modelLabel = await resolveSessionModelLabel(projectAlias, sessionId)
-    return modelLabel ? `Switched to session: ${sessionId}\nModel: ${modelLabel}` : `Switched to session: ${sessionId}`
-  }
-
-  function configuredModelLabel(value, variant) {
-    const rawVariant = String(variant || "").trim()
-    let base = ""
-    if (typeof value === "string") {
-      base = value.trim()
-    } else if (value && typeof value === "object") {
-      const provider = String(value.providerID || value.providerId || value.provider || "").trim()
-      const model = String(value.modelID || value.modelId || value.model || "").trim()
-      if (provider && model) base = model.toLowerCase().startsWith(`${provider.toLowerCase()}/`) ? model : `${provider}/${model}`
-      else base = model || provider || ""
-    }
-    if (!base) return ""
-    return rawVariant ? `${base} ${rawVariant}` : base
-  }
-
-  async function resolveConfiguredSessionModelLabel(projectAlias) {
+  async function resolveConfiguredModelInfo(projectAlias) {
     const oc = ocByAlias[projectAlias]
     const directory = projects?.[projectAlias]?.directory
     if (!oc?.getConfig) return null
     const configInfo = await oc.getConfig({ directory }).catch(() => null)
-    if (!configInfo || typeof configInfo !== "object") return null
-
-    const defaultAgentName = String(configInfo.default_agent || configInfo.defaultAgent || "").trim()
-    const agentMap = configInfo.agent && typeof configInfo.agent === "object" ? configInfo.agent : configInfo.agents
-    const agentConfig =
-      defaultAgentName && agentMap && typeof agentMap === "object" && agentMap[defaultAgentName] && typeof agentMap[defaultAgentName] === "object"
-        ? agentMap[defaultAgentName]
-        : null
-
-    const effectiveModel = agentConfig?.model ?? configInfo.model
-    const effectiveVariant = agentConfig?.variant ?? configInfo.variant
-    return configuredModelLabel(effectiveModel, effectiveVariant) || null
+    return configuredModelInfo(configInfo)
   }
 
-  async function buildNewSessionText(projectAlias, sessionId) {
-    const modelLabel = await resolveConfiguredSessionModelLabel(projectAlias)
-    return modelLabel ? `Created and switched to session: ${sessionId}\nModel: ${modelLabel}` : `Created and switched to session: ${sessionId}`
+  async function resolveEffectiveModelState(ctxKey, binding, { sessionModelInfo, configuredInfo } = {}) {
+    if (!binding?.projectAlias) return { label: "", source: "unknown", model: null, variant: "", preference: { mode: "inherit" } }
+
+    const preference = getModelPreference(ctxKey)
+    if (preference.mode === "custom") {
+      return {
+        ...preference,
+        label: formatModelLabel(preference.model, preference.variant),
+        source: "thread-custom",
+        preference,
+      }
+    }
+
+    if (preference.mode === "project-default") {
+      const resolvedConfiguredInfo = configuredInfo ?? (await resolveConfiguredModelInfo(binding.projectAlias))
+      if (resolvedConfiguredInfo?.label) {
+        return { ...resolvedConfiguredInfo, source: "thread-project-default", preference }
+      }
+    }
+
+    const resolvedSessionInfo = sessionModelInfo ?? (await resolveSessionModelInfo(binding.projectAlias, binding.sessionId))
+    if (resolvedSessionInfo?.label) {
+      return { ...resolvedSessionInfo, source: "session-history", preference }
+    }
+
+    const resolvedConfiguredInfo = configuredInfo ?? (await resolveConfiguredModelInfo(binding.projectAlias))
+    if (resolvedConfiguredInfo?.label) {
+      return { ...resolvedConfiguredInfo, source: "project-default", preference }
+    }
+
+    return { label: "", source: "unknown", model: null, variant: "", preference }
+  }
+
+  async function resolvePromptOverride(ctxKey, binding) {
+    const effectiveState = await resolveEffectiveModelState(ctxKey, binding)
+    if (!effectiveState?.model || (effectiveState.source !== "thread-custom" && effectiveState.source !== "thread-project-default")) {
+      return null
+    }
+    return {
+      model: effectiveState.model,
+      ...(effectiveState.variant ? { variant: effectiveState.variant } : {}),
+    }
+  }
+
+  function appendEffectiveModelLines(lines, effectiveState) {
+    if (!effectiveState?.label) return lines
+    lines.push(`Model: ${effectiveState.label}`)
+    if (effectiveState.source && effectiveState.source !== "unknown") {
+      lines.push(`Source: ${modelSourceLabel(effectiveState.source)}`)
+    }
+    return lines
+  }
+
+  async function buildSessionSwitchText(projectAlias, sessionId, { ctxKey } = {}) {
+    const lines = [`Switched to session: ${sessionId}`]
+    const effectiveState = await resolveEffectiveModelState(ctxKey, { projectAlias, sessionId })
+    return appendEffectiveModelLines(lines, effectiveState).join("\n")
+  }
+
+  async function buildNewSessionText(projectAlias, sessionId, { ctxKey } = {}) {
+    const lines = [`Created and switched to session: ${sessionId}`]
+    const effectiveState = await resolveEffectiveModelState(ctxKey, { projectAlias, sessionId })
+    return appendEffectiveModelLines(lines, effectiveState).join("\n")
+  }
+
+  function modelModeLabel(preference, effectiveState) {
+    if (preference?.mode === "project-default") {
+      return effectiveState?.source === "thread-project-default" ? "Project default override" : "Project default override (unavailable)"
+    }
+    if (preference?.mode === "custom") return "Custom override"
+    return "Inherit"
+  }
+
+  function chunkEntries(items, size) {
+    const chunks = []
+    for (let index = 0; index < items.length; index += size) chunks.push(items.slice(index, index + size))
+    return chunks
+  }
+
+  function buildModelSettingsText({ binding, preference, effectiveState, configuredInfo, sessionModelInfo, selectedModelKey }) {
+    const lines = [
+      "Model for this thread:",
+      `Project: ${binding.projectAlias}`,
+      `Session: ${binding.sessionId}`,
+      `Mode: ${modelModeLabel(preference, effectiveState)}`,
+      `Active: ${effectiveState?.label || "unknown"}`,
+    ]
+
+    if (effectiveState?.source && effectiveState.source !== "unknown") {
+      lines.push(`Source: ${modelSourceLabel(effectiveState.source)}`)
+    }
+
+    lines.push(`Project default: ${configuredInfo?.label || "unknown"}`)
+    if (sessionModelInfo?.label) lines.push(`Last session model: ${sessionModelInfo.label}`)
+
+    lines.push("")
+    if (selectedModelKey) {
+      lines.push(`Pick a variant for: ${selectedModelKey}`)
+      lines.push("Use 'No variant' to keep only provider/model.")
+    } else {
+      lines.push("Pick a mode or choose a common model below.")
+    }
+    lines.push("Typed forms: /model default, /model reset, /model <provider/model> [variant]")
+
+    return lines.join("\n")
+  }
+
+  async function setThreadModelPreference(ctxMeta, binding, nextPreference) {
+    const preference = normalizeModelPreference(nextPreference)
+
+    if (preference.mode === "project-default") {
+      const configuredInfo = await resolveConfiguredModelInfo(binding.projectAlias)
+      if (!configuredInfo?.model) {
+        return {
+          ok: false,
+          callbackText: "No project default",
+          message: "Project default model is not configured for this project.",
+        }
+      }
+      setModelPreference(ctxMeta.ctxKey, preference)
+      return { ok: true, callbackText: "Model: project default" }
+    }
+
+    if (preference.mode === "custom") {
+      setModelPreference(ctxMeta.ctxKey, preference)
+      return {
+        ok: true,
+        callbackText: preference.variant ? `Model: ${formatModelLabel(preference.model, preference.variant)}` : `Model: ${formatModelLabel(preference.model)}`,
+      }
+    }
+
+    setModelPreference(ctxMeta.ctxKey, null)
+    return { ok: true, callbackText: "Model: inherit" }
+  }
+
+  function modelSettingsKeyboard({ preference, configuredInfo, sessionModelInfo, selectedModelKey }) {
+    const rows = [
+      [
+        { text: `${preference.mode === "inherit" ? "✓ " : ""}Inherit`, callback_data: runtime.cb.pack("m|set|inherit") },
+        {
+          text: `${preference.mode === "project-default" ? "✓ " : ""}Project default`,
+          callback_data: runtime.cb.pack("m|set|project-default"),
+        },
+      ],
+    ]
+
+    const currentCustomModelKey = preference.mode === "custom" ? modelKeyOf(preference.model) : ""
+    const candidates = collectModelCandidates(preference.mode === "custom" ? preference.model : null, sessionModelInfo?.model, configuredInfo?.model)
+    for (const candidate of candidates) {
+      const candidateKey = modelKeyOf(candidate.model)
+      const prefix = selectedModelKey === candidateKey ? "▶ " : currentCustomModelKey === candidateKey ? "✓ " : ""
+      rows.push([{ text: `${prefix}${candidate.label}`, callback_data: runtime.cb.pack(`m|pick|${candidateKey}`) }])
+    }
+
+    if (selectedModelKey) {
+      const selectedModel = normalizeModelReference(selectedModelKey)
+      const currentVariant = preference.mode === "custom" && currentCustomModelKey === selectedModelKey ? normalizeVariant(preference.variant) : ""
+      rows.push([
+        {
+          text: `${preference.mode === "custom" && currentCustomModelKey === selectedModelKey && !currentVariant ? "✓ " : ""}No variant`,
+          callback_data: runtime.cb.pack(`m|apply|${selectedModelKey}|~`),
+        },
+      ])
+      for (const chunk of chunkEntries(commonVariantsForModel(selectedModel), 3)) {
+        rows.push(
+          chunk.map((variant) => ({
+            text: `${currentVariant === variant ? "✓ " : ""}${variant}`,
+            callback_data: runtime.cb.pack(`m|apply|${selectedModelKey}|${variant}`),
+          })),
+        )
+      }
+      rows.push([{ text: "Back", callback_data: runtime.cb.pack("m|back") }])
+    }
+
+    rows.push([{ text: "Close", callback_data: runtime.cb.pack("m|close") }])
+    return makeInlineKeyboard(rows)
+  }
+
+  async function renderModelSettings(ctxMeta, { binding, editMessageId, selectedModelKey } = {}) {
+    const currentBinding = binding || store.getBinding(ctxMeta.ctxKey)
+    if (!currentBinding) {
+      await sendToThread(ctxMeta, "Not bound. Use /bind <projectAlias> first.")
+      return
+    }
+
+    const preference = getModelPreference(ctxMeta.ctxKey)
+    const [configuredInfo, sessionModelInfo] = await Promise.all([
+      resolveConfiguredModelInfo(currentBinding.projectAlias),
+      resolveSessionModelInfo(currentBinding.projectAlias, currentBinding.sessionId),
+    ])
+    const effectiveState = await resolveEffectiveModelState(ctxMeta.ctxKey, currentBinding, { configuredInfo, sessionModelInfo })
+    const normalizedSelectedModelKey = selectedModelKey && modelKeyOf(selectedModelKey) ? modelKeyOf(selectedModelKey) : ""
+    const text = buildModelSettingsText({
+      binding: currentBinding,
+      preference,
+      effectiveState,
+      configuredInfo,
+      sessionModelInfo,
+      selectedModelKey: normalizedSelectedModelKey,
+    })
+    const replyMarkup = modelSettingsKeyboard({
+      preference,
+      configuredInfo,
+      sessionModelInfo,
+      selectedModelKey: normalizedSelectedModelKey,
+    })
+
+    if (editMessageId) {
+      await runtime.tg.editMessageText(ctxMeta.chatId, editMessageId, text, replyMarkup)
+      return
+    }
+    await sendToThread(ctxMeta, text, replyMarkup)
+  }
+
+  async function handleModelCommand(ctxMeta, argv) {
+    const binding = store.getBinding(ctxMeta.ctxKey)
+    if (!binding) {
+      await sendToThread(ctxMeta, "Not bound. Use /bind <projectAlias> first.")
+      return
+    }
+
+    const modelArg = String(argv?.[0] || "").trim()
+    const variantArg = normalizeVariant(argv?.[1])
+    if (!modelArg) {
+      await renderModelSettings(ctxMeta, { binding })
+      return
+    }
+
+    const normalized = modelArg.toLowerCase()
+    if (normalized === "reset" || normalized === "inherit") {
+      await setThreadModelPreference(ctxMeta, binding, null)
+      await renderModelSettings(ctxMeta, { binding })
+      return
+    }
+
+    if (normalized === "default" || normalized === "project-default" || normalized === "project_default") {
+      const result = await setThreadModelPreference(ctxMeta, binding, { mode: "project-default" })
+      if (!result.ok) {
+        await sendToThread(ctxMeta, result.message)
+        return
+      }
+      await renderModelSettings(ctxMeta, { binding })
+      return
+    }
+
+    const model = normalizeModelReference(modelArg)
+    const reservedVariant = ["reset", "inherit", "default", "project-default", "project_default"].includes(String(variantArg || "").toLowerCase())
+    if (reservedVariant) {
+      await sendToThread(ctxMeta, "Usage: /model\n/model default\n/model reset\n/model <provider/model> [variant]")
+      return
+    }
+    if (!model) {
+      await sendToThread(ctxMeta, "Usage: /model\n/model default\n/model reset\n/model <provider/model> [variant]")
+      return
+    }
+
+    await setThreadModelPreference(ctxMeta, binding, { mode: "custom", model, variant: variantArg })
+    await renderModelSettings(ctxMeta, { binding })
   }
 
   async function resolveLatestAssistantReply(projectAlias, sessionId) {
@@ -239,11 +462,17 @@ export function createCommandHandlers(runtime) {
   async function renderSessionsList(ctxMeta, { binding, editMessageId } = {}) {
     const oc = ocByAlias[binding.projectAlias]
     const sessions = await oc.listSessions({ directory: projects?.[binding.projectAlias]?.directory, limit: 10 })
-    const currentSessionModelLabel = await resolveSessionModelLabel(binding.projectAlias, binding.sessionId)
+    const [configuredInfo, sessionModelInfo] = await Promise.all([
+      resolveConfiguredModelInfo(binding.projectAlias),
+      resolveSessionModelInfo(binding.projectAlias, binding.sessionId),
+    ])
+    const effectiveState = await resolveEffectiveModelState(ctxMeta.ctxKey, binding, { configuredInfo, sessionModelInfo })
     runtime.markProjectUp(binding.projectAlias)
     const text = formatSessionsListText(binding.projectAlias, sessions, {
       currentSessionId: binding.sessionId,
-      currentSessionModelLabel,
+      currentSessionModelLabel: effectiveState?.label,
+      currentSessionModelSourceLabel:
+        effectiveState?.source && effectiveState.source !== "unknown" ? modelSourceLabel(effectiveState.source) : "",
       startupSessionId: startupSessionByProject[binding.projectAlias],
     })
     const replyMarkup = sessionsKeyboard(binding.projectAlias, sessions, {
@@ -299,7 +528,7 @@ export function createCommandHandlers(runtime) {
       const created = await oc.createSession({ title: title || undefined })
       if (created?.id) logger.info(`[${binding.projectAlias}] /new created session:`, created.id)
       await bindCtxToSession(ctxMeta, binding.projectAlias, created.id)
-      await sendToThread(ctxMeta, await buildNewSessionText(binding.projectAlias, created.id))
+      await sendToThread(ctxMeta, await buildNewSessionText(binding.projectAlias, created.id, { ctxKey: ctxMeta.ctxKey }))
 
       const p = projects[binding.projectAlias]
       if (p?.openAttachOnNew === true) {
@@ -391,7 +620,7 @@ export function createCommandHandlers(runtime) {
 
       await oc.getSession(targetSessionId)
       await bindCtxToSession(ctxMeta, binding.projectAlias, targetSessionId)
-      await sendToThread(ctxMeta, await buildSessionSwitchText(binding.projectAlias, targetSessionId))
+      await sendToThread(ctxMeta, await buildSessionSwitchText(binding.projectAlias, targetSessionId, { ctxKey: ctxMeta.ctxKey }))
     } catch (err) {
       await sendToThread(ctxMeta, formatProjectUnavailable(binding.projectAlias, err)).catch(() => {})
     }
@@ -439,16 +668,20 @@ export function createCommandHandlers(runtime) {
     const sseStatus = getProjectSseStatus(binding.projectAlias)
     const baseUrl = sanitizeBaseUrlForDisplay(projects?.[binding.projectAlias]?.baseUrl) || "unknown"
     const feedMode = feedModeLabel(getFeedMode(ctxMeta.ctxKey))
+    const effectiveState = await resolveEffectiveModelState(ctxMeta.ctxKey, binding)
     await sendToThread(
       ctxMeta,
-      [
-        `Project: ${binding.projectAlias}`,
-        `Session: ${binding.sessionId}`,
-        `Startup session: ${startupSessionId}`,
-        `Feed: ${feedMode}`,
-        `SSE: ${sseStatus}`,
-        `Base URL: ${baseUrl}`,
-      ].join("\n"),
+      appendEffectiveModelLines(
+        [
+          `Project: ${binding.projectAlias}`,
+          `Session: ${binding.sessionId}`,
+          `Startup session: ${startupSessionId}`,
+          `Feed: ${feedMode}`,
+          `SSE: ${sseStatus}`,
+          `Base URL: ${baseUrl}`,
+        ],
+        effectiveState,
+      ).join("\n"),
     )
   }
 
@@ -642,6 +875,7 @@ export function createCommandHandlers(runtime) {
       if (cmd === "/new") return handleNewCommand(ctxMeta, args)
       if (cmd === "/use") return handleUseCommand(ctxMeta, argv[0])
       if (cmd === "/sessions") return handleSessions(ctxMeta)
+      if (cmd === "/model") return handleModelCommand(ctxMeta, argv)
       if (cmd === "/feed") return handleFeed(ctxMeta)
       if (cmd === "/status") return handleWhere(ctxMeta)
       if (cmd === "/bindings") return handleBindings(ctxMeta)
@@ -667,7 +901,8 @@ export function createCommandHandlers(runtime) {
       const promptText = `${prefix}${text}`
       const sk = sessionKey(binding.projectAlias, binding.sessionId)
       ensureRecentPromptSet(sk).add(hashTextForEcho(promptText))
-      await oc.promptAsync(binding.sessionId, promptText)
+      const promptOverride = await resolvePromptOverride(ctxMeta.ctxKey, binding)
+      await oc.promptAsync(binding.sessionId, promptText, promptOverride || undefined)
     } catch (err) {
       const alias = binding.projectAlias
       const withButton = isLikelyConnectError(err) && canAutoStartProject(alias, { platform })
@@ -677,10 +912,12 @@ export function createCommandHandlers(runtime) {
 
   return {
     renderSessionsList,
+    renderModelSettings,
     handleBindCommand,
     handleNewCommand,
     handleUseCommand,
     handleSessions,
+    handleModelCommand,
     handleAbort,
     handleWhere,
     handleFeed,
@@ -690,5 +927,6 @@ export function createCommandHandlers(runtime) {
     handleUnbind,
     handleTelegramMessage,
     buildSessionSwitchText,
+    setThreadModelPreference,
   }
 }

@@ -10,12 +10,17 @@ test("formatSessionsListText shows current and startup markers", () => {
       { id: "ses_startup", title: "Startup session" },
       { id: "ses_other" },
     ],
-    { currentSessionId: "ses_current", currentSessionModelLabel: "openai/gpt-5 xhigh", startupSessionId: "ses_startup" },
+    {
+      currentSessionId: "ses_current",
+      currentSessionModelLabel: "openai/gpt-5 xhigh",
+      currentSessionModelSourceLabel: "Thread custom override",
+      startupSessionId: "ses_startup",
+    },
   )
 
   assert.match(text, /Sessions for 'pocket':/)
   assert.match(text, /Current: ses_current/)
-  assert.match(text, /Current model: openai\/gpt-5 xhigh/)
+  assert.match(text, /Current model: openai\/gpt-5 xhigh \(Thread custom override\)/)
   assert.match(text, /Startup: ses_startup/)
   assert.match(text, /Tap a button below to switch:/)
   assert.match(text, /- ses_current \[current\] — Current session/)

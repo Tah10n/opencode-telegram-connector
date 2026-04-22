@@ -84,6 +84,7 @@ function createFakeTelegramClient({ emptyPollDelayMs = 10, sendMessageImpl, send
   const sentDocuments = []
   const callbackAnswers = []
   const editedMessages = []
+  const deletedMessages = []
   const getUpdatesCalls = []
 
   return {
@@ -92,6 +93,7 @@ function createFakeTelegramClient({ emptyPollDelayMs = 10, sendMessageImpl, send
     sentDocuments,
     callbackAnswers,
     editedMessages,
+    deletedMessages,
     getUpdatesCalls,
     enqueue(update) {
       updates.push(update)
@@ -151,6 +153,10 @@ function createFakeTelegramClient({ emptyPollDelayMs = 10, sendMessageImpl, send
       editedMessages.push({ kind: "replyMarkup", chatId, messageId, replyMarkup })
       return true
     },
+    async deleteMessage(chatId, messageId) {
+      deletedMessages.push({ chatId, messageId })
+      return true
+    },
     async answerCallbackQuery(callbackQueryId, text) {
       callbackAnswers.push({ callbackQueryId, text })
       return true
@@ -163,6 +169,7 @@ function createFakeOpenCodeClient({
   messagesById = {},
   healthImpl,
   getConfigImpl,
+  getConfigProvidersImpl,
   listSessionsImpl,
   getSessionImpl,
   createSessionImpl,
@@ -179,6 +186,7 @@ function createFakeOpenCodeClient({
   const calls = {
     health: 0,
     getConfig: [],
+    getConfigProviders: 0,
     listSessions: [],
     getSession: [],
     createSession: [],
@@ -203,6 +211,10 @@ function createFakeOpenCodeClient({
       calls.getConfig.push(input)
       return getConfigImpl ? getConfigImpl(input) : { model: "openai/gpt-5" }
     },
+    async getConfigProviders() {
+      calls.getConfigProviders += 1
+      return getConfigProvidersImpl ? getConfigProvidersImpl() : { providers: [], default: {} }
+    },
     async listSessions(input = {}) {
       calls.listSessions.push(input)
       return listSessionsImpl ? listSessionsImpl(input) : startupSessions
@@ -219,9 +231,9 @@ function createFakeOpenCodeClient({
       calls.abortSession.push(sessionId)
       return abortSessionImpl ? abortSessionImpl(sessionId) : true
     },
-    async promptAsync(sessionId, text) {
-      calls.promptAsync.push({ sessionId, text })
-      return promptAsyncImpl ? promptAsyncImpl(sessionId, text) : { ok: true }
+    async promptAsync(sessionId, text, options = undefined) {
+      calls.promptAsync.push(options === undefined ? { sessionId, text } : { sessionId, text, options })
+      return promptAsyncImpl ? promptAsyncImpl(sessionId, text, options) : { ok: true }
     },
     async getMessage(sessionId, messageId) {
       calls.getMessage.push({ sessionId, messageId })
@@ -2901,6 +2913,113 @@ test("startConnector skips attach window auto-open after /new on non-Windows pla
     await harness.connector.stop()
 
     assert.deepEqual(attachCalls, [])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector keeps a custom /model override isolated per thread and across restart", async () => {
+  let secondHarness = null
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 900,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+        "100:9": { projectAlias: "demo", sessionId: "ses_2" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+        "demo:ses_2": { chatId: 100, threadIdOr0: 9 },
+      },
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(901, "/model openai/gpt-5 xhigh"))
+    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("Model for this thread:") && entry.text.includes("Active: openai/gpt-5 xhigh")))
+
+    harness.tg.enqueue(makeMessageUpdate(902, "hello thread 7"))
+    harness.tg.enqueue(makeMessageUpdate(903, "hello thread 9", { threadIdOr0: 9 }))
+    await waitFor(() => harness.ocCalls.promptAsync.length >= 2)
+    await harness.connector.stop()
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.modelPrefsByContext, {
+      "100:7": {
+        mode: "custom",
+        model: { providerID: "openai", modelID: "gpt-5" },
+        variant: "xhigh",
+      },
+    })
+    assert.deepEqual(harness.ocCalls.promptAsync, [
+      {
+        sessionId: "ses_1",
+        text: "[TG] hello thread 7",
+        options: { model: { providerID: "openai", modelID: "gpt-5" }, variant: "xhigh" },
+      },
+      {
+        sessionId: "ses_2",
+        text: "[TG] hello thread 9",
+      },
+    ])
+
+    secondHarness = await createHarness({ statePatch: state })
+    secondHarness.tg.enqueue(makeMessageUpdate(904, "after restart"))
+    await waitFor(() => secondHarness.ocCalls.promptAsync.length >= 1)
+
+    assert.deepEqual(secondHarness.ocCalls.promptAsync[0], {
+      sessionId: "ses_1",
+      text: "[TG] after restart",
+      options: { model: { providerID: "openai", modelID: "gpt-5" }, variant: "xhigh" },
+    })
+  } finally {
+    await harness.connector.stop()
+    await secondHarness?.connector.stop()
+  }
+})
+
+test("startConnector keeps the thread model override after /new", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 950,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    ocOptions: {
+      createSessionImpl: async (input) => ({ id: `ses_new:${input.title}` }),
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(951, "/model openai/gpt-5 xhigh"))
+    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("Active: openai/gpt-5 xhigh")))
+
+    harness.tg.enqueue(makeMessageUpdate(952, "/new Demo model"))
+    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("Created and switched to session: ses_new:Demo model")))
+
+    harness.tg.enqueue(makeMessageUpdate(953, "prompt after new"))
+    await waitFor(() => harness.ocCalls.promptAsync.some((entry) => entry.sessionId === "ses_new:Demo model"))
+
+    assert.ok(
+      harness.tg.sentMessages.some(
+        (entry) =>
+          entry.text.includes("Created and switched to session: ses_new:Demo model") &&
+          entry.text.includes("Model: openai/gpt-5 xhigh") &&
+          entry.text.includes("Source: Thread custom override"),
+      ),
+    )
+    assert.deepEqual(
+      harness.ocCalls.promptAsync.find((entry) => entry.sessionId === "ses_new:Demo model"),
+      {
+        sessionId: "ses_new:Demo model",
+        text: "[TG] prompt after new",
+        options: { model: { providerID: "openai", modelID: "gpt-5" }, variant: "xhigh" },
+      },
+    )
   } finally {
     await harness.connector.stop()
   }

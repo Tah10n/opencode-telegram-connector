@@ -198,6 +198,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       { command: "new", description: "Создать новую сессию" },
       { command: "use", description: "Переключиться на сессию" },
       { command: "sessions", description: "Недавние сессии проекта" },
+      { command: "model", description: "Настроить модель для текущего треда" },
       { command: "feed", description: "Настроить Telegram feed для треда" },
       { command: "status", description: "Показать текущую привязку" },
       { command: "bindings", description: "Показать все активные привязки в личке" },

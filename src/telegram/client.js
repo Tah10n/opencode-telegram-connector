@@ -167,6 +167,10 @@ export class TelegramClient {
     )
   }
 
+  deleteMessage(chatId, messageId) {
+    return this.call("deleteMessage", { chat_id: chatId, message_id: messageId }, { timeoutMs: 20_000 })
+  }
+
   answerCallbackQuery(callbackQueryId, text) {
     return this.call(
       "answerCallbackQuery",

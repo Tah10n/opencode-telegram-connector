@@ -1,7 +1,8 @@
 import path from "node:path"
 import { readJsonFile, writeJsonFileAtomic } from "./fileStore.js"
+import { normalizeModelPreference, storedModelPreference } from "../model-selection.js"
 
-export const STATE_SCHEMA_VERSION = 3
+export const STATE_SCHEMA_VERSION = 4
 export const DEFAULT_FEED_MODE = "main+changes"
 
 export function normalizeFeedMode(value) {
@@ -10,6 +11,10 @@ export function normalizeFeedMode(value) {
 }
 
 function defaultFeedByContext() {
+  return {}
+}
+
+function defaultModelPrefsByContext() {
   return {}
 }
 
@@ -29,6 +34,7 @@ export function defaultState() {
     bindings: {},
     sessionIndex: {},
     feedByContext: defaultFeedByContext(),
+    modelPrefsByContext: defaultModelPrefsByContext(),
     pendingPrompts: defaultPendingPrompts(),
   }
 }
@@ -68,10 +74,32 @@ export class StateStore {
     return normalizeFeedMode(this.state.feedByContext?.[ctxKey]?.mode)
   }
 
+  getModelPreference(ctxKey) {
+    return normalizeModelPreference(this.state.modelPrefsByContext?.[ctxKey])
+  }
+
   setFeedMode(ctxKey, mode) {
     if (!ctxKey) return
     this.state.feedByContext[ctxKey] = { mode: normalizeFeedMode(mode) }
     this.scheduleSave()
+  }
+
+  setModelPreference(ctxKey, value) {
+    if (!ctxKey) return
+    const stored = storedModelPreference(value)
+    if (!stored) {
+      this.clearModelPreference(ctxKey)
+      return
+    }
+    this.state.modelPrefsByContext[ctxKey] = stored
+    this.scheduleSave()
+  }
+
+  clearModelPreference(ctxKey) {
+    if (!ctxKey) return false
+    const existed = delete this.state.modelPrefsByContext[ctxKey]
+    if (existed) this.scheduleSave()
+    return existed
   }
 
   scheduleSave(delayMs = 250) {
@@ -202,6 +230,9 @@ export class StateStore {
     const prev = this.state.bindings[ctxKey]
     if (prev) {
       delete this.state.sessionIndex[sessionKey(prev.projectAlias, prev.sessionId)]
+      if (prev.projectAlias !== binding.projectAlias) {
+        delete this.state.modelPrefsByContext[ctxKey]
+      }
     }
 
     // If session is already bound elsewhere, move it.
@@ -210,6 +241,7 @@ export class StateStore {
     if (existingCtx) {
       const otherKey = `${existingCtx.chatId}:${existingCtx.threadIdOr0}`
       delete this.state.bindings[otherKey]
+      delete this.state.modelPrefsByContext[otherKey]
     }
 
     this.state.bindings[ctxKey] = {
@@ -228,6 +260,7 @@ export class StateStore {
     if (!prev) return false
     delete this.state.bindings[ctxKey]
     delete this.state.sessionIndex[sessionKey(prev.projectAlias, prev.sessionId)]
+    delete this.state.modelPrefsByContext[ctxKey]
     this.scheduleSave()
     return true
   }
@@ -246,6 +279,19 @@ function migrateStateIfNeeded(loaded) {
       bindings: loaded.bindings && typeof loaded.bindings === "object" ? loaded.bindings : {},
       sessionIndex: loaded.sessionIndex && typeof loaded.sessionIndex === "object" ? loaded.sessionIndex : {},
       feedByContext: normalizeFeedByContext(loaded.feedByContext),
+      modelPrefsByContext: normalizeModelPrefsByContext(loaded.modelPrefsByContext),
+      pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
+    }
+  }
+
+  if (loaded && typeof loaded === "object" && loaded.schemaVersion === 3) {
+    return {
+      schemaVersion: STATE_SCHEMA_VERSION,
+      updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
+      bindings: loaded.bindings && typeof loaded.bindings === "object" ? loaded.bindings : {},
+      sessionIndex: loaded.sessionIndex && typeof loaded.sessionIndex === "object" ? loaded.sessionIndex : {},
+      feedByContext: normalizeFeedByContext(loaded.feedByContext),
+      modelPrefsByContext: defaultModelPrefsByContext(),
       pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
     }
   }
@@ -257,6 +303,7 @@ function migrateStateIfNeeded(loaded) {
       bindings: loaded.bindings && typeof loaded.bindings === "object" ? loaded.bindings : {},
       sessionIndex: loaded.sessionIndex && typeof loaded.sessionIndex === "object" ? loaded.sessionIndex : {},
       feedByContext: defaultFeedByContext(),
+      modelPrefsByContext: defaultModelPrefsByContext(),
       pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
     }
   }
@@ -268,6 +315,7 @@ function migrateStateIfNeeded(loaded) {
       bindings: loaded.bindings && typeof loaded.bindings === "object" ? loaded.bindings : {},
       sessionIndex: loaded.sessionIndex && typeof loaded.sessionIndex === "object" ? loaded.sessionIndex : {},
       feedByContext: defaultFeedByContext(),
+      modelPrefsByContext: defaultModelPrefsByContext(),
       pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
     }
   }
@@ -281,6 +329,7 @@ function migrateStateIfNeeded(loaded) {
       bindings: {},
       sessionIndex: {},
       feedByContext: defaultFeedByContext(),
+      modelPrefsByContext: defaultModelPrefsByContext(),
       pendingPrompts: defaultPendingPrompts(),
     }
   }
@@ -305,5 +354,15 @@ function normalizeFeedByContext(value) {
     Object.entries(value)
       .filter(([ctxKey]) => typeof ctxKey === "string" && ctxKey)
       .map(([ctxKey, settings]) => [ctxKey, { mode: normalizeFeedMode(settings?.mode) }]),
+  )
+}
+
+function normalizeModelPrefsByContext(value) {
+  if (!value || typeof value !== "object") return defaultModelPrefsByContext()
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([ctxKey]) => typeof ctxKey === "string" && ctxKey)
+      .map(([ctxKey, pref]) => [ctxKey, storedModelPreference(pref)])
+      .filter(([, pref]) => !!pref),
   )
 }

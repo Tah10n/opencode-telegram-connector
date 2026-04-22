@@ -56,11 +56,12 @@ npm start
 
 - `/help`
 - `/bind <projectAlias>` (bind current thread to that project's startup session)
-- `/new [title]` (create a new session in this thread's project, bind to it, and show the configured model + variant when available)
+- `/new [title]` (create a new session in this thread's project, bind to it, and show the thread's active model + source when available)
 - `/use <sessionId|shareLink>` (bind to an existing session in this thread's project; accepts `https://opncd.ai/share/<id>` and `https://opncd.ai/s/<id>`; cross-project share links are rejected with guidance)
-- `/sessions` (list recent sessions for this thread's current project, including the current model + variant when available, and switch via buttons)
+- `/sessions` (list recent sessions for this thread's current project, including the current thread model + source when available, and switch via buttons)
+- `/model [provider/model] [variant]` (show or change the current thread's model preference; `/model default` pins the thread to the project's configured default, `/model reset` returns to inherited behavior)
 - `/feed` (configure which updates are mirrored into this thread: Main, Main + changes, Verbose)
-- `/status` (show current binding, feed mode, startup session, SSE status, and base URL)
+- `/status` (show current binding, active model + source, feed mode, startup session, SSE status, and base URL)
 - `/bindings` (list all active chat/topic bindings; private chat only)
 - `/abort` (abort the current thread's running session)
 - `/sendlast` (re-send the latest assistant reply from the currently bound session)
@@ -74,6 +75,7 @@ npm start
 - State is stored in `./.data/state.json` by default (override with `STATE_FILE`).
 - Each bound Telegram thread/topic stays isolated: switching sessions, streaming previews, changed-file cards, and prompt recovery in one thread do not affect other threads.
 - Feed mode is stored per Telegram thread/topic and survives rebinds and restarts.
+- Model preference is also stored per Telegram thread/topic and survives `/use`, `/new`, and connector restarts.
 - `Main` shows only final assistant replies.
 - `Main + changes` shows final assistant replies plus first-class `Changed files` cards.
 - `Verbose` also includes streaming previews and non-echo user mirroring.
@@ -83,9 +85,14 @@ npm start
 - `Changed files` cards support `Show diff` / `Back` and update the same Telegram message in place; if the diff is unavailable or too large, the bot falls back gracefully and may attach a `.txt` file.
 - Pending permission/question flows are restored after restart so you can continue approving or answering from Telegram; stale prompts/questions are dropped instead of being replayed forever when the backend no longer exposes them.
 - `/use <shareLink>` accepts both current OpenCode share links (`https://opncd.ai/share/<id>`) and older short links (`https://opncd.ai/s/<id>`).
-- When switching to an existing session, the connector also shows the most recent known model + variant for that session when OpenCode history exposes it.
+- When switching to an existing session, the connector shows the effective model for the current thread; in inherit mode it falls back to the most recent known session model when OpenCode history exposes it.
+- `/model` prefers inline buttons for common choices: inherit, project default, and common variants for the current/default model. Use `/model <provider/model> [variant]` as a typed fallback for anything else.
+- `Inherit` means the connector sends no explicit model override, so OpenCode keeps using the session's last model when available and otherwise falls back to the project default.
+- `Project default` means the connector resolves the project's configured default model/variant and sends that as a per-thread override on each prompt from that Telegram thread.
+- `Custom` means the connector sends the selected provider/model/variant on each prompt from that Telegram thread only; other threads and projects keep their own selections.
+- `/new` keeps the current thread's model preference when it creates and binds a new session, so the next prompt in that thread continues with the same override behavior.
 - `/sendlast` fetches the latest assistant reply for the currently bound session from OpenCode, so it still works after session switches or connector restarts.
-- `/new` reports the configured default model + variant for the new session when OpenCode config exposes them.
+- `/new` reports the effective model for the current thread: custom override, project default override, or inherited/default behavior.
 - If `/use <shareLink>` points to a session from a different configured project, the bot refuses the bind and tells you to bind the correct project alias first.
 - When a project becomes unavailable, bound threads receive an unavailable notice and, for `autoStart:true` projects, a **Start** button; once the project is healthy again they receive a single back-online notice.
 - Mirrored messages are sent with `parse_mode=HTML`. Triple-backtick fences (```code```) are rendered as Telegram `<pre><code>` blocks.

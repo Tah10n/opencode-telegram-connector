@@ -79,6 +79,10 @@ export class OpenCodeClient {
     return this.request(`/config`, { query: { directory } })
   }
 
+  getConfigProviders() {
+    return this.request(`/config/providers`)
+  }
+
   listSessions({ directory, limit } = {}) {
     return this.request("/session", { query: { directory, limit } })
   }
@@ -95,10 +99,19 @@ export class OpenCodeClient {
     return this.request(`/session/${sessionId}/abort`, { method: "POST" })
   }
 
-  promptAsync(sessionId, text) {
+  promptAsync(sessionId, text, options = {}) {
+    const payload = {
+      parts: [{ type: "text", text }],
+    }
+    if (options.model) payload.model = options.model
+    if (options.variant) payload.variant = options.variant
+    if (options.agent) payload.agent = options.agent
+    if (options.noReply === true) payload.noReply = true
+    if (options.system) payload.system = options.system
+    if (options.tools) payload.tools = options.tools
     return this.request(`/session/${sessionId}/prompt_async`, {
       method: "POST",
-      json: { parts: [{ type: "text", text }] },
+      json: payload,
     })
   }
 

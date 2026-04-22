@@ -1,4 +1,5 @@
 import { normalizeFeedMode } from "../state/store.js"
+import { normalizeModelReference } from "../model-selection.js"
 
 export function createCallbackHandlers(runtime) {
   const {
@@ -13,6 +14,7 @@ export function createCallbackHandlers(runtime) {
     sendToThread,
     ensureProjectStarted,
     renderFeedSettings,
+    renderModelSettings,
     renderChangedFilesView,
     renderSessionsList,
     feedModeLabel,
@@ -27,6 +29,7 @@ export function createCallbackHandlers(runtime) {
     persistQuestionWizard,
     finishQuestionWizard,
     buildSessionSwitchText = async (projectAlias, sessionId) => `Switched to session: ${sessionId}`,
+    setThreadModelPreference,
     isMissingPromptError = () => false,
     formatProjectUnavailable,
   } = runtime
@@ -85,7 +88,7 @@ export function createCallbackHandlers(runtime) {
           editMessageId: msg?.message_id,
         }).catch(async (err) => {
           runtime.logger?.error?.("Failed to refresh sessions list:", err?.message || String(err))
-          await sendToThread(ctxMeta, await buildSessionSwitchText(projectAlias, targetSessionId)).catch(() => {})
+          await sendToThread(ctxMeta, await buildSessionSwitchText(projectAlias, targetSessionId, { ctxKey: ctxMeta.ctxKey })).catch(() => {})
         })
         return
       }
@@ -116,6 +119,84 @@ export function createCallbackHandlers(runtime) {
         store.setFeedMode(ctxMeta.ctxKey, mode)
         await answerCallbackQuery(callbackQuery.id, `Feed: ${feedModeLabel(mode)}`)
         await renderFeedSettings(ctxMeta, { editMessageId: msg?.message_id }).catch(() => {})
+        return
+      }
+
+      if (kind === "m") {
+        const action = parts[1]
+        const binding = store.getBinding(ctxMeta.ctxKey)
+        if (!binding) {
+          await answerCallbackQuery(callbackQuery.id, "Not bound")
+          return
+        }
+
+        if (action === "close") {
+          await answerCallbackQuery(callbackQuery.id, "Closed")
+          if (typeof tg.deleteMessage === "function") {
+            await tg.deleteMessage(ctxMeta.chatId, msg?.message_id).catch(() => {})
+          } else if (typeof tg.editMessageReplyMarkup === "function") {
+            await tg.editMessageReplyMarkup(ctxMeta.chatId, msg?.message_id, null).catch(() => {})
+          }
+          return
+        }
+
+        if (action === "back") {
+          await answerCallbackQuery(callbackQuery.id, "Back")
+          await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(() => {})
+          return
+        }
+
+        if (action === "set") {
+          const nextMode = parts[2]
+          if (nextMode === "inherit") {
+            const result = await setThreadModelPreference(ctxMeta, binding, null)
+            await answerCallbackQuery(callbackQuery.id, result?.callbackText || "Model: inherit")
+          } else if (nextMode === "project-default") {
+            const result = await setThreadModelPreference(ctxMeta, binding, { mode: "project-default" })
+            if (!result?.ok) {
+              await answerCallbackQuery(callbackQuery.id, result?.callbackText || "Unavailable")
+              await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(() => {})
+              return
+            }
+            await answerCallbackQuery(callbackQuery.id, result.callbackText || "Model: project default")
+          } else {
+            await answerCallbackQuery(callbackQuery.id, "Invalid")
+            return
+          }
+          await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(() => {})
+          return
+        }
+
+        if (action === "pick") {
+          const modelKey = parts[2]
+          if (!modelKey) {
+            await answerCallbackQuery(callbackQuery.id, "Invalid")
+            return
+          }
+          await answerCallbackQuery(callbackQuery.id, "Pick variant")
+          await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id, selectedModelKey: modelKey }).catch(() => {})
+          return
+        }
+
+        if (action === "apply") {
+          const modelKey = parts[2]
+          const variantToken = parts[3]
+          if (!modelKey || variantToken == null) {
+            await answerCallbackQuery(callbackQuery.id, "Invalid")
+            return
+          }
+          if (!normalizeModelReference(modelKey)) {
+            await answerCallbackQuery(callbackQuery.id, "Invalid")
+            return
+          }
+          const variant = variantToken === "~" ? "" : variantToken
+          const result = await setThreadModelPreference(ctxMeta, binding, { mode: "custom", model: modelKey, variant })
+          await answerCallbackQuery(callbackQuery.id, result?.callbackText || (variant ? `Model: ${modelKey} ${variant}` : `Model: ${modelKey}`))
+          await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(() => {})
+          return
+        }
+
+        await answerCallbackQuery(callbackQuery.id, "Invalid")
         return
       }
 

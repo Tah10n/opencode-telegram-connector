@@ -49,6 +49,7 @@ function makeWizard({
 }
 
 function makeRuntime(overrides = {}) {
+  const { tg: tgOverrides, cb: cbOverrides, store: storeOverrides, ...runtimeOverrides } = overrides
   const callbackAnswers = []
   const sentMessages = []
   const bindCalls = []
@@ -56,6 +57,7 @@ function makeRuntime(overrides = {}) {
   const startCalls = []
   const feedCalls = []
   const changedFilesCalls = []
+  const modelCalls = []
   const rejectStateCalls = []
   const customStateCalls = []
   const rejectedNotes = []
@@ -72,11 +74,16 @@ function makeRuntime(overrides = {}) {
   const store = {
     getBinding: (ctxKey) => storeState.bindings?.[ctxKey] ?? null,
     setFeedMode: (ctxKey, mode) => feedCalls.push({ type: "set", ctxKey, mode }),
+    setModelPreference: (ctxKey, value) => modelCalls.push({ type: "set", ctxKey, value }),
+    clearModelPreference: (ctxKey) => {
+      modelCalls.push({ type: "clear", ctxKey })
+      return true
+    },
     deletePendingPermission: (projectAlias, permissionId) => {
       deletedPermissions.push({ projectAlias, permissionId })
       return true
     },
-    ...(overrides.store || {}),
+    ...(storeOverrides || {}),
   }
 
   const runtime = {
@@ -85,19 +92,20 @@ function makeRuntime(overrides = {}) {
         callbackAnswers.push({ callbackQueryId, text })
         return true
       },
-      ...(overrides.tg || {}),
+      deleteMessage: async () => true,
+      ...(tgOverrides || {}),
     },
-    cb: { unpack: (value) => value, ...(overrides.cb || {}) },
+    cb: { unpack: (value) => value, ...(cbOverrides || {}) },
     store,
-    projects: overrides.projects || { demo: { baseUrl: "http://127.0.0.1:4312" } },
-    ocByAlias: overrides.ocByAlias || {},
+    projects: runtimeOverrides.projects || { demo: { baseUrl: "http://127.0.0.1:4312" } },
+    ocByAlias: runtimeOverrides.ocByAlias || {},
     ctxMetaFromMessage: (msg) => ({
       chatId: msg?.chat?.id,
       chatType: msg?.chat?.type,
       threadIdOr0: msg?.message_thread_id || 0,
       ctxKey: `${msg?.chat?.id}:${msg?.message_thread_id || 0}`,
     }),
-    isAllowedUser: overrides.isAllowedUser || (() => true),
+    isAllowedUser: runtimeOverrides.isAllowedUser || (() => true),
     bindCtxToSession: async (ctxMeta, projectAlias, sessionId) => {
       bindCalls.push({ ctxMeta, projectAlias, sessionId })
     },
@@ -109,6 +117,19 @@ function makeRuntime(overrides = {}) {
     },
     renderFeedSettings: async (ctxMeta, options) => {
       feedCalls.push({ type: "render", ctxMeta, options })
+    },
+    renderModelSettings: async (ctxMeta, options) => {
+      modelCalls.push({ type: "render", ctxMeta, options })
+    },
+    setThreadModelPreference: async (ctxMeta, binding, value) => {
+      if (!value || value.mode === "inherit") {
+        modelCalls.push({ type: "clear", ctxKey: ctxMeta.ctxKey })
+        return { ok: true, callbackText: "Model: inherit" }
+      }
+      modelCalls.push({ type: "set", ctxKey: ctxMeta.ctxKey, value })
+      if (value.mode === "project-default") return { ok: true, callbackText: "Model: project default" }
+      const modelLabel = typeof value.model === "string" ? value.model : `${value.model.providerID}/${value.model.modelID}`
+      return { ok: true, callbackText: value.variant ? `Model: ${modelLabel} ${value.variant}` : `Model: ${modelLabel}` }
     },
     renderChangedFilesView: async (ctxMeta, projectAlias, sessionId, opencodeMessageId, action, options) => {
       changedFilesCalls.push({ ctxMeta, projectAlias, sessionId, opencodeMessageId, action, options })
@@ -123,7 +144,7 @@ function makeRuntime(overrides = {}) {
     sendRejectNotePrompt: async (ctxMeta, projectAlias, permissionId) => {
       rejectedNotes.push({ ctxMeta, projectAlias, permissionId })
     },
-    getWizard: overrides.getWizard || (() => null),
+    getWizard: runtimeOverrides.getWizard || (() => null),
     clearPersistedQuestionWizard: (projectAlias, questionId) => {
       clearedQuestionIds.push({ projectAlias, questionId })
     },
@@ -150,11 +171,11 @@ function makeRuntime(overrides = {}) {
     sendCurrentQuestionStep: async (wizard, options) => {
       sendQuestionStepCalls.push({ wizard: cloneWizardState(wizard), options })
     },
-    isMissingPromptError: overrides.isMissingPromptError || (() => false),
+    isMissingPromptError: runtimeOverrides.isMissingPromptError || (() => false),
     formatProjectUnavailable: (alias, err) => `Project '${alias}' is unavailable: ${err?.message || String(err)}`,
     logger: { error: (...args) => loggerErrors.push(args.map((arg) => String(arg)).join(" ")) },
     questionWizards,
-    ...overrides,
+    ...runtimeOverrides,
   }
 
   return {
@@ -165,6 +186,7 @@ function makeRuntime(overrides = {}) {
     sessionListCalls,
     startCalls,
     feedCalls,
+    modelCalls,
     changedFilesCalls,
     rejectStateCalls,
     customStateCalls,
@@ -301,6 +323,111 @@ test("createCallbackHandlers answers invalid feed and changed-files callbacks", 
   await handlers.handleTelegramCallback(makeCallback("cf|demo|ses_1|msg_1|noop"))
 
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Invalid", "Invalid"])
+})
+
+test("createCallbackHandlers updates model preference and rerenders settings", async () => {
+  const { runtime, callbackAnswers, modelCalls } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("m|set|project-default"))
+  await handlers.handleTelegramCallback(makeCallback("m|pick|openai/gpt-5"))
+  await handlers.handleTelegramCallback(makeCallback("m|apply|openai/gpt-5|xhigh"))
+  await handlers.handleTelegramCallback(makeCallback("m|back"))
+  await handlers.handleTelegramCallback(makeCallback("m|set|inherit"))
+
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), [
+    "Model: project default",
+    "Pick variant",
+    "Model: openai/gpt-5 xhigh",
+    "Back",
+    "Model: inherit",
+  ])
+  assert.deepEqual(modelCalls, [
+    { type: "set", ctxKey: "100:7", value: { mode: "project-default" } },
+    {
+      type: "render",
+      ctxMeta: { chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" },
+      options: { binding: { projectAlias: "demo", sessionId: "ses_current" }, editMessageId: 900 },
+    },
+    {
+      type: "render",
+      ctxMeta: { chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" },
+      options: { binding: { projectAlias: "demo", sessionId: "ses_current" }, editMessageId: 900, selectedModelKey: "openai/gpt-5" },
+    },
+    { type: "set", ctxKey: "100:7", value: { mode: "custom", model: "openai/gpt-5", variant: "xhigh" } },
+    {
+      type: "render",
+      ctxMeta: { chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" },
+      options: { binding: { projectAlias: "demo", sessionId: "ses_current" }, editMessageId: 900 },
+    },
+    {
+      type: "render",
+      ctxMeta: { chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" },
+      options: { binding: { projectAlias: "demo", sessionId: "ses_current" }, editMessageId: 900 },
+    },
+    { type: "clear", ctxKey: "100:7" },
+    {
+      type: "render",
+      ctxMeta: { chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" },
+      options: { binding: { projectAlias: "demo", sessionId: "ses_current" }, editMessageId: 900 },
+    },
+  ])
+})
+
+test("createCallbackHandlers closes model settings messages", async () => {
+  const deletedMessages = []
+  const { runtime, callbackAnswers } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    tg: {
+      deleteMessage: async (chatId, messageId) => {
+        deletedMessages.push({ chatId, messageId })
+        return true
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("m|close"))
+
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Closed"])
+  assert.deepEqual(deletedMessages, [{ chatId: 100, messageId: 900 }])
+})
+
+test("createCallbackHandlers keeps model settings unchanged when project default is unavailable", async () => {
+  const { runtime, callbackAnswers, modelCalls } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    setThreadModelPreference: async () => ({
+      ok: false,
+      callbackText: "No project default",
+      message: "Project default model is not configured for this project.",
+    }),
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("m|set|project-default"))
+
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["No project default"])
+  assert.deepEqual(modelCalls, [
+    {
+      type: "render",
+      ctxMeta: { chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" },
+      options: { binding: { projectAlias: "demo", sessionId: "ses_current" }, editMessageId: 900 },
+    },
+  ])
+})
+
+test("createCallbackHandlers rejects malformed model apply callbacks without changing state", async () => {
+  const { runtime, callbackAnswers, modelCalls } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("m|apply|not-a-model|xhigh"))
+
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Invalid"])
+  assert.deepEqual(modelCalls, [])
 })
 
 test("createCallbackHandlers resolves permission callbacks including stale and reject-note flows", async () => {

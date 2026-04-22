@@ -10,6 +10,20 @@ function makeRuntime(overrides = {}) {
   const storeState = overrides.storeState || { bindings: {} }
   const store = {
     getBinding: (ctxKey) => storeState.bindings?.[ctxKey] ?? null,
+    getModelPreference: (ctxKey) => storeState.modelPrefsByContext?.[ctxKey] ?? { mode: "inherit" },
+    setModelPreference: (ctxKey, value) => {
+      storeState.modelPrefsByContext ||= {}
+      if (!value || value.mode === "inherit") {
+        delete storeState.modelPrefsByContext[ctxKey]
+        return
+      }
+      storeState.modelPrefsByContext[ctxKey] = value
+    },
+    clearModelPreference: (ctxKey) => {
+      const existed = !!storeState.modelPrefsByContext?.[ctxKey]
+      if (storeState.modelPrefsByContext) delete storeState.modelPrefsByContext[ctxKey]
+      return existed
+    },
     get: () => storeState,
     unbind: () => false,
     ...(overrides.store || {}),
@@ -356,7 +370,7 @@ test("createCommandHandlers handleNewCommand reports configured model and varian
     },
   ])
   assert.equal(sent.length, 1)
-  assert.equal(sent[0].text, "Created and switched to session: ses_new\nModel: openai/gpt-5 xhigh")
+  assert.equal(sent[0].text, "Created and switched to session: ses_new\nModel: openai/gpt-5 xhigh\nSource: Inherited from project default")
 })
 
 test("createCommandHandlers renderSessionsList shows the current model when available", async () => {
@@ -387,5 +401,111 @@ test("createCommandHandlers renderSessionsList shows the current model when avai
 
   assert.equal(sent.length, 1)
   assert.match(sent[0].text, /Current: ses_current/)
-  assert.match(sent[0].text, /Current model: openai\/gpt-5 xhigh/)
+  assert.match(sent[0].text, /Current model: openai\/gpt-5 xhigh \(Inherited from session history\)/)
+})
+
+test("createCommandHandlers handleModelCommand stores a custom per-thread override", async () => {
+  const storeState = {
+    bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } },
+    modelPrefsByContext: {},
+  }
+  const handlers = createCommandHandlers(
+    makeRuntime({
+      storeState,
+      ocByAlias: {
+        demo: {
+          async getConfig() {
+            return { model: "openai/gpt-5" }
+          },
+          async listMessages() {
+            return []
+          },
+        },
+      },
+    }).runtime,
+  )
+
+  await handlers.handleModelCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, ["openai/gpt-5", "xhigh"])
+
+  assert.deepEqual(storeState.modelPrefsByContext, {
+    "100:7": {
+      mode: "custom",
+      model: { providerID: "openai", modelID: "gpt-5" },
+      variant: "xhigh",
+    },
+  })
+})
+
+test("createCommandHandlers handleModelCommand rejects reserved second-token modes", async () => {
+  const storeState = {
+    bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } },
+    modelPrefsByContext: {},
+  }
+  const { runtime, sent } = makeRuntime({ storeState })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleModelCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, ["openai/gpt-5", "reset"])
+
+  assert.deepEqual(storeState.modelPrefsByContext, {})
+  assert.equal(sent[0].text, "Usage: /model\n/model default\n/model reset\n/model <provider/model> [variant]")
+})
+
+test("createCommandHandlers handleModelCommand refuses project default when none is configured", async () => {
+  const storeState = {
+    bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } },
+    modelPrefsByContext: {},
+  }
+  const { runtime, sent } = makeRuntime({
+    storeState,
+    ocByAlias: {
+      demo: {
+        async getConfig() {
+          return {}
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleModelCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, ["default"])
+
+  assert.deepEqual(storeState.modelPrefsByContext, {})
+  assert.equal(sent[0].text, "Project default model is not configured for this project.")
+})
+
+test("createCommandHandlers handleTelegramMessage forwards the custom model override", async () => {
+  const promptCalls = []
+  const { runtime } = makeRuntime({
+    config: { tgPrefix: "[TG] " },
+    storeState: {
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } },
+      modelPrefsByContext: {
+        "100:7": { mode: "custom", model: { providerID: "openai", modelID: "gpt-5" }, variant: "xhigh" },
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async promptAsync(sessionId, text, options) {
+          promptCalls.push({ sessionId, text, options })
+          return { ok: true }
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_thread_id: 7,
+    text: "hello model",
+  })
+
+  assert.deepEqual(promptCalls, [
+    {
+      sessionId: "ses_current",
+      text: "[TG] hello model",
+      options: { model: { providerID: "openai", modelID: "gpt-5" }, variant: "xhigh" },
+    },
+  ])
 })
