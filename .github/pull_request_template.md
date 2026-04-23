@@ -21,4 +21,4 @@
 ## Safety
 
 - [ ] no secrets, private state, or local-only config were added
-- [ ] public/private behavior around auth and sensitive URLs was considered
+- [ ] auth and sensitive URL exposure behavior was considered

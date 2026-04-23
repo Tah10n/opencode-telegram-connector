@@ -43,5 +43,5 @@ npm run test:coverage
 - Keep commit history and PR scope focused.
 - Update docs when behavior or configuration changes.
 - Include tests when changing non-trivial logic.
-- When changing a completed roadmap feature, keep the public docs (`README.md`) and the relevant test coverage in sync.
-- Use `RELEASING.md` as the public-release checklist when preparing a release.
+- When changing a completed roadmap feature, keep the user-facing docs (`README.md`) and the relevant test coverage in sync.
+- Use `RELEASING.md` as the release checklist when preparing a release.

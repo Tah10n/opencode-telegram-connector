@@ -48,6 +48,7 @@ npm install
    - `TELEGRAM_BOT_TOKEN`
    - `TELEGRAM_ALLOWED_USER_ID`
 5. Define your projects in `connector.config.mjs`.
+   Legacy `PROJECTS_FILE` / `PROJECTS_JSON` is still supported if you need the older JSON-based setup.
 6. Start the connector:
 
 ```sh
@@ -69,10 +70,14 @@ Legacy `PROJECTS_FILE` / `PROJECTS_JSON` setup is still supported if you need it
 
 ```js
 export default {
+  cwd: ".",
+
   telegram: {
     botToken: process.env.TELEGRAM_BOT_TOKEN,
     allowedUserId: Number(process.env.TELEGRAM_ALLOWED_USER_ID),
   },
+
+  defaultProject: "pocket",
 
   projects: {
     pocket: {
@@ -96,15 +101,15 @@ export default {
 ### Binding and sessions
 
 - `/start`, `/help` — show help.
-- `/bind <projectAlias>` — bind the current chat/topic to a project's startup session.
-- `/new [title]` — create and bind a new session.
+- `/bind [projectAlias]` — bind the current chat/topic to a project's startup session. Without an argument, the bot asks for the alias interactively.
+- `/new [title]` — create a new session. With `openAttachOnNewMode: "new-window"` it binds immediately; with `same-window` Telegram stays on the current session until the attached TUI reports the switch, or you switch manually with `/use`.
 - `/use <sessionId|shareLink>` — bind an existing session. Supports `https://opncd.ai/share/<id>` and `https://opncd.ai/s/<id>`.
 - `/sessions` — list recent sessions and switch with buttons.
 - `/unbind` — remove the current binding.
 
 ### Thread settings and control
 
-- `/model [provider/model] [variant]` — show or change the model for the current thread.
+- `/model`, `/model default`, `/model reset`, `/model <provider/model> [variant]` — show or change the model for the current thread.
 - `/feed` — choose mirrored updates for the current thread.
 - `/status` — show the current binding, model, feed mode, SSE status, and base URL.
 - `/abort` — abort the active run in the current thread.
@@ -113,7 +118,7 @@ export default {
 
 ### Overview
 
-- `/projects` — show projects, startup sessions, SSE status, and active bindings.
+- `/projects` — show projects, startup sessions, SSE status, and active-binding summary. Binding scopes are hidden outside private chats.
 - `/bindings` — list all active bindings (**private chat only**).
 
 ## Feed modes
@@ -124,15 +129,17 @@ export default {
 
 ## Configuration overview
 
-### Global settings
+### Global settings (`connector.config.mjs` or env)
 
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_ALLOWED_USER_ID`
-- `STATE_FILE` (default: `./.data/state.json`)
-- `TG_PREFIX`
-- `ECHO_FILTER_MODE`
-- `OPENCODE_ALLOW_INSECURE_HTTP=1`
+- `TELEGRAM_BOT_TOKEN` / `telegram.botToken`
+- `TELEGRAM_ALLOWED_USER_ID` / `telegram.allowedUserId`
+- `DEFAULT_PROJECT` / `defaultProject`
+- `STATE_FILE` / `stateFile` (default: `./.data/state.json`)
+- `TG_PREFIX` / `tgPrefix`
+- `ECHO_FILTER_MODE` / `echoFilterMode` (`recent` or `prefix`)
+- `OPENCODE_ALLOW_INSECURE_HTTP=1` / `allowInsecureHttp`
 - `OPENCODE_TERMINAL` (Linux terminal launcher override)
+- `cwd` (`connector.config.mjs` only; base directory for relative paths)
 
 ### Per-project fields
 
@@ -155,6 +162,12 @@ export default {
 - `--projects-file <path>`
 - `--projects-json <json>`
 - `--state-file <path>`
+
+### Advanced debug env
+
+- `DEBUG_SSE_ROUTING=<projectAlias>[:sessionId]` — enable verbose SSE routing logs.
+- `MIRROR_COMPACTION=1` — also mirror compaction messages.
+- `OPENCODE_SERVER_DEBUG=1` — start local `opencode serve` processes with debug logging.
 
 ## Platform notes
 

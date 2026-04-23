@@ -1,11 +1,12 @@
 # Releasing
 
-Use this checklist before a public release.
+Use this checklist before a release.
 
-## Public readiness
+## Release readiness
 
 - Confirm `README.md` still matches the shipped behavior, commands, and configuration.
-- Confirm `.env.example` and `projects.example.json` still match supported setup paths.
+- Confirm `.env.example` and `connector.config.example.mjs` still match supported setup paths.
+- Confirm any documented legacy `PROJECTS_FILE` / `PROJECTS_JSON` fallback is still correct.
 - Confirm `LICENSE`, `SECURITY.md`, `CONTRIBUTING.md`, and `CODE_OF_CONDUCT.md` are present and current.
 - Confirm no secrets or private state are tracked or referenced by mistake (`.env`, `projects.json`, `.data/`).
 - If behavior changed, update `CHANGELOG.md` and any user-facing docs.
