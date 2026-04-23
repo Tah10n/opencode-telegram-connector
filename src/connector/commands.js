@@ -54,6 +54,7 @@ export function createCommandHandlers(runtime) {
     openAttachWindowWindowsFn,
     validateProject,
     bindCtxToSession,
+    primeTuiActiveSessionFollow,
     sendToThread,
     parseCtxKey,
     formatThreadLabel,
@@ -220,6 +221,12 @@ export function createCommandHandlers(runtime) {
 
   async function buildNewSessionText(projectAlias, sessionId, { ctxKey } = {}) {
     const lines = [`Created and switched to session: ${sessionId}`]
+    const effectiveState = await resolveEffectiveModelState(ctxKey, { projectAlias, sessionId })
+    return appendEffectiveModelLines(lines, effectiveState).join("\n")
+  }
+
+  async function buildCreatedSessionText(projectAlias, sessionId, { ctxKey } = {}) {
+    const lines = [`Created session: ${sessionId}`]
     const effectiveState = await resolveEffectiveModelState(ctxKey, { projectAlias, sessionId })
     return appendEffectiveModelLines(lines, effectiveState).join("\n")
   }
@@ -683,13 +690,70 @@ export function createCommandHandlers(runtime) {
     }
     const oc = ocByAlias[binding.projectAlias]
     try {
-      const created = await oc.createSession({ title: title || undefined })
-      if (created?.id) logger.info(`[${binding.projectAlias}] /new created session:`, created.id)
-      await bindCtxToSession(ctxMeta, binding.projectAlias, created.id)
-      await sendToThread(ctxMeta, await buildNewSessionText(binding.projectAlias, created.id, { ctxKey: ctxMeta.ctxKey }))
-
       const p = projects[binding.projectAlias]
       const attachOnNewMode = String(p?.openAttachOnNewMode || "same-window")
+      const created = await oc.createSession({ title: title || undefined })
+      if (created?.id) logger.info(`[${binding.projectAlias}] /new created session:`, created.id)
+
+      let tuiSwitchErr = null
+      const canRequestTuiSwitch = attachOnNewMode === "same-window" && typeof oc?.selectTuiSession === "function"
+      if (canRequestTuiSwitch) {
+        await oc
+          .selectTuiSession(created.id, { timeoutMs: 2500 })
+          .then(() => {
+            logger.info(`[${binding.projectAlias}] requested TUI switch to session:`, created.id)
+          })
+          .catch((err) => {
+            tuiSwitchErr = err
+            logger.info(
+              `[${binding.projectAlias}] failed to request TUI switch (same-window) for session=${created.id}: ${err?.message || String(err)}`,
+            )
+          })
+      }
+
+      let activeSessionSyncUnsupported = false
+      if (attachOnNewMode === "same-window" && !tuiSwitchErr && typeof oc?.getActiveTuiSession === "function") {
+        await oc.getActiveTuiSession({ timeoutMs: 1500 }).catch((err) => {
+          if (err?.isBoundaryError === true && err.status === 404) {
+            activeSessionSyncUnsupported = true
+            logger.info(`[${binding.projectAlias}] /tui/active-session is unavailable; same-window /new will stay in manual mode.`)
+          }
+        })
+      }
+
+      const sameWindowSwitchFailed = attachOnNewMode === "same-window" && (!canRequestTuiSwitch || !!tuiSwitchErr)
+      const canAutoFollowSameWindow =
+        attachOnNewMode === "same-window" && !sameWindowSwitchFailed && typeof oc?.getActiveTuiSession === "function" && !activeSessionSyncUnsupported
+      if (attachOnNewMode === "same-window") {
+        const createdSessionText = await buildCreatedSessionText(binding.projectAlias, created.id, { ctxKey: ctxMeta.ctxKey })
+        if (!canAutoFollowSameWindow) {
+          const sameWindowFallbackNote = sameWindowSwitchFailed
+            ? `Note: Could not switch the existing TUI automatically in same-window mode. Reattach manually if needed, use /use ${created.id}, or change the project to openAttachOnNewMode=new-window.`
+            : `Note: This opencode server does not expose confirmed active TUI session tracking, so Telegram stays on the current session. Use /use ${created.id} after switching in TUI, or change the project to openAttachOnNewMode=new-window.`
+          await sendToThread(
+            ctxMeta,
+            [
+              createdSessionText,
+              `Current thread stays on session: ${binding.sessionId}`,
+              sameWindowFallbackNote,
+            ].join("\n\n"),
+          )
+        } else {
+          primeTuiActiveSessionFollow?.(binding.projectAlias, ctxMeta, binding.sessionId)
+          await sendToThread(
+            ctxMeta,
+            [
+              createdSessionText,
+              `Current thread stays on session: ${binding.sessionId}`,
+              `Requested TUI switch to session: ${created.id}. Telegram will switch after the TUI reports the new active session.`,
+            ].join("\n\n"),
+          )
+        }
+      } else {
+        await bindCtxToSession(ctxMeta, binding.projectAlias, created.id)
+        await sendToThread(ctxMeta, await buildNewSessionText(binding.projectAlias, created.id, { ctxKey: ctxMeta.ctxKey }))
+      }
+
       if (attachOnNewMode === "new-window") {
         const launchSupport = getLaunchSupport({ project: p, platform })
         const openAttach = openAttachWindowFn || openAttachWindowWindowsFn
@@ -701,9 +765,7 @@ export function createCommandHandlers(runtime) {
           logger.info(`[${binding.projectAlias}] openAttachOnNewMode=new-window is configured, but no attach-window launcher is available on platform=${platform}.`)
         }
       } else if (attachOnNewMode === "same-window") {
-        logger.info(
-          `[${binding.projectAlias}] /new created ${created.id}; openAttachOnNewMode=same-window does not spawn another attach window. Reuse the current TUI window manually if needed.`,
-        )
+        logger.info(`[${binding.projectAlias}] /new created ${created.id}; openAttachOnNewMode=same-window (no new window spawned).`)
       }
     } catch (err) {
       await sendToThread(ctxMeta, formatProjectUnavailable(binding.projectAlias, err)).catch(() => {})

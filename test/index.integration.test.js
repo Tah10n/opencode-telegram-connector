@@ -200,6 +200,8 @@ function createFakeOpenCodeClient({
   listSessionsImpl,
   getSessionImpl,
   createSessionImpl,
+  selectTuiSessionImpl,
+  getActiveTuiSessionImpl,
   abortSessionImpl,
   promptAsyncImpl,
   getMessageImpl,
@@ -217,6 +219,8 @@ function createFakeOpenCodeClient({
     listSessions: [],
     getSession: [],
     createSession: [],
+    selectTuiSession: [],
+    getActiveTuiSession: [],
     abortSession: [],
     promptAsync: [],
     getMessage: [],
@@ -253,6 +257,14 @@ function createFakeOpenCodeClient({
     async createSession(input = {}) {
       calls.createSession.push(input)
       return createSessionImpl ? createSessionImpl(input) : { id: "ses_created" }
+    },
+    async selectTuiSession(sessionId, options = {}) {
+      calls.selectTuiSession.push(options === undefined ? { sessionId } : { sessionId, options })
+      return selectTuiSessionImpl ? selectTuiSessionImpl(sessionId, options) : true
+    },
+    async getActiveTuiSession(options = {}) {
+      calls.getActiveTuiSession.push(options)
+      return getActiveTuiSessionImpl ? getActiveTuiSessionImpl(options) : null
     },
     async abortSession(sessionId) {
       calls.abortSession.push(sessionId)
@@ -3412,6 +3424,7 @@ test("startConnector opens an attach window after /new on Linux when openAttachO
 
 test("startConnector does not open another attach window after /new when openAttachOnNewMode is same-window", async () => {
   const attachCalls = []
+  const activeSessions = [{ id: "ses_1" }, { id: "ses_same_window" }]
   const harness = await createHarness({
     statePatch: {
       updateOffset: 820,
@@ -3428,6 +3441,7 @@ test("startConnector does not open another attach window after /new when openAtt
     ocOptions: {
       createSessionImpl: async () => ({ id: "ses_same_window" }),
       getConfigImpl: async () => ({ model: "openai/gpt-5", default_agent: "build", agent: { build: { variant: "medium" } } }),
+      getActiveTuiSessionImpl: async () => (activeSessions.length ? activeSessions.shift() : { id: "ses_same_window" }),
     },
     openAttachWindowWindowsImpl: async (args) => {
       attachCalls.push(args)
@@ -3437,12 +3451,167 @@ test("startConnector does not open another attach window after /new when openAtt
 
   try {
     harness.tg.enqueue(makeMessageUpdate(821, "/new Same window title"))
-    await waitFor(
-      () => harness.tg.sentMessages.some((entry) => entry.text.includes("Created and switched to session: ses_same_window") && entry.text.includes("Model: openai/gpt-5 medium")),
-    )
+    await waitFor(() => harness.ocCalls.selectTuiSession.length === 1)
+    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("TUI switched to session: ses_same_window")))
     await harness.connector.stop()
 
     assert.deepEqual(attachCalls, [])
+    assert.deepEqual(harness.ocCalls.selectTuiSession, [{ sessionId: "ses_same_window", options: { timeoutMs: 2500 } }])
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.bindings, {
+      "100:7": { projectAlias: "demo", sessionId: "ses_same_window" },
+    })
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector keeps the old binding after /new when same-window TUI switch fails", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 830,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_old" },
+      },
+      sessionIndex: {
+        "demo:ses_old": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    projectPatch: {
+      openAttachOnNewMode: "same-window",
+    },
+    ocOptions: {
+      createSessionImpl: async () => ({ id: "ses_created_but_not_switched" }),
+      selectTuiSessionImpl: async () => {
+        throw Object.assign(new Error("unsupported"), { isBoundaryError: true, status: 404 })
+      },
+      getActiveTuiSessionImpl: async () => ({ id: "ses_old" }),
+      getConfigImpl: async () => ({ model: "openai/gpt-5" }),
+    },
+    platform: "win32",
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(831, "/new Keep old binding"))
+    await waitFor(() => harness.ocCalls.selectTuiSession.length === 1)
+    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("Current thread stays on session: ses_old")))
+    await harness.connector.stop()
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.bindings, {
+      "100:7": { projectAlias: "demo", sessionId: "ses_old" },
+    })
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector keeps the old binding after /new when active TUI session tracking is unavailable", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 835,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_old" },
+      },
+      sessionIndex: {
+        "demo:ses_old": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    projectPatch: {
+      openAttachOnNewMode: "same-window",
+    },
+    ocOptions: {
+      createSessionImpl: async () => ({ id: "ses_created_without_active_tracking" }),
+      selectTuiSessionImpl: async () => true,
+      getActiveTuiSessionImpl: async () => {
+        throw Object.assign(new Error("missing"), { isBoundaryError: true, status: 404 })
+      },
+      getConfigImpl: async () => ({ model: "openai/gpt-5" }),
+    },
+    platform: "win32",
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(836, "/new No active tracking"))
+    await waitFor(() => harness.ocCalls.selectTuiSession.length === 1)
+    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("Current thread stays on session: ses_old")))
+    await harness.connector.stop()
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.bindings, {
+      "100:7": { projectAlias: "demo", sessionId: "ses_old" },
+    })
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector auto-switches the Telegram binding to the active TUI session", async () => {
+  const activeSessions = [
+    { id: "ses_parent" },
+    null,
+    { id: "ses_tui_new" },
+  ]
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 840,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_parent" },
+      },
+      sessionIndex: {
+        "demo:ses_parent": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    ocOptions: {
+      getActiveTuiSessionImpl: async () => (activeSessions.length ? activeSessions.shift() : { id: "ses_tui_new" }),
+    },
+  })
+
+  try {
+    await waitFor(() => harness.ocCalls.getActiveTuiSession.length >= 3)
+    await waitFor(() => harness.tg.sentMessages.some((m) => m.text.includes("TUI switched to session: ses_tui_new")))
+    await harness.connector.stop()
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.bindings, {
+      "100:7": { projectAlias: "demo", sessionId: "ses_tui_new" },
+    })
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector keeps following the original Telegram thread across a conflicting active TUI session hop", async () => {
+  const activeSessions = [{ id: "ses_a" }, { id: "ses_b" }, { id: "ses_c" }]
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 850,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_a" },
+        "100:9": { projectAlias: "demo", sessionId: "ses_b" },
+      },
+      sessionIndex: {
+        "demo:ses_a": { chatId: 100, threadIdOr0: 7 },
+        "demo:ses_b": { chatId: 100, threadIdOr0: 9 },
+      },
+    },
+    ocOptions: {
+      getActiveTuiSessionImpl: async () => (activeSessions.length ? activeSessions.shift() : { id: "ses_c" }),
+    },
+  })
+
+  try {
+    await waitFor(() => harness.ocCalls.getActiveTuiSession.length >= 3)
+    await waitFor(
+      () => harness.tg.sentMessages.some((m) => m.options?.message_thread_id === 7 && m.text.includes("TUI switched to session: ses_c")),
+    )
+    await harness.connector.stop()
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.bindings, {
+      "100:7": { projectAlias: "demo", sessionId: "ses_c" },
+      "100:9": { projectAlias: "demo", sessionId: "ses_b" },
+    })
   } finally {
     await harness.connector.stop()
   }
@@ -3519,9 +3688,14 @@ test("startConnector keeps the thread model override after /new", async () => {
         "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
       },
     },
+    projectPatch: {
+      openAttachOnNewMode: "new-window",
+    },
     ocOptions: {
       createSessionImpl: async (input) => ({ id: `ses_new:${input.title}` }),
     },
+    openAttachWindowWindowsImpl: async () => {},
+    platform: "win32",
   })
 
   try {

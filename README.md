@@ -142,6 +142,9 @@ export default {
 - `serverLaunchMode`: `background` or `window`
 - `openTuiOnAutoStart`
 - `openAttachOnNewMode`: `same-window` or `new-window`
+  - `same-window` does not open a new window; it requests a switch for the existing attached TUI and keeps Telegram on the current session until the TUI reports the new active session.
+    When the opencode server exposes the TUI active-session API, Telegram can follow both Telegram-driven and TUI-driven session switches in the same thread.
+  - `new-window` opens a fresh `opencode attach --session ...` window for the new session.
 - `username` / `password` or `usernameEnv` / `passwordEnv`
 - `displayName`
 

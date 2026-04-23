@@ -194,4 +194,40 @@ export class OpenCodeClient {
   listQuestions({ signal } = {}) {
     return this.request(`/question`, { timeoutMs: 15_000, ...(signal ? { signal } : {}) })
   }
+
+  async selectTuiSession(sessionId, { timeoutMs = 5000 } = {}) {
+    // Best-effort: the /tui/select-session endpoint is not guaranteed to exist
+    // in all opencode versions. Fall back to publishing the equivalent event.
+    try {
+      return await this.request(`/tui/select-session`, {
+        method: "POST",
+        json: { sessionID: String(sessionId) },
+        timeoutMs,
+      })
+    } catch (err) {
+      if (err?.isBoundaryError === true && err.status === 404) {
+        // Fallback: /tui/publish { type: "tui.session.select", properties: { sessionID } }
+        try {
+          return await this.request(`/tui/publish`, {
+            method: "POST",
+            json: {
+              type: "tui.session.select",
+              properties: { sessionID: String(sessionId) },
+            },
+            timeoutMs,
+          })
+        } catch {
+          // Keep the original error for diagnostics.
+        }
+      }
+      throw err
+    }
+  }
+
+  getActiveTuiSession({ timeoutMs = 5000, signal } = {}) {
+    return this.request(`/tui/active-session`, {
+      timeoutMs,
+      ...(signal ? { signal } : {}),
+    })
+  }
 }

@@ -29,7 +29,8 @@ export default {
 
       // /new session behavior:
       // - "new-window" => open a fresh attach window for the new session
-      // - "same-window" => do not open another window; keep using the current TUI manually
+      // - "same-window" => do not open another window; try to switch an existing attached TUI to the new session (best-effort)
+      //                    and switch Telegram only after the server reports the new active TUI session
       openAttachOnNewMode: "new-window",
 
       username: "opencode",

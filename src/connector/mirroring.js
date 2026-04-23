@@ -305,12 +305,13 @@ export function createMirroringHandlers(runtime) {
     const routeCtx = { chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey: ctxKeyFrom(route.chatId, route.threadIdOr0) }
     const boundKey = sessionKey(projectAlias, resolved.boundSessionId)
 
-    if (resolved.boundSessionId !== sessionId) {
-      logSseDebug(projectAlias, sessionId, `drop=child_message bound=${resolved.boundSessionId}`)
-      return
-    }
+    // Avoid side effects (like auto-rebinding) for historical/backlog events.
     if (!eventStartedAfterLaunch(info, { allowCompletedAfterStart: info.role === "assistant" })) {
       logSseDebug(projectAlias, sessionId, "drop=before_connector_start")
+      return
+    }
+    if (resolved.boundSessionId !== sessionId) {
+      logSseDebug(projectAlias, sessionId, `drop=child_message bound=${resolved.boundSessionId}`)
       return
     }
 

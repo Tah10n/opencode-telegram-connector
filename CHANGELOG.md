@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Fixed
+- `/new` with `openAttachOnNewMode: "same-window"` now best-effort switches an attached TUI to the new session via opencode TUI control endpoints (with a manual fallback note on failure).
+- Telegram bindings can now follow TUI-reported active-session changes when the opencode server supports `/tui/active-session`.
+
 ### Added
 - Public-project split with subtree workflow helpers and boundary checks.
 - Manual preflight and smoke-test helper scripts.

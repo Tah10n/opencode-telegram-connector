@@ -103,6 +103,8 @@ test("OpenCodeClient convenience methods call the expected endpoints", async () 
   await client.listSessions({ directory: "C:/repo", limit: 5 })
   await client.getSession("ses_1")
   await client.createSession({ title: "demo" })
+  await client.selectTuiSession("ses_1")
+  await client.getActiveTuiSession()
   await client.abortSession("ses_1")
   await client.promptAsync("ses_1", "hello", { model: { providerID: "openai", modelID: "gpt-5" }, variant: "xhigh" })
   await client.getMessage("ses_1", "msg_1")
@@ -120,6 +122,8 @@ test("OpenCodeClient convenience methods call the expected endpoints", async () 
     { pathname: "/session", options: { query: { directory: "C:/repo", limit: 5 } } },
     { pathname: "/session/ses_1", options: undefined },
     { pathname: "/session", options: { method: "POST", json: { title: "demo" } } },
+    { pathname: "/tui/select-session", options: { method: "POST", json: { sessionID: "ses_1" }, timeoutMs: 5000 } },
+    { pathname: "/tui/active-session", options: { timeoutMs: 5000 } },
     { pathname: "/session/ses_1/abort", options: { method: "POST" } },
     {
       pathname: "/session/ses_1/prompt_async",
@@ -139,6 +143,35 @@ test("OpenCodeClient convenience methods call the expected endpoints", async () 
     { pathname: "/question/q_1/reject", options: { method: "POST" } },
     { pathname: "/permission", options: { timeoutMs: 15_000 } },
     { pathname: "/question", options: { timeoutMs: 15_000 } },
+  ])
+})
+
+test("OpenCodeClient selectTuiSession falls back to /tui/publish on 404", async () => {
+  const client = new OpenCodeClient({ baseUrl: "https://example.com" })
+  const calls = []
+  client.request = async (pathname, options) => {
+    calls.push({ pathname, options })
+    if (pathname === "/tui/select-session") {
+      const err = new Error("missing")
+      err.isBoundaryError = true
+      err.status = 404
+      throw err
+    }
+    return true
+  }
+
+  await client.selectTuiSession("ses_1")
+
+  assert.deepEqual(calls, [
+    { pathname: "/tui/select-session", options: { method: "POST", json: { sessionID: "ses_1" }, timeoutMs: 5000 } },
+    {
+      pathname: "/tui/publish",
+      options: {
+        method: "POST",
+        json: { type: "tui.session.select", properties: { sessionID: "ses_1" } },
+        timeoutMs: 5000,
+      },
+    },
   ])
 })
 

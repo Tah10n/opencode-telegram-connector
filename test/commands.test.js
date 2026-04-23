@@ -482,6 +482,7 @@ test("createCommandHandlers handleNewCommand reports configured model and varian
   const bindCalls = []
   const { runtime, sent } = makeRuntime({
     storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", openAttachOnNewMode: "new-window" } },
     ocByAlias: {
       demo: {
         async createSession(input) {
@@ -519,6 +520,116 @@ test("createCommandHandlers handleNewCommand reports configured model and varian
   ])
   assert.equal(sent.length, 1)
   assert.equal(sent[0].text, "Created and switched to session: ses_new\nModel: openai/gpt-5 xhigh\nSource: Inherited from project default")
+})
+
+test("createCommandHandlers handleNewCommand leaves the old binding until same-window TUI switch is confirmed", async () => {
+  const bindCalls = []
+  const primeCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", openAttachOnNewMode: "same-window" } },
+    ocByAlias: {
+      demo: {
+        async createSession() {
+          return { id: "ses_new" }
+        },
+        async getConfig() {
+          return { model: "openai/gpt-5" }
+        },
+        async selectTuiSession() {
+          return true
+        },
+        async getActiveTuiSession() {
+          return { id: "ses_current" }
+        },
+      },
+    },
+    bindCtxToSession: async (...args) => {
+      bindCalls.push(args)
+    },
+    primeTuiActiveSessionFollow: (...args) => {
+      primeCalls.push(args)
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleNewCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "Demo title")
+
+  assert.deepEqual(bindCalls, [])
+  assert.deepEqual(primeCalls, [["demo", { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "ses_current"]])
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Created session: ses_new/)
+  assert.match(sent[0].text, /Current thread stays on session: ses_current/)
+  assert.match(sent[0].text, /Requested TUI switch to session: ses_new/)
+})
+
+test("createCommandHandlers handleNewCommand falls back to manual mode when active TUI session tracking is unavailable", async () => {
+  const primeCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", openAttachOnNewMode: "same-window" } },
+    ocByAlias: {
+      demo: {
+        async createSession() {
+          return { id: "ses_new" }
+        },
+        async getConfig() {
+          return { model: "openai/gpt-5" }
+        },
+        async selectTuiSession() {
+          return true
+        },
+        async getActiveTuiSession() {
+          throw Object.assign(new Error("missing"), { isBoundaryError: true, status: 404 })
+        },
+      },
+    },
+    primeTuiActiveSessionFollow: (...args) => {
+      primeCalls.push(args)
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleNewCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "Demo title")
+
+  assert.deepEqual(primeCalls, [])
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Created session: ses_new/)
+  assert.match(sent[0].text, /Current thread stays on session: ses_current/)
+  assert.match(sent[0].text, /does not expose confirmed active TUI session tracking/i)
+})
+
+test("createCommandHandlers handleNewCommand includes a fallback note when TUI switching fails in same-window mode", async () => {
+  const bindCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", openAttachOnNewMode: "same-window" } },
+    ocByAlias: {
+      demo: {
+        async createSession() {
+          return { id: "ses_new" }
+        },
+        async getConfig() {
+          return { model: "openai/gpt-5" }
+        },
+        async selectTuiSession() {
+          throw new Error("not supported")
+        },
+      },
+    },
+    bindCtxToSession: async (...args) => {
+      bindCalls.push(args)
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleNewCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "Demo title")
+
+  assert.deepEqual(bindCalls, [])
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Created session: ses_new/)
+  assert.match(sent[0].text, /Current thread stays on session: ses_current/)
+  assert.match(sent[0].text, /Could not switch the existing TUI automatically/i)
 })
 
 test("createCommandHandlers renderSessionsList shows the current model when available", async () => {

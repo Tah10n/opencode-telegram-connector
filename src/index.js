@@ -393,6 +393,8 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const recentTgPromptsBySession = new LruMap(2000) // sessionKey -> LruSet(hash)
   const lastAssistantBySession = new LruMap(2000) // sessionKey -> { messageId, sessionId, text }
   const parentSessionBySession = new Map() // key `${projectAlias}:${sessionId}` -> parent session id or null
+  const tuiActiveSessionStateByProject = new Map() // alias -> { currentSessionId, followCtxKey }
+  const tuiActiveSessionUnsupportedProjects = new Set() // alias values where /tui/active-session is unavailable
   lifecycle.registerStopHook("assistantDebounce-cleanup", () => {
     for (const timer of assistantDebounce.values()) clearTimeout(timer)
     assistantDebounce.clear()
@@ -725,6 +727,140 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     logger.info("Bound", ctxMeta.ctxKey, "->", projectAlias, sessionId)
   }
 
+  function getBoundCtxForSession(projectAlias, sessionId) {
+    if (!projectAlias || !sessionId) return null
+    const route = store.get().sessionIndex?.[sessionKey(projectAlias, sessionId)]
+    if (!route) return null
+    const ctxKey = ctxKeyFrom(route.chatId, route.threadIdOr0)
+    const binding = store.getBinding(ctxKey)
+    if (binding?.projectAlias !== projectAlias || binding?.sessionId !== sessionId) return null
+    return { chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey }
+  }
+
+  function parseBoundCtxKey(ctxKey) {
+    const match = String(ctxKey || "").match(/^(-?\d+):(\d+)$/)
+    if (!match) return null
+    return { chatId: Number(match[1]), threadIdOr0: Number(match[2]), ctxKey: String(ctxKey) }
+  }
+
+  function primeTuiActiveSessionFollow(projectAlias, ctxMeta, sessionId) {
+    if (!projectAlias || !ctxMeta?.ctxKey || !sessionId) return
+    tuiActiveSessionStateByProject.set(projectAlias, {
+      currentSessionId: sessionId,
+      followCtxKey: ctxMeta.ctxKey,
+    })
+  }
+
+  async function syncProjectTuiActiveSession(projectAlias) {
+    if (tuiActiveSessionUnsupportedProjects.has(projectAlias)) return
+    const oc = ocByAlias[projectAlias]
+    if (!oc?.getActiveTuiSession) return
+
+    let activeSession = null
+    try {
+      activeSession = await oc.getActiveTuiSession({ timeoutMs: 2500, signal: abortController.signal })
+    } catch (err) {
+      const classification = classifyBoundaryError(err, {
+        source: "opencode",
+        operation: "GET /tui/active-session",
+        method: "GET",
+        pathname: "/tui/active-session",
+      })
+      if (classification.status === 404) {
+        tuiActiveSessionUnsupportedProjects.add(projectAlias)
+        logger.info(`[${projectAlias}] /tui/active-session is unavailable; disabling TUI session sync.`)
+      }
+      return
+    }
+
+    const activeSessionId = typeof activeSession?.id === "string" && activeSession.id.trim() ? activeSession.id.trim() : null
+    const previous = tuiActiveSessionStateByProject.get(projectAlias)
+    if (!previous) {
+      const activeCtx = activeSessionId ? getBoundCtxForSession(projectAlias, activeSessionId) : null
+      tuiActiveSessionStateByProject.set(projectAlias, {
+        currentSessionId: activeSessionId,
+        followCtxKey: activeCtx?.ctxKey || null,
+      })
+      return
+    }
+
+    if (previous.currentSessionId === activeSessionId) {
+      if (!previous.followCtxKey && activeSessionId) {
+        const activeCtx = getBoundCtxForSession(projectAlias, activeSessionId)
+        if (activeCtx?.ctxKey) {
+          tuiActiveSessionStateByProject.set(projectAlias, {
+            currentSessionId: activeSessionId,
+            followCtxKey: activeCtx.ctxKey,
+          })
+        }
+      }
+      return
+    }
+
+    const followCtxKey = previous.followCtxKey || getBoundCtxForSession(projectAlias, previous.currentSessionId)?.ctxKey || null
+    if (!activeSessionId) {
+      tuiActiveSessionStateByProject.set(projectAlias, {
+        currentSessionId: null,
+        followCtxKey,
+      })
+      return
+    }
+
+    const targetCtx = getBoundCtxForSession(projectAlias, activeSessionId)
+    if (!followCtxKey) {
+      tuiActiveSessionStateByProject.set(projectAlias, {
+        currentSessionId: activeSessionId,
+        followCtxKey: targetCtx?.ctxKey || null,
+      })
+      return
+    }
+
+    const followBinding = store.getBinding(followCtxKey)
+    if (followBinding?.projectAlias !== projectAlias) {
+      tuiActiveSessionStateByProject.set(projectAlias, {
+        currentSessionId: activeSessionId,
+        followCtxKey: targetCtx?.ctxKey || null,
+      })
+      return
+    }
+
+    if (followBinding.sessionId === activeSessionId) {
+      tuiActiveSessionStateByProject.set(projectAlias, {
+        currentSessionId: activeSessionId,
+        followCtxKey,
+      })
+      return
+    }
+
+    const sourceCtx = parseBoundCtxKey(followCtxKey)
+    if (!sourceCtx) {
+      tuiActiveSessionStateByProject.set(projectAlias, {
+        currentSessionId: activeSessionId,
+        followCtxKey: targetCtx?.ctxKey || null,
+      })
+      return
+    }
+
+    if (targetCtx && targetCtx.ctxKey !== followCtxKey) {
+      tuiActiveSessionStateByProject.set(projectAlias, {
+        currentSessionId: activeSessionId,
+        followCtxKey,
+      })
+      logger.info(
+        `[${projectAlias}] active TUI session ${activeSessionId} is already bound to another Telegram context; skipping auto-switch from ${followBinding.sessionId}.`,
+      )
+      return
+    }
+
+    await bindCtxToSession(sourceCtx, projectAlias, activeSessionId)
+    tuiActiveSessionStateByProject.set(projectAlias, {
+      currentSessionId: activeSessionId,
+      followCtxKey,
+    })
+    await sendToThread(sourceCtx, `TUI switched to session: ${activeSessionId}\nPrevious: ${followBinding.sessionId}`).catch(() => {})
+    logger.info(`[${projectAlias}] synced Telegram binding to active TUI session: ${followBinding.sessionId} -> ${activeSessionId}`)
+  }
+
   async function resolveBoundRoute(projectAlias, sessionId) {
     const oc = ocByAlias[projectAlias]
     if (!oc || !sessionId) return null
@@ -779,6 +915,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     openAttachWindowFn,
     validateProject,
     bindCtxToSession,
+    primeTuiActiveSessionFollow,
     sendToThread,
     parseCtxKey,
     formatThreadLabel,
@@ -1124,6 +1261,33 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     { kind: "loop", metadata: { source: "opencode", operation: "prompt polling" }, fatalOnError: true },
   )
 
+  const tuiActiveSessionSyncPromise = startManagedTask(
+    "tuiActiveSessionSync",
+    async () => {
+      while (!abortController.signal.aborted) {
+        for (const alias of Object.keys(projects)) {
+          try {
+            await syncProjectTuiActiveSession(alias)
+          } catch (err) {
+            logLoopIssue("tuiActiveSessionSync", err, {
+              projectAlias: alias,
+              retryable: true,
+              source: "opencode",
+              operation: "GET /tui/active-session",
+              method: "GET",
+              pathname: "/tui/active-session",
+            })
+          }
+        }
+        await sleepWithAbort(2_000)
+      }
+      for (const alias of Object.keys(projects)) {
+        recordLoopAbort("tuiActiveSessionSync", { projectAlias: alias, reason: "connector stop" })
+      }
+    },
+    { kind: "loop", metadata: { source: "opencode", operation: "GET /tui/active-session", pathname: "/tui/active-session" } },
+  )
+
   const telegramLoopPromise = startManagedTask(
     "telegramLoop",
     telegramLoop,
@@ -1138,7 +1302,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       abortController.abort()
       runtimeObservability.recordLoopSuccess("shutdown")
       await lifecycle.stopAll()
-      await Promise.allSettled([telegramLoopPromise, promptPollPromise])
+      await Promise.allSettled([telegramLoopPromise, promptPollPromise, tuiActiveSessionSyncPromise])
       await store.flush().catch(() => {})
     })()
     return stopPromise
