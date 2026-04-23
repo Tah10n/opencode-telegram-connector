@@ -467,6 +467,34 @@ test("startOpenCodeServeDetached spawns a detached server process and unreferenc
   assert.equal(calls[0].child.unrefCalled, true)
 })
 
+test("ensureOpenCodeRunning reports detached spawn failures without an unhandled child error", async (t) => {
+  const calls = useSpawnPlans(t, [{ spawn: false, error: new Error("opencode missing") }])
+
+  await assert.rejects(
+    ensureOpenCodeRunning({
+      projectAlias: "demo",
+      platform: "linux",
+      project: {
+        autoStart: true,
+        openTuiOnAutoStart: false,
+        directory: "/repo",
+        port: 4312,
+        baseUrl: "http://127.0.0.1:4312",
+      },
+      ocClient: {
+        async health() {
+          throw new Error("down")
+        },
+      },
+      logger: makeLogger(),
+    }),
+    /Failed to start opencode serve: opencode missing/,
+  )
+
+  assert.equal(calls[0].command, "opencode")
+  assert.equal(calls[0].child.unrefCalled, true)
+})
+
 test("ensureOpenCodeRunning returns early when the project is already healthy", async () => {
   const result = await ensureOpenCodeRunning({
     projectAlias: "demo",

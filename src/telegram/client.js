@@ -12,6 +12,28 @@ function makeTimeoutSignal(timeoutMs = 30_000) {
   return { signal: ctrl.signal, cancel: () => clearTimeout(t), didTimeout: () => didTimeout }
 }
 
+function isAbortSignal(value) {
+  return !!value && typeof value === "object" && typeof value.addEventListener === "function" && "aborted" in value
+}
+
+function combineSignals(...signals) {
+  const active = signals.filter(isAbortSignal)
+  if (active.length === 0) return undefined
+  if (active.length === 1) return active[0]
+  if (typeof AbortSignal?.any === "function") return AbortSignal.any(active)
+
+  const ctrl = new AbortController()
+  const abort = () => ctrl.abort()
+  for (const signal of active) {
+    if (signal.aborted) {
+      ctrl.abort()
+      break
+    }
+    signal.addEventListener("abort", abort, { once: true })
+  }
+  return ctrl.signal
+}
+
 export function splitTelegramText(text, maxLen = 3900) {
   const s = String(text ?? "")
   if (s.length <= maxLen) return [s]
@@ -49,10 +71,11 @@ export class TelegramClient {
     const timeout = makeTimeoutSignal(timeoutMs)
     let res
     try {
+      const requestSignal = combineSignals(signal, timeout.signal)
       res = await fetch(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        signal: signal || timeout.signal,
+        signal: requestSignal,
         body: params ? JSON.stringify(params) : "{}",
       })
     } catch (err) {
@@ -89,10 +112,11 @@ export class TelegramClient {
     const timeout = makeTimeoutSignal(timeoutMs)
     let res
     try {
+      const requestSignal = combineSignals(signal, timeout.signal)
       res = await fetch(url, {
         method: "POST",
         body: formData,
-        signal: signal || timeout.signal,
+        signal: requestSignal,
       })
     } catch (err) {
       throw boundaryErrorFromException(err, {

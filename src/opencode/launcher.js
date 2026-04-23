@@ -419,6 +419,24 @@ function launchDetachedProcess(command, args, { cwd, errorPrefix, successDelayMs
   })
 }
 
+function observeSpawnError(child) {
+  if (!child) return Promise.resolve(null)
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = (err = null) => {
+      if (settled) return
+      settled = true
+      child.off?.("spawn", onSpawn)
+      if (err) child.off?.("error", onError)
+      resolve(err)
+    }
+    const onError = (err) => finish(err)
+    const onSpawn = () => finish(null)
+    child.once?.("error", onError)
+    child.once?.("spawn", onSpawn)
+  })
+}
+
 async function openTerminalWindowMac({ shellCommand }) {
   const script = [
     'tell application "Terminal"',
@@ -626,8 +644,9 @@ export function startOpenCodeServeDetachedWindows({ directory, port }) {
     windowsHide: true,
     detached: true,
   })
+  const spawnError = observeSpawnError(child)
   child.unref()
-  return { child }
+  return { child, spawnError }
 }
 
 export async function openAttachWindowWindows({ directory, baseUrl, sessionId }) {
@@ -731,8 +750,9 @@ export function startOpenCodeServeDetached({ directory, port }) {
     windowsHide: true,
     detached: true,
   })
+  const spawnError = observeSpawnError(child)
   child.unref()
-  return { child }
+  return { child, spawnError }
 }
 
 export async function ensureOpenCodeRunning({ projectAlias, project, ocClient, logger, platform = process.platform, abortSignal }) {
@@ -848,6 +868,9 @@ export async function ensureOpenCodeRunning({ projectAlias, project, ocClient, l
     if (!pid && proc?.pid) pid = proc.pid
     startedMode = `${serverLaunchMode}+${launchSupport.openTuiOnAutoStart ? "tui" : "serve"}`
 
+    const launchError = await Promise.race([res.spawnError || Promise.resolve(null), delay(750).then(() => null)])
+    if (launchError) throw new Error(`Failed to start opencode serve: ${launchError?.message || String(launchError)}`)
+
     // If it immediately exited (e.g. port conflict), don't block: health wait below will surface details.
     await delay(750)
     if (pid && !isPidAlive(pid)) {
@@ -865,6 +888,8 @@ export async function ensureOpenCodeRunning({ projectAlias, project, ocClient, l
     const child = res.child || null
     pid = res.pid ?? child?.pid ?? null
     startedMode = `${serverLaunchMode}+${launchSupport.openTuiOnAutoStart ? "tui" : "serve"}`
+    const launchError = await Promise.race([res.spawnError || Promise.resolve(null), delay(750).then(() => null)])
+    if (launchError) throw new Error(`Failed to start opencode serve: ${launchError?.message || String(launchError)}`)
     stop = async () => {
       try {
         if (pid) process.kill(pid, "SIGTERM")

@@ -269,7 +269,12 @@ export function createPromptHandlers(runtime) {
       ctx: ctxMeta,
       createdAt: Date.now(),
     })
-    await sendPermissionPrompt(projectAlias, props, ctxMeta)
+    try {
+      await sendPermissionPrompt(projectAlias, props, ctxMeta)
+    } catch (err) {
+      prompted[projectAlias].permission.delete(props.id)
+      throw err
+    }
   }
 
   async function handleQuestionAsked({ projectAlias, props, resolveBoundRoute, logSseDebug }) {
@@ -285,8 +290,8 @@ export function createPromptHandlers(runtime) {
     if (!promptBaseline[projectAlias]?.loaded) return
     if (promptBaseline[projectAlias].question.has(props.id)) return
     if (prompted[projectAlias].question.has(props.id)) return
-    prompted[projectAlias].question.add(props.id)
     if (!props?.id || !Array.isArray(props.questions) || props.questions.length === 0) return
+    prompted[projectAlias].question.add(props.id)
 
     const ctx = { chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey: ctxKeyFrom(route.chatId, route.threadIdOr0) }
     const wizard = {
@@ -304,10 +309,15 @@ export function createPromptHandlers(runtime) {
     questionWizards.set(wizardKey(projectAlias, props.id), wizard)
     persistQuestionWizard(wizard)
 
-    await sendBlocksToThread(ctx, [
-      { type: "text", html: `<b>Question request</b>\n<code>${escapeHtml(props.id)}</code>\n\n${escapeHtml(`Project: ${projectAlias}`)}` },
-    ])
-    await sendCurrentQuestionStep(wizard)
+    try {
+      await sendBlocksToThread(ctx, [
+        { type: "text", html: `<b>Question request</b>\n<code>${escapeHtml(props.id)}</code>\n\n${escapeHtml(`Project: ${projectAlias}`)}` },
+      ])
+      await sendCurrentQuestionStep(wizard)
+    } catch (err) {
+      prompted[projectAlias].question.delete(props.id)
+      throw err
+    }
   }
 
   return {

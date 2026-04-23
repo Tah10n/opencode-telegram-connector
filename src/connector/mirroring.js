@@ -512,7 +512,11 @@ export function createMirroringHandlers(runtime) {
         if (replaceMessageId) assistantPreviewBySession.delete(boundKey)
         sets.assistant.add(info.id)
         logSseDebug(projectAlias, sessionId, `send=assistant msg=${info.id} thread=${route.threadIdOr0 || 0}`)
-      })().catch(() => {})
+      })().catch((err) => {
+        const message = err?.message || String(err)
+        runtime.logger?.error?.("Assistant final delivery failed:", projectAlias, sessionId, info.id, message)
+        logSseDebug(projectAlias, sessionId, `error=assistant_final_delivery msg=${info.id} ${message}`)
+      })
     }, 250)
     assistantDebounce.set(debounceKey, t)
   }

@@ -151,17 +151,23 @@ export function createPromptRecovery(runtime) {
           record(entry.projectAlias, "stale")
           continue
         }
+        try {
+          await sendPermissionPrompt(
+            entry.projectAlias,
+            {
+              id: entry.permissionId,
+              sessionID: entry.sessionID,
+              permission: entry.permission,
+              patterns: Array.isArray(entry.patterns) ? entry.patterns : [],
+            },
+            ctx,
+          )
+        } catch {
+          summary.permissions.retryable += 1
+          record(entry.projectAlias, "retryable")
+          continue
+        }
         prompted[entry.projectAlias]?.permission.add(entry.permissionId)
-        await sendPermissionPrompt(
-          entry.projectAlias,
-          {
-            id: entry.permissionId,
-            sessionID: entry.sessionID,
-            permission: entry.permission,
-            patterns: Array.isArray(entry.patterns) ? entry.patterns : [],
-          },
-          ctx,
-        ).catch(() => {})
         summary.permissions.restored += 1
         record(entry.projectAlias, "restored")
         continue
@@ -187,13 +193,22 @@ export function createPromptRecovery(runtime) {
           continue
         }
 
-        prompted[snapshot.projectAlias]?.question.add(snapshot.id)
         const wizard = buildWizardFromSnapshot({ ...snapshot, ctx }, { request: liveQuestion || snapshot.request })
         questionWizards.set(wizardKey(wizard.projectAlias, wizard.id), wizard)
-        await sendBlocksToThread(wizard.ctx, [
-          { type: "text", html: `<b>Question request resumed</b>\n<code>${escapeHtml(wizard.id)}</code>\n\n${escapeHtml(`Project: ${wizard.projectAlias}`)}` },
-        ]).catch(() => {})
-        await sendCurrentQuestionStep(wizard).catch(() => {})
+        try {
+          await sendBlocksToThread(wizard.ctx, [
+            {
+              type: "text",
+              html: `<b>Question request resumed</b>\n<code>${escapeHtml(wizard.id)}</code>\n\n${escapeHtml(`Project: ${wizard.projectAlias}`)}`,
+            },
+          ])
+          await sendCurrentQuestionStep(wizard)
+        } catch {
+          summary.questionWizards.retryable += 1
+          record(snapshot.projectAlias, "retryable")
+          continue
+        }
+        prompted[snapshot.projectAlias]?.question.add(snapshot.id)
         summary.questionWizards.restored += 1
         record(snapshot.projectAlias, "restored")
         continue
@@ -225,11 +240,17 @@ export function createPromptRecovery(runtime) {
           continue
         }
 
-        setRejectNoteAwaitingState(ctxKey, value)
         const bindingCtx = parseCtxKey(ctxKey)
         if (bindingCtx?.chatId) {
-          await sendRejectNotePrompt(bindingCtx, value.projectAlias, value.permissionId, { resumed: true }).catch(() => {})
+          try {
+            await sendRejectNotePrompt(bindingCtx, value.projectAlias, value.permissionId, { resumed: true })
+          } catch {
+            summary.rejectNotes.retryable += 1
+            record(value.projectAlias, "retryable")
+            continue
+          }
         }
+        setRejectNoteAwaitingState(ctxKey, value)
         summary.rejectNotes.restored += 1
         record(value.projectAlias, "restored")
         continue
@@ -267,14 +288,18 @@ export function createPromptRecovery(runtime) {
           continue
         }
 
-        setAwaitingCustomAnswerState(ctxKey, value)
         const label = wizard.request?.questions?.[value.qIndex]?.header || "question"
         const bindingCtx = parseCtxKey(ctxKey)
         if (bindingCtx?.chatId) {
-          await sendQuestionCustomAnswerPrompt(bindingCtx, value.projectAlias, value.requestId, value.qIndex, label, { resumed: true }).catch(
-            () => {},
-          )
+          try {
+            await sendQuestionCustomAnswerPrompt(bindingCtx, value.projectAlias, value.requestId, value.qIndex, label, { resumed: true })
+          } catch {
+            summary.customAnswers.retryable += 1
+            record(value.projectAlias, "retryable")
+            continue
+          }
         }
+        setAwaitingCustomAnswerState(ctxKey, value)
         summary.customAnswers.restored += 1
         record(value.projectAlias, "restored")
         continue

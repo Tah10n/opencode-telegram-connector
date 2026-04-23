@@ -27,7 +27,8 @@ test("TelegramClient call and callMultipart return Telegram results and surface 
 
     try {
       const client = new TelegramClient("token", { baseUrl: "https://api.example.test/bot" })
-      assert.deepEqual(await client.call("getMe", { probe: true }, { timeoutMs: 5, signal: "external-signal" }), { ok: true })
+      const external = new AbortController()
+      assert.deepEqual(await client.call("getMe", { probe: true }, { timeoutMs: 5, signal: external.signal }), { ok: true })
 
       const formData = new FormData()
       formData.set("probe", "1")
@@ -44,7 +45,7 @@ test("TelegramClient call and callMultipart return Telegram results and surface 
     assert.equal(calls[0].init.method, "POST")
     assert.equal(calls[0].init.headers["content-type"], "application/json")
     assert.equal(calls[0].init.body, JSON.stringify({ probe: true }))
-    assert.equal(calls[0].init.signal, "external-signal")
+    assert.equal(typeof calls[0].init.signal.addEventListener, "function")
     assert.equal(calls[1].url, "https://api.example.test/bot/sendDocument")
   } finally {
     globalThis.fetch = originalFetch
@@ -172,6 +173,29 @@ test("TelegramClient wraps timeout aborts and multipart fetch failures as bounda
       assert.equal(err.source, "telegram")
       assert.equal(err.pathname, "/sendDocument")
       assert.match(err.message, /multipart down/)
+      return true
+    })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("TelegramClient keeps its request timeout when an external abort signal is supplied", async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (_url, init) =>
+    await new Promise((_, reject) => {
+      init.signal.addEventListener("abort", () => reject(new DOMException("timed out", "AbortError")), { once: true })
+    })
+
+  try {
+    const client = new TelegramClient("token", { baseUrl: "https://api.example.test/bot" })
+    const external = new AbortController()
+    await assert.rejects(async () => client.call("getUpdates", { timeout: 30 }, { timeoutMs: 1, signal: external.signal }), (err) => {
+      const classification = classifyBoundaryError(err)
+      assert.equal(err.isBoundaryError, true)
+      assert.equal(err.source, "telegram")
+      assert.equal(err.pathname, "/getUpdates")
+      assert.equal(classification.retryable, true)
       return true
     })
   } finally {

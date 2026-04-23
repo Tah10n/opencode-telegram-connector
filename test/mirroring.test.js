@@ -365,3 +365,41 @@ test("handleMessageUpdated reports when the completed assistant reply has no vis
   const sets = runtime.forwardedBySession.get(sessionKey("demo", "ses_1"))
   assert.equal(sets.assistant.has("msg_1"), true)
 })
+
+test("handleMessageUpdated logs final assistant delivery failures without marking the reply forwarded", async (t) => {
+  useImmediateTimeouts(t)
+  const loggerErrors = []
+  const failedSendBlocks = []
+  const { runtime, handlers } = createHarness({
+    logger: {
+      error(...args) {
+        loggerErrors.push(args)
+      },
+    },
+    async sendBlocksToThread(...args) {
+      failedSendBlocks.push(args)
+      throw new Error("telegram down")
+    },
+    ocByAlias: {
+      demo: {
+        async getMessage() {
+          return {
+            info: { id: "msg_1", role: "assistant", time: { completed: 1 } },
+            parts: [{ type: "text", text: "Final" }],
+          }
+        },
+      },
+    },
+  })
+
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", time: { completed: 1 } } },
+  })
+  await flushAsyncWork()
+
+  assert.equal(failedSendBlocks.length, 1)
+  assert.match(loggerErrors[0].join(" "), /Assistant final delivery failed: demo ses_1 msg_1 telegram down/)
+  const sets = runtime.forwardedBySession.get(sessionKey("demo", "ses_1"))
+  assert.equal(sets.assistant.has("msg_1"), false)
+})
