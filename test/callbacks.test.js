@@ -2,6 +2,7 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { createCallbackHandlers } from "../src/connector/callbacks.js"
 import { makeBoundaryError } from "../src/boundary-errors.js"
+import { redactCmdlineSecrets } from "../src/url-utils.js"
 
 function makeCallback(data, overrides = {}) {
   const threadIdOr0 = overrides.threadIdOr0 ?? 7
@@ -172,7 +173,7 @@ function makeRuntime(overrides = {}) {
     sendCurrentQuestionStep: async (wizard, options) => {
       sendQuestionStepCalls.push({ wizard: cloneWizardState(wizard), options })
     },
-    formatProjectUnavailable: (alias, err) => `Project '${alias}' is unavailable: ${err?.message || String(err)}`,
+    formatProjectUnavailable: (alias, err) => `Project '${alias}' is unavailable: ${redactCmdlineSecrets(err?.message || String(err))}`,
     logger: { error: (...args) => loggerErrors.push(args.map((arg) => String(arg)).join(" ")) },
     questionWizards,
     ...runtimeOverrides,
@@ -353,12 +354,12 @@ test("createCallbackHandlers handles server-start, feed, and changed-files callb
   })
   const handlers = createCallbackHandlers(runtime)
 
-  await handlers.handleTelegramCallback(makeCallback("srv|demo|start"))
+  await handlers.handleTelegramCallback(makeCallback("srv|demo|start", { chatType: "private", threadIdOr0: 0 }))
   await handlers.handleTelegramCallback(makeCallback("feed|verbose"))
   await handlers.handleTelegramCallback(makeCallback("cf|demo|ses_1|msg_1|show"))
 
   assert.equal(callbackAnswers[0].text, "Starting…")
-  assert.deepEqual(startCalls, [{ projectAlias: "demo", ctxMeta: { chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" } }])
+  assert.deepEqual(startCalls, [{ projectAlias: "demo", ctxMeta: { chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" } }])
   assert.deepEqual(feedCalls, [
     { type: "set", ctxKey: "100:7", mode: "verbose" },
     { type: "render", ctxMeta: { chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" }, options: { editMessageId: 900 } },
@@ -375,6 +376,67 @@ test("createCallbackHandlers handles server-start, feed, and changed-files callb
   ])
 })
 
+test("createCallbackHandlers handles project health and sessions callbacks", async () => {
+  const healthCalls = []
+  const projectSessionCalls = []
+  const { runtime, callbackAnswers, sentMessages } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312" } },
+    validateProject: async (projectAlias) => {
+      healthCalls.push(projectAlias)
+    },
+    renderProjectSessions: async (ctxMeta, projectAlias, options) => {
+      projectSessionCalls.push({ ctxMeta, projectAlias, options })
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("srv|demo|health", { chatType: "private", threadIdOr0: 0 }))
+  await handlers.handleTelegramCallback(makeCallback("srv|demo|sessions", { chatType: "private", threadIdOr0: 0 }))
+
+  assert.deepEqual(healthCalls, ["demo"])
+  assert.deepEqual(projectSessionCalls, [
+    {
+      ctxMeta: { chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" },
+      projectAlias: "demo",
+      options: { editMessageId: 900 },
+    },
+  ])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Checking…", "Sessions"])
+  assert.match(sentMessages[0].text, /health check: online/)
+})
+
+test("createCallbackHandlers reports unavailable project health with start action", async () => {
+  const { runtime, callbackAnswers, sentMessages } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312" } },
+    validateProject: async () => {
+      throw new Error("connect ECONNREFUSED http://127.0.0.1:4312?token=secret")
+    },
+    canAutoStartProject: () => true,
+    startServerKeyboard: (projectAlias) => ({ inline_keyboard: [[{ text: "Start", callback_data: `srv|${projectAlias}|start` }]] }),
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("srv|demo|health", { chatType: "private", threadIdOr0: 0 }))
+
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Checking…"])
+  assert.equal(sentMessages.length, 1)
+  assert.match(sentMessages[0].text, /Project 'demo' is unavailable/)
+  assert.doesNotMatch(sentMessages[0].text, /token=secret|secret/)
+})
+
+test("createCallbackHandlers blocks project controls in unrelated group threads", async () => {
+  const { runtime, callbackAnswers, startCalls } = makeRuntime({
+    projects: { demo: { autoStart: true } },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("srv|demo|start"))
+  await handlers.handleTelegramCallback(makeCallback("srv|demo|health"))
+
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Private chat only", "Private chat only"])
+  assert.deepEqual(startCalls, [])
+})
+
 test("createCallbackHandlers closes feed and sessions messages", async () => {
   const deletedMessages = []
   const { runtime, callbackAnswers } = makeRuntime({
@@ -389,9 +451,11 @@ test("createCallbackHandlers closes feed and sessions messages", async () => {
 
   await handlers.handleTelegramCallback(makeCallback("feed|close"))
   await handlers.handleTelegramCallback(makeCallback("s|close"))
+  await handlers.handleTelegramCallback(makeCallback("srv|close"))
 
-  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Closed", "Closed"])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Closed", "Closed", "Closed"])
   assert.deepEqual(deletedMessages, [
+    { chatId: 100, messageId: 900 },
     { chatId: 100, messageId: 900 },
     { chatId: 100, messageId: 900 },
   ])

@@ -1270,6 +1270,41 @@ test("startConnector /status includes runtime observability lines", async () => 
   }
 })
 
+test("startConnector /runtime shows compact private-chat runtime state", async () => {
+  const harness = await createHarness({
+    statePatch: { updateOffset: 295 },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(295, "/runtime", { chatType: "private", threadIdOr0: 0 }))
+
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+
+    const runtimeText = harness.tg.sentMessages.at(-1)?.text || ""
+    assert.match(runtimeText, /^Runtime:/)
+    assert.match(runtimeText, /managedTasks=/)
+    assert.match(runtimeText, /Telegram poll:/)
+    assert.match(runtimeText, /Backlog drain:/)
+    assert.match(runtimeText, /Updates: retryable=0 skipped=0/)
+    assert.doesNotMatch(runtimeText, /state\.json|test-token/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector /runtime refuses group chats", async () => {
+  const harness = await createHarness({ statePatch: { updateOffset: 296 } })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(296, "/runtime"))
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+
+    assert.match(harness.tg.sentMessages.at(-1)?.text || "", /Use \/runtime only in a private chat/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
 test("startConnector /status keeps SSE connected after a non-SSE request failure", async () => {
   const harness = await createHarness({
     statePatch: {
@@ -1374,6 +1409,52 @@ test("startConnector /projects hides binding scopes in group chats", async () =>
     assert.match(text, /^Projects:/)
     assert.match(text, /Bindings: hidden outside private chat/)
     assert.doesNotMatch(text, /chat 100\/main|chat 100\/topic 11/)
+    const labels = harness.tg.sentMessages.at(-1)?.replyMarkup?.inline_keyboard.flat().map((button) => button.text) || []
+    assert.ok(labels.includes("Close"))
+    assert.equal(labels.includes("Retry demo"), false)
+    assert.equal(labels.includes("Start demo"), false)
+    assert.equal(labels.includes("Sessions demo"), false)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector /projects actions retry health, show sessions, and close", async () => {
+  const harness = await createHarness({
+    statePatch: { updateOffset: 298 },
+    startupSessions: [{ id: "ses_startup", title: "Startup" }, { id: "ses_other", title: "Other" }],
+    ensureStartupSessionImpl: async ({ alias, startupSessionByProject }) => {
+      startupSessionByProject[alias] = "ses_startup"
+      return "ses_startup"
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(298, "/projects", { chatType: "private", threadIdOr0: 0 }))
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+
+    const projectMessage = harness.tg.sentMessages.at(-1)
+    const labels = projectMessage.replyMarkup.inline_keyboard.flat().map((button) => button.text)
+    assert.ok(labels.includes("Retry demo"))
+    assert.ok(labels.includes("Sessions demo"))
+    assert.ok(labels.includes("Close"))
+
+    harness.tg.enqueue(makeCallbackUpdate(299, "srv|demo|health", { chatType: "private", threadIdOr0: 0, messageId: projectMessage.result.message_id }))
+    await waitFor(() => harness.tg.sentMessages.some((entry) => /health check: online/.test(entry.text)))
+
+    harness.tg.enqueue(makeCallbackUpdate(300, "srv|demo|sessions", { chatType: "private", threadIdOr0: 0, messageId: projectMessage.result.message_id }))
+    await waitFor(() => harness.tg.editedMessages.some((entry) => entry.messageId === projectMessage.result.message_id && /Sessions for 'demo':/.test(entry.text)))
+    const sessionsEdit = harness.tg.editedMessages.find((entry) => entry.messageId === projectMessage.result.message_id && /Sessions for 'demo':/.test(entry.text))
+    assert.match(sessionsEdit.text, /Viewing only/)
+    assert.deepEqual(sessionsEdit.replyMarkup.inline_keyboard.flat().map((button) => button.text), ["Close"])
+
+    harness.tg.enqueue(makeCallbackUpdate(301, "srv|close", { chatType: "private", threadIdOr0: 0, messageId: projectMessage.result.message_id }))
+    await waitFor(() => harness.tg.deletedMessages.some((entry) => entry.messageId === projectMessage.result.message_id))
+
+    assert.ok(harness.ocCalls.health >= 1)
+    assert.ok(harness.tg.callbackAnswers.some((entry) => entry.callbackQueryId === "cb_299" && entry.text === "Checking…"))
+    assert.ok(harness.tg.callbackAnswers.some((entry) => entry.callbackQueryId === "cb_300" && entry.text === "Sessions"))
+    assert.ok(harness.tg.callbackAnswers.some((entry) => entry.callbackQueryId === "cb_301" && entry.text === "Closed"))
   } finally {
     await harness.connector.stop()
   }

@@ -1,5 +1,5 @@
 import { makeInlineKeyboard } from "../telegram/client.js"
-import { sanitizeBaseUrlForDisplay } from "../url-utils.js"
+import { redactCmdlineSecrets, sanitizeBaseUrlForDisplay } from "../url-utils.js"
 import { isRetryableBoundaryError, normalizeBoundaryError } from "../boundary-errors.js"
 import { getLaunchSupport } from "../opencode/launcher.js"
 
@@ -46,6 +46,23 @@ export function buildProjectsOverviewText({
   return lines.join("\n")
 }
 
+export function buildProjectsOverviewKeyboard({ projects, cb, canAutoStartProject, platform, showProjectControls = true, showSessions = false }) {
+  const rows = []
+  if (showProjectControls) {
+    for (const alias of Object.keys(projects || {})) {
+      const row = []
+      if (canAutoStartProject?.(alias, { platform })) {
+        row.push({ text: `Start ${alias}`, callback_data: cb.pack(`srv|${alias}|start`) })
+      }
+      row.push({ text: `Retry ${alias}`, callback_data: cb.pack(`srv|${alias}|health`) })
+      if (showSessions) row.push({ text: `Sessions ${alias}`, callback_data: cb.pack(`srv|${alias}|sessions`) })
+      rows.push(row)
+    }
+  }
+  rows.push([{ text: "Close", callback_data: cb.pack("srv|close") }])
+  return makeInlineKeyboard(rows)
+}
+
 export function createOverviewHelpers({ projects, store, startInProgress, parseCtxKey, sendToThread, cb }) {
   const projectLastUnavailableNoticeAt = new Map()
   const projectIsDown = new Map()
@@ -61,7 +78,7 @@ export function createOverviewHelpers({ projects, store, startInProgress, parseC
 
   function formatProjectUnavailable(projectAlias, err) {
     const baseUrl = sanitizeBaseUrlForDisplay(projects?.[projectAlias]?.baseUrl)
-    const msg = normalizeBoundaryError(err, { source: "opencode" }).message
+    const msg = redactCmdlineSecrets(normalizeBoundaryError(err, { source: "opencode" }).message)
     return `Project '${projectAlias}' is unavailable. Start opencode at ${baseUrl}.\n\n${msg}`
   }
 
@@ -142,6 +159,15 @@ export function createOverviewHelpers({ projects, store, startInProgress, parseC
         previewLimit: input.previewLimit,
         showBindingScopes: input.showBindingScopes,
         hiddenBindingsLabel: input.hiddenBindingsLabel,
+      }),
+    buildProjectsOverviewKeyboard: (input = {}) =>
+      buildProjectsOverviewKeyboard({
+        projects,
+        cb,
+        canAutoStartProject,
+        platform: input.platform,
+        showProjectControls: input.showProjectControls,
+        showSessions: input.showSessions,
       }),
     canAutoStartProject,
     isRetryableProjectError,

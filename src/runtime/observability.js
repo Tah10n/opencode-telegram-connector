@@ -1,4 +1,5 @@
 import { normalizeBoundaryError } from "../boundary-errors.js"
+import { redactCmdlineSecrets } from "../url-utils.js"
 
 function createLoopState() {
   return {
@@ -46,7 +47,7 @@ function createGlobalState() {
 
 function safeErrorMessage(err) {
   if (!err) return ""
-  return normalizeBoundaryError(err, { source: err?.source || "runtime" }).message
+  return redactCmdlineSecrets(normalizeBoundaryError(err, { source: err?.source || "runtime" }).message)
 }
 
 function formatTime(value) {
@@ -57,8 +58,21 @@ function formatLoopLine(label, loop, { includeFallback = false, includeConnected
   const parts = [`${label}: retries=${loop.retries}`, `aborted=${loop.aborted}`]
   if (includeFallback) parts.push(`hits=${loop.fallbackHits}`)
   if (includeConnected) parts.push(`connected=${formatTime(loop.lastConnectedAt)}`)
+  if (loop.lastSuccessAt) parts.push(`lastOk=${formatTime(loop.lastSuccessAt)}`)
+  if (loop.lastRetryAt) parts.push(`lastRetry=${formatTime(loop.lastRetryAt)}`)
+  if (loop.lastErrorAt) parts.push(`lastErrorAt=${formatTime(loop.lastErrorAt)}`)
+  if (loop.lastAbortAt) parts.push(`lastAbort=${formatTime(loop.lastAbortAt)}`)
   if (loop.lastError) parts.push(`lastError=${loop.lastError}`)
   return parts.join(" ")
+}
+
+function summarizeTasks(tasks) {
+  const counts = new Map()
+  for (const task of Array.isArray(tasks) ? tasks : []) {
+    const kind = task?.kind || "unknown"
+    counts.set(kind, (counts.get(kind) || 0) + 1)
+  }
+  return [...counts.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([kind, count]) => `${kind}=${count}`).join(" ") || "none"
 }
 
 export function createRuntimeObservability({ projectAliases = [] } = {}) {
@@ -184,6 +198,17 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
     return lines
   }
 
+  function buildRuntimeStatusLines({ managedTasks = [], shutdownState = "running" } = {}) {
+    return [
+      `Runtime: managedTasks=${Array.isArray(managedTasks) ? managedTasks.length : 0} taskKinds=${summarizeTasks(managedTasks)} shutdown=${shutdownState}`,
+      formatLoopLine("Telegram poll", globalState.loops.telegramPoll),
+      formatLoopLine("Backlog drain", globalState.loops.backlogDrain),
+      formatLoopLine("Prompt poll", globalState.loops.promptPoll, { includeFallback: true }),
+      formatLoopLine("Shutdown", globalState.loops.shutdown),
+      `Updates: retryable=${globalState.updates.retryable} skipped=${globalState.updates.skipped}`,
+    ]
+  }
+
   return {
     recordLoopRetry,
     recordLoopError,
@@ -196,5 +221,6 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
     recordUpdateRetry,
     recordUpdateSkip,
     buildStatusLines,
+    buildRuntimeStatusLines,
   }
 }

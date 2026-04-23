@@ -72,6 +72,7 @@ function makeRuntime(overrides = {}) {
     ensureRecentPromptSet: () => ({ add() {} }),
     hashTextForEcho: () => "hash",
     formatProjectUnavailable: (alias) => `Project '${alias}' is unavailable.`,
+    markProjectUp() {},
     buildProjectsOverviewText: ({ startupSessionByProject, formatThreadLabel, previewLimit, showBindingScopes, hiddenBindingsLabel }) =>
       buildProjectsOverviewTextBase({
         projects,
@@ -157,6 +158,72 @@ test("createCommandHandlers handleProjects renders overview with binding counts 
   assert.match(text, /Bindings: 2 \(chat 100\/main, chat 100\/topic 11\)/)
   assert.match(text, /- other/)
   assert.match(text, /Bindings: 1 \(chat 200\/main\)/)
+})
+
+test("createCommandHandlers handleProjects includes project action keyboard", async () => {
+  const replyMarkup = { inline_keyboard: [[{ text: "Retry demo", callback_data: "srv|demo|health" }]] }
+  const { runtime, sent } = makeRuntime({
+    buildProjectsOverviewKeyboard: (input) => {
+      assert.deepEqual(input, { platform: "win32", showProjectControls: true, showSessions: true })
+      return replyMarkup
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleProjects({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" })
+
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].replyMarkup, replyMarkup)
+})
+
+test("createCommandHandlers handleRuntime renders private runtime status", async () => {
+  const { runtime, sent } = makeRuntime({
+    buildGlobalRuntimeStatusLines: () => [
+      "Runtime: managedTasks=3 taskKinds=loop=2 timer=1 shutdown=running",
+      "Telegram poll: retries=1 aborted=0 lastRetry=2026-04-24T00:00:00.000Z",
+      "Updates: retryable=1 skipped=2",
+    ],
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleRuntime({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" })
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /^Runtime:/)
+  assert.match(sent[0].text, /managedTasks=3/)
+  assert.match(sent[0].text, /Telegram poll:/)
+  assert.match(sent[0].text, /Updates: retryable=1 skipped=2/)
+})
+
+test("createCommandHandlers handleRuntime is private-chat only", async () => {
+  const { runtime, sent } = makeRuntime({ buildGlobalRuntimeStatusLines: () => ["should not render"] })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleRuntime({ chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" })
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Use \/runtime only in a private chat/)
+})
+
+test("createCommandHandlers renderProjectSessions is view-only when private chat is unbound", async () => {
+  const { runtime, sent } = makeRuntime({
+    ocByAlias: {
+      demo: {
+        async listSessions() {
+          return []
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderProjectSessions({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, "demo")
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Viewing only/)
+  assert.match(sent[0].text, /Bind the target chat\/thread to this project/)
+  assert.doesNotMatch(sent[0].text, /\/use <sessionId> to switch/)
+  assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text), ["Close"])
 })
 
 test("createCommandHandlers handleProjects hides binding scopes outside private chats", async () => {

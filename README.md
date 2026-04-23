@@ -112,13 +112,14 @@ export default {
 - `/model`, `/model default`, `/model reset`, `/model <provider/model> [variant]` — show or change the model for the current thread.
 - `/feed` — choose mirrored updates for the current thread.
 - `/status` — show the current binding, model, feed mode, SSE status, and base URL.
+- `/runtime` or `/health` — show compact connector runtime counters (**private chat only**): managed tasks, Telegram polling, backlog drain, update retry/skip counts, prompt polling, and shutdown state.
 - `/abort` — abort the active run in the current thread.
 - `/sendlast` — resend the latest assistant reply for the bound session.
 - `/cancel` — cancel the current Telegram-side flow.
 
 ### Overview
 
-- `/projects` — show projects, startup sessions, SSE status, and active-binding summary. Binding scopes are hidden outside private chats.
+- `/projects` — show projects, startup sessions, SSE status, active-binding summary, and safe action buttons: Start where auto-start is supported, Retry health check, Show sessions in private chats, and Close. Binding scopes are hidden outside private chats.
 - `/bindings` — list all active bindings (**private chat only**).
 
 ## Feed modes
@@ -186,6 +187,26 @@ Recommended options:
 - **pm2** / **launchd** / another process manager for your platform
 
 Treat the process as a single long-running worker: if a truly fatal runtime error occurs, inspect the logs and let the supervisor restart it instead of trying to keep the broken process alive.
+
+### Runtime smoke checks
+
+After changing runtime/recovery behavior, run the connector under your usual supervisor and check:
+
+1. `/runtime` in a private chat shows managed tasks, Telegram polling, backlog drain, prompt polling, update retry/skip counts, and shutdown state.
+2. `/projects` offers Retry health check and Close for every project, Start only where auto-start is configured and supported, and Show sessions only in private chats.
+3. Stop and restart the supervisor-managed process; bindings, offset, feed mode, model preference, and pending prompts should recover without duplicate actions.
+4. Temporarily stop one opencode server, use `/projects` → Retry health check, then restore the server and retry again to confirm project-scoped recovery works without restarting the connector.
+
+## Troubleshooting matrix
+
+| Symptom | What to check | Safe recovery action |
+| --- | --- | --- |
+| Telegram polling appears stuck | Use `/runtime` in a private chat and inspect `Telegram poll` retries, `lastErrorAt`, and update retry/skip counts. Ensure only one connector instance is running for the bot token. | Fix the Telegram/API/network issue; restart the connector only if the supervisor reports the process is unhealthy. |
+| OpenCode unavailable | Use `/projects` and the project's Retry health check. `/status` also shows the current project's SSE and sanitized base URL. | Start opencode manually, or press Start if the project exposes a Start button. Retry health after the server is up. |
+| Duplicate prompts or callbacks | Check `/status` for prompt cleanup/recovery and callback outcome counters. Duplicates after restart should be skipped as already handled. | If duplicates continue, keep the connector single-instance and inspect logs around prompt polling/SSE reconnects. |
+| Stale callbacks | Button presses may answer `No longer active` or `Already handled` after a prompt is completed or rejected. | Dismiss the old message with Close and wait for any current prompt to be delivered again if it is still live. |
+| Wrong thread/session | Use `/status` in the thread and `/bindings` in a private chat to compare bindings. | Use `/use <sessionId>`, `/bind <projectAlias>`, `/new`, or `/unbind` in the affected thread. |
+| Failed auto-start | `/projects` shows Start only when local launch is supported. Logs include launcher errors without exposing secrets. | Verify `opencode` is on `PATH`, the project `directory` and `port` are configured, and a GUI terminal is available if you configured window/TUI launch. |
 
 ## Important behavior and limits
 

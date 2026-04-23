@@ -32,6 +32,7 @@ function helpText() {
     "/model <provider/model> [variant]",
     "/feed",
     "/status",
+    "/runtime or /health (private chat only)",
     "/bindings (private chat only)",
     "/abort",
     "/sendlast",
@@ -73,6 +74,7 @@ export function createCommandHandlers(runtime) {
     hashTextForEcho,
     formatProjectUnavailable,
     buildProjectsOverviewText,
+    buildProjectsOverviewKeyboard,
     isCommand,
     parseCommand,
     rejectNoteAwaiting,
@@ -87,6 +89,7 @@ export function createCommandHandlers(runtime) {
     setRejectNoteAwaitingState,
     setAwaitingCustomAnswerState,
     buildRuntimeStatusLines,
+    buildGlobalRuntimeStatusLines,
   } = runtime
 
   async function resolveStartupSession(alias, { forceRefresh = false } = {}) {
@@ -650,6 +653,10 @@ export function createCommandHandlers(runtime) {
     return makeInlineKeyboard(rows)
   }
 
+  function closeKeyboard(callbackData = "s|close") {
+    return makeInlineKeyboard([[{ text: "Close", callback_data: runtime.cb.pack(callbackData) }]])
+  }
+
   async function renderSessionsList(ctxMeta, { binding, editMessageId } = {}) {
     const oc = ocByAlias[binding.projectAlias]
     const sessions = await oc.listSessions({ directory: projects?.[binding.projectAlias]?.directory, limit: 10 })
@@ -675,6 +682,39 @@ export function createCommandHandlers(runtime) {
       return
     }
     await sendToThread(ctxMeta, text, replyMarkup)
+  }
+
+  async function renderProjectSessions(ctxMeta, projectAlias, { editMessageId } = {}) {
+    if (!projectAlias || !projects?.[projectAlias]) {
+      await safeInformThread(ctxMeta, "Unknown project.")
+      return
+    }
+    const existing = store.getBinding(ctxMeta.ctxKey)
+    if (ctxMeta?.chatType !== "private" && existing?.projectAlias !== projectAlias) {
+      await safeInformThread(ctxMeta, "Use project session actions only in a private chat unless this thread is bound to that project.")
+      return
+    }
+    const startupSid = startupSessionByProject[projectAlias] || (await resolveStartupSession(projectAlias)) || ""
+    if (existing?.projectAlias !== projectAlias) {
+      const oc = ocByAlias[projectAlias]
+      const sessions = await oc.listSessions({ directory: projects?.[projectAlias]?.directory, limit: 10 })
+      runtime.markProjectUp(projectAlias)
+      const text = `${formatSessionsListText(projectAlias, sessions, { startupSessionId: startupSid })}\n\nViewing only. Bind the target chat/thread to switch sessions with buttons.`
+        .replace("Tap a button below to switch:\n\n", "")
+        .replace("Use /new to create one or /use <sessionId> to switch.", "Bind the target chat/thread to this project before creating or switching sessions from Telegram.")
+        .replace("Use /use <sessionId> to switch.", "Use /bind <projectAlias> in the target chat/thread, then /use <sessionId> to switch.")
+      const replyMarkup = closeKeyboard("srv|close")
+      if (editMessageId) {
+        await runtime.tg.editMessageText(ctxMeta.chatId, editMessageId, text, replyMarkup)
+        return
+      }
+      await sendToThread(ctxMeta, text, replyMarkup)
+      return
+    }
+    await renderSessionsList(ctxMeta, {
+      binding: { projectAlias, sessionId: existing.sessionId || startupSid },
+      editMessageId,
+    })
   }
 
   async function handleBindCommand(ctxMeta, argv) {
@@ -940,6 +980,15 @@ export function createCommandHandlers(runtime) {
     )
   }
 
+  async function handleRuntime(ctxMeta) {
+    if (ctxMeta?.chatType !== "private") {
+      await safeInformThread(ctxMeta, "Use /runtime only in a private chat with the bot. Runtime state can include project aliases and operational details.")
+      return
+    }
+    const lines = buildGlobalRuntimeStatusLines?.() || ["Runtime status is unavailable."]
+    await sendToThread(ctxMeta, ["Runtime:", ...lines].join("\n"))
+  }
+
   async function handleFeed(ctxMeta, { editMessageId } = {}) {
     await renderFeedSettings(ctxMeta, { editMessageId })
   }
@@ -1023,7 +1072,12 @@ export function createCommandHandlers(runtime) {
       previewLimit: 3,
       showBindingScopes: ctxMeta?.chatType === "private",
     })
-    await sendToThread(ctxMeta, text)
+    const replyMarkup = buildProjectsOverviewKeyboard?.({
+      platform,
+      showProjectControls: ctxMeta?.chatType === "private",
+      showSessions: ctxMeta?.chatType === "private",
+    })
+    await sendToThread(ctxMeta, text, replyMarkup)
   }
 
   async function handleUnbind(ctxMeta) {
@@ -1255,6 +1309,11 @@ export function createCommandHandlers(runtime) {
         await markMessageHandled("status")
         return
       }
+      if (cmd === "/runtime" || cmd === "/health") {
+        await handleRuntime(ctxMeta)
+        await markMessageHandled("runtime")
+        return
+      }
       if (cmd === "/bindings") {
         await handleBindings(ctxMeta)
         await markMessageHandled("bindings")
@@ -1320,10 +1379,12 @@ export function createCommandHandlers(runtime) {
     handleModelCommand,
     handleAbort,
     handleWhere,
+    handleRuntime,
     handleFeed,
     handleBindings,
     handleSendLast,
     handleProjects,
+    renderProjectSessions,
     handleUnbind,
     handleTelegramMessage,
     buildSessionSwitchText,

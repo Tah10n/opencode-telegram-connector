@@ -3,7 +3,7 @@ import assert from "node:assert/strict"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { createOverviewHelpers } from "../src/connector/overview.js"
+import { buildProjectsOverviewKeyboard, createOverviewHelpers } from "../src/connector/overview.js"
 
 function swapEnv(t, patch) {
   const previous = new Map()
@@ -43,6 +43,29 @@ test("createOverviewHelpers startServerKeyboard packs callback data", () => {
 
   const keyboard = helpers.startServerKeyboard("veryLongAliasNameForProject1234567890")
   assert.equal(keyboard.inline_keyboard[0][0].callback_data, "packed:srv|veryLongAliasNameForProject1234567890|start")
+})
+
+test("buildProjectsOverviewKeyboard includes safe project actions", () => {
+  const keyboard = buildProjectsOverviewKeyboard({
+    projects: { demo: {}, remote: {} },
+    cb: { pack: (value) => `packed:${value}` },
+    canAutoStartProject: (alias) => alias === "demo",
+    platform: "win32",
+    showSessions: true,
+  })
+
+  assert.deepEqual(keyboard.inline_keyboard, [
+    [
+      { text: "Start demo", callback_data: "packed:srv|demo|start" },
+      { text: "Retry demo", callback_data: "packed:srv|demo|health" },
+      { text: "Sessions demo", callback_data: "packed:srv|demo|sessions" },
+    ],
+    [
+      { text: "Retry remote", callback_data: "packed:srv|remote|health" },
+      { text: "Sessions remote", callback_data: "packed:srv|remote|sessions" },
+    ],
+    [{ text: "Close", callback_data: "packed:srv|close" }],
+  ])
 })
 
 test("createOverviewHelpers sends unavailable and recovered notices only to threads bound to that project", async () => {
@@ -88,6 +111,22 @@ test("createOverviewHelpers sends unavailable and recovered notices only to thre
   assert.match(sent[0].text, /Project 'demo' is unavailable/)
   assert.match(sent[2].text, /Project 'demo' is back online/)
   assert.ok(!sent.some((entry) => entry.ctx.ctxKey === "200:0"))
+})
+
+test("createOverviewHelpers redacts sensitive error details in unavailable notices", async () => {
+  const helpers = createOverviewHelpers({
+    projects: { demo: { baseUrl: "http://user:secret@example.test:4312/path?token=abc#frag" } },
+    store: { get: () => ({ bindings: {} }) },
+    startInProgress: new Map(),
+    parseCtxKey: () => null,
+    sendToThread: async () => {},
+    cb: { pack: (value) => value },
+  })
+
+  const text = helpers.formatProjectUnavailable("demo", new Error("GET http://user:secret@example.test:4312/path?token=abc#frag Authorization: Bearer supersecret"))
+
+  assert.match(text, /http:\/\/example\.test:4312\/path\?token=\*\*\*/)
+  assert.doesNotMatch(text, /user|supersecret|abc|frag|Bearer supersecret/)
 })
 
 test("createOverviewHelpers offers a Start button for Linux TUI auto-start projects", async (t) => {

@@ -27,10 +27,12 @@ export function createCallbackHandlers(runtime) {
     bindCtxToSession,
     sendToThread,
     ensureProjectStarted,
+    validateProject,
     renderFeedSettings,
     renderModelSettings,
     renderChangedFilesView,
     renderSessionsList,
+    renderProjectSessions,
     feedModeLabel,
     setRejectNoteAwaitingState,
     sendRejectNotePrompt,
@@ -45,6 +47,9 @@ export function createCallbackHandlers(runtime) {
     buildSessionSwitchText = defaultBuildSessionSwitchText,
     setThreadModelPreference,
     formatProjectUnavailable,
+    canAutoStartProject,
+    startServerKeyboard,
+    platform,
     recordCallbackOutcome,
   } = runtime
 
@@ -117,6 +122,11 @@ export function createCallbackHandlers(runtime) {
       store.hasIdempotencyKey?.(questionRejectIdempotencyKey(projectAlias, "", questionId))
   }
 
+  function canUseProjectControl(ctxMeta, projectAlias) {
+    if (ctxMeta?.chatType === "private") return true
+    return store.getBinding(ctxMeta?.ctxKey)?.projectAlias === projectAlias
+  }
+
   async function handleTelegramCallback(callbackQuery) {
     if (!isAllowedUser(callbackQuery?.from)) return
     const msg = callbackQuery.message
@@ -178,18 +188,49 @@ export function createCallbackHandlers(runtime) {
       }
 
       if (kind === "srv") {
+        if (parts[1] === "close") {
+          await closeInteractiveMessage(callbackQuery.id, ctxMeta, msg?.message_id)
+          return
+        }
         const projectAlias = parts[1]
         const action = parts[2]
         if (!projectAlias || !projects?.[projectAlias]) {
           await answerCallbackQuery(callbackQuery.id, "Unknown project")
           return
         }
-        if (action !== "start") {
-          await answerCallbackQuery(callbackQuery.id, "Invalid")
+        if (action === "start") {
+          if (!canUseProjectControl(ctxMeta, projectAlias)) {
+            await answerCallbackQuery(callbackQuery.id, "Private chat only")
+            return
+          }
+          await answerCallbackQuery(callbackQuery.id, "Starting…")
+          void ensureProjectStarted(projectAlias, ctxMeta)
           return
         }
-        await answerCallbackQuery(callbackQuery.id, "Starting…")
-        void ensureProjectStarted(projectAlias, ctxMeta)
+        if (action === "health") {
+          if (!canUseProjectControl(ctxMeta, projectAlias)) {
+            await answerCallbackQuery(callbackQuery.id, "Private chat only")
+            return
+          }
+          await answerCallbackQuery(callbackQuery.id, "Checking…")
+          try {
+            await validateProject(projectAlias)
+            await sendToThread(ctxMeta, `Project '${projectAlias}' health check: online.`).catch(ignoreError)
+          } catch (err) {
+            const replyMarkup = canAutoStartProject?.(projectAlias, { platform }) ? startServerKeyboard?.(projectAlias) : null
+            await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err), replyMarkup).catch(ignoreError)
+          }
+          return
+        }
+        if (action === "sessions") {
+          await answerCallbackQuery(callbackQuery.id, "Sessions")
+          await renderProjectSessions(ctxMeta, projectAlias, { editMessageId: msg?.message_id }).catch(async (err) => {
+            runtime.logger?.error?.("Failed to render project sessions:", err?.message || String(err))
+            await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err)).catch(ignoreError)
+          })
+          return
+        }
+        await answerCallbackQuery(callbackQuery.id, "Invalid")
         return
       }
 

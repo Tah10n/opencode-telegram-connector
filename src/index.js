@@ -213,6 +213,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       { command: "model", description: "Настроить модель для текущего треда" },
       { command: "feed", description: "Настроить Telegram feed для треда" },
       { command: "status", description: "Показать текущую привязку" },
+      { command: "runtime", description: "Показать состояние коннектора в личке" },
       { command: "bindings", description: "Показать все активные привязки в личке" },
       { command: "abort", description: "Прервать текущую сессию" },
       { command: "sendlast", description: "Отправить последнее сообщение модели" },
@@ -922,6 +923,11 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     parseCtxKey,
     formatThreadLabel,
     buildRuntimeStatusLines: runtimeObservability.buildStatusLines,
+    buildGlobalRuntimeStatusLines: () =>
+      runtimeObservability.buildRuntimeStatusLines({
+        managedTasks: lifecycle.snapshot(),
+        shutdownState: abortController.signal.aborted ? "stopping" : "running",
+      }),
     isCommand,
     parseCommand,
     compareNumbers,
@@ -953,6 +959,8 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     bindCtxToSession,
     sendToThread,
     ensureProjectStarted,
+    validateProject,
+    platform,
   })
   const { handleTelegramCallback } = callbackHandlers
 
