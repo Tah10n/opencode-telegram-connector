@@ -1,6 +1,13 @@
 import { normalizeFeedMode } from "../state/store.js"
 import { normalizeModelReference } from "../model-selection.js"
 import { classifyBoundaryError, isRetryableBoundaryError, isStaleBoundaryError } from "../boundary-errors.js"
+import {
+  permissionNoteIdempotencyPrefix,
+  permissionReplyIdempotencyKey,
+  permissionReplyIdempotencyPrefix,
+  questionRejectIdempotencyKey,
+  questionReplyIdempotencyPrefix,
+} from "./idempotency.js"
 
 async function defaultBuildSessionSwitchText(_projectAlias, sessionId) {
   return `Switched to session: ${sessionId}`
@@ -54,6 +61,60 @@ export function createCallbackHandlers(runtime) {
     if (typeof tg.editMessageReplyMarkup === "function") {
       await tg.editMessageReplyMarkup(ctxMeta.chatId, messageId, null).catch(ignoreError)
     }
+  }
+
+  function hasIdempotencyKey(key) {
+    return !!key && typeof store?.hasIdempotencyKey === "function" && store.hasIdempotencyKey(key)
+  }
+
+  async function markIdempotencyKey(key, metadata = {}) {
+    if (!key) return false
+    if (typeof store?.markIdempotencyKey === "function") {
+      return store.markIdempotencyKey(key, metadata)
+    }
+    if (typeof store?.markIdempotencyKeyAndFlush === "function") {
+      return store.markIdempotencyKeyAndFlush(key, metadata)
+    }
+    return false
+  }
+
+  function cleanupPermissionState(ctxKey, projectAlias, permissionId, sessionID = "") {
+    store.deletePendingPermission(projectAlias, permissionId, sessionID)
+    setRejectNoteAwaitingState(ctxKey, null)
+  }
+
+  function cleanupQuestionState(ctxKey, projectAlias, questionId, sessionID = "") {
+    runtime.questionWizards.delete(sessionID ? `${projectAlias}:${sessionID}:${questionId}` : `${projectAlias}:${questionId}`)
+    runtime.questionWizards.delete(`${projectAlias}:${questionId}`)
+    clearPersistedQuestionWizard(projectAlias, questionId, sessionID)
+    setAwaitingCustomAnswerState(ctxKey, null)
+  }
+
+  function parsePermissionParts(parts) {
+    if (parts.length >= 5) return { projectAlias: parts[1], sessionID: parts[2] || "", permissionId: parts[3], action: parts[4] }
+    return { projectAlias: parts[1], sessionID: "", permissionId: parts[2], action: parts[3] }
+  }
+
+  function parseQuestionParts(parts) {
+    const oldShape = parts.length < 4 || parts[3] === "reject" || Number.isInteger(Number(parts[3]))
+    if (oldShape) return { projectAlias: parts[1], sessionID: "", questionId: parts[2], rest: parts.slice(3) }
+    return { projectAlias: parts[1], sessionID: parts[2] || "", questionId: parts[3], rest: parts.slice(4) }
+  }
+
+  function hasHandledPermission(projectAlias, sessionID, permissionId) {
+    if (typeof store?.hasIdempotencyKeyPrefix !== "function") return false
+    return store.hasIdempotencyKeyPrefix(permissionReplyIdempotencyPrefix(projectAlias, sessionID, permissionId)) ||
+      store.hasIdempotencyKeyPrefix(permissionNoteIdempotencyPrefix(projectAlias, sessionID, permissionId)) ||
+      store.hasIdempotencyKeyPrefix(permissionReplyIdempotencyPrefix(projectAlias, "", permissionId)) ||
+      store.hasIdempotencyKeyPrefix(permissionNoteIdempotencyPrefix(projectAlias, "", permissionId))
+  }
+
+  function hasHandledQuestion(projectAlias, sessionID, questionId) {
+    return (typeof store?.hasIdempotencyKeyPrefix === "function" &&
+        (store.hasIdempotencyKeyPrefix(questionReplyIdempotencyPrefix(projectAlias, sessionID, questionId)) ||
+          store.hasIdempotencyKeyPrefix(questionReplyIdempotencyPrefix(projectAlias, "", questionId)))) ||
+      store.hasIdempotencyKey?.(questionRejectIdempotencyKey(projectAlias, sessionID, questionId)) ||
+      store.hasIdempotencyKey?.(questionRejectIdempotencyKey(projectAlias, "", questionId))
   }
 
   async function handleTelegramCallback(callbackQuery) {
@@ -258,21 +319,33 @@ export function createCallbackHandlers(runtime) {
       }
 
       if (kind === "p") {
-        const projectAlias = parts[1]
-        const permissionId = parts[2]
-        const action = parts[3]
+        const { projectAlias, sessionID, permissionId, action } = parsePermissionParts(parts)
         const oc = ocByAlias[projectAlias]
         if (!oc) {
           await answerCallbackQuery(callbackQuery.id, "Unknown project")
           return
         }
         if (action === "once" || action === "always" || action === "reject") {
+          const replyKey = permissionReplyIdempotencyKey(projectAlias, sessionID, permissionId, action)
+          if (hasIdempotencyKey(replyKey) || hasHandledPermission(projectAlias, sessionID, permissionId)) {
+            cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, sessionID)
+            await store.flush?.()
+            await answerCallbackQuery(callbackQuery.id, "Already handled")
+            return
+          }
           try {
             await oc.replyPermission(permissionId, { reply: action })
           } catch (err) {
             if (isStaleBoundaryError(err, { source: "opencode", pathname: `/permission/${permissionId}/reply`, method: "POST" })) {
-              store.deletePendingPermission(projectAlias, permissionId)
-              setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
+              await markIdempotencyKey(replyKey, {
+                kind: "permission-reply",
+                projectAlias,
+                ctxKey: ctxMeta.ctxKey,
+                operation: "replyPermission",
+                action,
+              })
+              cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, sessionID)
+              await store.flush?.()
               recordCallbackOutcome?.(projectAlias, "stale")
               await answerCallbackQuery(callbackQuery.id, "No longer active")
               return
@@ -285,20 +358,35 @@ export function createCallbackHandlers(runtime) {
             }
             throw err
           }
-          store.deletePendingPermission(projectAlias, permissionId)
-          setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
+          await markIdempotencyKey(replyKey, {
+            kind: "permission-reply",
+            projectAlias,
+            ctxKey: ctxMeta.ctxKey,
+            operation: "replyPermission",
+            action,
+          })
+          cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, sessionID)
+          await store.flush?.()
           await answerCallbackQuery(callbackQuery.id, "OK")
           return
         }
         if (action === "reject_note") {
+          if (hasHandledPermission(projectAlias, sessionID, permissionId)) {
+            cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, sessionID)
+            await store.flush?.()
+            await answerCallbackQuery(callbackQuery.id, "Already handled")
+            return
+          }
+          setRejectNoteAwaitingState(ctxMeta.ctxKey, { projectAlias, permissionId, ...(sessionID ? { sessionID } : {}) })
           try {
-            await sendRejectNotePrompt(ctxMeta, projectAlias, permissionId)
+            await sendRejectNotePrompt(ctxMeta, projectAlias, permissionId, { sessionID })
           } catch (err) {
+            setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
             runtime.logger?.error?.("Failed to start reject-note flow:", err?.message || String(err))
             await answerCallbackQuery(callbackQuery.id, "Unavailable")
             return
           }
-          setRejectNoteAwaitingState(ctxMeta.ctxKey, { projectAlias, permissionId })
+          await store.flush?.()
           await answerCallbackQuery(callbackQuery.id, "Send note")
           return
         }
@@ -312,23 +400,34 @@ export function createCallbackHandlers(runtime) {
       }
 
       if (kind === "q") {
-        const projectAlias = parts[1]
-        const questionId = parts[2]
+        const { projectAlias, sessionID, questionId, rest } = parseQuestionParts(parts)
         const oc = ocByAlias[projectAlias]
         if (!oc) {
           await answerCallbackQuery(callbackQuery.id, "Unknown project")
           return
         }
 
-        const wizard = getWizard(projectAlias, questionId)
-        if (parts.length === 4 && parts[3] === "reject") {
+        const wizard = getWizard(projectAlias, questionId, sessionID)
+        if (rest.length === 1 && rest[0] === "reject") {
+          const rejectKey = questionRejectIdempotencyKey(projectAlias, sessionID, questionId)
+          if (hasIdempotencyKey(rejectKey) || hasHandledQuestion(projectAlias, sessionID, questionId)) {
+            cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, sessionID)
+            await store.flush?.()
+            await answerCallbackQuery(callbackQuery.id, "Already handled")
+            return
+          }
           try {
             await oc.rejectQuestion(questionId)
           } catch (err) {
             if (isStaleBoundaryError(err, { source: "opencode", pathname: `/question/${questionId}/reject`, method: "POST" })) {
-              runtime.questionWizards.delete(`${projectAlias}:${questionId}`)
-              clearPersistedQuestionWizard(projectAlias, questionId)
-              setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
+              await markIdempotencyKey(rejectKey, {
+                kind: "question-reject",
+                projectAlias,
+                ctxKey: ctxMeta.ctxKey,
+                operation: "rejectQuestion",
+              })
+              cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, sessionID)
+              await store.flush?.()
               recordCallbackOutcome?.(projectAlias, "stale")
               await answerCallbackQuery(callbackQuery.id, "No longer active")
               return
@@ -341,25 +440,36 @@ export function createCallbackHandlers(runtime) {
             }
             throw err
           }
-          runtime.questionWizards.delete(`${projectAlias}:${questionId}`)
-          clearPersistedQuestionWizard(projectAlias, questionId)
-          setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
+          await markIdempotencyKey(rejectKey, {
+            kind: "question-reject",
+            projectAlias,
+            ctxKey: ctxMeta.ctxKey,
+            operation: "rejectQuestion",
+          })
+          cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, sessionID)
+          await store.flush?.()
           await answerCallbackQuery(callbackQuery.id, "Rejected")
           return
         }
 
         if (!wizard) {
+          if (hasHandledQuestion(projectAlias, sessionID, questionId)) {
+            cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, sessionID)
+            await store.flush?.()
+            await answerCallbackQuery(callbackQuery.id, "Already handled")
+            return
+          }
           await answerCallbackQuery(callbackQuery.id, "Not found")
           return
         }
-        if (parts.length < 5) {
+        if (rest.length < 2) {
           await answerCallbackQuery(callbackQuery.id, "Invalid")
           return
         }
 
-        const qIndex = Number(parts[3])
-        const action = parts[4]
-        const arg = parts[5]
+        const qIndex = Number(rest[0])
+        const action = rest[1]
+        const arg = rest[2]
         if (!Number.isInteger(qIndex) || qIndex !== wizard.index) {
           await answerCallbackQuery(callbackQuery.id, "Out of date")
           return
@@ -376,14 +486,16 @@ export function createCallbackHandlers(runtime) {
             await answerCallbackQuery(callbackQuery.id, "Custom disabled")
             return
           }
+          setAwaitingCustomAnswerState(ctxMeta.ctxKey, { projectAlias, requestId: questionId, ...(sessionID ? { sessionID } : {}), qIndex })
           try {
-            await sendQuestionCustomAnswerPrompt(ctxMeta, projectAlias, questionId, qIndex, q.header || "question")
+            await sendQuestionCustomAnswerPrompt(ctxMeta, projectAlias, questionId, qIndex, q.header || "question", { sessionID })
           } catch (err) {
+            setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
             runtime.logger?.error?.("Failed to start custom-answer flow:", err?.message || String(err))
             await answerCallbackQuery(callbackQuery.id, "Unavailable")
             return
           }
-          setAwaitingCustomAnswerState(ctxMeta.ctxKey, { projectAlias, requestId: questionId, qIndex })
+          await store.flush?.()
           await answerCallbackQuery(callbackQuery.id, "Send answer")
           return
         }

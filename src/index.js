@@ -2,6 +2,7 @@ import { setTimeout as delay } from "node:timers/promises"
 import crypto from "node:crypto"
 import { createCallbackHandlers } from "./connector/callbacks.js"
 import { createCommandHandlers } from "./connector/commands.js"
+import { promptIdentity, telegramUpdateIdempotencyKey } from "./connector/idempotency.js"
 import { createMirroringHandlers } from "./connector/mirroring.js"
 import { createOverviewHelpers } from "./connector/overview.js"
 import { createPromptHandlers } from "./connector/prompts.js"
@@ -605,9 +606,10 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         if (currentAwaiting?.projectAlias === w?.projectAlias && currentAwaiting?.requestId === w?.request?.id) {
           setAwaitingCustomAnswerState(ctxKey, null)
         }
-        prompted[w?.projectAlias]?.question.delete(w?.request?.id)
+        prompted[w?.projectAlias]?.question.delete(promptIdentity(w?.request?.id || w?.id, w?.sessionID))
+        prompted[w?.projectAlias]?.question.delete(w?.request?.id || w?.id)
         questionWizards.delete(k)
-        clearPersistedQuestionWizard(w?.projectAlias, w?.request?.id)
+        clearPersistedQuestionWizard(w?.projectAlias, w?.request?.id || w?.id, w?.sessionID)
         runtimeObservability.recordPromptCleanup(w?.projectAlias, "stale")
         logger.info("Stale prompt wizard cleaned up:", w?.projectAlias || "unknown", w?.request?.id || w?.id || "unknown")
       }
@@ -958,19 +960,34 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     const type = evt?.type
     const props = evt?.properties || {}
 
+    function isInitialBaselinePrompt(kind) {
+      const identity = promptIdentity(props?.id, props?.sessionID)
+      const base = promptBaseline[projectAlias]
+      return !!identity && !!base?.loaded && !!base[kind]?.has(identity)
+    }
+
     if (type === "message.updated") {
       await handleMessageUpdated({ projectAlias, props })
-      return
+      return false
     }
 
     if (type === "permission.asked") {
-      await handlePermissionAsked({ projectAlias, props, resolveBoundRoute, logSseDebug })
-      return
+      if (isInitialBaselinePrompt("permission")) {
+        logSseDebug(projectAlias, props.sessionID, `drop=permission_initial_baseline id=${props.id}`)
+        return false
+      }
+      return handlePermissionAsked({ projectAlias, props, resolveBoundRoute, logSseDebug })
     }
 
     if (type === "question.asked") {
-      await handleQuestionAsked({ projectAlias, props, resolveBoundRoute, logSseDebug })
+      if (isInitialBaselinePrompt("question")) {
+        logSseDebug(projectAlias, props.sessionID, `drop=question_initial_baseline id=${props.id}`)
+        return false
+      }
+      return handleQuestionAsked({ projectAlias, props, resolveBoundRoute, logSseDebug })
     }
+
+    return false
   }
 
   async function drainTelegramBacklogIfNeeded() {
@@ -1065,8 +1082,13 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       backoff = 1000
       for (const u of updates) {
         let shouldAdvanceOffset = false
+        const updateKey = telegramUpdateIdempotencyKey(u?.update_id)
+        if (updateKey && store.hasIdempotencyKey?.(updateKey)) {
+          store.setUpdateOffset(u.update_id + 1)
+          continue
+        }
         try {
-          if (u.message) await handleTelegramMessage(u.message)
+          if (u.message) await handleTelegramMessage(u.message, { updateId: u.update_id })
           if (u.callback_query) await handleTelegramCallback(u.callback_query)
           shouldAdvanceOffset = true
         } catch (err) {
@@ -1093,6 +1115,11 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         }
 
         if (shouldAdvanceOffset) {
+          store.markIdempotencyKey?.(updateKey, {
+            kind: "telegram-update",
+            updateId: u.update_id,
+            operation: u.message ? "message" : u.callback_query ? "callback" : "unknown",
+          })
           store.setUpdateOffset(u.update_id + 1)
         } else {
           await sleepWithAbort(1000)
@@ -1103,9 +1130,9 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   }
 
   if (recoverPendingPromptsOnStartup) {
-    await restorePendingPromptState()
-      .then((summary) => {
-        if (!summary) return
+    try {
+      const summary = await restorePendingPromptState()
+      if (summary) {
         const totals = summary.totals || {}
         logger.info(
           "Pending prompt recovery:",
@@ -1114,11 +1141,14 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
           `retryable=${totals.retryable || 0}`,
           `fatal=${totals.fatal || 0}`,
         )
-      })
-      .catch((err) => {
-        logger.error("Failed to restore pending prompts:", err?.message || String(err))
-      })
+        if ((totals.restored || 0) > 0 || (totals.stale || 0) > 0) await store.flush?.()
+      }
+    } catch (err) {
+      logger.error("Failed to restore pending prompts:", err?.message || String(err))
+    }
   }
+
+  await Promise.all(Object.keys(projects).map((alias) => ensureBaselineLoaded(alias)))
 
   for (const alias of Object.keys(projects)) {
     startManagedTask(
@@ -1182,7 +1212,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     while (!abortController.signal.aborted) {
       for (const alias of Object.keys(projects)) {
         try {
-          await ensureBaselineLoaded(alias)
+          await ensureBaselineLoaded(alias, { populateInitialSnapshot: false })
           if (!promptBaseline[alias]?.loaded) continue
           const oc = ocByAlias[alias]
           const [permsResult, questionsResult] = await Promise.allSettled([
@@ -1231,17 +1261,17 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
           }
           if (Array.isArray(perms)) {
             for (const p of perms) {
-              if (promptBaseline[alias].permission.has(p.id)) continue
-              runtimeObservability.recordLoopFallbackHit("promptPoll", { projectAlias: alias })
+              if (promptBaseline[alias].permission.has(promptIdentity(p?.id, p?.sessionID))) continue
               // send via SSE handler shape
-              await onSseEvent({ projectAlias: alias, evt: { type: "permission.asked", properties: p } })
+              const delivered = await onSseEvent({ projectAlias: alias, evt: { type: "permission.asked", properties: p } })
+              if (delivered) runtimeObservability.recordLoopFallbackHit("promptPoll", { projectAlias: alias })
             }
           }
           if (Array.isArray(questions)) {
             for (const q of questions) {
-              if (promptBaseline[alias].question.has(q.id)) continue
-              runtimeObservability.recordLoopFallbackHit("promptPoll", { projectAlias: alias })
-              await onSseEvent({ projectAlias: alias, evt: { type: "question.asked", properties: q } })
+              if (promptBaseline[alias].question.has(promptIdentity(q?.id, q?.sessionID))) continue
+              const delivered = await onSseEvent({ projectAlias: alias, evt: { type: "question.asked", properties: q } })
+              if (delivered) runtimeObservability.recordLoopFallbackHit("promptPoll", { projectAlias: alias })
             }
           }
         } catch (err) {

@@ -1,7 +1,16 @@
 import { makeInlineKeyboard } from "../telegram/client.js"
 import { escapeHtml } from "../telegram/formatter.js"
 import { ctxKeyFrom } from "../telegram/routing.js"
+import { promptKey } from "../state/store.js"
 import { isRetryableBoundaryError, isStaleBoundaryError } from "../boundary-errors.js"
+import {
+  permissionNoteIdempotencyPrefix,
+  permissionReplyIdempotencyPrefix,
+  promptIdentity,
+  questionRejectIdempotencyKey,
+  questionReplyIdempotencyKey,
+  questionReplyIdempotencyPrefix,
+} from "./idempotency.js"
 
 export function createPromptHandlers(runtime) {
   const {
@@ -18,18 +27,78 @@ export function createPromptHandlers(runtime) {
     sendBlocksToThread,
     parseCtxKey,
     clampString,
-    recoverPendingPromptsOnStartup,
     markProjectUp,
   } = runtime
 
-  const wizardKey = (projectAlias, requestId) => `${projectAlias}:${requestId}`
-  const getWizard = (projectAlias, requestId) => questionWizards.get(wizardKey(projectAlias, requestId)) || null
+  const wizardKey = (projectAlias, requestId, sessionID = "") => promptKey(projectAlias, requestId, sessionID)
+  const initialPendingPrompts = JSON.parse(JSON.stringify(store.getPendingPrompts?.() || store.get?.().pendingPrompts || {}))
+  const getWizard = (projectAlias, requestId, sessionID = "") => {
+    if (sessionID) return questionWizards.get(wizardKey(projectAlias, requestId, sessionID)) || null
+    return questionWizards.get(wizardKey(projectAlias, requestId)) || [...questionWizards.values()].find((wizard) => wizard?.projectAlias === projectAlias && (wizard?.id || wizard?.request?.id) === requestId) || null
+  }
   function persistQuestionWizard(wizard) {
-    store.setQuestionWizard(wizardKey(wizard.projectAlias, wizard.request.id), wizard)
+    store.setQuestionWizard(wizardKey(wizard.projectAlias, wizard.request.id, wizard.sessionID), wizard)
   }
 
-  function clearPersistedQuestionWizard(projectAlias, requestId) {
-    store.deleteQuestionWizard(wizardKey(projectAlias, requestId))
+  function clearPersistedQuestionWizard(projectAlias, requestId, sessionID = "") {
+    store.deleteQuestionWizard(wizardKey(projectAlias, requestId, sessionID))
+    if (!sessionID) store.deleteQuestionWizard(wizardKey(projectAlias, requestId))
+  }
+
+  function hasIdempotencyKey(key) {
+    return !!key && typeof store?.hasIdempotencyKey === "function" && store.hasIdempotencyKey(key)
+  }
+
+  function hasIdempotencyPrefix(prefix) {
+    return !!prefix && typeof store?.hasIdempotencyKeyPrefix === "function" && store.hasIdempotencyKeyPrefix(prefix)
+  }
+
+  function collectPendingPromptIdentities(projectAlias, pending = store.getPendingPrompts?.() || store.get?.().pendingPrompts || {}) {
+    const permissions = new Set()
+    const questions = new Set()
+    for (const entry of Object.values(pending.permissions || {})) {
+      if (entry?.projectAlias === projectAlias) {
+        const identity = promptIdentity(entry.permissionId, entry.sessionID)
+        if (identity) permissions.add(identity)
+      }
+    }
+    for (const entry of Object.values(pending.rejectNotes || {})) {
+      if (entry?.projectAlias === projectAlias) {
+        const identity = promptIdentity(entry.permissionId, entry.sessionID)
+        if (identity) permissions.add(identity)
+      }
+    }
+    for (const entry of Object.values(pending.questionWizards || {})) {
+      if (entry?.projectAlias === projectAlias) {
+        const identity = promptIdentity(entry.id || entry.request?.id, entry.sessionID)
+        if (identity) questions.add(identity)
+      }
+    }
+    for (const entry of Object.values(pending.customAnswers || {})) {
+      if (entry?.projectAlias === projectAlias) {
+        const identity = promptIdentity(entry.requestId, entry.sessionID)
+        if (identity) questions.add(identity)
+      }
+    }
+    return { permissions, questions }
+  }
+
+  async function markIdempotencyKey(key, metadata = {}) {
+    if (!key) return false
+    if (typeof store?.markIdempotencyKey === "function") {
+      return store.markIdempotencyKey(key, metadata)
+    }
+    if (typeof store?.markIdempotencyKeyAndFlush === "function") {
+      return store.markIdempotencyKeyAndFlush(key, metadata)
+    }
+    return false
+  }
+
+  function clearQuestionWizardState(wizard) {
+    questionWizards.delete(wizardKey(wizard.projectAlias, wizard.request.id, wizard.sessionID))
+    questionWizards.delete(wizardKey(wizard.projectAlias, wizard.request.id))
+    clearPersistedQuestionWizard(wizard.projectAlias, wizard.request.id, wizard.sessionID)
+    setAwaitingCustomAnswerState(wizard.ctx.ctxKey, null)
   }
 
   function setRejectNoteAwaitingState(ctxKey, value) {
@@ -105,19 +174,19 @@ export function createPromptHandlers(runtime) {
         const label = String(q.options[i].label)
         const checked = selectedLabels?.has(label)
         const text = `${checked ? "[x]" : "[ ]"} ${clampString(label, 50)}`
-        rows.push([{ text, callback_data: cb.pack(`q|${projectAlias}|${req.id}|${stepIndex}|t|${i}`) }])
+        rows.push([{ text, callback_data: cb.pack(`q|${projectAlias}|${req.sessionID || ""}|${req.id}|${stepIndex}|t|${i}`) }])
       }
-      rows.push([{ text: "Done", callback_data: cb.pack(`q|${projectAlias}|${req.id}|${stepIndex}|done`) }])
+      rows.push([{ text: "Done", callback_data: cb.pack(`q|${projectAlias}|${req.sessionID || ""}|${req.id}|${stepIndex}|done`) }])
     } else {
       for (let i = 0; i < q.options.length; i++) {
         const label = String(q.options[i].label)
-        rows.push([{ text: clampString(label, 60), callback_data: cb.pack(`q|${projectAlias}|${req.id}|${stepIndex}|o|${i}`) }])
+        rows.push([{ text: clampString(label, 60), callback_data: cb.pack(`q|${projectAlias}|${req.sessionID || ""}|${req.id}|${stepIndex}|o|${i}`) }])
       }
     }
 
     const bottomRow = []
-    if (allowCustom) bottomRow.push({ text: "Type answer", callback_data: cb.pack(`q|${projectAlias}|${req.id}|${stepIndex}|custom`) })
-    bottomRow.push({ text: "Reject", callback_data: cb.pack(`q|${projectAlias}|${req.id}|reject`) })
+    if (allowCustom) bottomRow.push({ text: "Type answer", callback_data: cb.pack(`q|${projectAlias}|${req.sessionID || ""}|${req.id}|${stepIndex}|custom`) })
+    bottomRow.push({ text: "Reject", callback_data: cb.pack(`q|${projectAlias}|${req.sessionID || ""}|${req.id}|reject`) })
     rows.push(bottomRow)
 
     return { html: escapeHtml(lines.join("\n")), replyMarkup: makeInlineKeyboard(rows) }
@@ -167,12 +236,12 @@ export function createPromptHandlers(runtime) {
       ],
       replyMarkup: makeInlineKeyboard([
         [
-          { text: "Allow once", callback_data: cb.pack(`p|${projectAlias}|${props.id}|once`) },
-          { text: "Always allow", callback_data: cb.pack(`p|${projectAlias}|${props.id}|always`) },
+          { text: "Allow once", callback_data: cb.pack(`p|${projectAlias}|${props.sessionID || ""}|${props.id}|once`) },
+          { text: "Always allow", callback_data: cb.pack(`p|${projectAlias}|${props.sessionID || ""}|${props.id}|always`) },
         ],
         [
-          { text: "Reject", callback_data: cb.pack(`p|${projectAlias}|${props.id}|reject`) },
-          { text: "Reject with note", callback_data: cb.pack(`p|${projectAlias}|${props.id}|reject_note`) },
+          { text: "Reject", callback_data: cb.pack(`p|${projectAlias}|${props.sessionID || ""}|${props.id}|reject`) },
+          { text: "Reject with note", callback_data: cb.pack(`p|${projectAlias}|${props.sessionID || ""}|${props.id}|reject_note`) },
         ],
       ]),
     }
@@ -183,33 +252,45 @@ export function createPromptHandlers(runtime) {
     await sendBlocksToThread(ctxMeta, rendered.blocks, rendered.replyMarkup)
   }
 
-  async function sendRejectNotePrompt(ctxMeta, projectAlias, permissionId, { resumed = false } = {}) {
+  async function sendRejectNotePrompt(ctxMeta, projectAlias, permissionId, { resumed = false, sessionID = "" } = {}) {
     const prefix = resumed ? "Resumed. " : ""
     await sendToThread(
       ctxMeta,
       `${prefix}Send rejection note for ${permissionId} (next message will be used).`,
-      makeInlineKeyboard([[{ text: "Cancel", callback_data: cb.pack(`p|${projectAlias}|${permissionId}|cancel_note`) }]]),
+      makeInlineKeyboard([[{ text: "Cancel", callback_data: cb.pack(`p|${projectAlias}|${sessionID || ""}|${permissionId}|cancel_note`) }]]),
     )
   }
 
-  async function sendQuestionCustomAnswerPrompt(ctxMeta, projectAlias, questionId, qIndex, label, { resumed = false } = {}) {
+  async function sendQuestionCustomAnswerPrompt(ctxMeta, projectAlias, questionId, qIndex, label, { resumed = false, sessionID = "" } = {}) {
     const prefix = resumed ? "Resumed. " : ""
     await sendToThread(
       ctxMeta,
       `${prefix}Send your answer for: ${label || "question"} (next message will be used).`,
-      makeInlineKeyboard([[{ text: "Cancel", callback_data: cb.pack(`q|${projectAlias}|${questionId}|${qIndex}|cancel_custom`) }]]),
+      makeInlineKeyboard([[{ text: "Cancel", callback_data: cb.pack(`q|${projectAlias}|${sessionID || ""}|${questionId}|${qIndex}|cancel_custom`) }]]),
     )
   }
 
   async function finishQuestionWizard(wizard) {
     const oc = ocByAlias[wizard.projectAlias]
+    const replyKey = questionReplyIdempotencyKey(wizard.projectAlias, wizard.sessionID, wizard.request.id, wizard.answers)
+    if (hasIdempotencyKey(replyKey)) {
+      clearQuestionWizardState(wizard)
+      await store.flush?.()
+      return { outcome: "duplicate", duplicate: true }
+    }
     try {
       await oc.replyQuestion(wizard.request.id, wizard.answers)
     } catch (err) {
       if (isStaleBoundaryError(err, { source: "opencode", pathname: `/question/${wizard.request.id}/reply`, method: "POST" })) {
-        questionWizards.delete(wizardKey(wizard.projectAlias, wizard.request.id))
-        clearPersistedQuestionWizard(wizard.projectAlias, wizard.request.id)
-        setAwaitingCustomAnswerState(wizard.ctx.ctxKey, null)
+        await markIdempotencyKey(replyKey, {
+          kind: "question-reply",
+          projectAlias: wizard.projectAlias,
+          ctxKey: wizard.ctx?.ctxKey,
+          sessionId: wizard.sessionID,
+          operation: "replyQuestion",
+        })
+        clearQuestionWizardState(wizard)
+        await store.flush?.()
         await sendToThread(wizard.ctx, "Question is no longer active.").catch(() => {})
         return { outcome: "stale", stale: true }
       }
@@ -218,27 +299,39 @@ export function createPromptHandlers(runtime) {
       }
       throw err
     }
-    questionWizards.delete(wizardKey(wizard.projectAlias, wizard.request.id))
-    clearPersistedQuestionWizard(wizard.projectAlias, wizard.request.id)
-    setAwaitingCustomAnswerState(wizard.ctx.ctxKey, null)
+    await markIdempotencyKey(replyKey, {
+      kind: "question-reply",
+      projectAlias: wizard.projectAlias,
+      ctxKey: wizard.ctx?.ctxKey,
+      sessionId: wizard.sessionID,
+      operation: "replyQuestion",
+    })
+    clearQuestionWizardState(wizard)
+    await store.flush?.()
     await sendToThread(wizard.ctx, `Answered: ${wizard.request.id}`).catch(() => {})
     return { outcome: "ok", stale: false }
   }
 
-  async function ensureBaselineLoaded(projectAlias) {
+  async function ensureBaselineLoaded(projectAlias, { populateInitialSnapshot = true } = {}) {
     const base = promptBaseline[projectAlias]
     if (!base || base.loaded) return
-    if (recoverPendingPromptsOnStartup) {
-      base.loaded = true
-      return
-    }
     const oc = ocByAlias[projectAlias]
     try {
       const [perms, questions] = await Promise.all([oc.listPermissions(), oc.listQuestions()])
       if (!Array.isArray(perms) || !Array.isArray(questions)) return
+      if (populateInitialSnapshot) {
+        const pending = collectPendingPromptIdentities(projectAlias)
+        const initialPending = collectPendingPromptIdentities(projectAlias, initialPendingPrompts)
+        for (const permission of perms) {
+          const identity = promptIdentity(permission?.id, permission?.sessionID)
+          if (identity && !pending.permissions.has(identity) && !initialPending.permissions.has(identity)) base.permission.add(identity)
+        }
+        for (const question of questions) {
+          const identity = promptIdentity(question?.id, question?.sessionID)
+          if (identity && !pending.questions.has(identity) && !initialPending.questions.has(identity)) base.question.add(identity)
+        }
+      }
       markProjectUp(projectAlias)
-      for (const p of perms) base.permission.add(p.id)
-      for (const q of questions) base.question.add(q.id)
       base.loaded = true
     } catch {
       // retry later
@@ -251,14 +344,13 @@ export function createPromptHandlers(runtime) {
     const resolved = await resolveBoundRoute(projectAlias, sessionId)
     if (!resolved?.route) {
       logSseDebug(projectAlias, sessionId, "drop=permission_no_route")
-      return
+      return false
     }
     const route = resolved.route
-    await ensureBaselineLoaded(projectAlias)
-    if (!promptBaseline[projectAlias]?.loaded) return
-    if (promptBaseline[projectAlias].permission.has(props.id)) return
-    if (prompted[projectAlias].permission.has(props.id)) return
-    prompted[projectAlias].permission.add(props.id)
+    const permissionIdentity = promptIdentity(props.id, props.sessionID)
+    if (hasIdempotencyPrefix(permissionReplyIdempotencyPrefix(projectAlias, props.sessionID, props.id)) || hasIdempotencyPrefix(permissionNoteIdempotencyPrefix(projectAlias, props.sessionID, props.id))) return false
+    if (prompted[projectAlias].permission.has(permissionIdentity)) return false
+    prompted[projectAlias].permission.add(permissionIdentity)
     const ctxMeta = { chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey: ctxKeyFrom(route.chatId, route.threadIdOr0) }
     store.setPendingPermission({
       projectAlias,
@@ -271,10 +363,12 @@ export function createPromptHandlers(runtime) {
     })
     try {
       await sendPermissionPrompt(projectAlias, props, ctxMeta)
+      await store.flush?.()
     } catch (err) {
-      prompted[projectAlias].permission.delete(props.id)
+      prompted[projectAlias].permission.delete(permissionIdentity)
       throw err
     }
+    return true
   }
 
   async function handleQuestionAsked({ projectAlias, props, resolveBoundRoute, logSseDebug }) {
@@ -283,15 +377,14 @@ export function createPromptHandlers(runtime) {
     const resolved = await resolveBoundRoute(projectAlias, sessionId)
     if (!resolved?.route) {
       logSseDebug(projectAlias, sessionId, "drop=question_no_route")
-      return
+      return false
     }
     const route = resolved.route
-    await ensureBaselineLoaded(projectAlias)
-    if (!promptBaseline[projectAlias]?.loaded) return
-    if (promptBaseline[projectAlias].question.has(props.id)) return
-    if (prompted[projectAlias].question.has(props.id)) return
-    if (!props?.id || !Array.isArray(props.questions) || props.questions.length === 0) return
-    prompted[projectAlias].question.add(props.id)
+    const questionIdentity = promptIdentity(props.id, props.sessionID)
+    if (hasIdempotencyPrefix(questionReplyIdempotencyPrefix(projectAlias, props.sessionID, props.id)) || hasIdempotencyKey(questionRejectIdempotencyKey(projectAlias, props.sessionID, props.id))) return false
+    if (prompted[projectAlias].question.has(questionIdentity)) return false
+    if (!props?.id || !Array.isArray(props.questions) || props.questions.length === 0) return false
+    prompted[projectAlias].question.add(questionIdentity)
 
     const ctx = { chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey: ctxKeyFrom(route.chatId, route.threadIdOr0) }
     const wizard = {
@@ -306,7 +399,7 @@ export function createPromptHandlers(runtime) {
       createdAt: Date.now(),
       ctx,
     }
-    questionWizards.set(wizardKey(projectAlias, props.id), wizard)
+    questionWizards.set(wizardKey(projectAlias, props.id, props.sessionID), wizard)
     persistQuestionWizard(wizard)
 
     try {
@@ -314,10 +407,12 @@ export function createPromptHandlers(runtime) {
         { type: "text", html: `<b>Question request</b>\n<code>${escapeHtml(props.id)}</code>\n\n${escapeHtml(`Project: ${projectAlias}`)}` },
       ])
       await sendCurrentQuestionStep(wizard)
+      await store.flush?.()
     } catch (err) {
-      prompted[projectAlias].question.delete(props.id)
+      prompted[projectAlias].question.delete(questionIdentity)
       throw err
     }
+    return true
   }
 
   return {

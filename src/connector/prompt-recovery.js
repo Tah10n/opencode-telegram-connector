@@ -1,5 +1,6 @@
 import { classifyBoundaryError } from "../boundary-errors.js"
 import { escapeHtml } from "../telegram/formatter.js"
+import { permissionNoteIdempotencyPrefix, permissionReplyIdempotencyPrefix, promptIdentity, questionReplyIdempotencyPrefix, questionRejectIdempotencyKey } from "./idempotency.js"
 
 function defaultTypeSummary() {
   return { restored: 0, stale: 0, retryable: 0, fatal: 0 }
@@ -96,7 +97,7 @@ export function createPromptRecovery(runtime) {
             ? {
                 outcome: "ok",
                 ids: new Set(
-                  permissionsResult.value.map((entry) => entry?.id).filter((id) => typeof id === "string" && id),
+                  permissionsResult.value.flatMap((entry) => [promptIdentity(entry?.id, entry?.sessionID), promptIdentity(entry?.id)]).filter((id) => typeof id === "string" && id),
                 ),
               }
             : {
@@ -111,7 +112,7 @@ export function createPromptRecovery(runtime) {
                 byId: new Map(
                   questionsResult.value
                     .filter((entry) => typeof entry?.id === "string" && entry.id)
-                    .map((entry) => [entry.id, entry]),
+                    .flatMap((entry) => [[promptIdentity(entry.id, entry.sessionID), entry], [promptIdentity(entry.id), entry]]),
                 ),
               }
             : {
@@ -137,15 +138,53 @@ export function createPromptRecovery(runtime) {
       recordPromptRecovery?.(projectAlias, outcome)
     }
 
+    function hasLedgerPrefix(prefix) {
+      return !!prefix && typeof store?.hasIdempotencyKeyPrefix === "function" && store.hasIdempotencyKeyPrefix(prefix)
+    }
+
+    function hasHandledPermission(projectAlias, sessionID, permissionId) {
+      return hasLedgerPrefix(permissionReplyIdempotencyPrefix(projectAlias, sessionID, permissionId)) ||
+        hasLedgerPrefix(permissionNoteIdempotencyPrefix(projectAlias, sessionID, permissionId)) ||
+        hasLedgerPrefix(permissionReplyIdempotencyPrefix(projectAlias, "", permissionId)) ||
+        hasLedgerPrefix(permissionNoteIdempotencyPrefix(projectAlias, "", permissionId))
+    }
+
+    function hasHandledQuestion(projectAlias, sessionID, questionId) {
+      return hasLedgerPrefix(questionReplyIdempotencyPrefix(projectAlias, sessionID, questionId)) ||
+        store.hasIdempotencyKey?.(questionRejectIdempotencyKey(projectAlias, sessionID, questionId)) ||
+        hasLedgerPrefix(questionReplyIdempotencyPrefix(projectAlias, "", questionId)) ||
+        store.hasIdempotencyKey?.(questionRejectIdempotencyKey(projectAlias, "", questionId))
+    }
+
+    function liveHasPrompt(collection, promptId, sessionID) {
+      if (sessionID) return collection.has(promptIdentity(promptId, sessionID))
+      return collection.has(promptIdentity(promptId))
+    }
+
+    function getRecoveredWizard(projectAlias, requestId, sessionID = "") {
+      const scopedWizard = questionWizards.get(wizardKey(projectAlias, requestId, sessionID))
+      if (scopedWizard || sessionID) return scopedWizard || null
+      return questionWizards.get(wizardKey(projectAlias, requestId)) ||
+        [...questionWizards.values()].find((wizard) => wizard?.projectAlias === projectAlias && (wizard?.id || wizard?.request?.id) === requestId) ||
+        null
+    }
+
     for (const entry of Object.values(pending.permissions || {})) {
       const ctx = entry?.ctx
       if (!entry?.projectAlias || !entry?.permissionId || !ctx?.chatId || !ctx?.ctxKey) continue
+      if (hasHandledPermission(entry.projectAlias, entry.sessionID, entry.permissionId)) {
+        store.deletePendingPermission(entry.projectAlias, entry.permissionId, entry.sessionID)
+        summary.permissions.stale += 1
+        recordPromptCleanup?.(entry.projectAlias, "stale")
+        record(entry.projectAlias, "stale")
+        continue
+      }
 
       const live = await getLivePromptSnapshot(entry.projectAlias)
       const permissions = live.permissions
       if (permissions.outcome === "ok") {
-        if (!permissions.ids.has(entry.permissionId)) {
-          store.deletePendingPermission(entry.projectAlias, entry.permissionId)
+        if (!liveHasPrompt(permissions.ids, entry.permissionId, entry.sessionID)) {
+          store.deletePendingPermission(entry.projectAlias, entry.permissionId, entry.sessionID)
           summary.permissions.stale += 1
           recordPromptCleanup?.(entry.projectAlias, "stale")
           record(entry.projectAlias, "stale")
@@ -167,7 +206,7 @@ export function createPromptRecovery(runtime) {
           record(entry.projectAlias, "retryable")
           continue
         }
-        prompted[entry.projectAlias]?.permission.add(entry.permissionId)
+        prompted[entry.projectAlias]?.permission.add(promptIdentity(entry.permissionId, entry.sessionID))
         summary.permissions.restored += 1
         record(entry.projectAlias, "restored")
         continue
@@ -180,13 +219,20 @@ export function createPromptRecovery(runtime) {
     for (const snapshot of Object.values(pending.questionWizards || {})) {
       const ctx = snapshot?.ctx
       if (!snapshot?.projectAlias || !snapshot?.id || !ctx?.chatId || !ctx?.ctxKey) continue
+      if (hasHandledQuestion(snapshot.projectAlias, snapshot.sessionID, snapshot.id)) {
+        clearPersistedQuestionWizard(snapshot.projectAlias, snapshot.id, snapshot.sessionID)
+        summary.questionWizards.stale += 1
+        recordPromptCleanup?.(snapshot.projectAlias, "stale")
+        record(snapshot.projectAlias, "stale")
+        continue
+      }
 
       const live = await getLivePromptSnapshot(snapshot.projectAlias)
       const questions = live.questions
       if (questions.outcome === "ok") {
-        const liveQuestion = questions.byId.get(snapshot.id)
+        const liveQuestion = questions.byId.get(promptIdentity(snapshot.id, snapshot.sessionID)) || (!snapshot.sessionID ? questions.byId.get(promptIdentity(snapshot.id)) : null)
         if (!liveQuestion) {
-          clearPersistedQuestionWizard(snapshot.projectAlias, snapshot.id)
+          clearPersistedQuestionWizard(snapshot.projectAlias, snapshot.id, snapshot.sessionID)
           summary.questionWizards.stale += 1
           recordPromptCleanup?.(snapshot.projectAlias, "stale")
           record(snapshot.projectAlias, "stale")
@@ -194,7 +240,7 @@ export function createPromptRecovery(runtime) {
         }
 
         const wizard = buildWizardFromSnapshot({ ...snapshot, ctx }, { request: liveQuestion || snapshot.request })
-        questionWizards.set(wizardKey(wizard.projectAlias, wizard.id), wizard)
+        questionWizards.set(wizardKey(wizard.projectAlias, wizard.id, wizard.sessionID), wizard)
         try {
           await sendBlocksToThread(wizard.ctx, [
             {
@@ -208,16 +254,16 @@ export function createPromptRecovery(runtime) {
           record(snapshot.projectAlias, "retryable")
           continue
         }
-        prompted[snapshot.projectAlias]?.question.add(snapshot.id)
+        prompted[snapshot.projectAlias]?.question.add(promptIdentity(snapshot.id, snapshot.sessionID))
         summary.questionWizards.restored += 1
         record(snapshot.projectAlias, "restored")
         continue
       }
 
       if (questions.outcome === "retryable") {
-        prompted[snapshot.projectAlias]?.question.add(snapshot.id)
+        prompted[snapshot.projectAlias]?.question.add(promptIdentity(snapshot.id, snapshot.sessionID))
         questionWizards.set(
-          wizardKey(snapshot.projectAlias, snapshot.id),
+          wizardKey(snapshot.projectAlias, snapshot.id, snapshot.sessionID),
           buildWizardFromSnapshot({ ...snapshot, ctx }),
         )
       }
@@ -228,11 +274,18 @@ export function createPromptRecovery(runtime) {
 
     for (const [ctxKey, value] of Object.entries(pending.rejectNotes || {})) {
       if (!value?.projectAlias || !value?.permissionId) continue
+      if (hasHandledPermission(value.projectAlias, value.sessionID, value.permissionId)) {
+        setRejectNoteAwaitingState(ctxKey, null)
+        summary.rejectNotes.stale += 1
+        recordPromptCleanup?.(value.projectAlias, "stale")
+        record(value.projectAlias, "stale")
+        continue
+      }
 
       const live = await getLivePromptSnapshot(value.projectAlias)
       const permissions = live.permissions
       if (permissions.outcome === "ok") {
-        if (!permissions.ids.has(value.permissionId)) {
+        if (!liveHasPrompt(permissions.ids, value.permissionId, value.sessionID)) {
           setRejectNoteAwaitingState(ctxKey, null)
           summary.rejectNotes.stale += 1
           recordPromptCleanup?.(value.projectAlias, "stale")
@@ -243,7 +296,7 @@ export function createPromptRecovery(runtime) {
         const bindingCtx = parseCtxKey(ctxKey)
         if (bindingCtx?.chatId) {
           try {
-            await sendRejectNotePrompt(bindingCtx, value.projectAlias, value.permissionId, { resumed: true })
+            await sendRejectNotePrompt(bindingCtx, value.projectAlias, value.permissionId, { resumed: true, sessionID: value.sessionID })
           } catch {
             summary.rejectNotes.retryable += 1
             record(value.projectAlias, "retryable")
@@ -266,11 +319,18 @@ export function createPromptRecovery(runtime) {
 
     for (const [ctxKey, value] of Object.entries(pending.customAnswers || {})) {
       if (!value?.projectAlias || !value?.requestId || !Number.isInteger(value?.qIndex)) continue
+      if (hasHandledQuestion(value.projectAlias, value.sessionID, value.requestId)) {
+        setAwaitingCustomAnswerState(ctxKey, null)
+        summary.customAnswers.stale += 1
+        recordPromptCleanup?.(value.projectAlias, "stale")
+        record(value.projectAlias, "stale")
+        continue
+      }
 
       const live = await getLivePromptSnapshot(value.projectAlias)
       const questions = live.questions
       if (questions.outcome === "ok") {
-        if (!questions.byId.has(value.requestId)) {
+        if (!questions.byId.has(promptIdentity(value.requestId, value.sessionID)) && (value.sessionID || !questions.byId.has(promptIdentity(value.requestId)))) {
           setAwaitingCustomAnswerState(ctxKey, null)
           summary.customAnswers.stale += 1
           recordPromptCleanup?.(value.projectAlias, "stale")
@@ -278,7 +338,7 @@ export function createPromptRecovery(runtime) {
           continue
         }
 
-        const wizard = questionWizards.get(wizardKey(value.projectAlias, value.requestId)) || null
+        const wizard = getRecoveredWizard(value.projectAlias, value.requestId, value.sessionID)
         const question = wizard?.request?.questions?.[value.qIndex]
         if (!wizard || !question) {
           setAwaitingCustomAnswerState(ctxKey, null)
@@ -292,7 +352,7 @@ export function createPromptRecovery(runtime) {
         const bindingCtx = parseCtxKey(ctxKey)
         if (bindingCtx?.chatId) {
           try {
-            await sendQuestionCustomAnswerPrompt(bindingCtx, value.projectAlias, value.requestId, value.qIndex, label, { resumed: true })
+            await sendQuestionCustomAnswerPrompt(bindingCtx, value.projectAlias, value.requestId, value.qIndex, label, { resumed: true, sessionID: value.sessionID })
           } catch {
             summary.customAnswers.retryable += 1
             record(value.projectAlias, "retryable")
@@ -306,7 +366,7 @@ export function createPromptRecovery(runtime) {
       }
 
       if (questions.outcome === "retryable") {
-        const wizard = questionWizards.get(wizardKey(value.projectAlias, value.requestId)) || null
+        const wizard = getRecoveredWizard(value.projectAlias, value.requestId, value.sessionID)
         const question = wizard?.request?.questions?.[value.qIndex]
         if (wizard && question) {
           setAwaitingCustomAnswerState(ctxKey, value)

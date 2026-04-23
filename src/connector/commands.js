@@ -4,6 +4,7 @@ import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList
 import { sanitizeBaseUrlForDisplay } from "../url-utils.js"
 import { sessionKey } from "../state/store.js"
 import { getLaunchSupport } from "../opencode/launcher.js"
+import { permissionNoteIdempotencyKey, telegramMessageIdempotencyKey } from "./idempotency.js"
 import {
   collectModelCandidates,
   commonVariantsForModel,
@@ -110,6 +111,31 @@ export function createCommandHandlers(runtime) {
 
   async function safeInformThread(ctxMeta, text, replyMarkup, options) {
     await sendToThread(ctxMeta, text, replyMarkup, options).catch(() => {})
+  }
+
+  function hasIdempotencyKey(key) {
+    return !!key && typeof store?.hasIdempotencyKey === "function" && store.hasIdempotencyKey(key)
+  }
+
+  async function markIdempotencyEntries(entries, { flush = true } = {}) {
+    const normalized = entries.filter((entry) => !!entry?.key)
+    if (!normalized.length) return false
+    if (typeof store?.markIdempotencyKey === "function") {
+      let marked = false
+      for (const entry of normalized) {
+        marked = store.markIdempotencyKey(entry.key, entry.metadata || {}) || marked
+      }
+      if (marked && flush && typeof store?.flush === "function") await store.flush()
+      return marked
+    }
+    if (typeof store?.markIdempotencyKeyAndFlush === "function") {
+      let marked = false
+      for (const entry of normalized) {
+        marked = (await store.markIdempotencyKeyAndFlush(entry.key, entry.metadata || {})) || marked
+      }
+      return marked
+    }
+    return false
   }
 
   function normalizeEpochMs(value) {
@@ -1005,7 +1031,7 @@ export function createCommandHandlers(runtime) {
     await sendToThread(ctxMeta, ok ? "Unbound." : "Not bound.")
   }
 
-  async function handleTelegramMessage(msg) {
+  async function handleTelegramMessage(msg, options = {}) {
     if (!runtime.isAllowedUser(msg?.from)) return
     const ctxMeta = runtime.ctxMetaFromMessage(msg)
     if (!ctxMeta.chatId) return
@@ -1013,12 +1039,32 @@ export function createCommandHandlers(runtime) {
     const text = msg?.text
     if (typeof text !== "string" || !text.trim()) return
 
+    const messageKey = telegramMessageIdempotencyKey(ctxMeta, msg)
+    if (hasIdempotencyKey(messageKey)) return
+
+    async function markMessageHandled(operation, metadata = {}) {
+      await markIdempotencyEntries([
+        {
+          key: messageKey,
+          metadata: {
+            kind: "telegram-message",
+            ctxKey: ctxMeta.ctxKey,
+            operation,
+            updateId: Number.isInteger(options?.updateId) ? options.updateId : undefined,
+            messageId: Number.isInteger(msg?.message_id) ? msg.message_id : undefined,
+            ...metadata,
+          },
+        },
+      ])
+    }
+
     const awaitingQ = awaitingCustomAnswer.get(ctxMeta.ctxKey)
     if (awaitingQ) {
-      const wizard = getWizard(awaitingQ.projectAlias, awaitingQ.requestId)
+      const wizard = getWizard(awaitingQ.projectAlias, awaitingQ.requestId, awaitingQ.sessionID)
       if (!wizard || wizard.index !== awaitingQ.qIndex) {
         setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
         await sendToThread(ctxMeta, "Question is no longer active.")
+        await markMessageHandled("customAnswerStale", { projectAlias: awaitingQ.projectAlias })
         return
       }
       const nextWizard = cloneWizardState(wizard)
@@ -1032,12 +1078,15 @@ export function createCommandHandlers(runtime) {
           await sendToThread(ctxMeta, "Question answer is temporarily unavailable. Send the answer again or /cancel.").catch(() => {})
           return
         }
+        await markMessageHandled("replyQuestion", { projectAlias: awaitingQ.projectAlias, sessionId: wizard.sessionID })
       } else {
         nextWizard.index = nextIndex
         await sendCurrentQuestionStep(nextWizard)
         applyWizardState(wizard, nextWizard)
         persistQuestionWizard(wizard)
         setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
+        await store.flush?.()
+        await markMessageHandled("questionNextStep", { projectAlias: awaitingQ.projectAlias, sessionId: wizard.sessionID })
       }
       return
     }
@@ -1045,12 +1094,44 @@ export function createCommandHandlers(runtime) {
     const awaiting = rejectNoteAwaiting.get(ctxMeta.ctxKey)
     if (awaiting) {
       const oc = ocByAlias[awaiting.projectAlias]
+      const noteKey = permissionNoteIdempotencyKey(awaiting.projectAlias, awaiting.sessionID, awaiting.permissionId, text)
+      if (hasIdempotencyKey(noteKey)) {
+        store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId, awaiting.sessionID)
+        setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
+        await markMessageHandled("replyPermissionNote", { projectAlias: awaiting.projectAlias })
+        await sendToThread(ctxMeta, "Rejection note already sent.").catch(() => {})
+        return
+      }
       try {
         await oc.replyPermission(awaiting.permissionId, { reply: "reject", message: text })
       } catch (err) {
         if (isStaleBoundaryError(err, { source: "opencode", pathname: `/permission/${awaiting.permissionId}/reply`, method: "POST" })) {
-          store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId)
+          await markIdempotencyEntries([
+            {
+              key: noteKey,
+              metadata: {
+                kind: "permission-note",
+                projectAlias: awaiting.projectAlias,
+                ctxKey: ctxMeta.ctxKey,
+                operation: "replyPermission",
+                action: "reject_note",
+              },
+            },
+            {
+              key: messageKey,
+              metadata: {
+                kind: "telegram-message",
+                projectAlias: awaiting.projectAlias,
+                ctxKey: ctxMeta.ctxKey,
+                operation: "replyPermissionNote",
+                updateId: Number.isInteger(options?.updateId) ? options.updateId : undefined,
+                messageId: Number.isInteger(msg?.message_id) ? msg.message_id : undefined,
+              },
+            },
+          ], { flush: false })
+          store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId, awaiting.sessionID)
           setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
+          await store.flush?.()
           await sendToThread(ctxMeta, "Permission request is no longer active.").catch(() => {})
           return
         }
@@ -1060,8 +1141,32 @@ export function createCommandHandlers(runtime) {
         }
         throw err
       }
-      store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId)
+      await markIdempotencyEntries([
+        {
+          key: noteKey,
+          metadata: {
+            kind: "permission-note",
+            projectAlias: awaiting.projectAlias,
+            ctxKey: ctxMeta.ctxKey,
+            operation: "replyPermission",
+            action: "reject_note",
+          },
+        },
+        {
+          key: messageKey,
+          metadata: {
+            kind: "telegram-message",
+            projectAlias: awaiting.projectAlias,
+            ctxKey: ctxMeta.ctxKey,
+            operation: "replyPermissionNote",
+            updateId: Number.isInteger(options?.updateId) ? options.updateId : undefined,
+            messageId: Number.isInteger(msg?.message_id) ? msg.message_id : undefined,
+          },
+        },
+      ], { flush: false })
+      store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId, awaiting.sessionID)
       setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
+      await store.flush?.()
       await sendToThread(ctxMeta, "Rejection note sent.").catch(() => {})
       return
     }
@@ -1073,6 +1178,7 @@ export function createCommandHandlers(runtime) {
         if (cmd === "/cancel") {
           bindAliasAwaiting.delete(ctxMeta.ctxKey)
           await sendToThread(ctxMeta, "Cancelled.")
+          await markMessageHandled("bindAliasCancel")
           return
         }
         bindAliasAwaiting.delete(ctxMeta.ctxKey)
@@ -1083,7 +1189,9 @@ export function createCommandHandlers(runtime) {
           return
         }
         bindAliasAwaiting.delete(ctxMeta.ctxKey)
-        return handleBindCommand(ctxMeta, [alias])
+        await handleBindCommand(ctxMeta, [alias])
+        await markMessageHandled("bindAlias", { projectAlias: alias })
+        return
       }
     }
 
@@ -1097,33 +1205,83 @@ export function createCommandHandlers(runtime) {
         if (hadCustomAnswer) setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
         const cancelled = hadBind || hadRejectNote || hadCustomAnswer
         await sendToThread(ctxMeta, cancelled ? "Cancelled." : "Nothing to cancel.")
+        await markMessageHandled("cancel")
         return
       }
       if (cmd === "/help" || cmd === "/start") {
         await sendToThread(ctxMeta, helpText())
+        await markMessageHandled(cmd)
         return
       }
       if (cmd === "/bind") {
         if (!argv?.[0]) {
           bindAliasAwaiting.set(ctxMeta.ctxKey, { startedAt: Date.now() })
           await sendToThread(ctxMeta, "Send project alias (or /projects to list). You can /cancel.")
+          await markMessageHandled("bindPrompt")
           return
         }
         bindAliasAwaiting.delete(ctxMeta.ctxKey)
-        return handleBindCommand(ctxMeta, argv)
+        await handleBindCommand(ctxMeta, argv)
+        await markMessageHandled("bind", { projectAlias: argv[0] })
+        return
       }
-      if (cmd === "/new") return handleNewCommand(ctxMeta, args)
-      if (cmd === "/use") return handleUseCommand(ctxMeta, argv[0])
-      if (cmd === "/sessions") return handleSessions(ctxMeta)
-      if (cmd === "/model") return handleModelCommand(ctxMeta, argv)
-      if (cmd === "/feed") return handleFeed(ctxMeta)
-      if (cmd === "/status") return handleWhere(ctxMeta)
-      if (cmd === "/bindings") return handleBindings(ctxMeta)
-      if (cmd === "/abort") return handleAbort(ctxMeta)
-      if (cmd === "/sendlast") return handleSendLast(ctxMeta)
-      if (cmd === "/projects") return handleProjects(ctxMeta)
-      if (cmd === "/unbind") return handleUnbind(ctxMeta)
+      if (cmd === "/new") {
+        await handleNewCommand(ctxMeta, args)
+        await markMessageHandled("new")
+        return
+      }
+      if (cmd === "/use") {
+        await handleUseCommand(ctxMeta, argv[0])
+        await markMessageHandled("use")
+        return
+      }
+      if (cmd === "/sessions") {
+        await handleSessions(ctxMeta)
+        await markMessageHandled("sessions")
+        return
+      }
+      if (cmd === "/model") {
+        await handleModelCommand(ctxMeta, argv)
+        await markMessageHandled("model")
+        return
+      }
+      if (cmd === "/feed") {
+        await handleFeed(ctxMeta)
+        await markMessageHandled("feed")
+        return
+      }
+      if (cmd === "/status") {
+        await handleWhere(ctxMeta)
+        await markMessageHandled("status")
+        return
+      }
+      if (cmd === "/bindings") {
+        await handleBindings(ctxMeta)
+        await markMessageHandled("bindings")
+        return
+      }
+      if (cmd === "/abort") {
+        await handleAbort(ctxMeta)
+        await markMessageHandled("abort")
+        return
+      }
+      if (cmd === "/sendlast") {
+        await handleSendLast(ctxMeta)
+        await markMessageHandled("sendlast")
+        return
+      }
+      if (cmd === "/projects") {
+        await handleProjects(ctxMeta)
+        await markMessageHandled("projects")
+        return
+      }
+      if (cmd === "/unbind") {
+        await handleUnbind(ctxMeta)
+        await markMessageHandled("unbind")
+        return
+      }
       await sendToThread(ctxMeta, "Unknown command. Use /help.")
+      await markMessageHandled("unknownCommand")
       return
     }
 
@@ -1132,6 +1290,7 @@ export function createCommandHandlers(runtime) {
       const def = config.defaultProject
       if (def) await sendToThread(ctxMeta, `Not bound. Use /bind <projectAlias> (default: ${def}).`)
       else await sendToThread(ctxMeta, "Not bound. Use /bind <projectAlias>.")
+      await markMessageHandled("unbound")
       return
     }
 
@@ -1143,6 +1302,7 @@ export function createCommandHandlers(runtime) {
       ensureRecentPromptSet(sk).add(hashTextForEcho(promptText))
       const promptOverride = await resolvePromptOverride(ctxMeta.ctxKey, binding)
       await oc.promptAsync(binding.sessionId, promptText, promptOverride || undefined)
+      await markMessageHandled("promptAsync", { projectAlias: binding.projectAlias, sessionId: binding.sessionId })
     } catch (err) {
       const alias = binding.projectAlias
       const withButton = isRetryableProjectError(err) && canAutoStartProject(alias, { platform })

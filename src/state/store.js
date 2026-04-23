@@ -2,8 +2,10 @@ import path from "node:path"
 import { readJsonFile, writeJsonFileAtomic } from "./fileStore.js"
 import { normalizeModelPreference, storedModelPreference } from "../model-selection.js"
 
-export const STATE_SCHEMA_VERSION = 4
+export const STATE_SCHEMA_VERSION = 5
 export const DEFAULT_FEED_MODE = "main+changes"
+export const DEFAULT_IDEMPOTENCY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
+export const DEFAULT_IDEMPOTENCY_MAX_ENTRIES = 5000
 
 export function normalizeFeedMode(value) {
   if (value === "main" || value === "main+changes" || value === "verbose") return value
@@ -27,6 +29,10 @@ function defaultPendingPrompts() {
   }
 }
 
+function defaultIdempotencyLedger() {
+  return { keys: {} }
+}
+
 export function defaultState() {
   return {
     schemaVersion: STATE_SCHEMA_VERSION,
@@ -36,11 +42,17 @@ export function defaultState() {
     feedByContext: defaultFeedByContext(),
     modelPrefsByContext: defaultModelPrefsByContext(),
     pendingPrompts: defaultPendingPrompts(),
+    idempotency: defaultIdempotencyLedger(),
   }
 }
 
 export function sessionKey(projectAlias, sessionId) {
   return `${projectAlias}:${sessionId}`
+}
+
+export function promptKey(projectAlias, promptId, sessionID = "") {
+  const session = String(sessionID || "").trim()
+  return session ? `${projectAlias}:${session}:${promptId}` : `${projectAlias}:${promptId}`
 }
 
 export class StateStore {
@@ -68,6 +80,76 @@ export class StateStore {
 
   getPendingPrompts() {
     return this.state.pendingPrompts
+  }
+
+  getPendingPermission(projectAlias, permissionId, sessionID = "") {
+    if (!projectAlias || !permissionId) return null
+    return findPromptRecord(this.state.pendingPrompts.permissions, projectAlias, permissionId, sessionID)
+  }
+
+  getIdempotencyLedger() {
+    return this.state.idempotency
+  }
+
+  hasIdempotencyKey(key) {
+    const normalized = normalizeIdempotencyKey(key)
+    if (!normalized) return false
+    return !!this.state.idempotency?.keys?.[normalized]
+  }
+
+  hasIdempotencyKeyPrefix(prefix) {
+    const normalized = normalizeIdempotencyKey(prefix)
+    if (!normalized) return false
+    return Object.keys(this.state.idempotency?.keys || {}).some((key) => key.startsWith(normalized))
+  }
+
+  markIdempotencyKey(key, metadata = {}) {
+    const normalized = normalizeIdempotencyKey(key)
+    if (!normalized) return false
+    this.pruneIdempotency()
+    this.state.idempotency.keys[normalized] = normalizeIdempotencyEntry({
+      ...metadata,
+      createdAt: typeof metadata?.createdAt === "number" ? metadata.createdAt : Date.now(),
+    })
+    this.scheduleSave()
+    return true
+  }
+
+  async markIdempotencyKeyAndFlush(key, metadata = {}) {
+    const ok = this.markIdempotencyKey(key, metadata)
+    if (ok) await this.flush()
+    return ok
+  }
+
+  pruneIdempotency({ now = Date.now(), maxAgeMs = DEFAULT_IDEMPOTENCY_MAX_AGE_MS, maxEntries = DEFAULT_IDEMPOTENCY_MAX_ENTRIES } = {}) {
+    const ledger = this.state.idempotency?.keys
+    if (!ledger || typeof ledger !== "object") return 0
+    let removed = 0
+    for (const [key, entry] of Object.entries(ledger)) {
+      const createdAt = typeof entry?.createdAt === "number" ? entry.createdAt : 0
+      if (!createdAt || now - createdAt > maxAgeMs) {
+        delete ledger[key]
+        removed += 1
+      }
+    }
+
+    const entries = Object.entries(ledger)
+    if (entries.length > maxEntries) {
+      entries
+        .sort((a, b) => {
+          const aCreated = typeof a[1]?.createdAt === "number" ? a[1].createdAt : 0
+          const bCreated = typeof b[1]?.createdAt === "number" ? b[1].createdAt : 0
+          return aCreated - bCreated
+        })
+        .slice(0, entries.length - maxEntries)
+        .forEach(([key]) => {
+          delete ledger[key]
+          removed += 1
+        })
+    }
+
+    if (removed) this.scheduleSave()
+    return removed
   }
 
   getFeedMode(ctxKey) {
@@ -129,7 +211,7 @@ export class StateStore {
 
   setPendingPermission(record) {
     if (!record?.projectAlias || !record?.permissionId) return
-    this.state.pendingPrompts.permissions[sessionKey(record.projectAlias, record.permissionId)] = {
+    this.state.pendingPrompts.permissions[promptKey(record.projectAlias, record.permissionId, record.sessionID)] = {
       projectAlias: record.projectAlias,
       permissionId: record.permissionId,
       sessionID: record.sessionID || "",
@@ -145,10 +227,20 @@ export class StateStore {
     this.scheduleSave()
   }
 
-  deletePendingPermission(projectAlias, permissionId) {
+  deletePendingPermission(projectAlias, permissionId, sessionID = "") {
     if (!projectAlias || !permissionId) return false
-    const key = sessionKey(projectAlias, permissionId)
-    const existed = delete this.state.pendingPrompts.permissions[key]
+    const key = promptKey(projectAlias, permissionId, sessionID)
+    let existed = delete this.state.pendingPrompts.permissions[key]
+    if (!sessionID) {
+      const legacyKey = sessionKey(projectAlias, permissionId)
+      existed = delete this.state.pendingPrompts.permissions[legacyKey] || existed
+      for (const [entryKey, entry] of Object.entries(this.state.pendingPrompts.permissions)) {
+        if (entry?.projectAlias === projectAlias && entry?.permissionId === permissionId) {
+          delete this.state.pendingPrompts.permissions[entryKey]
+          existed = true
+        }
+      }
+    }
     if (existed) this.scheduleSave()
     return existed
   }
@@ -162,6 +254,7 @@ export class StateStore {
     this.state.pendingPrompts.rejectNotes[ctxKey] = {
       projectAlias: value.projectAlias,
       permissionId: value.permissionId,
+      sessionID: value.sessionID || "",
     }
     this.scheduleSave()
   }
@@ -182,6 +275,7 @@ export class StateStore {
     this.state.pendingPrompts.customAnswers[ctxKey] = {
       projectAlias: value.projectAlias,
       requestId: value.requestId,
+      sessionID: value.sessionID || "",
       qIndex: value.qIndex,
     }
     this.scheduleSave()
@@ -276,11 +370,25 @@ function migrateStateIfNeeded(loaded) {
     return {
       schemaVersion: STATE_SCHEMA_VERSION,
       updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
-      bindings: loaded.bindings && typeof loaded.bindings === "object" ? loaded.bindings : {},
-      sessionIndex: loaded.sessionIndex && typeof loaded.sessionIndex === "object" ? loaded.sessionIndex : {},
+      bindings: normalizeBindings(loaded.bindings),
+      sessionIndex: normalizeSessionIndex(loaded.sessionIndex),
       feedByContext: normalizeFeedByContext(loaded.feedByContext),
       modelPrefsByContext: normalizeModelPrefsByContext(loaded.modelPrefsByContext),
       pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
+      idempotency: normalizeIdempotencyLedger(loaded.idempotency),
+    }
+  }
+
+  if (loaded && typeof loaded === "object" && loaded.schemaVersion === 4) {
+    return {
+      schemaVersion: STATE_SCHEMA_VERSION,
+      updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
+      bindings: normalizeBindings(loaded.bindings),
+      sessionIndex: normalizeSessionIndex(loaded.sessionIndex),
+      feedByContext: normalizeFeedByContext(loaded.feedByContext),
+      modelPrefsByContext: normalizeModelPrefsByContext(loaded.modelPrefsByContext),
+      pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
+      idempotency: normalizeIdempotencyLedger(loaded.idempotency),
     }
   }
 
@@ -288,11 +396,12 @@ function migrateStateIfNeeded(loaded) {
     return {
       schemaVersion: STATE_SCHEMA_VERSION,
       updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
-      bindings: loaded.bindings && typeof loaded.bindings === "object" ? loaded.bindings : {},
-      sessionIndex: loaded.sessionIndex && typeof loaded.sessionIndex === "object" ? loaded.sessionIndex : {},
+      bindings: normalizeBindings(loaded.bindings),
+      sessionIndex: normalizeSessionIndex(loaded.sessionIndex),
       feedByContext: normalizeFeedByContext(loaded.feedByContext),
       modelPrefsByContext: defaultModelPrefsByContext(),
       pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
+      idempotency: defaultIdempotencyLedger(),
     }
   }
 
@@ -300,11 +409,12 @@ function migrateStateIfNeeded(loaded) {
     return {
       schemaVersion: STATE_SCHEMA_VERSION,
       updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
-      bindings: loaded.bindings && typeof loaded.bindings === "object" ? loaded.bindings : {},
-      sessionIndex: loaded.sessionIndex && typeof loaded.sessionIndex === "object" ? loaded.sessionIndex : {},
+      bindings: normalizeBindings(loaded.bindings),
+      sessionIndex: normalizeSessionIndex(loaded.sessionIndex),
       feedByContext: defaultFeedByContext(),
       modelPrefsByContext: defaultModelPrefsByContext(),
       pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
+      idempotency: defaultIdempotencyLedger(),
     }
   }
 
@@ -312,11 +422,12 @@ function migrateStateIfNeeded(loaded) {
     return {
       schemaVersion: STATE_SCHEMA_VERSION,
       updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
-      bindings: loaded.bindings && typeof loaded.bindings === "object" ? loaded.bindings : {},
-      sessionIndex: loaded.sessionIndex && typeof loaded.sessionIndex === "object" ? loaded.sessionIndex : {},
+      bindings: normalizeBindings(loaded.bindings),
+      sessionIndex: normalizeSessionIndex(loaded.sessionIndex),
       feedByContext: defaultFeedByContext(),
       modelPrefsByContext: defaultModelPrefsByContext(),
       pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
+      idempotency: defaultIdempotencyLedger(),
     }
   }
 
@@ -331,6 +442,7 @@ function migrateStateIfNeeded(loaded) {
       feedByContext: defaultFeedByContext(),
       modelPrefsByContext: defaultModelPrefsByContext(),
       pendingPrompts: defaultPendingPrompts(),
+      idempotency: defaultIdempotencyLedger(),
     }
   }
 
@@ -341,11 +453,122 @@ function normalizePendingPrompts(value) {
   const base = defaultPendingPrompts()
   if (!value || typeof value !== "object") return base
   return {
-    permissions: value.permissions && typeof value.permissions === "object" ? value.permissions : {},
-    rejectNotes: value.rejectNotes && typeof value.rejectNotes === "object" ? value.rejectNotes : {},
-    customAnswers: value.customAnswers && typeof value.customAnswers === "object" ? value.customAnswers : {},
-    questionWizards: value.questionWizards && typeof value.questionWizards === "object" ? value.questionWizards : {},
+    permissions: normalizePendingPermissionRecords(value.permissions),
+    rejectNotes: normalizeCtxPromptRecords(value.rejectNotes, "permissionId"),
+    customAnswers: normalizeCtxPromptRecords(value.customAnswers, "requestId"),
+    questionWizards: normalizeQuestionWizardRecords(value.questionWizards),
   }
+}
+
+function normalizeBindings(value) {
+  if (!value || typeof value !== "object") return {}
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([ctxKey, binding]) => {
+        if (typeof ctxKey !== "string" || !ctxKey) return false
+        if (!binding || typeof binding !== "object") return false
+        return typeof binding.projectAlias === "string" && !!binding.projectAlias && typeof binding.sessionId === "string" && !!binding.sessionId
+      })
+      .map(([ctxKey, binding]) => [ctxKey, { projectAlias: binding.projectAlias, sessionId: binding.sessionId }]),
+  )
+}
+
+function normalizeSessionIndex(value) {
+  if (!value || typeof value !== "object") return {}
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key, route]) => {
+        if (typeof key !== "string" || !key) return false
+        if (!route || typeof route !== "object") return false
+        return Number.isFinite(route.chatId) && Number.isInteger(route.threadIdOr0)
+      })
+      .map(([key, route]) => [key, { chatId: route.chatId, threadIdOr0: route.threadIdOr0 }]),
+  )
+}
+
+function findPromptRecord(records, projectAlias, promptId, sessionID = "") {
+  if (!records || typeof records !== "object") return null
+  const direct = records[promptKey(projectAlias, promptId, sessionID)]
+  if (direct) return direct
+  if (!sessionID) {
+    const legacy = records[sessionKey(projectAlias, promptId)]
+    if (legacy) return legacy
+  }
+  return Object.values(records).find((entry) => {
+    if (entry?.projectAlias !== projectAlias) return false
+    const entryId = entry?.permissionId || entry?.id || entry?.request?.id
+    if (entryId !== promptId) return false
+    return sessionID ? entry?.sessionID === sessionID : true
+  }) || null
+}
+
+function normalizePendingPermissionRecords(value) {
+  if (!value || typeof value !== "object") return {}
+  return Object.fromEntries(
+    Object.values(value)
+      .filter((entry) => entry?.projectAlias && entry?.permissionId)
+      .map((entry) => [promptKey(entry.projectAlias, entry.permissionId, entry.sessionID), entry]),
+  )
+}
+
+function normalizeCtxPromptRecords(value, idField) {
+  if (!value || typeof value !== "object") return {}
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([ctxKey, entry]) => typeof ctxKey === "string" && ctxKey && entry?.projectAlias && entry?.[idField])
+      .map(([ctxKey, entry]) => [ctxKey, { ...entry, sessionID: entry.sessionID || "" }]),
+  )
+}
+
+function normalizeQuestionWizardRecords(value) {
+  if (!value || typeof value !== "object") return {}
+  return Object.fromEntries(
+    Object.values(value)
+      .filter((wizard) => wizard?.projectAlias && (wizard?.id || wizard?.request?.id))
+      .map((wizard) => [promptKey(wizard.projectAlias, wizard.id || wizard.request.id, wizard.sessionID), wizard]),
+  )
+}
+
+function normalizeIdempotencyKey(key) {
+  const normalized = typeof key === "string" ? key.trim() : ""
+  if (!normalized || normalized.length > 512) return ""
+  return normalized
+}
+
+function normalizeMetadataString(value, maxLength = 200) {
+  if (value == null) return undefined
+  const text = String(value).trim()
+  if (!text) return undefined
+  return text.length > maxLength ? text.slice(0, maxLength) : text
+}
+
+function normalizeIdempotencyEntry(value) {
+  const createdAt = typeof value?.createdAt === "number" && Number.isFinite(value.createdAt) ? value.createdAt : Date.now()
+  const entry = { createdAt }
+  for (const [name, maxLength] of [
+    ["kind", 80],
+    ["projectAlias", 120],
+    ["ctxKey", 80],
+    ["sessionId", 160],
+    ["operation", 120],
+    ["action", 80],
+  ]) {
+    const text = normalizeMetadataString(value?.[name], maxLength)
+    if (text) entry[name] = text
+  }
+  if (Number.isInteger(value?.updateId)) entry.updateId = value.updateId
+  if (Number.isInteger(value?.messageId)) entry.messageId = value.messageId
+  return entry
+}
+
+function normalizeIdempotencyLedger(value) {
+  const source = value?.keys && typeof value.keys === "object" ? value.keys : value && typeof value === "object" ? value : {}
+  const entries = Object.entries(source)
+    .filter(([key]) => !!normalizeIdempotencyKey(key))
+    .map(([key, entry]) => [normalizeIdempotencyKey(key), normalizeIdempotencyEntry(entry)])
+    .sort((a, b) => a[1].createdAt - b[1].createdAt)
+    .slice(-DEFAULT_IDEMPOTENCY_MAX_ENTRIES)
+  return { keys: Object.fromEntries(entries) }
 }
 
 function normalizeFeedByContext(value) {

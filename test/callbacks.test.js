@@ -562,6 +562,39 @@ test("createCallbackHandlers resolves permission callbacks including stale and r
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["OK", "No longer active", "Send note", "Cancelled"])
 })
 
+test("createCallbackHandlers skips duplicate permission callbacks via idempotency ledger", async () => {
+  const idempotencyKeys = new Set()
+  const pendingPermissions = new Set(["demo:perm_dup"])
+  const replyCalls = []
+  const { runtime, callbackAnswers } = makeRuntime({
+    store: {
+      getPendingPermission: (projectAlias, permissionId) => (pendingPermissions.has(`${projectAlias}:${permissionId}`) ? { projectAlias, permissionId } : null),
+      deletePendingPermission: (projectAlias, permissionId) => pendingPermissions.delete(`${projectAlias}:${permissionId}`),
+      hasIdempotencyKey: (key) => idempotencyKeys.has(key),
+      markIdempotencyKey: (key) => {
+        idempotencyKeys.add(key)
+        return true
+      },
+      flush: async () => {},
+    },
+    ocByAlias: {
+      demo: {
+        async replyPermission(permissionId, payload) {
+          replyCalls.push({ permissionId, payload })
+          return { ok: true }
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_dup|once", { id: "cb_a" }))
+  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_dup|once", { id: "cb_b" }))
+
+  assert.deepEqual(replyCalls, [{ permissionId: "perm_dup", payload: { reply: "once" } }])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["OK", "Already handled"])
+})
+
 test("createCallbackHandlers degrades transient permission callback failures without blocking the user", async () => {
   const { runtime, callbackAnswers, sentMessages, loggerErrors } = makeRuntime({
     ocByAlias: {
@@ -649,6 +682,39 @@ test("createCallbackHandlers rejects stale and successful question callbacks", a
     { ctxKey: "100:7", value: null },
   ])
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["No longer active", "Rejected"])
+})
+
+test("createCallbackHandlers skips duplicate question reject callbacks via idempotency ledger", async () => {
+  const wizard = makeWizard({ id: "q_dup" })
+  const idempotencyKeys = new Set()
+  const rejectCalls = []
+  const { runtime, callbackAnswers } = makeRuntime({
+    questionWizards: new Map([["demo:q_dup", wizard]]),
+    getWizard: () => wizard,
+    store: {
+      hasIdempotencyKey: (key) => idempotencyKeys.has(key),
+      markIdempotencyKey: (key) => {
+        idempotencyKeys.add(key)
+        return true
+      },
+      flush: async () => {},
+    },
+    ocByAlias: {
+      demo: {
+        async rejectQuestion(questionId) {
+          rejectCalls.push({ questionId })
+          return { ok: true }
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("q|demo|q_dup|reject", { id: "cb_a" }))
+  await handlers.handleTelegramCallback(makeCallback("q|demo|q_dup|reject", { id: "cb_b" }))
+
+  assert.deepEqual(rejectCalls, [{ questionId: "q_dup" }])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Rejected", "Already handled"])
 })
 
 test("createCallbackHandlers clears persisted question state even without an in-memory wizard", async () => {

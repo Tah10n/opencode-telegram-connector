@@ -86,9 +86,9 @@ test("StateStore persists pending prompt recovery state", () => {
     ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
     createdAt: 1,
   })
-  store.setRejectNoteAwaiting("100:7", { projectAlias: "demo", permissionId: "perm_1" })
-  store.setAwaitingCustomAnswer("100:7", { projectAlias: "demo", requestId: "q_1", qIndex: 0 })
-  store.setQuestionWizard("demo:q_1", {
+  store.setRejectNoteAwaiting("100:7", { projectAlias: "demo", permissionId: "perm_1", sessionID: "ses_1" })
+  store.setAwaitingCustomAnswer("100:7", { projectAlias: "demo", requestId: "q_1", sessionID: "ses_1", qIndex: 0 })
+  store.setQuestionWizard("demo:ses_1:q_1", {
     projectAlias: "demo",
     id: "q_1",
     request: {
@@ -104,7 +104,7 @@ test("StateStore persists pending prompt recovery state", () => {
   })
 
   assert.deepEqual(store.getPendingPrompts().permissions, {
-    "demo:perm_1": {
+    "demo:ses_1:perm_1": {
       projectAlias: "demo",
       permissionId: "perm_1",
       sessionID: "ses_1",
@@ -115,13 +115,13 @@ test("StateStore persists pending prompt recovery state", () => {
     },
   })
   assert.deepEqual(store.getPendingPrompts().rejectNotes, {
-    "100:7": { projectAlias: "demo", permissionId: "perm_1" },
+    "100:7": { projectAlias: "demo", permissionId: "perm_1", sessionID: "ses_1" },
   })
   assert.deepEqual(store.getPendingPrompts().customAnswers, {
-    "100:7": { projectAlias: "demo", requestId: "q_1", qIndex: 0 },
+    "100:7": { projectAlias: "demo", requestId: "q_1", sessionID: "ses_1", qIndex: 0 },
   })
   assert.deepEqual(store.getPendingPrompts().questionWizards, {
-    "demo:q_1": {
+    "demo:ses_1:q_1": {
       projectAlias: "demo",
       id: "q_1",
       sessionID: "ses_1",
@@ -137,10 +137,10 @@ test("StateStore persists pending prompt recovery state", () => {
     },
   })
 
-  assert.equal(store.deletePendingPermission("demo", "perm_1"), true)
+  assert.equal(store.deletePendingPermission("demo", "perm_1", "ses_1"), true)
   assert.equal(store.deleteRejectNoteAwaiting("100:7"), true)
   assert.equal(store.deleteAwaitingCustomAnswer("100:7"), true)
-  assert.equal(store.deleteQuestionWizard("demo:q_1"), true)
+  assert.equal(store.deleteQuestionWizard("demo:ses_1:q_1"), true)
   assert.deepEqual(store.getPendingPrompts(), {
     permissions: {},
     rejectNotes: {},
@@ -191,7 +191,25 @@ test("StateStore keeps model preference per context and clears it on project reb
   assert.deepEqual(store.getModelPreference("100:9"), { mode: "inherit" })
 })
 
-test("StateStore migrates schema version 1 state to version 4", async () => {
+test("StateStore persists and prunes idempotency ledger entries", async () => {
+  const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-state.json"), logger: makeLogger() })
+  store.scheduleSave = () => {}
+
+  assert.equal(store.hasIdempotencyKey("permission-reply:demo:perm_1:once"), false)
+  assert.equal(store.markIdempotencyKey("permission-reply:demo:perm_1:once", {
+    kind: "permission-reply",
+    projectAlias: "demo",
+    ctxKey: "100:7",
+    operation: "replyPermission",
+    action: "once",
+    createdAt: 10,
+  }), true)
+  assert.equal(store.hasIdempotencyKey("permission-reply:demo:perm_1:once"), true)
+  assert.equal(store.pruneIdempotency({ now: 20, maxAgeMs: 5 }), 1)
+  assert.equal(store.hasIdempotencyKey("permission-reply:demo:perm_1:once"), false)
+})
+
+test("StateStore migrates schema version 1 state to version 5", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -203,7 +221,7 @@ test("StateStore migrates schema version 1 state to version 4", async () => {
   const store = new StateStore({ filePath, logger: makeLogger() })
   const loaded = await store.load()
 
-  assert.equal(loaded.schemaVersion, 4)
+  assert.equal(loaded.schemaVersion, 5)
   assert.equal(loaded.updateOffset, 77)
   assert.deepEqual(loaded.feedByContext, {})
   assert.deepEqual(loaded.modelPrefsByContext, {})
@@ -213,9 +231,10 @@ test("StateStore migrates schema version 1 state to version 4", async () => {
     customAnswers: {},
     questionWizards: {},
   })
+  assert.deepEqual(loaded.idempotency, { keys: {} })
 })
 
-test("StateStore migrates schema version 2 state to version 4", async () => {
+test("StateStore migrates schema version 2 state to version 5", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -237,14 +256,15 @@ test("StateStore migrates schema version 2 state to version 4", async () => {
   const store = new StateStore({ filePath, logger: makeLogger() })
   const loaded = await store.load()
 
-  assert.equal(loaded.schemaVersion, 4)
+  assert.equal(loaded.schemaVersion, 5)
   assert.equal(loaded.updateOffset, 88)
   assert.deepEqual(loaded.feedByContext, {})
   assert.deepEqual(loaded.modelPrefsByContext, {})
   assert.deepEqual(loaded.bindings, { "100:7": { projectAlias: "demo", sessionId: "ses_1" } })
+  assert.deepEqual(loaded.idempotency, { keys: {} })
 })
 
-test("StateStore migrates schema version 3 state to version 4", async () => {
+test("StateStore migrates schema version 3 state to version 5", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -267,10 +287,106 @@ test("StateStore migrates schema version 3 state to version 4", async () => {
   const store = new StateStore({ filePath, logger: makeLogger() })
   const loaded = await store.load()
 
-  assert.equal(loaded.schemaVersion, 4)
+  assert.equal(loaded.schemaVersion, 5)
   assert.equal(loaded.updateOffset, 99)
   assert.deepEqual(loaded.feedByContext, { "100:7": { mode: "verbose" } })
   assert.deepEqual(loaded.modelPrefsByContext, {})
+  assert.deepEqual(loaded.idempotency, { keys: {} })
+})
+
+test("StateStore migrates schema version 4 state to version 5", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  await fs.writeFile(
+    filePath,
+    JSON.stringify(
+      {
+        schemaVersion: 4,
+        updateOffset: 100,
+        bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+        sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+        feedByContext: { "100:7": { mode: "main" } },
+        modelPrefsByContext: { "100:7": { mode: "project-default" } },
+        pendingPrompts: { permissions: {}, rejectNotes: {}, customAnswers: {}, questionWizards: {} },
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  )
+
+  const store = new StateStore({ filePath, logger: makeLogger() })
+  const loaded = await store.load()
+
+  assert.equal(loaded.schemaVersion, 5)
+  assert.equal(loaded.updateOffset, 100)
+  assert.deepEqual(loaded.feedByContext, { "100:7": { mode: "main" } })
+  assert.deepEqual(loaded.modelPrefsByContext, { "100:7": { mode: "project-default" } })
+  assert.deepEqual(loaded.idempotency, { keys: {} })
+})
+
+test("StateStore normalizes partially malformed schema version 5 sections", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  await fs.writeFile(
+    filePath,
+    JSON.stringify(
+      {
+        schemaVersion: 5,
+        updateOffset: 101,
+        bindings: {
+          "100:7": { projectAlias: "demo", sessionId: "ses_1", extra: true },
+          "bad:1": { projectAlias: "demo" },
+          "bad:2": null,
+        },
+        sessionIndex: {
+          "demo:ses_1": { chatId: 100, threadIdOr0: 7, extra: true },
+          "demo:bad": { chatId: "100", threadIdOr0: 7 },
+        },
+        feedByContext: {
+          "100:7": { mode: "verbose" },
+          "100:9": { mode: "nonsense" },
+          "": { mode: "main" },
+        },
+        modelPrefsByContext: {
+          "100:7": { mode: "custom", model: { providerID: "openai", modelID: "gpt-5" }, variant: "xhigh" },
+          "100:9": { mode: "custom", model: null },
+        },
+        pendingPrompts: {
+          permissions: {
+            valid: { projectAlias: "demo", permissionId: "perm_1", sessionID: "ses_1", ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" } },
+            invalid: { projectAlias: "demo" },
+          },
+          rejectNotes: { "100:7": { projectAlias: "demo", permissionId: "perm_1" }, bad: { projectAlias: "demo" } },
+          customAnswers: { "100:7": { projectAlias: "demo", requestId: "q_1", qIndex: 0 }, bad: { projectAlias: "demo" } },
+          questionWizards: {
+            valid: { projectAlias: "demo", id: "q_1", sessionID: "ses_1", request: { id: "q_1", questions: [] }, ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" } },
+            invalid: { id: "missing_project" },
+          },
+        },
+        idempotency: { keys: { "tg-update:1": { createdAt: 10 }, "": { createdAt: 11 } } },
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  )
+
+  const store = new StateStore({ filePath, logger: makeLogger() })
+  const loaded = await store.load()
+
+  assert.deepEqual(loaded.bindings, { "100:7": { projectAlias: "demo", sessionId: "ses_1" } })
+  assert.deepEqual(loaded.sessionIndex, { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } })
+  assert.equal(loaded.feedByContext["100:7"].mode, "verbose")
+  assert.equal(loaded.feedByContext["100:9"].mode, DEFAULT_FEED_MODE)
+  assert.deepEqual(loaded.modelPrefsByContext, {
+    "100:7": { mode: "custom", model: { providerID: "openai", modelID: "gpt-5" }, variant: "xhigh" },
+  })
+  assert.deepEqual(Object.keys(loaded.pendingPrompts.permissions), ["demo:ses_1:perm_1"])
+  assert.deepEqual(loaded.pendingPrompts.rejectNotes, { "100:7": { projectAlias: "demo", permissionId: "perm_1", sessionID: "" } })
+  assert.deepEqual(loaded.pendingPrompts.customAnswers, { "100:7": { projectAlias: "demo", requestId: "q_1", sessionID: "", qIndex: 0 } })
+  assert.deepEqual(Object.keys(loaded.pendingPrompts.questionWizards), ["demo:ses_1:q_1"])
+  assert.equal(store.hasIdempotencyKey("tg-update:1"), true)
 })
 
 test("StateStore migrates legacy state and flush persists the new schema", async () => {
@@ -285,7 +401,7 @@ test("StateStore migrates legacy state and flush persists the new schema", async
   const store = new StateStore({ filePath, logger: makeLogger() })
   const loaded = await store.load()
 
-  assert.equal(loaded.schemaVersion, 4)
+  assert.equal(loaded.schemaVersion, 5)
   assert.equal(loaded.updateOffset, 123)
   assert.deepEqual(loaded.bindings, {})
   assert.deepEqual(loaded.sessionIndex, {})
@@ -297,6 +413,7 @@ test("StateStore migrates legacy state and flush persists the new schema", async
     customAnswers: {},
     questionWizards: {},
   })
+  assert.deepEqual(loaded.idempotency, { keys: {} })
 
   store.scheduleSave = () => {}
   store.setBinding("42:0", { projectAlias: "demo", sessionId: "ses_9" }, { chatId: 42, threadIdOr0: 0 })
@@ -304,7 +421,7 @@ test("StateStore migrates legacy state and flush persists the new schema", async
   await store.flush()
 
   const persisted = JSON.parse(await fs.readFile(filePath, "utf8"))
-  assert.equal(persisted.schemaVersion, 4)
+  assert.equal(persisted.schemaVersion, 5)
   assert.equal(persisted.updateOffset, 456)
   assert.deepEqual(persisted.bindings, {
     "42:0": { projectAlias: "demo", sessionId: "ses_9" },
@@ -320,6 +437,7 @@ test("StateStore migrates legacy state and flush persists the new schema", async
     customAnswers: {},
     questionWizards: {},
   })
+  assert.deepEqual(persisted.idempotency, { keys: {} })
 })
 
 test("resolveDefaultStatePath appends .data/state.json to the cwd", () => {
