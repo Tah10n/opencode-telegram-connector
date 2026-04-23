@@ -305,6 +305,8 @@ async function createHarness({
   projectPatch,
   extraProjects,
   initialUpdates = [],
+  startSseLoopImpl,
+  onFatalErrorImpl,
   ensureOpenCodeRunningImpl,
   ensureStartupSessionImpl,
   openAttachWindowWindowsImpl,
@@ -370,8 +372,9 @@ async function createHarness({
       createOpenCodeClient: () => ocClientsByAlias[ocAliases.shift()],
       startSseLoop: ({ projectAlias, ...rest }) => {
         sseHandlers.set(projectAlias, rest)
-        return { stop() {} }
+        return startSseLoopImpl ? startSseLoopImpl({ projectAlias, ...rest }) : { stop() {} }
       },
+      ...(onFatalErrorImpl ? { onFatalError: onFatalErrorImpl } : {}),
       ...(ensureOpenCodeRunningImpl ? { ensureOpenCodeRunning: ensureOpenCodeRunningImpl } : {}),
       ...(ensureStartupSessionImpl ? { ensureStartupSession: ensureStartupSessionImpl } : {}),
       ...(openAttachWindowWindowsImpl ? { openAttachWindowWindows: openAttachWindowWindowsImpl } : {}),
@@ -1221,6 +1224,34 @@ test("startConnector /status shows startup session, SSE status, and sanitized ba
     assert.match(status, /SSE: connected/)
     assert.match(status, /Base URL: http:\/\/example\.test:4312\/path\?token=\*\*\*/) 
     assert.doesNotMatch(status, /secret|user|frag|abc/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector /status includes runtime observability lines", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 294,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_current" },
+      },
+      sessionIndex: {
+        "demo:ses_current": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(295, "/status"))
+
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+
+    const status = harness.tg.sentMessages.at(-1)?.text || ""
+    assert.match(status, /Prompt recovery: restored=0 stale=0 retryable=0 fatal=0/)
+    assert.match(status, /Callback outcomes: stale=0 retryable=0 fatal=0/)
+    assert.match(status, /SSE observed: retries=0 aborted=0 connected=never/)
+    assert.match(status, /Runtime: update retries=0 skipped=0 telegram retries=0 backlog retries=0/)
   } finally {
     await harness.connector.stop()
   }
@@ -2396,6 +2427,61 @@ test("startConnector defers SSE startup until the initial auto-start settles", a
   }
 })
 
+test("startConnector stop stays bounded while auto-start health wait is in flight", async () => {
+  let startCalls = 0
+  let observedAbort = false
+  let releaseAbortWait = () => {}
+  const abortObserved = new Promise((resolve) => {
+    releaseAbortWait = resolve
+  })
+
+  const harness = await createHarness({
+    projectPatch: {
+      autoStart: true,
+    },
+    ensureOpenCodeRunningImpl: async ({ abortSignal }) => {
+      startCalls += 1
+      if (abortSignal?.aborted) {
+        observedAbort = true
+        releaseAbortWait()
+        return null
+      }
+      await new Promise((resolve) => {
+        abortSignal?.addEventListener?.(
+          "abort",
+          () => {
+            observedAbort = true
+            releaseAbortWait()
+            resolve()
+          },
+          { once: true },
+        )
+      })
+      const err = new Error("aborted")
+      err.name = "AbortError"
+      throw err
+    },
+  })
+
+  try {
+    await waitFor(() => startCalls === 1)
+
+    let stopped = false
+    const stopPromise = harness.connector.stop().then(() => {
+      stopped = true
+    })
+
+    await abortObserved
+    await stopPromise
+
+    assert.equal(observedAbort, true)
+    assert.equal(stopped, true)
+  } finally {
+    releaseAbortWait()
+    await harness.connector.stop()
+  }
+})
+
 test("startConnector offers a start button on connect errors and recovers after start callback", async () => {
   const startCalls = []
   let promptAttempts = 0
@@ -2569,6 +2655,43 @@ test("startConnector replays remaining updates after a mid-batch Telegram handle
   }
 })
 
+test("startConnector skips non-retryable updates without wedging later updates", async () => {
+  let sendAttempts = 0
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 610,
+    },
+    tgOptions: {
+      sendMessageImpl: async () => {
+        sendAttempts += 1
+        if (sendAttempts === 2) {
+          throw makeBoundaryError({
+            source: "telegram",
+            operation: "sendMessage",
+            method: "POST",
+            pathname: "/sendMessage",
+            outcome: "fatal",
+            message: "chat not found",
+          })
+        }
+      },
+    },
+    initialUpdates: [[makeMessageUpdate(610, "/help"), makeMessageUpdate(611, "/help"), makeMessageUpdate(612, "/help")]],
+  })
+
+  try {
+    await waitFor(() => harness.tg.sentMessages.length === 2)
+    await harness.connector.stop()
+
+    const state = await readState(harness.stateFile)
+    assert.equal(state.updateOffset, 613)
+    assert.ok(harness.tg.getUpdatesCalls.some((call) => call?.timeout === 30 && call?.offset === 610))
+    assert.ok(!harness.tg.getUpdatesCalls.some((call) => call?.timeout === 30 && call?.offset === 611))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
 test("startConnector finalizes assistant replies independently when sessions reuse the same message id", async () => {
   const completedAt = new Date(Date.now() + 60_000).toISOString()
   const harness = await createHarness({
@@ -2647,6 +2770,72 @@ test("startConnector stop cancels pending assistant finalization timers", async 
     assert.equal(harness.tg.sentHtmlBlocks.length, 0)
     assert.equal(harness.tg.sentMessages.length, 0)
     assert.equal(harness.tg.sentDocuments.length, 0)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector stop waits for SSE done after synchronous stop request", async () => {
+  let resolveSseStop = () => {}
+  let stopCalls = 0
+  const sseStopped = new Promise((resolve) => {
+    resolveSseStop = resolve
+  })
+
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 665,
+    },
+    startSseLoopImpl: () => ({
+      stop() {
+        stopCalls += 1
+      },
+      done: sseStopped,
+    }),
+  })
+
+  try {
+    await waitFor(() => harness.hasSseHandler("demo"))
+
+    let stopped = false
+    const stopPromise = harness.connector.stop().then(() => {
+      stopped = true
+    })
+
+    await delay(20)
+    assert.equal(stopCalls, 1)
+    assert.equal(stopped, false)
+
+    resolveSseStop()
+    await stopPromise
+    assert.equal(stopped, true)
+  } finally {
+    resolveSseStop()
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector reports fatal escaped core-loop errors instead of swallowing them", async () => {
+  const fatalErrors = []
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 666,
+    },
+    delayImpl: async () => {
+      throw new Error("fatal loop crash")
+    },
+    onFatalErrorImpl: (err) => {
+      fatalErrors.push(err)
+    },
+  })
+
+  try {
+    await waitFor(() => fatalErrors.length === 1)
+    const getUpdatesCount = harness.tg.getUpdatesCalls.length
+    await delay(30)
+
+    assert.match(fatalErrors[0]?.message || "", /fatal loop crash/)
+    assert.equal(harness.tg.getUpdatesCalls.length, getUpdatesCount)
   } finally {
     await harness.connector.stop()
   }

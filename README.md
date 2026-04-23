@@ -159,6 +159,18 @@ export default {
 - On Linux, the connector tries `OPENCODE_TERMINAL` first and then common terminal emulators from `PATH`.
 - In headless Linux/macOS environments, connecting to an already running opencode server still works, but opening a new terminal window requires an available GUI/terminal launcher.
 
+## Running under a supervisor
+
+The connector now logs last-resort `unhandledRejection` / `uncaughtException` failures and exits so an external supervisor can restart it cleanly.
+
+Recommended options:
+
+- **systemd** with `Restart=on-failure`
+- **Docker** with `--restart unless-stopped` or `restart: unless-stopped`
+- **pm2** / **launchd** / another process manager for your platform
+
+Treat the process as a single long-running worker: if a truly fatal runtime error occurs, inspect the logs and let the supervisor restart it instead of trying to keep the broken process alive.
+
 ## Important behavior and limits
 
 - The bot accepts messages from a single Telegram user ID only.

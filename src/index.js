@@ -6,6 +6,7 @@ import { createMirroringHandlers } from "./connector/mirroring.js"
 import { createOverviewHelpers } from "./connector/overview.js"
 import { createPromptHandlers } from "./connector/prompts.js"
 import { createPromptRecovery } from "./connector/prompt-recovery.js"
+import { classifyBoundaryError, normalizeBoundaryError } from "./boundary-errors.js"
 import { TelegramClient, makeInlineKeyboard } from "./telegram/client.js"
 import { formatMarkdownToTelegramHtmlBlocks, escapeHtml } from "./telegram/formatter.js"
 import { ctxKeyFrom, threadIdOr0FromMessage } from "./telegram/routing.js"
@@ -16,6 +17,8 @@ import { ensureOpenCodeRunning, openAttachWindow } from "./opencode/launcher.js"
 import { extractPatchDiffText, extractPatchFiles, formatChangedFilesText } from "./message-display.js"
 import { findSessionByShareUrl, parseSessionReference } from "./session-ref.js"
 import { resolveSessionRoute } from "./session-route.js"
+import { createLifecycleManager } from "./runtime/lifecycle.js"
+import { createRuntimeObservability } from "./runtime/observability.js"
 import { DEFAULT_FEED_MODE, StateStore, normalizeFeedMode, resolveDefaultStatePath, sessionKey } from "./state/store.js"
 import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "./session-list.js"
 import { sanitizeBaseUrlForDisplay } from "./url-utils.js"
@@ -156,6 +159,13 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const ensureStartupSessionFn = deps?.ensureStartupSession || ensureStartupSession
   const ensureOpenCodeRunningFn = deps?.ensureOpenCodeRunning || ensureOpenCodeRunning
   const openAttachWindowFn = deps?.openAttachWindow || deps?.openAttachWindowWindows || openAttachWindow
+  const onFatalError =
+    deps?.onFatalError ||
+    ((err) => {
+      queueMicrotask(() => {
+        throw err
+      })
+    })
   const platform = deps?.platform || process.platform
   const sleep = deps?.delay || delay
   const wizardTtlMs = Number.isFinite(deps?.wizardTtlMs) ? Math.max(0, Number(deps.wizardTtlMs)) : 2 * 60 * 60 * 1000
@@ -220,24 +230,52 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       allowInsecureHttp: config.allowInsecureHttp === true,
     })
   }
+  const lifecycle = createLifecycleManager()
+  const runtimeObservability = createRuntimeObservability({ projectAliases: Object.keys(projects) })
+  const abortController = new AbortController()
 
   // Auto-start opencode servers (best-effort) and pick a startup session per project.
   // Important: do not block connector startup on auto-start (Telegram should stay responsive).
-  const autoStarted = new Map() // alias -> {stop}
   const startInProgress = new Map() // alias -> Promise
   const startupSessionByProject = {} // alias -> sessionId
   const startupSessionInProgress = new Map() // alias -> Promise<sessionId|null>
 
   async function getStartupSession(alias, options) {
-    return ensureStartupSessionFn({
-      alias,
-      startInProgress,
-      startupSessionByProject,
-      startupSessionInProgress,
-      ocByAlias,
-      logger,
-      ...(options || {}),
-    })
+    try {
+      const sessionId = await ensureStartupSessionFn({
+        alias,
+        startInProgress,
+        startupSessionByProject,
+        startupSessionInProgress,
+        ocByAlias,
+        logger,
+        abortSignal: abortController.signal,
+        ...(options || {}),
+      })
+      if (sessionId) runtimeObservability.recordLoopSuccess("startupSession", { projectAlias: alias })
+      return sessionId
+    } catch (err) {
+      if (abortController.signal.aborted) return null
+      const classification = classifyBoundaryError(err, {
+        source: "opencode",
+        operation: "startup session",
+      })
+      if (classification.retryable) {
+        logLoopIssue("startupSession", classification.error, {
+          projectAlias: alias,
+          retryable: true,
+          source: "opencode",
+          operation: "startup session",
+        })
+      } else {
+        logLoopIssue("startupSession", classification.error, {
+          projectAlias: alias,
+          source: "opencode",
+          operation: "startup session",
+        })
+      }
+      throw err
+    }
   }
 
   function startProjectInBackground(alias, { notifyOnFailure = false } = {}) {
@@ -248,13 +286,38 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     const promise = (async () => {
       try {
         logger.info(`[${alias}] autoStart check...`)
-        const handle = await ensureOpenCodeRunningFn({ projectAlias: alias, project: p, ocClient: oc, logger, platform })
-        if (handle?.stop) autoStarted.set(alias, handle)
+        const handle = await ensureOpenCodeRunningFn({
+          projectAlias: alias,
+          project: p,
+          ocClient: oc,
+          logger,
+          platform,
+          abortSignal: abortController.signal,
+        })
+        if (handle?.stop) {
+          trackManagedHandle(`autoStart-handle:${alias}`, handle, { kind: "task", metadata: { projectAlias: alias } })
+        }
+        runtimeObservability.recordLoopSuccess("autoStart", { projectAlias: alias })
         markProjectUp(alias)
         await getStartupSession(alias, { waitForStart: false })
         return handle
       } catch (err) {
-        logger.error("Auto-start failed:", alias, err?.message || String(err))
+        if (abortController.signal.aborted) return null
+        const classification = classifyBoundaryError(err, { source: "opencode", operation: "autoStart" })
+        if (classification.retryable) {
+          logLoopIssue("autoStart", classification.error, {
+            projectAlias: alias,
+            retryable: true,
+            source: "opencode",
+            operation: "autoStart",
+          })
+        } else {
+          logLoopIssue("autoStart", classification.error, {
+            projectAlias: alias,
+            source: "opencode",
+            operation: "autoStart",
+          })
+        }
         if (notifyOnFailure) {
           await notifyProjectUnavailable(alias, err, { force: true, platform }).catch(() => {})
         }
@@ -265,18 +328,19 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     })()
 
     startInProgress.set(alias, promise)
+    trackManagedPromise(`autoStart:${alias}`, promise, { kind: "task", metadata: { projectAlias: alias } })
     return promise
   }
 
-  void (async () => {
-    try {
+  startManagedTask(
+    "autoStart-kickoff",
+    async () => {
       const aliases = Object.keys(projects).filter((a) => projects?.[a]?.autoStart)
       if (aliases.length) logger.info("Auto-start projects:", aliases.join(", "))
       await Promise.allSettled(aliases.map((alias) => startProjectInBackground(alias, { notifyOnFailure: true })))
-    } catch (err) {
-      logger.error("Auto-start loop failed:", err?.message || String(err))
-    }
-  })()
+    },
+    { kind: "task", metadata: { source: "runtime", operation: "autoStart kickoff" } },
+  )
 
   async function ensureProjectStarted(alias, ctxMeta) {
     if (!canAutoStartProject(alias, { platform })) {
@@ -293,7 +357,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     }
 
     const p = projects[alias]
-    void (async () => {
+    const task = (async () => {
       try {
         await sendToThread(ctxMeta, `Starting opencode for '${alias}'…`).catch(() => {})
         const handle = await startProjectInBackground(alias)
@@ -303,10 +367,18 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         await sendToThread(ctxMeta, formatProjectUnavailable(alias, err)).catch(() => {})
       }
     })()
+    trackManagedPromise(`manualStart:${alias}:${ctxMeta?.ctxKey || "unknown"}:${Date.now()}`, task, {
+      kind: "task",
+      metadata: { projectAlias: alias },
+    })
+    return task
   }
 
   for (const alias of Object.keys(projects)) {
-    void getStartupSession(alias, { waitForStart: false }).catch(() => {})
+    trackManagedPromise(`startupSession-prefetch:${alias}`, getStartupSession(alias, { waitForStart: false }).catch(() => null), {
+      kind: "task",
+      metadata: { projectAlias: alias },
+    })
   }
 
   const cb = makeCallbackStore()
@@ -321,6 +393,10 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const recentTgPromptsBySession = new LruMap(2000) // sessionKey -> LruSet(hash)
   const lastAssistantBySession = new LruMap(2000) // sessionKey -> { messageId, sessionId, text }
   const parentSessionBySession = new Map() // key `${projectAlias}:${sessionId}` -> parent session id or null
+  lifecycle.registerStopHook("assistantDebounce-cleanup", () => {
+    for (const timer of assistantDebounce.values()) clearTimeout(timer)
+    assistantDebounce.clear()
+  })
 
   const promptBaseline = {}
   const prompted = {}
@@ -405,9 +481,89 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     setRejectNoteAwaitingState,
     setAwaitingCustomAnswerState,
     markProjectUp,
+    recordPromptRecovery: runtimeObservability.recordPromptRecovery,
+    recordPromptCleanup: runtimeObservability.recordPromptCleanup,
   })
 
-  const abortController = new AbortController()
+  let fatalRuntimeErrorReported = false
+
+  function trackManagedPromise(name, promise, { kind = "task", metadata, stop } = {}) {
+    lifecycle.registerPromise(name, promise, { kind, metadata, stop })
+    return promise
+  }
+
+  function trackManagedHandle(name, handle, { kind = "task", metadata } = {}) {
+    lifecycle.registerHandle(name, handle, { kind, metadata })
+    return handle
+  }
+
+  function recordLoopError(loopName, err, { projectAlias, source = projectAlias ? "opencode" : "runtime", operation, method, pathname } = {}) {
+    const normalized = normalizeBoundaryError(err, {
+      source,
+      operation,
+      method,
+      pathname,
+    })
+    runtimeObservability.recordLoopError(loopName, { projectAlias, err: normalized })
+    return normalized
+  }
+
+  function logLoopIssue(loopName, err, { projectAlias, retryable = false, source = projectAlias ? "opencode" : "runtime", operation, method, pathname } = {}) {
+    const normalized = normalizeBoundaryError(err, {
+      source,
+      operation,
+      method,
+      pathname,
+    })
+    if (retryable) {
+      runtimeObservability.recordLoopRetry(loopName, { projectAlias, err: normalized })
+      logger.warn(`${loopName} retryable${projectAlias ? ` [${projectAlias}]` : ""}:`, normalized.message)
+    } else {
+      runtimeObservability.recordLoopError(loopName, { projectAlias, err: normalized })
+      logger.error(`${loopName} error${projectAlias ? ` [${projectAlias}]` : ""}:`, normalized.message)
+    }
+    return normalized
+  }
+
+  function recordLoopAbort(loopName, { projectAlias, reason } = {}) {
+    runtimeObservability.recordLoopAbort(loopName, { projectAlias, reason })
+    logger.info(`${loopName} aborted${projectAlias ? ` [${projectAlias}]` : ""}:`, reason || "stopped")
+  }
+
+  function reportFatalRuntimeError(err, { name, projectAlias } = {}) {
+    if (fatalRuntimeErrorReported || abortController.signal.aborted) return
+    fatalRuntimeErrorReported = true
+    abortController.abort()
+    logger.error(`Fatal runtime error${name ? ` in ${name}` : ""}${projectAlias ? ` [${projectAlias}]` : ""}:`, err.message)
+    onFatalError(err)
+  }
+
+  function startManagedTask(name, run, { kind = "task", metadata, fatalOnError = false } = {}) {
+    const promise = (async () => {
+      try {
+        return await run()
+      } catch (err) {
+        if (abortController.signal.aborted) return null
+        const normalized = logLoopIssue(name, err, {
+          projectAlias: metadata?.projectAlias,
+          source: metadata?.source || (metadata?.projectAlias ? "opencode" : "runtime"),
+          operation: metadata?.operation,
+          method: metadata?.method,
+          pathname: metadata?.pathname,
+        })
+        if (fatalOnError) {
+          reportFatalRuntimeError(normalized, {
+            name,
+            projectAlias: metadata?.projectAlias,
+          })
+          throw normalized
+        }
+        return null
+      }
+    })()
+    trackManagedPromise(name, promise, { kind, metadata })
+    return promise
+  }
 
   async function sleepWithAbort(ms) {
     if (abortController.signal.aborted) return
@@ -450,10 +606,13 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         prompted[w?.projectAlias]?.question.delete(w?.request?.id)
         questionWizards.delete(k)
         clearPersistedQuestionWizard(w?.projectAlias, w?.request?.id)
+        runtimeObservability.recordPromptCleanup(w?.projectAlias, "stale")
+        logger.info("Stale prompt wizard cleaned up:", w?.projectAlias || "unknown", w?.request?.id || w?.id || "unknown")
       }
     }
   }, wizardGcIntervalMs)
   wizardGcTimer.unref?.()
+  lifecycle.registerTimer("questionWizard-gc", wizardGcTimer)
 
   const mirroringHandlers = createMirroringHandlers({
     ...promptHandlers,
@@ -510,10 +669,20 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
 
   async function sendToThread(ctxMeta, text, replyMarkup, options = {}) {
     if (!ctxMeta?.chatId) return
-    await tg.sendMessage(ctxMeta.chatId, text, replyMarkup, {
-      ...options,
-      message_thread_id: ctxMeta.threadIdOr0 || undefined,
-    })
+    try {
+      await tg.sendMessage(ctxMeta.chatId, text, replyMarkup, {
+        ...options,
+        message_thread_id: ctxMeta.threadIdOr0 || undefined,
+      })
+    } catch (err) {
+      throw normalizeBoundaryError(err, {
+        source: "telegram",
+        operation: "sendMessage",
+        method: "POST",
+        pathname: "/sendMessage",
+        ...(err?.isBoundaryError === true ? {} : { outcome: "retryable" }),
+      })
+    }
   }
 
   function parseCtxKey(key) {
@@ -528,9 +697,19 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
 
   async function sendBlocksToThread(ctxMeta, blocks, replyMarkup) {
     if (!ctxMeta?.chatId) return
-    await tg.sendHtmlBlocks(ctxMeta.chatId, blocks, replyMarkup, {
-      message_thread_id: ctxMeta.threadIdOr0 || undefined,
-    })
+    try {
+      await tg.sendHtmlBlocks(ctxMeta.chatId, blocks, replyMarkup, {
+        message_thread_id: ctxMeta.threadIdOr0 || undefined,
+      })
+    } catch (err) {
+      throw normalizeBoundaryError(err, {
+        source: "telegram",
+        operation: "sendHtmlBlocks",
+        method: "POST",
+        pathname: "/sendMessage",
+        ...(err?.isBoundaryError === true ? {} : { outcome: "retryable" }),
+      })
+    }
   }
 
   async function validateProject(alias) {
@@ -603,6 +782,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     sendToThread,
     parseCtxKey,
     formatThreadLabel,
+    buildRuntimeStatusLines: runtimeObservability.buildStatusLines,
     isCommand,
     parseCommand,
     compareNumbers,
@@ -627,6 +807,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     tg,
     cb,
     logger,
+    recordCallbackOutcome: runtimeObservability.recordCallbackOutcome,
     questionWizards,
     ctxMetaFromMessage,
     isAllowedUser,
@@ -661,22 +842,41 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     let offset = 0
     let backoff = 1000
     while (true) {
-      if (abortController.signal.aborted) return
+      if (abortController.signal.aborted) {
+        recordLoopAbort("backlogDrain", { reason: "connector stop" })
+        return
+      }
       const updates = await tg
         .getUpdates({ offset, timeout: 0, limit: 100, allowed_updates: ["message", "callback_query"], signal: abortController.signal })
         .catch((err) => {
           if (abortController.signal.aborted) return null
-          logger.error("Backlog drain error:", err?.message || String(err))
+          const classification = classifyBoundaryError(err, {
+            source: "telegram",
+            operation: "getUpdates",
+            method: "POST",
+            pathname: "/getUpdates",
+          })
+          logLoopIssue("backlogDrain", classification.error, {
+            retryable: classification.retryable,
+            source: "telegram",
+            operation: "getUpdates",
+            method: "POST",
+            pathname: "/getUpdates",
+          })
           return null
         })
 
-      if (abortController.signal.aborted) return
+      if (abortController.signal.aborted) {
+        recordLoopAbort("backlogDrain", { reason: "connector stop" })
+        return
+      }
       if (!Array.isArray(updates)) {
         await sleepWithAbort(backoff)
         backoff = Math.min(30_000, backoff * 2)
         continue
       }
 
+      runtimeObservability.recordLoopSuccess("backlogDrain")
       backoff = 1000
       if (updates.length === 0) break
       offset = updates[updates.length - 1].update_id + 1
@@ -695,34 +895,67 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         .getUpdates({ offset, timeout: 30, limit: 100, allowed_updates: ["message", "callback_query"], signal: abortController.signal })
         .catch((err) => {
           if (abortController.signal.aborted) return null
-          logger.error("getUpdates error:", err?.message || String(err))
+          const classification = classifyBoundaryError(err, {
+            source: "telegram",
+            operation: "getUpdates",
+            method: "POST",
+            pathname: "/getUpdates",
+          })
+          logLoopIssue("telegramPoll", classification.error, {
+            retryable: classification.retryable,
+            source: "telegram",
+            operation: "getUpdates",
+            method: "POST",
+            pathname: "/getUpdates",
+          })
           return null
         })
-      if (abortController.signal.aborted) break
+      if (abortController.signal.aborted) {
+        recordLoopAbort("telegramPoll", { reason: "connector stop" })
+        break
+      }
       if (!Array.isArray(updates)) {
         // Avoid a tight loop on network/API errors.
         await sleepWithAbort(backoff)
         backoff = Math.min(30_000, backoff * 2)
         continue
       }
+      runtimeObservability.recordLoopSuccess("telegramPoll")
       if (updates.length === 0) {
         backoff = 1000
         continue
       }
       backoff = 1000
       for (const u of updates) {
-        let ok = false
+        let shouldAdvanceOffset = false
         try {
           if (u.message) await handleTelegramMessage(u.message)
           if (u.callback_query) await handleTelegramCallback(u.callback_query)
-          ok = true
+          shouldAdvanceOffset = true
         } catch (err) {
-          logger.error("Update handler error:", err?.message || String(err))
+          const classification = classifyBoundaryError(err)
+          if (classification.retryable) {
+            runtimeObservability.recordUpdateRetry()
+            logger.warn(
+              "Retryable update handler error:",
+              `update=${u.update_id}`,
+              `kind=${classification.kind}`,
+              classification.error.message,
+            )
+          } else {
+            runtimeObservability.recordUpdateSkip()
+            logger.error(
+              "Skipping non-retryable update:",
+              `update=${u.update_id}`,
+              `outcome=${classification.outcome}`,
+              `kind=${classification.kind}`,
+              classification.error.message,
+            )
+            shouldAdvanceOffset = true
+          }
         }
 
-        // Only advance offset if we handled this update successfully.
-        // Otherwise we'd drop it permanently.
-        if (ok) {
+        if (shouldAdvanceOffset) {
           store.setUpdateOffset(u.update_id + 1)
         } else {
           await sleepWithAbort(1000)
@@ -750,71 +983,165 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       })
   }
 
-  const sseLoops = []
-  const sseLoopStarters = []
   for (const alias of Object.keys(projects)) {
-    sseLoopStarters.push(
-      (async () => {
+    startManagedTask(
+      `sseStarter:${alias}`,
+      async () => {
         await waitForPromiseOrAbort(startInProgress.get(alias))
         if (abortController.signal.aborted) return null
         const handle = startSseLoop({
           projectAlias: alias,
           ocClient: ocByAlias[alias],
           logger,
-          onConnect: ({ projectAlias }) => markProjectSseConnected(projectAlias),
+          onConnect: ({ projectAlias }) => {
+            markProjectSseConnected(projectAlias)
+            runtimeObservability.recordLoopSuccess("sse", { projectAlias, connected: true })
+          },
           onEvent: onSseEvent,
           onError: ({ projectAlias, err }) => {
             markProjectSseDown(projectAlias)
+            const classification = classifyBoundaryError(err, {
+              source: "opencode",
+              operation: "GET /event",
+              method: "GET",
+              pathname: "/event",
+            })
+            if (classification.retryable) {
+              logLoopIssue("sse", classification.error, {
+                projectAlias,
+                retryable: true,
+                source: "opencode",
+                operation: "GET /event",
+                method: "GET",
+                pathname: "/event",
+              })
+            } else {
+              logLoopIssue("sse", classification.error, {
+                projectAlias,
+                source: "opencode",
+                operation: "GET /event",
+                method: "GET",
+                pathname: "/event",
+              })
+            }
             return notifyProjectUnavailable(projectAlias, err, { platform })
+          },
+          onAbort: ({ projectAlias, err }) => {
+            recordLoopAbort("sse", { projectAlias, reason: err?.message || "aborted" })
           },
           abortSignal: abortController.signal,
         })
-        sseLoops.push(handle)
+        trackManagedHandle(`sse:${alias}`, handle, { kind: "loop", metadata: { projectAlias: alias } })
         return handle
-      })(),
+      },
+      { kind: "task", metadata: { projectAlias: alias, source: "opencode", operation: "SSE start" }, fatalOnError: true },
     )
   }
 
   // Periodic prompt poll (helps when SSE is down).
-  const promptPollPromise = (async () => {
+  const promptPollPromise = startManagedTask(
+    "promptPoll",
+    async () => {
     while (!abortController.signal.aborted) {
       for (const alias of Object.keys(projects)) {
-        await ensureBaselineLoaded(alias)
-        if (!promptBaseline[alias]?.loaded) continue
-        const oc = ocByAlias[alias]
-        const [perms, questions] = await Promise.all([oc.listPermissions().catch(() => null), oc.listQuestions().catch(() => null)])
-        if (Array.isArray(perms) || Array.isArray(questions)) markProjectUp(alias)
-        if (Array.isArray(perms)) {
-          for (const p of perms) {
-            if (promptBaseline[alias].permission.has(p.id)) continue
-            // send via SSE handler shape
-            await onSseEvent({ projectAlias: alias, evt: { type: "permission.asked", properties: p } })
+        try {
+          await ensureBaselineLoaded(alias)
+          if (!promptBaseline[alias]?.loaded) continue
+          const oc = ocByAlias[alias]
+          const [permsResult, questionsResult] = await Promise.allSettled([
+            oc.listPermissions({ signal: abortController.signal }),
+            oc.listQuestions({ signal: abortController.signal }),
+          ])
+          const perms = permsResult.status === "fulfilled" ? permsResult.value : null
+          const questions = questionsResult.status === "fulfilled" ? questionsResult.value : null
+
+          if (permsResult.status === "rejected") {
+            const classification = classifyBoundaryError(permsResult.reason, {
+              source: "opencode",
+              operation: "GET /permission",
+              method: "GET",
+              pathname: "/permission",
+            })
+            logLoopIssue("promptPoll", classification.error, {
+              projectAlias: alias,
+              retryable: classification.retryable,
+              source: "opencode",
+              operation: "GET /permission",
+              method: "GET",
+              pathname: "/permission",
+            })
           }
-        }
-        if (Array.isArray(questions)) {
-          for (const q of questions) {
-            if (promptBaseline[alias].question.has(q.id)) continue
-            await onSseEvent({ projectAlias: alias, evt: { type: "question.asked", properties: q } })
+          if (questionsResult.status === "rejected") {
+            const classification = classifyBoundaryError(questionsResult.reason, {
+              source: "opencode",
+              operation: "GET /question",
+              method: "GET",
+              pathname: "/question",
+            })
+            logLoopIssue("promptPoll", classification.error, {
+              projectAlias: alias,
+              retryable: classification.retryable,
+              source: "opencode",
+              operation: "GET /question",
+              method: "GET",
+              pathname: "/question",
+            })
           }
+
+          if (Array.isArray(perms) || Array.isArray(questions)) {
+            markProjectUp(alias)
+            runtimeObservability.recordLoopSuccess("promptPoll", { projectAlias: alias })
+          }
+          if (Array.isArray(perms)) {
+            for (const p of perms) {
+              if (promptBaseline[alias].permission.has(p.id)) continue
+              runtimeObservability.recordLoopFallbackHit("promptPoll", { projectAlias: alias })
+              // send via SSE handler shape
+              await onSseEvent({ projectAlias: alias, evt: { type: "permission.asked", properties: p } })
+            }
+          }
+          if (Array.isArray(questions)) {
+            for (const q of questions) {
+              if (promptBaseline[alias].question.has(q.id)) continue
+              runtimeObservability.recordLoopFallbackHit("promptPoll", { projectAlias: alias })
+              await onSseEvent({ projectAlias: alias, evt: { type: "question.asked", properties: q } })
+            }
+          }
+        } catch (err) {
+          logLoopIssue("promptPoll", err, {
+            projectAlias: alias,
+            source: "opencode",
+            operation: "prompt polling",
+          })
         }
       }
       await sleepWithAbort(15_000)
     }
-  })()
-
-  const telegramLoopPromise = telegramLoop()
-
-  const stop = async () => {
-    abortController.abort()
-    clearInterval(wizardGcTimer)
-    for (const timer of assistantDebounce.values()) clearTimeout(timer)
-    assistantDebounce.clear()
-    for (const s of sseLoops) s.stop?.()
-    for (const h of autoStarted.values()) {
-      await Promise.resolve(h.stop?.()).catch(() => {})
+    for (const alias of Object.keys(projects)) {
+      recordLoopAbort("promptPoll", { projectAlias: alias, reason: "connector stop" })
     }
-    await Promise.allSettled([telegramLoopPromise, promptPollPromise, ...sseLoopStarters])
-    await store.flush().catch(() => {})
+  },
+    { kind: "loop", metadata: { source: "opencode", operation: "prompt polling" }, fatalOnError: true },
+  )
+
+  const telegramLoopPromise = startManagedTask(
+    "telegramLoop",
+    telegramLoop,
+    { kind: "loop", metadata: { source: "telegram", operation: "getUpdates", method: "POST", pathname: "/getUpdates" }, fatalOnError: true },
+  )
+
+  let stopPromise = null
+  const stop = async () => {
+    if (stopPromise) return stopPromise
+    stopPromise = (async () => {
+      logger.info("Stopping connector. Managed tasks:", lifecycle.snapshot().map((entry) => `${entry.kind}:${entry.name}`).join(", ") || "none")
+      abortController.abort()
+      runtimeObservability.recordLoopSuccess("shutdown")
+      await lifecycle.stopAll()
+      await Promise.allSettled([telegramLoopPromise, promptPollPromise])
+      await store.flush().catch(() => {})
+    })()
+    return stopPromise
   }
 
   return { stop, stateFile }

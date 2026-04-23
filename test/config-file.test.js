@@ -4,7 +4,7 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import crypto from "node:crypto"
-import { buildRuntimeConfig } from "../src/config/runtime.js"
+import { buildRuntimeConfig, parseCliArgs } from "../src/config/runtime.js"
 
 async function makeTempDir() {
   const dir = path.join(os.tmpdir(), `telegram-connector-${crypto.randomUUID()}`)
@@ -209,4 +209,88 @@ test("buildRuntimeConfig falls back to legacy env and projects json when config 
   assert.equal(config.telegram.botToken, "env-token")
   assert.equal(config.telegram.allowedUserId, 77)
   assert.equal(config.projects.demo.baseUrl, "http://127.0.0.1:4312")
+})
+
+test("parseCliArgs parses supported flags and help aliases", () => {
+  const parsed = parseCliArgs([
+    "--env-file",
+    "./.env.custom",
+    "--config-file",
+    "./config/connector.config.mjs",
+    "--projects-file",
+    "./projects.json",
+    "--projects-json",
+    '{"demo":{"baseUrl":"http://127.0.0.1:4312"}}',
+    "--state-file",
+    "./.data/state.json",
+    "-h",
+    "--unknown",
+  ])
+
+  assert.deepEqual(parsed, {
+    envFile: "./.env.custom",
+    configFile: "./config/connector.config.mjs",
+    projectsFile: "./projects.json",
+    projectsJson: '{"demo":{"baseUrl":"http://127.0.0.1:4312"}}',
+    stateFile: "./.data/state.json",
+    help: true,
+  })
+
+  assert.deepEqual(parseCliArgs(["--help"]), { help: true })
+  assert.deepEqual(parseCliArgs([]), {})
+})
+
+test("parseCliArgs rejects missing flag values", () => {
+  assert.throws(() => parseCliArgs(["--env-file"]), /Missing value for --env-file/)
+  assert.throws(() => parseCliArgs(["--projects-file", "--state-file", "state.json"]), /Missing value for --projects-file/)
+})
+
+test("buildRuntimeConfig resolves explicit CLI env, config, projects, and state paths from cwd", async (t) => {
+  const dir = await makeTempDir()
+  const nestedDir = path.join(dir, "nested")
+  await fs.mkdir(nestedDir, { recursive: true })
+  swapEnv(t, {
+    TELEGRAM_BOT_TOKEN: undefined,
+    TELEGRAM_ALLOWED_USER_ID: undefined,
+    PROJECTS_JSON: undefined,
+    PROJECTS_FILE: undefined,
+    STATE_FILE: undefined,
+  })
+  await fs.writeFile(path.join(nestedDir, "custom.env"), "TELEGRAM_BOT_TOKEN=env-token\nTELEGRAM_ALLOWED_USER_ID=77\n", "utf8")
+  await fs.writeFile(
+    path.join(nestedDir, "connector.config.mjs"),
+    `export default {
+      projects: {
+        cfgdemo: {
+          baseUrl: "http://127.0.0.1:4312"
+        }
+      }
+    }
+    `,
+    "utf8",
+  )
+  await fs.writeFile(
+    path.join(nestedDir, "projects.json"),
+    JSON.stringify({ filedemo: { directory: "./repo", port: 4999 } }, null, 2),
+    "utf8",
+  )
+
+  const { config, envFile, configFile, loadedConfigFile } = await buildRuntimeConfig({
+    cwd: dir,
+    args: {
+      envFile: path.relative(process.cwd(), path.join(nestedDir, "custom.env")),
+      configFile: path.relative(process.cwd(), path.join(nestedDir, "connector.config.mjs")),
+      projectsFile: path.relative(process.cwd(), path.join(nestedDir, "projects.json")),
+      stateFile: path.relative(process.cwd(), path.join(nestedDir, "state.json")),
+    },
+  })
+
+  assert.equal(envFile, path.resolve(dir, "nested", "custom.env"))
+  assert.equal(configFile, path.resolve(dir, "nested", "connector.config.mjs"))
+  assert.equal(loadedConfigFile, true)
+  assert.equal(config.telegram.botToken, "env-token")
+  assert.equal(config.telegram.allowedUserId, 77)
+  assert.equal(config.stateFile, path.resolve(dir, "nested", "state.json"))
+  assert.deepEqual(Object.keys(config.projects), ["filedemo"])
+  assert.equal(config.projects.filedemo.directory, path.resolve(dir, "nested", "repo"))
 })

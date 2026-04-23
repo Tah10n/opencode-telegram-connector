@@ -16,12 +16,13 @@ test("OpenCodeClient request sends query params, auth headers, and JSON bodies",
   }
 
   try {
+    const external = new AbortController()
     const client = new OpenCodeClient({ baseUrl: "https://example.com/api", username: "user", password: "secret" })
     const result = await client.request("/session", {
       method: "POST",
       query: { directory: "C:/repo", limit: 10, ignored: null },
       json: { title: "demo" },
-      signal: "external-signal",
+      signal: external.signal,
     })
 
     assert.deepEqual(result, { ok: true })
@@ -32,7 +33,8 @@ test("OpenCodeClient request sends query params, auth headers, and JSON bodies",
     assert.equal(calls[0].init.headers["content-type"], "application/json")
     assert.match(calls[0].init.headers.authorization, /^Basic /)
     assert.equal(calls[0].init.body, JSON.stringify({ title: "demo" }))
-    assert.equal(calls[0].init.signal, "external-signal")
+    assert.equal(calls[0].init.signal instanceof AbortSignal, true)
+    assert.equal(calls[0].init.signal.aborted, false)
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -147,4 +149,30 @@ test("OpenCodeClient headers keep accept header and default auth username", () =
   assert.equal(headers.accept, "application/json")
   assert.equal(headers["x-test"], "1")
   assert.match(headers.authorization, /^Basic /)
+})
+
+test("OpenCodeClient request keeps timeout behavior when an external abort signal is provided", async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (_url, init) => {
+    await new Promise((_resolve, reject) => {
+      init.signal.addEventListener(
+        "abort",
+        () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+        { once: true },
+      )
+    })
+  }
+
+  try {
+    const client = new OpenCodeClient({ baseUrl: "https://example.com" })
+    const external = new AbortController()
+    await assert.rejects(client.request("/slow", { timeoutMs: 5, signal: external.signal }), (err) => {
+      const classification = classifyBoundaryError(err)
+      assert.equal(classification.retryable, true)
+      assert.equal(err.kind, "timeout")
+      return true
+    })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })

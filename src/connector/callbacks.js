@@ -38,6 +38,7 @@ export function createCallbackHandlers(runtime) {
     buildSessionSwitchText = defaultBuildSessionSwitchText,
     setThreadModelPreference,
     formatProjectUnavailable,
+    recordCallbackOutcome,
   } = runtime
 
   async function answerCallbackQuery(callbackQueryId, text) {
@@ -67,6 +68,7 @@ export function createCallbackHandlers(runtime) {
 
     const parts = String(data).split("|")
     const kind = parts[0]
+    const callbackProjectAlias = projects?.[parts[1]] ? parts[1] : store.getBinding(ctxMeta.ctxKey)?.projectAlias || null
 
     try {
       if (kind === "s") {
@@ -271,10 +273,12 @@ export function createCallbackHandlers(runtime) {
             if (isStaleBoundaryError(err, { source: "opencode", pathname: `/permission/${permissionId}/reply`, method: "POST" })) {
               store.deletePendingPermission(projectAlias, permissionId)
               setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
+              recordCallbackOutcome?.(projectAlias, "stale")
               await answerCallbackQuery(callbackQuery.id, "No longer active")
               return
             }
             if (isRetryableBoundaryError(err, { source: "opencode", pathname: `/permission/${permissionId}/reply`, method: "POST" })) {
+              recordCallbackOutcome?.(projectAlias, "retryable")
               await answerCallbackQuery(callbackQuery.id, "Temporarily unavailable")
               await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(ignoreError)
               return
@@ -325,10 +329,12 @@ export function createCallbackHandlers(runtime) {
               runtime.questionWizards.delete(`${projectAlias}:${questionId}`)
               clearPersistedQuestionWizard(projectAlias, questionId)
               setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
+              recordCallbackOutcome?.(projectAlias, "stale")
               await answerCallbackQuery(callbackQuery.id, "No longer active")
               return
             }
             if (isRetryableBoundaryError(err, { source: "opencode", pathname: `/question/${questionId}/reject`, method: "POST" })) {
+              recordCallbackOutcome?.(projectAlias, "retryable")
               await answerCallbackQuery(callbackQuery.id, "Temporarily unavailable")
               await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(ignoreError)
               return
@@ -478,14 +484,17 @@ export function createCallbackHandlers(runtime) {
       runtime.logger?.error?.("Callback handler error:", err?.message || String(err))
       const classification = classifyBoundaryError(err)
       if (classification.stale) {
+        recordCallbackOutcome?.(callbackProjectAlias, "stale")
         await answerCallbackQuery(callbackQuery.id, "No longer active")
         return
       }
       if (classification.retryable) {
+        recordCallbackOutcome?.(callbackProjectAlias, "retryable")
         await answerCallbackQuery(callbackQuery.id, "Temporarily unavailable")
         await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(ignoreError)
         return
       }
+      recordCallbackOutcome?.(callbackProjectAlias, "fatal")
       await answerCallbackQuery(callbackQuery.id, "Action failed")
       await sendToThread(ctxMeta, "Action failed. Please try again.").catch(ignoreError)
     }

@@ -7,6 +7,7 @@ export async function ensureStartupSession({
   logger,
   waitForStart = true,
   forceRefresh = false,
+  abortSignal,
 }) {
   if (!waitForStart && startInProgress.has(alias)) {
     return startupSessionByProject[alias] || null
@@ -27,12 +28,12 @@ export async function ensureStartupSession({
     const oc = ocByAlias[alias]
     if (!oc) return null
 
-    const list = await oc.listSessions({ limit: 1 }).catch(() => null)
+    const list = await oc.listSessions({ limit: 1, signal: abortSignal })
     const latest = Array.isArray(list) && list[0] ? list[0] : null
     if (latest?.id) {
       startupSessionByProject[alias] = latest.id
     } else {
-      const created = await oc.createSession({}).catch(() => null)
+      const created = await oc.createSession({ signal: abortSignal })
       if (created?.id) {
         logger?.info?.(`[${alias}] created startup session:`, created.id)
         startupSessionByProject[alias] = created.id

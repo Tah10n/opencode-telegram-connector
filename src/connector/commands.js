@@ -84,6 +84,7 @@ export function createCommandHandlers(runtime) {
     sendCurrentQuestionStep,
     setRejectNoteAwaitingState,
     setAwaitingCustomAnswerState,
+    buildRuntimeStatusLines,
   } = runtime
 
   async function resolveStartupSession(alias, { forceRefresh = false } = {}) {
@@ -833,6 +834,7 @@ export function createCommandHandlers(runtime) {
     const baseUrl = sanitizeBaseUrlForDisplay(projects?.[binding.projectAlias]?.baseUrl) || "unknown"
     const feedMode = feedModeLabel(getFeedMode(ctxMeta.ctxKey))
     const effectiveState = await resolveEffectiveModelState(ctxMeta.ctxKey, binding)
+    const runtimeLines = buildRuntimeStatusLines?.(binding.projectAlias) || []
     await sendToThread(
       ctxMeta,
       appendEffectiveModelLines(
@@ -843,6 +845,7 @@ export function createCommandHandlers(runtime) {
           `Feed: ${feedMode}`,
           `SSE: ${sseStatus}`,
           `Base URL: ${baseUrl}`,
+          ...runtimeLines,
         ],
         effectiveState,
       ).join("\n"),

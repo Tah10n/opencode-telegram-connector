@@ -73,6 +73,8 @@ export function createPromptRecovery(runtime) {
     setRejectNoteAwaitingState,
     setAwaitingCustomAnswerState,
     markProjectUp,
+    recordPromptRecovery,
+    recordPromptCleanup,
   } = runtime
 
   const livePromptSnapshotByProject = new Map()
@@ -131,6 +133,10 @@ export function createPromptRecovery(runtime) {
     const summary = createSummary()
     const pending = store.getPendingPrompts?.() || store.get().pendingPrompts || {}
 
+    function record(projectAlias, outcome) {
+      recordPromptRecovery?.(projectAlias, outcome)
+    }
+
     for (const entry of Object.values(pending.permissions || {})) {
       const ctx = entry?.ctx
       if (!entry?.projectAlias || !entry?.permissionId || !ctx?.chatId || !ctx?.ctxKey) continue
@@ -141,6 +147,8 @@ export function createPromptRecovery(runtime) {
         if (!permissions.ids.has(entry.permissionId)) {
           store.deletePendingPermission(entry.projectAlias, entry.permissionId)
           summary.permissions.stale += 1
+          recordPromptCleanup?.(entry.projectAlias, "stale")
+          record(entry.projectAlias, "stale")
           continue
         }
         prompted[entry.projectAlias]?.permission.add(entry.permissionId)
@@ -155,10 +163,12 @@ export function createPromptRecovery(runtime) {
           ctx,
         ).catch(() => {})
         summary.permissions.restored += 1
+        record(entry.projectAlias, "restored")
         continue
       }
 
       summary.permissions[permissions.outcome] += 1
+      record(entry.projectAlias, permissions.outcome)
     }
 
     for (const snapshot of Object.values(pending.questionWizards || {})) {
@@ -172,6 +182,8 @@ export function createPromptRecovery(runtime) {
         if (!liveQuestion) {
           clearPersistedQuestionWizard(snapshot.projectAlias, snapshot.id)
           summary.questionWizards.stale += 1
+          recordPromptCleanup?.(snapshot.projectAlias, "stale")
+          record(snapshot.projectAlias, "stale")
           continue
         }
 
@@ -183,6 +195,7 @@ export function createPromptRecovery(runtime) {
         ]).catch(() => {})
         await sendCurrentQuestionStep(wizard).catch(() => {})
         summary.questionWizards.restored += 1
+        record(snapshot.projectAlias, "restored")
         continue
       }
 
@@ -195,6 +208,7 @@ export function createPromptRecovery(runtime) {
       }
 
       summary.questionWizards[questions.outcome] += 1
+      record(snapshot.projectAlias, questions.outcome)
     }
 
     for (const [ctxKey, value] of Object.entries(pending.rejectNotes || {})) {
@@ -206,6 +220,8 @@ export function createPromptRecovery(runtime) {
         if (!permissions.ids.has(value.permissionId)) {
           setRejectNoteAwaitingState(ctxKey, null)
           summary.rejectNotes.stale += 1
+          recordPromptCleanup?.(value.projectAlias, "stale")
+          record(value.projectAlias, "stale")
           continue
         }
 
@@ -215,6 +231,7 @@ export function createPromptRecovery(runtime) {
           await sendRejectNotePrompt(bindingCtx, value.projectAlias, value.permissionId, { resumed: true }).catch(() => {})
         }
         summary.rejectNotes.restored += 1
+        record(value.projectAlias, "restored")
         continue
       }
 
@@ -223,6 +240,7 @@ export function createPromptRecovery(runtime) {
       }
 
       summary.rejectNotes[permissions.outcome] += 1
+      record(value.projectAlias, permissions.outcome)
     }
 
     for (const [ctxKey, value] of Object.entries(pending.customAnswers || {})) {
@@ -234,6 +252,8 @@ export function createPromptRecovery(runtime) {
         if (!questions.byId.has(value.requestId)) {
           setAwaitingCustomAnswerState(ctxKey, null)
           summary.customAnswers.stale += 1
+          recordPromptCleanup?.(value.projectAlias, "stale")
+          record(value.projectAlias, "stale")
           continue
         }
 
@@ -242,6 +262,8 @@ export function createPromptRecovery(runtime) {
         if (!wizard || !question) {
           setAwaitingCustomAnswerState(ctxKey, null)
           summary.customAnswers.stale += 1
+          recordPromptCleanup?.(value.projectAlias, "stale")
+          record(value.projectAlias, "stale")
           continue
         }
 
@@ -254,6 +276,7 @@ export function createPromptRecovery(runtime) {
           )
         }
         summary.customAnswers.restored += 1
+        record(value.projectAlias, "restored")
         continue
       }
 
@@ -266,6 +289,7 @@ export function createPromptRecovery(runtime) {
       }
 
       summary.customAnswers[questions.outcome] += 1
+      record(value.projectAlias, questions.outcome)
     }
 
     return { ...summary, totals: summarizeTotals(summary) }

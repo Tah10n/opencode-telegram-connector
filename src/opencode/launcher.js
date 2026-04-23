@@ -240,20 +240,43 @@ async function findOpenCodeUiProcessWindows({ port } = {}) {
   return null
 }
 
-export async function waitForHealth(ocClient, { timeoutMs = 30_000, logger, projectAlias } = {}) {
+export async function waitForHealth(ocClient, { timeoutMs = 30_000, logger, projectAlias, abortSignal } = {}) {
   const started = Date.now()
   let backoff = 250
   let lastErr = null
-  while (Date.now() - started < timeoutMs) {
+
+  function throwAbortError() {
+    const err = new Error("Aborted waiting for health")
+    err.name = "AbortError"
+    throw err
+  }
+
+  async function delayWithAbort(ms) {
+    if (abortSignal?.aborted) throwAbortError()
+    let onAbort = null
+    const abortPromise = new Promise((_, reject) => {
+      onAbort = () => reject(Object.assign(new Error("Aborted waiting for health"), { name: "AbortError" }))
+      abortSignal?.addEventListener?.("abort", onAbort, { once: true })
+    })
     try {
-      const h = await ocClient.health()
+      await Promise.race([delay(ms), abortPromise])
+    } finally {
+      if (onAbort) abortSignal?.removeEventListener?.("abort", onAbort)
+    }
+  }
+
+  while (Date.now() - started < timeoutMs) {
+    if (abortSignal?.aborted) throwAbortError()
+    try {
+      const h = await ocClient.health({ signal: abortSignal })
       if (h && (h.healthy === true || h.ok === true || h.version)) return h
     } catch (err) {
+      if (err?.name === "AbortError") throw err
       lastErr = err
       // retry
       if (Date.now() - started > timeoutMs) throw err
     }
-    await delay(backoff)
+    await delayWithAbort(backoff)
     backoff = Math.min(2000, backoff * 2)
   }
   const detail = lastErr ? ` Last error: ${lastErr?.message || String(lastErr)}` : ""
@@ -712,7 +735,7 @@ export function startOpenCodeServeDetached({ directory, port }) {
   return { child }
 }
 
-export async function ensureOpenCodeRunning({ projectAlias, project, ocClient, logger, platform = process.platform }) {
+export async function ensureOpenCodeRunning({ projectAlias, project, ocClient, logger, platform = process.platform, abortSignal }) {
   const launchSupport = getLaunchSupport({ project, platform })
   const serverLaunchMode = launchSupport.serverLaunchMode
 
@@ -764,9 +787,11 @@ export async function ensureOpenCodeRunning({ projectAlias, project, ocClient, l
   // Do not auto-open a new attach/TUI window here: `openTuiOnAutoStart`
   // should only apply when this connector actually had to start the server.
   try {
-    await ocClient.health()
+    await ocClient.health({ signal: abortSignal })
     return { started: false, pid: null, stop: async () => {} }
-  } catch {}
+  } catch (err) {
+    if (err?.name === "AbortError" || abortSignal?.aborted) throw err
+  }
 
   if (!project?.autoStart) {
     throw new Error(`Project '${projectAlias}' is down and autoStart=false`)
@@ -800,11 +825,13 @@ export async function ensureOpenCodeRunning({ projectAlias, project, ocClient, l
       }
 
       if (uiAlreadyRunning) {
-        await waitForHealth(ocClient, { timeoutMs: 15_000, logger, projectAlias }).catch(() => {})
         try {
-          await ocClient.health()
+          await waitForHealth(ocClient, { timeoutMs: 15_000, logger, projectAlias, abortSignal })
+          await ocClient.health({ signal: abortSignal })
           return { started: false, pid: null, stop: async () => {} }
-        } catch {}
+        } catch (err) {
+          if (err?.name === "AbortError" || abortSignal?.aborted) throw err
+        }
       }
     }
 
@@ -846,8 +873,21 @@ export async function ensureOpenCodeRunning({ projectAlias, project, ocClient, l
   }
 
   logger?.info?.(`[${projectAlias}] started opencode (${startedMode}) pid=${pid || "?"} port=${project.port}`)
-  await waitForHealth(ocClient, { timeoutMs: 180_000, logger, projectAlias })
+  try {
+    await waitForHealth(ocClient, { timeoutMs: 180_000, logger, projectAlias, abortSignal })
 
-  await maybeOpenAttachUi()
-  return { started: true, pid, stop }
+    if (abortSignal?.aborted) {
+      const err = new Error("Auto-start aborted")
+      err.name = "AbortError"
+      throw err
+    }
+
+    await maybeOpenAttachUi()
+    return { started: true, pid, stop }
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      await Promise.resolve(stop?.()).catch(() => {})
+    }
+    throw err
+  }
 }

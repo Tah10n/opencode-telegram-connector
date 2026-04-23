@@ -211,6 +211,30 @@ test("waitForHealth times out with the last error in the message", async (t) => 
   assert.match(logger.logs.error[0], /^\[demo\] Timed out waiting for health/)
 })
 
+test("waitForHealth aborts promptly when abortSignal is triggered", async () => {
+  const abortController = new AbortController()
+  let calls = 0
+
+  const promise = waitForHealth(
+    {
+      async health() {
+        calls += 1
+        throw new Error("still starting")
+      },
+    },
+    { timeoutMs: 10_000, abortSignal: abortController.signal },
+  )
+
+  abortController.abort()
+
+  await assert.rejects(promise, (err) => {
+    assert.equal(err?.name, "AbortError")
+    assert.match(err?.message || "", /Aborted waiting for health/)
+    return true
+  })
+  assert.ok(calls >= 1)
+})
+
 test("getLaunchSupport reports cross-platform TUI and attach support", (t) => {
   const fakeBin = makeFakeLauncherDir(t, "x-terminal-emulator")
   swapEnv(t, { DISPLAY: ":0", WAYLAND_DISPLAY: undefined, PATH: fakeBin, OPENCODE_TERMINAL: undefined })
@@ -754,4 +778,97 @@ test("ensureOpenCodeRunning starts detached serve mode on non-Windows platforms"
 
   await result.stop()
   assert.deepEqual(killCalls, [[777, "SIGTERM"]])
+})
+
+test("ensureOpenCodeRunning stops a spawned process when auto-start is aborted", async (t) => {
+  usePatchedPlatform(t, "linux")
+  useSpawnPlans(t, [{ pid: 4321, close: false }])
+
+  const killCalls = []
+  usePatchedProcessKill(t, (...args) => {
+    killCalls.push(args)
+  })
+
+  let healthCalls = 0
+  const abortController = new AbortController()
+  const promise = ensureOpenCodeRunning({
+    projectAlias: "demo",
+    project: {
+      autoStart: true,
+      openTuiOnAutoStart: false,
+      directory: "/repo",
+      port: 4312,
+    },
+    ocClient: {
+      async health({ signal } = {}) {
+        healthCalls += 1
+        if (healthCalls === 1) throw new Error("down")
+        return new Promise((_resolve, reject) => {
+          signal?.addEventListener?.(
+            "abort",
+            () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+            { once: true },
+          )
+        })
+      },
+    },
+    logger: makeLogger(),
+    abortSignal: abortController.signal,
+  })
+
+  await new Promise((resolve) => setImmediate(resolve))
+  abortController.abort()
+
+  await assert.rejects(promise, (err) => {
+    assert.equal(err?.name, "AbortError")
+    return true
+  })
+  assert.deepEqual(killCalls, [[4321, "SIGTERM"]])
+})
+
+test("ensureOpenCodeRunning does not spawn a new Windows server after abort during existing-UI wait", async (t) => {
+  usePatchedPlatform(t, "win32")
+  const calls = useSpawnPlans(t, [
+    {
+      stdout: [JSON.stringify([{ ProcessId: 555, Name: "WindowsTerminal.exe", CommandLine: 'opencode attach http://127.0.0.1:4312' }])],
+    },
+  ])
+
+  let healthCalls = 0
+  const abortController = new AbortController()
+  const promise = ensureOpenCodeRunning({
+    projectAlias: "demo",
+    project: {
+      autoStart: true,
+      openTuiOnAutoStart: true,
+      directory: "C:/repo",
+      port: 4312,
+    },
+    ocClient: {
+      async health({ signal } = {}) {
+        healthCalls += 1
+        if (healthCalls === 1) throw new Error("down")
+        return new Promise((_resolve, reject) => {
+          signal?.addEventListener?.(
+            "abort",
+            () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+            { once: true },
+          )
+        })
+      },
+    },
+    logger: makeLogger(),
+    abortSignal: abortController.signal,
+    platform: "win32",
+  })
+
+  await new Promise((resolve) => setImmediate(resolve))
+  abortController.abort()
+
+  await assert.rejects(promise, (err) => {
+    assert.equal(err?.name, "AbortError")
+    return true
+  })
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].command, "powershell")
 })

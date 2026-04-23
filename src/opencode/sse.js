@@ -43,11 +43,15 @@ async function* readLines(readableStream) {
   if (buf) yield buf
 }
 
-export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect, onEvent, onError, abortSignal }) {
+export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect, onEvent, onError, onAbort, abortSignal }) {
   let stopped = false
   let activeCtrl = null
   let forwardAbort = null
   let idleTimer = null
+  let resolveStopped = () => {}
+  const stopRequested = new Promise((resolve) => {
+    resolveStopped = resolve
+  })
 
   const HEALTH_CHECK_MIN_INTERVAL_MS = readIntEnv("OPENCODE_SSE_HEALTHCHECK_MIN_INTERVAL_MS", 15_000)
   let lastHealthCheckAt = 0
@@ -68,12 +72,28 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
   }
 
   const stop = () => {
+    if (stopped) return
     stopped = true
+    resolveStopped()
     clearIdleTimer()
     activeCtrl?.abort()
   }
 
-  void (async () => {
+  async function waitForRetryBackoff(ms) {
+    if (stopped || abortSignal?.aborted) return
+    let onAbort = null
+    const abortPromise = new Promise((resolve) => {
+      onAbort = () => resolve()
+      abortSignal?.addEventListener?.("abort", onAbort, { once: true })
+    })
+    try {
+      await Promise.race([delay(ms), stopRequested, abortPromise])
+    } finally {
+      if (onAbort) abortSignal?.removeEventListener?.("abort", onAbort)
+    }
+  }
+
+  const done = (async () => {
     let backoff = 1000
     while (!stopped && !(abortSignal?.aborted)) {
       const ctrl = new AbortController()
@@ -176,6 +196,9 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
         if (isAbort) {
           // Normal: stop/idle-timeout abort.
           logger?.info?.("SSE aborted:", projectAlias, msg)
+          try {
+            await onAbort?.({ projectAlias, err: normalized })
+          } catch {}
         } else if (isTransientDisconnect) {
           logger?.info?.("SSE disconnected:", projectAlias, msg)
           // Transient disconnects happen; only escalate if the server is actually unhealthy.
@@ -200,7 +223,7 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
             await onError?.({ projectAlias, err: normalized })
           } catch {}
         }
-        await delay(backoff)
+        await waitForRetryBackoff(backoff)
         backoff = Math.min(30_000, backoff * 2)
       } finally {
         abortSignal?.removeEventListener?.("abort", forwardAbort)
@@ -209,7 +232,20 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
         if (activeCtrl === ctrl) activeCtrl = null
       }
     }
-  })()
+  })().catch(async (err) => {
+    const normalized = boundaryErrorFromException(err, {
+      source: "opencode",
+      operation: "GET /event",
+      method: "GET",
+      pathname: "/event",
+    })
+    if (!stopped && !(abortSignal?.aborted)) {
+      logger?.error?.("SSE loop crashed:", projectAlias, normalized.message)
+      try {
+        await onError?.({ projectAlias, err: normalized })
+      } catch {}
+    }
+  })
 
-  return { stop }
+  return { stop, done }
 }

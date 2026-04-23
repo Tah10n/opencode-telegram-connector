@@ -266,3 +266,23 @@ test("startOpenCodeSseLoop aborts an idle connection and logs it as a normal sto
 
   assert.equal(logger.logs.info.some((entry) => entry[0] === "SSE aborted:" && entry[1] === "demo"), true)
 })
+
+test("startOpenCodeSseLoop exposes done for explicit stop without reporting an error", async (t) => {
+  useFetchStub(t, async (_url, init) => makeAbortableSseResponse(init.signal))
+
+  let errorCalls = 0
+  const loop = startOpenCodeSseLoop({
+    projectAlias: "demo",
+    ocClient: makeClient(),
+    logger: makeLogger(),
+    onError: async () => {
+      errorCalls += 1
+    },
+  })
+
+  await new Promise((resolve) => originalGlobalSetTimeout(resolve, 20))
+  loop.stop()
+  await loop.done
+
+  assert.equal(errorCalls, 0)
+})

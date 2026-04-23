@@ -17,6 +17,24 @@ function makeTimeoutSignal(timeoutMs = 30_000) {
   return { signal: ctrl.signal, cancel: () => clearTimeout(t), didTimeout: () => didTimeout }
 }
 
+function combineSignals(...signals) {
+  const active = signals.filter(Boolean)
+  if (active.length === 0) return undefined
+  if (active.length === 1) return active[0]
+  if (typeof AbortSignal?.any === "function") return AbortSignal.any(active)
+
+  const ctrl = new AbortController()
+  const abort = () => ctrl.abort()
+  for (const signal of active) {
+    if (signal.aborted) {
+      ctrl.abort()
+      break
+    }
+    signal.addEventListener?.("abort", abort, { once: true })
+  }
+  return ctrl.signal
+}
+
 export class OpenCodeClient {
   constructor({ baseUrl, username, password, allowInsecureHttp = false }) {
     this.baseUrl = String(baseUrl).replace(/\/$/, "")
@@ -61,10 +79,11 @@ export class OpenCodeClient {
     const t = makeTimeoutSignal(timeoutMs)
     let res
     try {
+      const requestSignal = combineSignals(signal, t.signal)
       res = await fetch(url, {
         method,
         headers: this.headers(json ? { "content-type": "application/json" } : undefined),
-        signal: signal || t.signal,
+        signal: requestSignal,
         body: json ? JSON.stringify(json) : undefined,
       })
     } catch (err) {
@@ -101,8 +120,8 @@ export class OpenCodeClient {
     }
   }
 
-  health() {
-    return this.request("/global/health")
+  health({ signal } = {}) {
+    return signal ? this.request("/global/health", { signal }) : this.request("/global/health")
   }
 
   getConfig({ directory } = {}) {
@@ -113,16 +132,16 @@ export class OpenCodeClient {
     return this.request(`/config/providers`)
   }
 
-  listSessions({ directory, limit } = {}) {
-    return this.request("/session", { query: { directory, limit } })
+  listSessions({ directory, limit, signal } = {}) {
+    return this.request("/session", { query: { directory, limit }, ...(signal ? { signal } : {}) })
   }
 
   getSession(sessionId) {
     return this.request(`/session/${sessionId}`)
   }
 
-  createSession({ title } = {}) {
-    return this.request("/session", { method: "POST", json: title ? { title } : {} })
+  createSession({ title, signal } = {}) {
+    return this.request("/session", { method: "POST", json: title ? { title } : {}, ...(signal ? { signal } : {}) })
   }
 
   abortSession(sessionId) {
@@ -168,11 +187,11 @@ export class OpenCodeClient {
     return this.request(`/question/${questionId}/reject`, { method: "POST" })
   }
 
-  listPermissions() {
-    return this.request(`/permission`, { timeoutMs: 15_000 })
+  listPermissions({ signal } = {}) {
+    return this.request(`/permission`, { timeoutMs: 15_000, ...(signal ? { signal } : {}) })
   }
 
-  listQuestions() {
-    return this.request(`/question`, { timeoutMs: 15_000 })
+  listQuestions({ signal } = {}) {
+    return this.request(`/question`, { timeoutMs: 15_000, ...(signal ? { signal } : {}) })
   }
 }

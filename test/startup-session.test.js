@@ -202,3 +202,91 @@ test("ensureStartupSession does not wait for auto-start when waitForStart is fal
   assert.equal(listCalls, 0)
   assert.equal(createCalls, 0)
 })
+
+test("ensureStartupSession aborts promptly when abortSignal cancels startup requests", async () => {
+  const startInProgress = new Map()
+  const startupSessionByProject = {}
+  const startupSessionInProgress = new Map()
+  const abortController = new AbortController()
+  let createCalls = 0
+
+  const promise = ensureStartupSession({
+    alias: "demo",
+    startInProgress,
+    startupSessionByProject,
+    startupSessionInProgress,
+    ocByAlias: {
+      demo: {
+        async listSessions({ signal } = {}) {
+          return new Promise((_resolve, reject) => {
+            if (signal?.aborted) {
+              reject(Object.assign(new Error("aborted"), { name: "AbortError" }))
+              return
+            }
+            signal?.addEventListener?.(
+              "abort",
+              () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+              { once: true },
+            )
+          })
+        },
+        async createSession({ signal } = {}) {
+          createCalls += 1
+          return new Promise((_resolve, reject) => {
+            if (signal?.aborted) {
+              reject(Object.assign(new Error("aborted"), { name: "AbortError" }))
+              return
+            }
+            signal?.addEventListener?.(
+              "abort",
+              () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+              { once: true },
+            )
+          })
+        },
+      },
+    },
+    logger: makeLogger(),
+    abortSignal: abortController.signal,
+  })
+
+  abortController.abort()
+
+  await assert.rejects(promise, (err) => {
+    assert.equal(err?.name, "AbortError")
+    return true
+  })
+  assert.equal(createCalls, 0)
+})
+
+test("ensureStartupSession does not create a replacement session when listing sessions fails", async () => {
+  const startInProgress = new Map()
+  const startupSessionByProject = {}
+  const startupSessionInProgress = new Map()
+  let createCalls = 0
+
+  await assert.rejects(
+    ensureStartupSession({
+      alias: "demo",
+      startInProgress,
+      startupSessionByProject,
+      startupSessionInProgress,
+      ocByAlias: {
+        demo: {
+          async listSessions() {
+            throw new Error("temporary failure")
+          },
+          async createSession() {
+            createCalls += 1
+            return { id: "sess-created" }
+          },
+        },
+      },
+      logger: makeLogger(),
+    }),
+    /temporary failure/,
+  )
+
+  assert.equal(createCalls, 0)
+  assert.equal(startupSessionByProject.demo, undefined)
+})
