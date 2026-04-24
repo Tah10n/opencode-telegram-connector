@@ -122,6 +122,9 @@ test("createCommandHandlers handleWhere renders operator status fields", async (
     startupSessionByProject: { demo: "ses_startup" },
     sseByAlias: { demo: "connected" },
     feedByContext: { "100:7": "verbose" },
+    ocByAlias: {
+      demo: { async getSession(sessionId) { return { id: sessionId } } },
+    },
   })
   const handlers = createCommandHandlers(runtime)
 
@@ -133,6 +136,7 @@ test("createCommandHandlers handleWhere renders operator status fields", async (
   assert.match(sent[0].text, /Startup session: ses_startup/)
   assert.match(sent[0].text, /Feed: Verbose/)
   assert.match(sent[0].text, /SSE: connected/)
+  assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text), ["Sessions", "New", "Feed", "Model", "Unbind", "Close"])
 })
 
 test("createCommandHandlers handleWhere reports stale session health with repair actions", async () => {
@@ -156,8 +160,9 @@ test("createCommandHandlers handleWhere reports stale session health with repair
   assert.match(sent[0].text, /Binding health: stale: session missing/)
   assert.deepEqual(
     sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text),
-    ["Remove 100:7", "Rebind startup 100:7", "New session 100:7", "Keep 100:7", "Close"],
+    ["Sessions", "New", "Feed", "Model", "Remove 100:7", "Rebind startup 100:7", "New session 100:7", "Keep 100:7", "Close"],
   )
+  assert.match(sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Remove 100:7")?.callback_data, /^b\|confirm-unbind\|100:7$/)
 })
 
 test("createCommandHandlers handleProjects renders overview with binding counts and scope preview", async () => {
@@ -191,10 +196,10 @@ test("createCommandHandlers handleProjects renders overview with binding counts 
 })
 
 test("createCommandHandlers handleProjects includes project action keyboard", async () => {
-  const replyMarkup = { inline_keyboard: [[{ text: "Retry demo", callback_data: "srv|demo|health" }]] }
+  const replyMarkup = { inline_keyboard: [[{ text: "Status demo", callback_data: "srv|demo|health" }]] }
   const { runtime, sent } = makeRuntime({
     buildProjectsOverviewKeyboard: (input) => {
-      assert.deepEqual(input, { platform: "win32", showProjectControls: true, showSessions: true })
+      assert.deepEqual(input, { platform: "win32", showProjectControls: true, showSessions: true, showBindControls: true, currentBinding: null })
       return replyMarkup
     },
   })
@@ -347,6 +352,7 @@ test("createCommandHandlers handleBindings shows health labels and index repair 
   assert.match(sent[0].text, /removed \/ ses_old \[stale: project missing\]/)
   assert.match(sent[0].text, /Index repair available: removedBindings=0 removedIndex=1 rebuilt=1/)
   assert.equal(sent[0].replyMarkup.inline_keyboard.flat().some((button) => button.text === "Repair index"), true)
+  assert.match(sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Remove 100:0")?.callback_data, /^b\|confirm-unbind\|100:0$/)
 })
 
 test("createCommandHandlers handleBindings rejects non-private chats", async () => {
@@ -376,7 +382,9 @@ test("createCommandHandlers handleAbort without binding returns guidance", async
   await handlers.handleAbort({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" })
 
   assert.equal(sent.length, 1)
-  assert.equal(sent[0].text, "Not bound. Use /bind <projectAlias> first.")
+  assert.match(sent[0].text, /Abort needs a bound thread\./)
+  assert.match(sent[0].text, /Scope: chat 100 \/ topic 7/)
+  assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text), ["Projects", "Close"])
 })
 
 test("createCommandHandlers handleSessions swallows Telegram send failures for the not-bound guidance", async () => {
@@ -507,7 +515,8 @@ test("createCommandHandlers clears stale awaiting custom-answer state", async ()
   assert.deepEqual(cleared, [{ ctxKey: "100:7", value: null }])
   assert.equal(awaitingCustomAnswer.has("100:7"), false)
   assert.equal(sent[0].text, "Question is no longer active.")
-  assert.equal(sent[1].text, "Not bound. Use /bind <projectAlias>.")
+  assert.match(sent[1].text, /This thread is not bound yet\./)
+  assert.match(sent[1].text, /Use \/projects to see available aliases\./)
 })
 
 test("createCommandHandlers handleBindCommand validates arguments and current bindings", async () => {
@@ -607,13 +616,16 @@ test("createCommandHandlers handleUseCommand reports moved session conflicts", a
   await handlers.handleUseCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "ses_shared")
 
   assert.equal(sent.length, 1)
-  assert.match(sent[0].text, /Switched to session: ses_shared/)
+  assert.match(sent[0].text, /Changed: this thread now uses session ses_shared\./)
+  assert.match(sent[0].text, /Project: demo/)
+  assert.match(sent[0].text, /Feed: Main \+ changes/)
   assert.match(sent[0].text, /already bound to chat 200 \/ topic 3 and was moved to this thread/)
 })
 
-test("createCommandHandlers handleUnbind reports whether a binding existed", async () => {
+test("createCommandHandlers handleUnbind asks for confirmation before removing a binding", async () => {
   let calls = 0
   const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
     store: {
       unbind() {
         calls += 1
@@ -624,10 +636,11 @@ test("createCommandHandlers handleUnbind reports whether a binding existed", asy
   const handlers = createCommandHandlers(runtime)
 
   await handlers.handleUnbind({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" })
-  await handlers.handleUnbind({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" })
 
-  assert.equal(sent[0].text, "Unbound.")
-  assert.equal(sent[1].text, "Not bound.")
+  assert.equal(calls, 0)
+  assert.match(sent[0].text, /Confirm unbind for this thread:/)
+  assert.match(sent[0].text, /Project: demo/)
+  assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text), ["Remove this thread binding", "Close"])
 })
 
 test("createCommandHandlers handleProjects refreshes startup sessions without waiting for auto-start", async () => {
@@ -692,7 +705,7 @@ test("createCommandHandlers handleNewCommand reports configured model and varian
     },
   ])
   assert.equal(sent.length, 1)
-  assert.equal(sent[0].text, "Created and switched to session: ses_new\nModel: openai/gpt-5 xhigh\nSource: Inherited from project default")
+  assert.equal(sent[0].text, "Changed: this thread now uses new session ses_new.\nProject: demo\nSession: ses_new\nFeed: Main + changes\nModel: openai/gpt-5 xhigh\nSource: Inherited from project default")
 })
 
 test("createCommandHandlers handleNewCommand leaves the old binding until same-window TUI switch is confirmed", async () => {
@@ -834,7 +847,7 @@ test("createCommandHandlers renderSessionsList shows the current model when avai
   assert.equal(sent.length, 1)
   assert.match(sent[0].text, /Current: ses_current/)
   assert.match(sent[0].text, /Current model: openai\/gpt-5 xhigh \(Inherited from session history\)/)
-  assert.equal(sent[0].replyMarkup.inline_keyboard.at(-1)?.[0]?.text, "Close")
+  assert.deepEqual(sent[0].replyMarkup.inline_keyboard.at(-1)?.map((button) => button.text), ["Refresh", "New", "Close"])
 })
 
 test("createCommandHandlers renderModelSettings shows provider selection before models", async () => {
@@ -971,9 +984,10 @@ test("createCommandHandlers handleModelCommand covers no-binding, reset, and inv
   await handlers.handleModelCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, ["reset"])
   await handlers.handleModelCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, ["bad-model"]) 
 
-  assert.equal(sent[0].text, "Not bound. Use /bind <projectAlias> first.")
-  assert.equal(sent[1].text, "Not bound. Use /bind <projectAlias> first.")
+  assert.match(sent[0].text, /Model settings need a bound thread\./)
+  assert.match(sent[1].text, /Model changes need a bound thread\./)
   assert.match(sent[2].text, /Model for this thread:/)
+  assert.match(sent[3].text, /Changed: this thread now inherits its model/)
   assert.match(sent[3].text, /Mode: Inherit/)
   assert.equal(sent[4].text, "Usage: /model\n/model default\n/model reset\n/model <provider/model> \[variant\]")
   assert.deepEqual(storeState.modelPrefsByContext, {})
@@ -1162,8 +1176,10 @@ test("createCommandHandlers handleTelegramMessage serves help and unknown comman
     text: "/cancel",
   })
 
-  assert.match(sent[0].text, /^Commands:/)
+  assert.match(sent[0].text, /^Telegram connector help:/)
+  assert.match(sent[0].text, /Scope: chat 100 \/ main/)
   assert.match(sent[0].text, /\/bind <projectAlias>/)
+  assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text), ["Projects", "Close"])
   assert.equal(sent[1].text, "Unknown command. Use /help.")
   assert.equal(sent[2].text, "Nothing to cancel.")
 })
@@ -1185,7 +1201,8 @@ test("createCommandHandlers handleTelegramMessage prompts for bind alias and can
     text: "/cancel",
   })
 
-  assert.equal(sent[0].text, "Send project alias (or /projects to list). You can /cancel.")
+  assert.match(sent[0].text, /Send a project alias for this thread/)
+  assert.match(sent[0].text, /You can \/cancel\./)
   assert.equal(sent[1].text, "Cancelled.")
   assert.equal(runtime.bindAliasAwaiting.has("100:0"), false)
 })
@@ -1225,7 +1242,7 @@ test("createCommandHandlers handleTelegramMessage binds after receiving a plain-
       sessionId: "ses_created",
     },
   ])
-  assert.equal(sent[0].text, "Send project alias (or /projects to list). You can /cancel.")
+  assert.match(sent[0].text, /Send a project alias for this thread/)
   assert.equal(sent[1].text, "Bound to project 'demo' with new session: ses_created")
   assert.equal(runtime.bindAliasAwaiting.has("100:0"), false)
 })

@@ -1,6 +1,7 @@
 import { normalizeFeedMode } from "../state/store.js"
 import { normalizeModelReference } from "../model-selection.js"
 import { classifyBoundaryError, isRetryableBoundaryError, isStaleBoundaryError } from "../boundary-errors.js"
+import { makeInlineKeyboard } from "../telegram/client.js"
 import {
   permissionNoteIdempotencyPrefix,
   permissionReplyIdempotencyKey,
@@ -37,6 +38,9 @@ export function createCallbackHandlers(runtime) {
     renderSessionsList,
     renderProjectSessions,
     handleBindings,
+    handleBindCommand,
+    handleNewCommand,
+    handleProjects,
     feedModeLabel,
     setRejectNoteAwaitingState,
     sendRejectNotePrompt,
@@ -135,10 +139,27 @@ export function createCallbackHandlers(runtime) {
     return ctxMeta?.chatType === "private" || ctxMeta?.ctxKey === targetCtxKey
   }
 
+  function canUseProjectBind(ctxMeta, projectAlias) {
+    if (ctxMeta?.chatType === "private") return true
+    const binding = store.getBinding(ctxMeta?.ctxKey)
+    return !binding || binding.projectAlias === projectAlias
+  }
+
   function describeTargetCtx(ctxKey) {
     const parsed = parseCtxKey?.(ctxKey)
     if (!parsed) return ctxKey
     return `chat ${parsed.chatId} / ${formatThreadLabel?.(parsed.threadIdOr0) || `thread ${parsed.threadIdOr0}`}`
+  }
+
+  function packCallbackData(data) {
+    return typeof cb?.pack === "function" ? cb.pack(data) : data
+  }
+
+  function unbindConfirmationKeyboard(ctxKey, binding) {
+    return makeInlineKeyboard([
+      [{ text: "Remove this thread binding", callback_data: packCallbackData(`b|unbind|${ctxKey}|${binding.projectAlias}|${binding.sessionId}`) }],
+      [{ text: "Close", callback_data: packCallbackData("b|close") }],
+    ])
   }
 
   async function handleTelegramCallback(callbackQuery) {
@@ -159,6 +180,35 @@ export function createCallbackHandlers(runtime) {
       if (kind === "s") {
         if (parts[1] === "close") {
           await closeInteractiveMessage(callbackQuery.id, ctxMeta, msg?.message_id)
+          return
+        }
+        if (parts[1] === "refresh") {
+          const binding = store.getBinding(ctxMeta.ctxKey)
+          if (!binding) {
+            await answerCallbackQuery(callbackQuery.id, "Not bound")
+            return
+          }
+          await answerCallbackQuery(callbackQuery.id, "Sessions")
+          await renderSessionsList(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(async (err) => {
+            runtime.logger?.error?.("Failed to refresh sessions list:", err?.message || String(err))
+            await sendToThread(ctxMeta, formatProjectUnavailable(binding.projectAlias, err)).catch(ignoreError)
+          })
+          return
+        }
+        if (parts[1] === "new") {
+          if (typeof handleNewCommand !== "function") {
+            await answerCallbackQuery(callbackQuery.id, "Invalid")
+            return
+          }
+          if (!store.getBinding(ctxMeta.ctxKey)) {
+            await answerCallbackQuery(callbackQuery.id, "Not bound")
+            return
+          }
+          await answerCallbackQuery(callbackQuery.id, "Creating…")
+          await handleNewCommand(ctxMeta, "").catch(async (err) => {
+            runtime.logger?.error?.("Failed to create session from callback:", err?.message || String(err))
+            await sendToThread(ctxMeta, "Action failed. Please try /new.").catch(ignoreError)
+          })
           return
         }
         const projectAlias = parts[1]
@@ -206,6 +256,15 @@ export function createCallbackHandlers(runtime) {
           await closeInteractiveMessage(callbackQuery.id, ctxMeta, msg?.message_id)
           return
         }
+        if (parts[1] === "projects") {
+          if (typeof handleProjects !== "function") {
+            await answerCallbackQuery(callbackQuery.id, "Invalid")
+            return
+          }
+          await answerCallbackQuery(callbackQuery.id, "Projects")
+          await handleProjects(ctxMeta).catch(ignoreError)
+          return
+        }
         const projectAlias = parts[1]
         const action = parts[2]
         if (!projectAlias || !projects?.[projectAlias]) {
@@ -219,6 +278,22 @@ export function createCallbackHandlers(runtime) {
           }
           await answerCallbackQuery(callbackQuery.id, "Starting…")
           void ensureProjectStarted(projectAlias, ctxMeta)
+          return
+        }
+        if (action === "bind") {
+          if (!canUseProjectBind(ctxMeta, projectAlias)) {
+            await answerCallbackQuery(callbackQuery.id, "Private chat only")
+            return
+          }
+          if (typeof handleBindCommand !== "function") {
+            await answerCallbackQuery(callbackQuery.id, "Invalid")
+            return
+          }
+          await answerCallbackQuery(callbackQuery.id, "Binding…")
+          await handleBindCommand(ctxMeta, [projectAlias]).catch(async (err) => {
+            runtime.logger?.error?.("Failed to bind project from callback:", err?.message || String(err))
+            await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err)).catch(ignoreError)
+          })
           return
         }
         if (action === "health") {
@@ -287,11 +362,48 @@ export function createCallbackHandlers(runtime) {
           await sendToThread(ctxMeta, `Kept binding for ${describeTargetCtx(targetCtxKey)} unchanged.`).catch(ignoreError)
           return
         }
+        if (action === "confirm-unbind") {
+          await answerCallbackQuery(callbackQuery.id, "Confirm")
+          await sendToThread(
+            ctxMeta,
+            [
+              "Confirm unbind for this thread:",
+              `Scope: ${describeTargetCtx(targetCtxKey)}`,
+              `Project: ${binding.projectAlias}`,
+              `Session: ${binding.sessionId}`,
+              "This only removes the Telegram binding; it does not delete the opencode session.",
+            ].join("\n"),
+            unbindConfirmationKeyboard(targetCtxKey, binding),
+          ).catch(ignoreError)
+          return
+        }
         if (action === "unbind") {
+          const expectedProjectAlias = parts[3] || ""
+          const expectedSessionId = parts[4] || ""
+          if (!expectedProjectAlias || !expectedSessionId) {
+            await answerCallbackQuery(callbackQuery.id, "Confirm")
+            await sendToThread(
+              ctxMeta,
+              [
+                "Confirm unbind for this thread:",
+                `Scope: ${describeTargetCtx(targetCtxKey)}`,
+                `Project: ${binding.projectAlias}`,
+                `Session: ${binding.sessionId}`,
+                "This only removes the Telegram binding; it does not delete the opencode session.",
+              ].join("\n"),
+              unbindConfirmationKeyboard(targetCtxKey, binding),
+            ).catch(ignoreError)
+            return
+          }
+          if (binding.projectAlias !== expectedProjectAlias || binding.sessionId !== expectedSessionId) {
+            await answerCallbackQuery(callbackQuery.id, "Binding changed")
+            await sendToThread(ctxMeta, `Binding changed for ${describeTargetCtx(targetCtxKey)}. Open /status or /bindings and confirm again.`).catch(ignoreError)
+            return
+          }
           const ok = store.unbind(targetCtxKey)
           if (ok) await store.flush?.()
           await answerCallbackQuery(callbackQuery.id, ok ? "Unbound" : "Not bound")
-          await sendToThread(ctxMeta, ok ? `Removed binding for ${describeTargetCtx(targetCtxKey)}.` : "Binding was already absent.").catch(ignoreError)
+          await sendToThread(ctxMeta, ok ? `Changed: binding removed.\nRemoved binding for ${describeTargetCtx(targetCtxKey)}.` : "Binding was already absent.").catch(ignoreError)
           return
         }
         if (action === "rebind" || action === "new") {
@@ -331,6 +443,11 @@ export function createCallbackHandlers(runtime) {
           await closeInteractiveMessage(callbackQuery.id, ctxMeta, msg?.message_id)
           return
         }
+        if (rawMode === "settings") {
+          await answerCallbackQuery(callbackQuery.id, "Feed")
+          await renderFeedSettings(ctxMeta, { editMessageId: msg?.message_id }).catch(ignoreError)
+          return
+        }
         if (rawMode !== "main" && rawMode !== "main+changes" && rawMode !== "verbose") {
           await answerCallbackQuery(callbackQuery.id, "Invalid")
           return
@@ -338,7 +455,7 @@ export function createCallbackHandlers(runtime) {
         const mode = normalizeFeedMode(rawMode)
         store.setFeedMode(ctxMeta.ctxKey, mode)
         await answerCallbackQuery(callbackQuery.id, `Feed: ${feedModeLabel(mode)}`)
-        await renderFeedSettings(ctxMeta, { editMessageId: msg?.message_id }).catch(ignoreError)
+        await renderFeedSettings(ctxMeta, { editMessageId: msg?.message_id, noticeText: `Changed: this thread feed is now ${feedModeLabel(mode)}.` }).catch(ignoreError)
         return
       }
 
@@ -352,6 +469,12 @@ export function createCallbackHandlers(runtime) {
         const binding = store.getBinding(ctxMeta.ctxKey)
         if (!binding) {
           await answerCallbackQuery(callbackQuery.id, "Not bound")
+          return
+        }
+
+        if (action === "settings") {
+          await answerCallbackQuery(callbackQuery.id, "Model")
+          await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(ignoreError)
           return
         }
 
@@ -374,22 +497,27 @@ export function createCallbackHandlers(runtime) {
 
         if (action === "set") {
           const nextMode = parts[2]
+          let setResult = null
           if (nextMode === "inherit") {
-            const result = await setThreadModelPreference(ctxMeta, binding, null)
-            await answerCallbackQuery(callbackQuery.id, result?.callbackText || "Model: inherit")
+            setResult = await setThreadModelPreference(ctxMeta, binding, null)
+            await answerCallbackQuery(callbackQuery.id, setResult?.callbackText || "Model: inherit")
           } else if (nextMode === "project-default") {
-            const result = await setThreadModelPreference(ctxMeta, binding, { mode: "project-default" })
-            if (!result?.ok) {
-              await answerCallbackQuery(callbackQuery.id, result?.callbackText || "Unavailable")
+            setResult = await setThreadModelPreference(ctxMeta, binding, { mode: "project-default" })
+            if (!setResult?.ok) {
+              await answerCallbackQuery(callbackQuery.id, setResult?.callbackText || "Unavailable")
               await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(ignoreError)
               return
             }
-            await answerCallbackQuery(callbackQuery.id, result.callbackText || "Model: project default")
+            await answerCallbackQuery(callbackQuery.id, setResult.callbackText || "Model: project default")
           } else {
             await answerCallbackQuery(callbackQuery.id, "Invalid")
             return
           }
-          await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(ignoreError)
+          await renderModelSettings(ctxMeta, {
+            binding,
+            editMessageId: msg?.message_id,
+            ...(setResult?.noticeText ? { noticeText: setResult.noticeText } : {}),
+          }).catch(ignoreError)
           return
         }
 
@@ -428,7 +556,11 @@ export function createCallbackHandlers(runtime) {
           const variant = variantToken === "~" ? "" : variantToken
           const result = await setThreadModelPreference(ctxMeta, binding, { mode: "custom", model: modelKey, variant })
           await answerCallbackQuery(callbackQuery.id, result?.callbackText || (variant ? `Model: ${modelKey} ${variant}` : `Model: ${modelKey}`))
-          await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(ignoreError)
+          await renderModelSettings(ctxMeta, {
+            binding,
+            editMessageId: msg?.message_id,
+            ...(result?.noticeText ? { noticeText: result.noticeText } : {}),
+          }).catch(ignoreError)
           return
         }
 
@@ -437,6 +569,10 @@ export function createCallbackHandlers(runtime) {
       }
 
       if (kind === "cf") {
+        if (parts[1] === "close") {
+          await closeInteractiveMessage(callbackQuery.id, ctxMeta, msg?.message_id)
+          return
+        }
         const projectAlias = parts[1]
         const sessionId = parts[2]
         const opencodeMessageId = parts[3]

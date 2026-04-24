@@ -43,6 +43,7 @@ test("createOverviewHelpers startServerKeyboard packs callback data", () => {
 
   const keyboard = helpers.startServerKeyboard("veryLongAliasNameForProject1234567890")
   assert.equal(keyboard.inline_keyboard[0][0].callback_data, "packed:srv|veryLongAliasNameForProject1234567890|start")
+  assert.equal(keyboard.inline_keyboard[1][0].callback_data, "packed:srv|close")
 })
 
 test("buildProjectsOverviewKeyboard includes safe project actions", () => {
@@ -57,13 +58,28 @@ test("buildProjectsOverviewKeyboard includes safe project actions", () => {
   assert.deepEqual(keyboard.inline_keyboard, [
     [
       { text: "Start demo", callback_data: "packed:srv|demo|start" },
-      { text: "Retry demo", callback_data: "packed:srv|demo|health" },
+      { text: "Status demo", callback_data: "packed:srv|demo|health" },
       { text: "Sessions demo", callback_data: "packed:srv|demo|sessions" },
     ],
     [
-      { text: "Retry remote", callback_data: "packed:srv|remote|health" },
+      { text: "Status remote", callback_data: "packed:srv|remote|health" },
       { text: "Sessions remote", callback_data: "packed:srv|remote|sessions" },
     ],
+    [{ text: "Close", callback_data: "packed:srv|close" }],
+  ])
+})
+
+test("buildProjectsOverviewKeyboard can show bind-only actions for unbound threads", () => {
+  const keyboard = buildProjectsOverviewKeyboard({
+    projects: { demo: {}, remote: {} },
+    cb: { pack: (value) => `packed:${value}` },
+    showProjectControls: false,
+    showBindControls: true,
+  })
+
+  assert.deepEqual(keyboard.inline_keyboard, [
+    [{ text: "Bind demo", callback_data: "packed:srv|demo|bind" }],
+    [{ text: "Bind remote", callback_data: "packed:srv|remote|bind" }],
     [{ text: "Close", callback_data: "packed:srv|close" }],
   ])
 })

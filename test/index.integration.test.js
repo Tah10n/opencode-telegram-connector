@@ -826,7 +826,7 @@ test("startConnector /use keeps supporting raw session ids", async () => {
     assert.deepEqual(state.bindings, {
       "100:7": { projectAlias: "demo", sessionId: "ses_manual" },
     })
-    assert.ok(harness.tg.sentMessages.some((entry) => entry.text.includes("Switched to session: ses_manual")))
+    assert.ok(harness.tg.sentMessages.some((entry) => entry.text.includes("Changed: this thread now uses session ses_manual.")))
   } finally {
     await harness.connector.stop()
   }
@@ -840,7 +840,7 @@ test("startConnector /use share link requires an existing binding", async () => 
 
     await waitFor(() => harness.tg.sentMessages.length >= 1)
 
-    assert.ok(harness.tg.sentMessages.some((entry) => entry.text === "Not bound. Use /bind <projectAlias> first."))
+    assert.ok(harness.tg.sentMessages.some((entry) => /Switching sessions needs a bound thread\./.test(entry.text)))
     assert.deepEqual(harness.ocCalls.getSession, [])
   } finally {
     await harness.connector.stop()
@@ -920,7 +920,7 @@ test("startConnector /use accepts a shared session link for the current project"
       ),
     )
     assert.ok(
-      harness.tg.sentMessages.some((entry) => entry.text.includes("Switched to session: ses_shared") && entry.text.includes("Model: openai/gpt-5 xhigh")),
+      harness.tg.sentMessages.some((entry) => entry.text.includes("Changed: this thread now uses session ses_shared.") && entry.text.includes("Model: openai/gpt-5 xhigh")),
     )
   } finally {
     await harness.connector.stop()
@@ -1194,7 +1194,7 @@ test("startConnector /abort without binding returns guidance", async () => {
     await waitFor(() => harness.tg.sentMessages.length >= 1)
 
     assert.deepEqual(harness.ocCalls.abortSession, [])
-    assert.ok(harness.tg.sentMessages.some((entry) => entry.text === "Not bound. Use /bind <projectAlias> first."))
+    assert.ok(harness.tg.sentMessages.some((entry) => /Abort needs a bound thread\./.test(entry.text)))
   } finally {
     await harness.connector.stop()
   }
@@ -1435,7 +1435,8 @@ test("startConnector /projects actions retry health, show sessions, and close", 
 
     const projectMessage = harness.tg.sentMessages.at(-1)
     const labels = projectMessage.replyMarkup.inline_keyboard.flat().map((button) => button.text)
-    assert.ok(labels.includes("Retry demo"))
+    assert.ok(labels.includes("Status demo"))
+    assert.ok(labels.includes("Bind demo"))
     assert.ok(labels.includes("Sessions demo"))
     assert.ok(labels.includes("Close"))
 
@@ -1851,12 +1852,17 @@ test("startConnector /unbind removes the current binding and blocks further prom
 
   try {
     harness.tg.enqueue(makeMessageUpdate(298, "/unbind"))
-    harness.tg.enqueue(makeMessageUpdate(299, "hello after unbind"))
+    await waitFor(() => harness.tg.sentMessages.some((entry) => /Confirm unbind for this thread:/.test(entry.text)))
+    const confirmMessage = harness.tg.sentMessages.find((entry) => /Confirm unbind for this thread:/.test(entry.text))
+    const removeButton = confirmMessage.replyMarkup.inline_keyboard.flat().find((button) => button.text === "Remove this thread binding")
+    assert.ok(removeButton)
+    harness.tg.enqueue(makeCallbackUpdate(299, removeButton.callback_data, { messageId: confirmMessage.result.message_id }))
+    harness.tg.enqueue(makeMessageUpdate(300, "hello after unbind"))
 
     await waitFor(
       () =>
-        harness.tg.sentMessages.some((entry) => entry.text === "Unbound.") &&
-        harness.tg.sentMessages.some((entry) => entry.text === "Not bound. Use /bind <projectAlias>."),
+        harness.tg.sentMessages.some((entry) => /Changed: binding removed\./.test(entry.text)) &&
+        harness.tg.sentMessages.some((entry) => /This thread is not bound yet\./.test(entry.text)),
     )
     await harness.connector.stop()
 
@@ -2755,7 +2761,7 @@ test("startConnector drains old backlog before processing live updates and advan
 
     const state = await readState(harness.stateFile)
     assert.equal(harness.tg.sentMessages.length, 1)
-    assert.match(harness.tg.sentMessages[0].text, /Commands:/)
+    assert.match(harness.tg.sentMessages[0].text, /Telegram connector help:/)
     assert.ok(harness.tg.getUpdatesCalls.some((call) => call?.timeout === 0 && call?.offset === 0))
     assert.ok(harness.tg.getUpdatesCalls.some((call) => call?.timeout === 30 && call?.offset === 13))
     assert.equal(state.updateOffset, 14)
@@ -3948,7 +3954,7 @@ test("startConnector opens an attach window after /new when openAttachOnNewMode 
   try {
     harness.tg.enqueue(makeMessageUpdate(701, "/new Demo title"))
     await waitFor(() => attachCalls.length === 1)
-    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("Created and switched to session: ses_new:Demo title")))
+    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("Changed: this thread now uses new session ses_new:Demo title.")))
     await harness.connector.stop()
 
     const state = await readState(harness.stateFile)
@@ -3965,7 +3971,7 @@ test("startConnector opens an attach window after /new when openAttachOnNewMode 
     })
     assert.ok(
       harness.tg.sentMessages.some(
-        (entry) => entry.text.includes("Created and switched to session: ses_new:Demo title") && entry.text.includes("Model: openai/gpt-5 xhigh"),
+        (entry) => entry.text.includes("Changed: this thread now uses new session ses_new:Demo title.") && entry.text.includes("Model: openai/gpt-5 xhigh"),
       ),
     )
   } finally {
@@ -4005,7 +4011,7 @@ test("startConnector opens an attach window after /new on Linux when openAttachO
     harness.tg.enqueue(makeMessageUpdate(801, "/new Linux title"))
     await waitFor(() => attachCalls.length === 1)
     await waitFor(
-      () => harness.tg.sentMessages.some((entry) => entry.text.includes("Created and switched to session: ses_linux") && entry.text.includes("Model: openai/gpt-5 medium")),
+      () => harness.tg.sentMessages.some((entry) => entry.text.includes("Changed: this thread now uses new session ses_linux.") && entry.text.includes("Model: openai/gpt-5 medium")),
     )
     await harness.connector.stop()
 
@@ -4303,7 +4309,7 @@ test("startConnector keeps the thread model override after /new", async () => {
     await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("Active: openai/gpt-5 xhigh")))
 
     harness.tg.enqueue(makeMessageUpdate(952, "/new Demo model"))
-    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("Created and switched to session: ses_new:Demo model")))
+    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("Changed: this thread now uses new session ses_new:Demo model.")))
 
     harness.tg.enqueue(makeMessageUpdate(953, "prompt after new"))
     await waitFor(() => harness.ocCalls.promptAsync.some((entry) => entry.sessionId === "ses_new:Demo model"))
@@ -4311,7 +4317,7 @@ test("startConnector keeps the thread model override after /new", async () => {
     assert.ok(
       harness.tg.sentMessages.some(
         (entry) =>
-          entry.text.includes("Created and switched to session: ses_new:Demo model") &&
+          entry.text.includes("Changed: this thread now uses new session ses_new:Demo model.") &&
           entry.text.includes("Model: openai/gpt-5 xhigh") &&
           entry.text.includes("Source: Thread custom override"),
       ),

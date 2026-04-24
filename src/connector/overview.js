@@ -46,17 +46,29 @@ export function buildProjectsOverviewText({
   return lines.join("\n")
 }
 
-export function buildProjectsOverviewKeyboard({ projects, cb, canAutoStartProject, platform, showProjectControls = true, showSessions = false }) {
+export function buildProjectsOverviewKeyboard({
+  projects,
+  cb,
+  canAutoStartProject,
+  platform,
+  showProjectControls = true,
+  showSessions = false,
+  showBindControls = false,
+  currentBinding = null,
+}) {
   const rows = []
-  if (showProjectControls) {
+  if (showProjectControls || showBindControls) {
     for (const alias of Object.keys(projects || {})) {
       const row = []
-      if (canAutoStartProject?.(alias, { platform })) {
+      if (showBindControls && (!currentBinding || currentBinding.projectAlias === alias)) {
+        row.push({ text: currentBinding?.projectAlias === alias ? `Bound ${alias}` : `Bind ${alias}`, callback_data: cb.pack(`srv|${alias}|bind`) })
+      }
+      if (showProjectControls && canAutoStartProject?.(alias, { platform })) {
         row.push({ text: `Start ${alias}`, callback_data: cb.pack(`srv|${alias}|start`) })
       }
-      row.push({ text: `Retry ${alias}`, callback_data: cb.pack(`srv|${alias}|health`) })
-      if (showSessions) row.push({ text: `Sessions ${alias}`, callback_data: cb.pack(`srv|${alias}|sessions`) })
-      rows.push(row)
+      if (showProjectControls) row.push({ text: `Status ${alias}`, callback_data: cb.pack(`srv|${alias}|health`) })
+      if (showProjectControls && showSessions) row.push({ text: `Sessions ${alias}`, callback_data: cb.pack(`srv|${alias}|sessions`) })
+      if (row.length) rows.push(row)
     }
   }
   rows.push([{ text: "Close", callback_data: cb.pack("srv|close") }])
@@ -90,6 +102,7 @@ export function createOverviewHelpers({ projects, store, startInProgress, parseC
           callback_data: cb.pack(`srv|${projectAlias}|start`),
         },
       ],
+      [{ text: "Close", callback_data: cb.pack("srv|close") }],
     ])
   }
 
@@ -168,6 +181,8 @@ export function createOverviewHelpers({ projects, store, startInProgress, parseC
         platform: input.platform,
         showProjectControls: input.showProjectControls,
         showSessions: input.showSessions,
+        showBindControls: input.showBindControls,
+        currentBinding: input.currentBinding,
       }),
     canAutoStartProject,
     isRetryableProjectError,

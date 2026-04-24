@@ -19,27 +19,32 @@ import {
 } from "../model-selection.js"
 import { isRetryableBoundaryError, isStaleBoundaryError } from "../boundary-errors.js"
 
-function helpText() {
+function helpText({ scopeLabel = "this thread", defaultProject = "", isBound = false } = {}) {
+  const next = isBound
+    ? "Next: use the buttons below for Sessions, New, Feed, Model, or Unbind."
+    : `Next: tap Projects, or send ${defaultProject ? `/bind ${defaultProject}` : "/bind <projectAlias>"}.`
   return [
-    "Commands:",
-    "/bind <projectAlias>",
-    "/new [title]",
-    "/use <sessionId|shareLink>",
-    "/sessions",
-    "/model",
-    "/model default",
-    "/model reset",
-    "/model <provider/model> [variant]",
-    "/feed",
-    "/status",
-    "/runtime or /health (private chat only)",
-    "/bindings (private chat only)",
-    "/abort",
-    "/sendlast",
-    "/projects",
-    "/unbind",
-    "/cancel",
-  ].join("\n")
+    "Telegram connector help:",
+    `Scope: ${scopeLabel}`,
+    next,
+    defaultProject && !isBound ? `Default project hint: ${defaultProject}` : "",
+    "",
+    "Thread commands:",
+    "/bind <projectAlias> — bind this chat/thread",
+    "/new [title] — create a session for this thread",
+    "/use <sessionId|shareLink> — switch this thread",
+    "/sessions — recent sessions for this thread's project",
+    "/model — model override for this thread",
+    "/feed — Telegram feed mode for this thread",
+    "/status — current binding for this thread",
+    "/unbind — remove this thread's binding after confirmation",
+    "",
+    "Operator commands:",
+    "/projects — project overview",
+    "/runtime or /health — private chat only",
+    "/bindings — private chat only",
+    "/abort, /sendlast, /cancel",
+  ].filter((line) => line !== "").join("\n")
 }
 
 export function createCommandHandlers(runtime) {
@@ -114,6 +119,69 @@ export function createCommandHandlers(runtime) {
 
   async function safeInformThread(ctxMeta, text, replyMarkup, options) {
     await sendToThread(ctxMeta, text, replyMarkup, options).catch(() => {})
+  }
+
+  function threadScopeLabel(ctxMeta) {
+    if (!ctxMeta?.chatId) return "this thread"
+    return `chat ${ctxMeta.chatId} / ${formatThreadLabel(ctxMeta.threadIdOr0)}`
+  }
+
+  function configuredDefaultProject() {
+    const alias = String(config?.defaultProject || "").trim()
+    return alias && projects?.[alias] ? alias : ""
+  }
+
+  function unboundGuidanceText(ctxMeta, reason = "This thread is not bound yet.") {
+    const def = configuredDefaultProject()
+    return [
+      reason,
+      `Scope: ${threadScopeLabel(ctxMeta)}`,
+      `Next: tap Projects${def ? `, tap Bind ${def}, or send /bind ${def}` : ", then bind a project with /bind <projectAlias>"}.`,
+      def ? `Default project hint: ${def}` : "Use /projects to see available aliases.",
+    ].join("\n")
+  }
+
+  function unboundGuidanceKeyboard() {
+    const rows = []
+    const def = configuredDefaultProject()
+    if (def) rows.push([{ text: `Bind ${def}`, callback_data: runtime.cb.pack(`srv|${def}|bind`) }])
+    rows.push([{ text: "Projects", callback_data: runtime.cb.pack("srv|projects") }])
+    rows.push([{ text: "Close", callback_data: runtime.cb.pack("srv|close") }])
+    return makeInlineKeyboard(rows)
+  }
+
+  function boundThreadActionsKeyboard(ctxMeta) {
+    return makeInlineKeyboard([
+      [
+        { text: "Sessions", callback_data: runtime.cb.pack("s|refresh") },
+        { text: "New", callback_data: runtime.cb.pack("s|new") },
+      ],
+      [
+        { text: "Feed", callback_data: runtime.cb.pack("feed|settings") },
+        { text: "Model", callback_data: runtime.cb.pack("m|settings") },
+      ],
+      [
+        { text: "Unbind", callback_data: runtime.cb.pack(`b|confirm-unbind|${ctxMeta.ctxKey}`) },
+        { text: "Close", callback_data: runtime.cb.pack("s|close") },
+      ],
+    ])
+  }
+
+  function unbindConfirmationText(ctxMeta, binding) {
+    return [
+      "Confirm unbind for this thread:",
+      `Scope: ${threadScopeLabel(ctxMeta)}`,
+      `Project: ${binding.projectAlias}`,
+      `Session: ${binding.sessionId}`,
+      "This only removes the Telegram binding; it does not delete the opencode session.",
+    ].join("\n")
+  }
+
+  function unbindConfirmationKeyboard(ctxKey, binding) {
+    return makeInlineKeyboard([
+      [{ text: "Remove this thread binding", callback_data: runtime.cb.pack(`b|unbind|${ctxKey}|${binding.projectAlias}|${binding.sessionId}`) }],
+      [{ text: "Close", callback_data: runtime.cb.pack("b|close") }],
+    ])
   }
 
   function hasIdempotencyKey(key) {
@@ -280,7 +348,7 @@ export function createCommandHandlers(runtime) {
       const ctxKey = entry.ctxKey
       const projectAlias = entry.binding?.projectAlias
       const projectKnown = !!projects?.[projectAlias]
-      rows.push([{ text: `Remove ${ctxKey}`, callback_data: runtime.cb.pack(`b|unbind|${ctxKey}`) }])
+      rows.push([{ text: `Remove ${ctxKey}`, callback_data: runtime.cb.pack(`b|confirm-unbind|${ctxKey}`) }])
       if (projectKnown) {
         rows.push([
           { text: `Rebind startup ${ctxKey}`, callback_data: runtime.cb.pack(`b|rebind|${ctxKey}`) },
@@ -310,19 +378,34 @@ export function createCommandHandlers(runtime) {
   }
 
   async function buildSessionSwitchText(projectAlias, sessionId, { ctxKey } = {}) {
-    const lines = [`Switched to session: ${sessionId}`]
+    const lines = [
+      `Changed: this thread now uses session ${sessionId}.`,
+      `Project: ${projectAlias}`,
+      `Session: ${sessionId}`,
+    ]
+    if (ctxKey) lines.push(`Feed: ${feedModeLabel(getFeedMode(ctxKey))}`)
     const effectiveState = await resolveEffectiveModelState(ctxKey, { projectAlias, sessionId })
     return appendEffectiveModelLines(lines, effectiveState).join("\n")
   }
 
   async function buildNewSessionText(projectAlias, sessionId, { ctxKey } = {}) {
-    const lines = [`Created and switched to session: ${sessionId}`]
+    const lines = [
+      `Changed: this thread now uses new session ${sessionId}.`,
+      `Project: ${projectAlias}`,
+      `Session: ${sessionId}`,
+    ]
+    if (ctxKey) lines.push(`Feed: ${feedModeLabel(getFeedMode(ctxKey))}`)
     const effectiveState = await resolveEffectiveModelState(ctxKey, { projectAlias, sessionId })
     return appendEffectiveModelLines(lines, effectiveState).join("\n")
   }
 
   async function buildCreatedSessionText(projectAlias, sessionId, { ctxKey } = {}) {
-    const lines = [`Created session: ${sessionId}`]
+    const lines = [
+      `Changed: created session ${sessionId}.`,
+      `Project: ${projectAlias}`,
+      `Created session: ${sessionId}`,
+    ]
+    if (ctxKey) lines.push(`Feed: ${feedModeLabel(getFeedMode(ctxKey))}`)
     const effectiveState = await resolveEffectiveModelState(ctxKey, { projectAlias, sessionId })
     return appendEffectiveModelLines(lines, effectiveState).join("\n")
   }
@@ -493,7 +576,7 @@ export function createCommandHandlers(runtime) {
         }
       }
       setModelPreference(ctxMeta.ctxKey, preference)
-      return { ok: true, callbackText: "Model: project default" }
+      return { ok: true, callbackText: "Model: project default", noticeText: "Changed: this thread now uses the project default model override." }
     }
 
     if (preference.mode === "custom") {
@@ -501,11 +584,12 @@ export function createCommandHandlers(runtime) {
       return {
         ok: true,
         callbackText: preference.variant ? `Model: ${formatModelLabel(preference.model, preference.variant)}` : `Model: ${formatModelLabel(preference.model)}`,
+        noticeText: `Changed: this thread now uses ${formatModelLabel(preference.model, preference.variant)}.`,
       }
     }
 
     setModelPreference(ctxMeta.ctxKey, null)
-    return { ok: true, callbackText: "Model: inherit" }
+    return { ok: true, callbackText: "Model: inherit", noticeText: "Changed: this thread now inherits its model from session/project defaults." }
   }
 
   function modelSettingsKeyboard({ preference, providerCatalog, selectedProviderId, selectedModelKey }) {
@@ -571,10 +655,10 @@ export function createCommandHandlers(runtime) {
     return makeInlineKeyboard(rows)
   }
 
-  async function renderModelSettings(ctxMeta, { binding, editMessageId, selectedProviderId, selectedModelKey } = {}) {
+  async function renderModelSettings(ctxMeta, { binding, editMessageId, selectedProviderId, selectedModelKey, noticeText = "" } = {}) {
     const currentBinding = binding || store.getBinding(ctxMeta.ctxKey)
     if (!currentBinding) {
-      await sendToThread(ctxMeta, "Not bound. Use /bind <projectAlias> first.")
+      await sendToThread(ctxMeta, unboundGuidanceText(ctxMeta, "Model settings need a bound thread."), unboundGuidanceKeyboard())
       return
     }
 
@@ -604,7 +688,7 @@ export function createCommandHandlers(runtime) {
         : normalizedSelectedModelKey && requestedModel && providerCatalog.some((provider) => provider.id === requestedModel.providerID)
           ? requestedModel.providerID
           : ""
-    const text = buildModelSettingsText({
+    const settingsText = buildModelSettingsText({
       binding: currentBinding,
       preference,
       effectiveState,
@@ -614,6 +698,7 @@ export function createCommandHandlers(runtime) {
       selectedProviderId: normalizedSelectedProviderId,
       selectedModelKey: normalizedSelectedModelKey,
     })
+    const text = noticeText ? `${noticeText}\n\n${settingsText}` : settingsText
     const replyMarkup = modelSettingsKeyboard({
       preference,
       providerCatalog,
@@ -631,7 +716,7 @@ export function createCommandHandlers(runtime) {
   async function handleModelCommand(ctxMeta, argv) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await sendToThread(ctxMeta, "Not bound. Use /bind <projectAlias> first.")
+      await sendToThread(ctxMeta, unboundGuidanceText(ctxMeta, "Model changes need a bound thread."), unboundGuidanceKeyboard())
       return
     }
 
@@ -644,8 +729,8 @@ export function createCommandHandlers(runtime) {
 
     const normalized = modelArg.toLowerCase()
     if (normalized === "reset" || normalized === "inherit") {
-      await setThreadModelPreference(ctxMeta, binding, null)
-      await renderModelSettings(ctxMeta, { binding })
+      const result = await setThreadModelPreference(ctxMeta, binding, null)
+      await renderModelSettings(ctxMeta, { binding, noticeText: result.noticeText })
       return
     }
 
@@ -655,7 +740,7 @@ export function createCommandHandlers(runtime) {
         await sendToThread(ctxMeta, result.message)
         return
       }
-      await renderModelSettings(ctxMeta, { binding })
+      await renderModelSettings(ctxMeta, { binding, noticeText: result.noticeText })
       return
     }
 
@@ -670,8 +755,8 @@ export function createCommandHandlers(runtime) {
       return
     }
 
-    await setThreadModelPreference(ctxMeta, binding, { mode: "custom", model, variant: variantArg })
-    await renderModelSettings(ctxMeta, { binding })
+    const result = await setThreadModelPreference(ctxMeta, binding, { mode: "custom", model, variant: variantArg })
+    await renderModelSettings(ctxMeta, { binding, noticeText: result.noticeText })
   }
 
   async function resolveLatestAssistantReply(projectAlias, sessionId) {
@@ -716,7 +801,11 @@ export function createCommandHandlers(runtime) {
         callback_data: runtime.cb.pack(`s|${projectAlias}|${session.id}`),
       },
     ])
-    rows.push([{ text: "Close", callback_data: runtime.cb.pack("s|close") }])
+    rows.push([
+      { text: "Refresh", callback_data: runtime.cb.pack("s|refresh") },
+      { text: "New", callback_data: runtime.cb.pack("s|new") },
+      { text: "Close", callback_data: runtime.cb.pack("s|close") },
+    ])
     return makeInlineKeyboard(rows)
   }
 
@@ -818,7 +907,7 @@ export function createCommandHandlers(runtime) {
   async function handleNewCommand(ctxMeta, title) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await safeInformThread(ctxMeta, "Not bound. Use /bind <projectAlias> first.")
+      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Creating a session needs a bound thread."), unboundGuidanceKeyboard())
       return
     }
     const oc = ocByAlias[binding.projectAlias]
@@ -920,7 +1009,7 @@ export function createCommandHandlers(runtime) {
     }
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await safeInformThread(ctxMeta, "Not bound. Use /bind <projectAlias> first.")
+      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Switching sessions needs a bound thread."), unboundGuidanceKeyboard())
       return
     }
     const oc = ocByAlias[binding.projectAlias]
@@ -989,7 +1078,7 @@ export function createCommandHandlers(runtime) {
   async function handleSessions(ctxMeta) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await safeInformThread(ctxMeta, "Not bound. Use /bind <projectAlias> first.")
+      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Session list needs a bound thread."), unboundGuidanceKeyboard())
       return
     }
     try {
@@ -1002,7 +1091,7 @@ export function createCommandHandlers(runtime) {
   async function handleAbort(ctxMeta) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await safeInformThread(ctxMeta, "Not bound. Use /bind <projectAlias> first.")
+      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Abort needs a bound thread."), unboundGuidanceKeyboard())
       return
     }
     const oc = ocByAlias[binding.projectAlias]
@@ -1021,7 +1110,7 @@ export function createCommandHandlers(runtime) {
   async function handleWhere(ctxMeta) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await safeInformThread(ctxMeta, "Not bound. Use /bind <projectAlias>.")
+      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Status needs a bound thread."), unboundGuidanceKeyboard())
       return
     }
     const health = await resolveBindingHealth(ctxMeta.ctxKey, binding)
@@ -1031,6 +1120,12 @@ export function createCommandHandlers(runtime) {
     const feedMode = feedModeLabel(getFeedMode(ctxMeta.ctxKey))
     const effectiveState = await resolveEffectiveModelState(ctxMeta.ctxKey, binding)
     const runtimeLines = buildRuntimeStatusLines?.(binding.projectAlias) || []
+    const replyMarkup = health.status === "ok"
+      ? boundThreadActionsKeyboard(ctxMeta)
+      : makeInlineKeyboard([
+        ...boundThreadActionsKeyboard(ctxMeta).inline_keyboard.slice(0, 2),
+        ...bindingRepairKeyboard([{ ctxKey: ctxMeta.ctxKey, binding, health }]).inline_keyboard,
+      ])
     await sendToThread(
       ctxMeta,
       appendEffectiveModelLines(
@@ -1046,7 +1141,7 @@ export function createCommandHandlers(runtime) {
         ],
         effectiveState,
       ).join("\n"),
-      health.status === "ok" ? null : bindingRepairKeyboard([{ ctxKey: ctxMeta.ctxKey, binding, health }]),
+      replyMarkup,
     )
   }
 
@@ -1103,7 +1198,7 @@ export function createCommandHandlers(runtime) {
   async function handleSendLast(ctxMeta) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await safeInformThread(ctxMeta, "Not bound. Use /bind <projectAlias>.")
+      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Sending the last assistant reply needs a bound thread."), unboundGuidanceKeyboard())
       return
     }
     const oc = ocByAlias[binding.projectAlias]
@@ -1144,6 +1239,7 @@ export function createCommandHandlers(runtime) {
   async function handleProjects(ctxMeta) {
     const aliases = Object.keys(projects)
     await Promise.allSettled(aliases.map((a) => resolveStartupSession(a, { forceRefresh: true })))
+    const currentBinding = store.getBinding(ctxMeta.ctxKey)
     const lines = [buildProjectsOverviewText({
       startupSessionByProject,
       formatThreadLabel,
@@ -1173,13 +1269,19 @@ export function createCommandHandlers(runtime) {
       platform,
       showProjectControls: ctxMeta?.chatType === "private",
       showSessions: ctxMeta?.chatType === "private",
+      showBindControls: ctxMeta?.chatType === "private" || !currentBinding,
+      currentBinding,
     })
     await sendToThread(ctxMeta, lines.join("\n"), replyMarkup)
   }
 
   async function handleUnbind(ctxMeta) {
-    const ok = store.unbind(ctxMeta.ctxKey)
-    await sendToThread(ctxMeta, ok ? "Unbound." : "Not bound.")
+    const binding = store.getBinding(ctxMeta.ctxKey)
+    if (!binding) {
+      await sendToThread(ctxMeta, unboundGuidanceText(ctxMeta, "This thread is already unbound."), unboundGuidanceKeyboard())
+      return
+    }
+    await sendToThread(ctxMeta, unbindConfirmationText(ctxMeta, binding), unbindConfirmationKeyboard(ctxMeta.ctxKey, binding))
   }
 
   async function handleTelegramMessage(msg, options = {}) {
@@ -1360,14 +1462,19 @@ export function createCommandHandlers(runtime) {
         return
       }
       if (cmd === "/help" || cmd === "/start") {
-        await sendToThread(ctxMeta, helpText())
+        const binding = store.getBinding(ctxMeta.ctxKey)
+        await sendToThread(
+          ctxMeta,
+          helpText({ scopeLabel: threadScopeLabel(ctxMeta), defaultProject: configuredDefaultProject(), isBound: !!binding }),
+          binding ? boundThreadActionsKeyboard(ctxMeta) : unboundGuidanceKeyboard(),
+        )
         await markMessageHandled(cmd)
         return
       }
       if (cmd === "/bind") {
         if (!argv?.[0]) {
           bindAliasAwaiting.set(ctxMeta.ctxKey, { startedAt: Date.now() })
-          await sendToThread(ctxMeta, "Send project alias (or /projects to list). You can /cancel.")
+          await sendToThread(ctxMeta, `${unboundGuidanceText(ctxMeta, "Send a project alias for this thread, or tap a button below.")}\nYou can /cancel.`, unboundGuidanceKeyboard())
           await markMessageHandled("bindPrompt")
           return
         }
@@ -1443,9 +1550,7 @@ export function createCommandHandlers(runtime) {
 
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      const def = config.defaultProject
-      if (def) await sendToThread(ctxMeta, `Not bound. Use /bind <projectAlias> (default: ${def}).`)
-      else await sendToThread(ctxMeta, "Not bound. Use /bind <projectAlias>.")
+      await sendToThread(ctxMeta, unboundGuidanceText(ctxMeta), unboundGuidanceKeyboard())
       await markMessageHandled("unbound")
       return
     }

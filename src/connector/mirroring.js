@@ -101,8 +101,9 @@ export function createMirroringHandlers(runtime) {
     ])
   }
 
-  async function renderFeedSettings(ctxMeta, { editMessageId } = {}) {
-    const text = renderFeedSettingsText(ctxMeta.ctxKey)
+  async function renderFeedSettings(ctxMeta, { editMessageId, noticeText = "" } = {}) {
+    const settingsText = renderFeedSettingsText(ctxMeta.ctxKey)
+    const text = noticeText ? `${noticeText}\n\n${settingsText}` : settingsText
     const replyMarkup = feedKeyboard(ctxMeta.ctxKey)
     if (editMessageId) {
       await tg.editMessageText(ctxMeta.chatId, editMessageId, text, replyMarkup)
@@ -122,11 +123,17 @@ export function createMirroringHandlers(runtime) {
   }
 
   function changedFilesSummaryKeyboard(projectAlias, sessionId, messageId) {
-    return makeInlineKeyboard([[{ text: "Show diff", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|show`) }]])
+    return makeInlineKeyboard([[
+      { text: "Show diff", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|show`) },
+      { text: "Close", callback_data: cb.pack("cf|close") },
+    ]])
   }
 
   function changedFilesDiffKeyboard(projectAlias, sessionId, messageId) {
-    return makeInlineKeyboard([[{ text: "Back", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|back`) }]])
+    return makeInlineKeyboard([[
+      { text: "Back", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|back`) },
+      { text: "Close", callback_data: cb.pack("cf|close") },
+    ]])
   }
 
   function extractTextParts(message) {
