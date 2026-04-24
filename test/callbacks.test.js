@@ -227,6 +227,120 @@ test("createCallbackHandlers rejects unknown callback kinds", async () => {
   assert.deepEqual(callbackAnswers, [{ callbackQueryId: "cb_1", text: "Invalid" }])
 })
 
+test("createCallbackHandlers asks for confirmation before runtime stop", async () => {
+  const editCalls = []
+  const { runtime, callbackAnswers } = makeRuntime({
+    tg: {
+      editMessageText: async (...args) => {
+        editCalls.push(args)
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("rt|confirm-stop", { chatType: "private", threadIdOr0: 0, messageId: 77 }))
+
+  assert.deepEqual(callbackAnswers, [{ callbackQueryId: "cb_1", text: "Confirm stop" }])
+  assert.equal(editCalls[0][0], 100)
+  assert.equal(editCalls[0][1], 77)
+  assert.match(editCalls[0][2], /Stop connector\?/)
+  assert.deepEqual(editCalls[0][3].inline_keyboard.flat().map((button) => button.text), ["Confirm stop", "Cancel"])
+  assert.deepEqual(editCalls[0][3].inline_keyboard.flat().map((button) => button.callback_data), ["rt|stop", "rt|cancel"])
+})
+
+test("createCallbackHandlers asks for confirmation before runtime restart", async () => {
+  const editCalls = []
+  const { runtime, callbackAnswers } = makeRuntime({
+    tg: {
+      editMessageText: async (...args) => {
+        editCalls.push(args)
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("rt|confirm-restart", { chatType: "private", threadIdOr0: 0, messageId: 78 }))
+
+  assert.deepEqual(callbackAnswers, [{ callbackQueryId: "cb_1", text: "Confirm restart" }])
+  assert.equal(editCalls[0][1], 78)
+  assert.match(editCalls[0][2], /Restart connector\?/)
+  assert.match(editCalls[0][2], /exit with code 1/)
+  assert.deepEqual(editCalls[0][3].inline_keyboard.flat().map((button) => button.text), ["Confirm restart", "Cancel"])
+  assert.deepEqual(editCalls[0][3].inline_keyboard.flat().map((button) => button.callback_data), ["rt|restart", "rt|cancel"])
+})
+
+test("createCallbackHandlers schedules confirmed runtime shutdown actions", async () => {
+  const editCalls = []
+  const scheduled = []
+  const shutdownRequests = []
+  const runtimeNotices = []
+  const flushCalls = []
+  const { runtime, callbackAnswers } = makeRuntime({
+    store: {
+      setPendingRuntimeOnlineNotice: (notice) => {
+        runtimeNotices.push(notice)
+        return true
+      },
+      flush: async () => {
+        flushCalls.push("flush")
+      },
+    },
+    requestRuntimeShutdown: async (request) => {
+      shutdownRequests.push(request)
+    },
+    scheduleRuntimeShutdown: (fn) => {
+      scheduled.push(fn)
+    },
+    tg: {
+      editMessageText: async (...args) => {
+        editCalls.push(args)
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("rt|stop", { chatType: "private", threadIdOr0: 0, messageId: 79 }))
+  await handlers.handleTelegramCallback(makeCallback("rt|restart", { id: "cb_2", chatType: "private", threadIdOr0: 0, messageId: 80 }))
+
+  assert.deepEqual(callbackAnswers, [
+    { callbackQueryId: "cb_1", text: "Stopping…" },
+    { callbackQueryId: "cb_2", text: "Restarting…" },
+  ])
+  assert.match(editCalls[0][2], /Stop requested/)
+  assert.match(editCalls[1][2], /Restart requested/)
+  assert.equal(runtimeNotices.length, 1)
+  assert.equal(runtimeNotices[0].kind, "restart")
+  assert.equal(runtimeNotices[0].chatId, 100)
+  assert.equal(typeof runtimeNotices[0].createdAt, "number")
+  assert.deepEqual(flushCalls, ["flush"])
+  assert.equal(scheduled.length, 2)
+  await scheduled[0]()
+  await scheduled[1]()
+  assert.deepEqual(shutdownRequests, [{ action: "stop" }, { action: "restart" }])
+})
+
+test("createCallbackHandlers keeps runtime controls private and reports unavailable launchers", async () => {
+  const editCalls = []
+  const { runtime, callbackAnswers } = makeRuntime({
+    tg: {
+      editMessageText: async (...args) => {
+        editCalls.push(args)
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("rt|confirm-stop", { chatType: "supergroup" }))
+  await handlers.handleTelegramCallback(makeCallback("rt|stop", { id: "cb_2", chatType: "private", threadIdOr0: 0, messageId: 81 }))
+
+  assert.deepEqual(callbackAnswers, [
+    { callbackQueryId: "cb_1", text: "Private chat only" },
+    { callbackQueryId: "cb_2", text: "Unavailable" },
+  ])
+  assert.equal(editCalls.length, 1)
+  assert.match(editCalls[0][2], /unavailable/)
+})
+
 test("createCallbackHandlers switches sessions and refreshes the sessions list", async () => {
   const { runtime, callbackAnswers, bindCalls, sessionListCalls } = makeRuntime({
     storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },

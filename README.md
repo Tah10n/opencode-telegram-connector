@@ -123,7 +123,7 @@ In groups and forum topics, Telegram commands addressed to another bot are ignor
 - `/model`, `/model default`, `/model reset`, `/model <provider/model> [variant]` — show or change the model for the current thread.
 - `/feed` — choose mirrored updates for the current thread.
 - `/status` — show the current binding, model, feed mode, SSE status, and base URL.
-- `/runtime` or `/health` — show compact connector runtime counters (**private chat only**): managed tasks, Telegram polling, backlog drain, update retry/skip counts, prompt polling, and shutdown state.
+- `/runtime` or `/health` — show compact connector runtime counters (**private chat only**): managed tasks, Telegram polling, backlog drain, update retry/skip counts, prompt polling, and shutdown state. The message includes **Restart**, **Stop**, and **Close** buttons. Restart and Stop always ask for confirmation first; after a supervised Restart, the bot sends a private-chat notice when the connector is online again.
 - `/abort` — abort the active run in the current thread.
 - `/sendlast` — resend the latest assistant reply for the bound session.
 - `/cancel` — cancel the current Telegram-side flow.
@@ -233,18 +233,167 @@ Prefer the `limits` object in `connector.config.mjs`; env fallbacks are availabl
 - **Windows**, **macOS**, and **Linux desktop** environments support local auto-start and optional attach/TUI windows.
 - On Linux, the connector tries `OPENCODE_TERMINAL` first and then common terminal emulators from `PATH`.
 - In headless Linux/macOS environments, connecting to an already running opencode server still works, but opening a new terminal window requires an available GUI/terminal launcher.
+- For long-running service examples on each platform, see [Running under a supervisor](#running-under-a-supervisor).
 
 ## Running under a supervisor
 
 The connector now logs last-resort `unhandledRejection` / `uncaughtException` failures and exits so an external supervisor can restart it cleanly.
 
-Recommended options:
+`/runtime` in a private Telegram chat includes runtime control buttons:
 
-- **systemd** with `Restart=on-failure`
-- **Docker** with `--restart unless-stopped` or `restart: unless-stopped`
-- **pm2** / **launchd** / another process manager for your platform
+- **Restart** asks for confirmation, stores a private-chat online notice, then stops the connector and exits with code `1`. Configure your supervisor to restart non-zero exits. After startup succeeds, the connector sends `Connector is online again after restart.` to the private chat where Restart was confirmed.
+- **Stop** asks for confirmation, then stops Telegram polling/OpenCode streams, flushes state, and exits with code `0`. Configure your supervisor to leave clean exit code `0` stopped.
+- **Cancel** or **Close** leaves the process running.
 
-Treat the process as a single long-running worker: if a truly fatal runtime error occurs, inspect the logs and let the supervisor restart it instead of trying to keep the broken process alive.
+Treat the process as a single long-running worker: if a truly fatal runtime error occurs, inspect the logs and let the supervisor restart it instead of trying to keep the broken process alive. Do not run multiple connector instances with the same Telegram bot token.
+
+### PM2 (Windows, macOS, Linux)
+
+PM2 is the most portable option for a Node.js service. Example `ecosystem.config.cjs`:
+
+```js
+module.exports = {
+  apps: [
+    {
+      name: "telegram-connector",
+      script: "src/cli.js",
+      interpreter: "node",
+      cwd: __dirname,
+      autorestart: true,
+      // /runtime Stop exits 0 and should stay stopped; /runtime Restart exits 1 and restarts.
+      stop_exit_codes: [0],
+    },
+  ],
+}
+```
+
+Start and inspect it:
+
+```sh
+npm install -g pm2
+pm2 start ecosystem.config.cjs
+pm2 save
+pm2 status
+pm2 logs telegram-connector
+```
+
+Autostart after reboot is platform-specific:
+
+- Linux/macOS: run `pm2 startup`, execute the command it prints, then run `pm2 save` again.
+- Windows: use Task Scheduler to run `pm2 resurrect` at user login, or use a helper such as `pm2-windows-startup`.
+
+### systemd (Linux)
+
+Example unit at `/etc/systemd/system/telegram-connector.service`:
+
+```ini
+[Unit]
+Description=Telegram connector for opencode
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=connector
+WorkingDirectory=/opt/telegram-connector/project
+ExecStart=/usr/bin/node src/cli.js --env-file /opt/telegram-connector/project/.env
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now telegram-connector
+sudo systemctl status telegram-connector
+journalctl -u telegram-connector -f
+```
+
+`Restart=on-failure` restarts `/runtime` Restart (`exit 1`) and leaves `/runtime` Stop (`exit 0`) stopped.
+
+### launchd (macOS)
+
+Example user agent at `~/Library/LaunchAgents/dev.opencode.telegram-connector.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.opencode.telegram-connector</string>
+  <key>WorkingDirectory</key><string>/Users/YOU/telegram-connector/project</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/node</string>
+    <string>src/cli.js</string>
+    <string>--env-file</string>
+    <string>/Users/YOU/telegram-connector/project/.env</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
+  <key>StandardOutPath</key><string>/Users/YOU/telegram-connector/project/.data/connector.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/YOU/telegram-connector/project/.data/connector.err.log</string>
+</dict>
+</plist>
+```
+
+Load and inspect it:
+
+```sh
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.opencode.telegram-connector.plist
+launchctl print gui/$(id -u)/dev.opencode.telegram-connector
+tail -f .data/connector.err.log
+```
+
+`SuccessfulExit=false` restarts non-zero exits and leaves clean exit code `0` stopped.
+
+### NSSM / Windows service
+
+NSSM is useful when you want a Windows Service instead of a user-session PM2 process. It is best for headless mode; Windows services are not ideal for opening interactive attach/TUI windows.
+
+Run these commands from an elevated PowerShell prompt and adjust paths:
+
+```powershell
+nssm install telegram-connector
+nssm set telegram-connector Application "C:\Program Files\nodejs\node.exe"
+nssm set telegram-connector AppDirectory "C:\path\to\telegram-connector\project"
+nssm set telegram-connector AppParameters "src\cli.js --env-file C:\path\to\telegram-connector\project\.env"
+nssm set telegram-connector AppStdout "C:\path\to\telegram-connector\project\.data\connector.out.log"
+nssm set telegram-connector AppStderr "C:\path\to\telegram-connector\project\.data\connector.err.log"
+nssm set telegram-connector AppExit 0 Exit
+nssm set telegram-connector AppExit Default Restart
+nssm set telegram-connector AppRestartDelay 5000
+nssm start telegram-connector
+```
+
+`AppExit 0 Exit` leaves `/runtime` Stop stopped. `AppExit Default Restart` restarts `/runtime` Restart and other non-zero exits.
+
+### Docker
+
+If you package the connector in a container, use a restart policy that restarts failures but not manual stops. For example:
+
+```sh
+docker run -d --name telegram-connector --restart on-failure --env-file .env telegram-connector:latest
+```
+
+In Compose:
+
+```yaml
+services:
+  telegram-connector:
+    image: telegram-connector:latest
+    env_file: .env
+    restart: on-failure
+```
+
+Use `on-failure` if you want `/runtime` Restart (`exit 1`) to relaunch and `/runtime` Stop (`exit 0`) to stay stopped. Use `unless-stopped` only if you want the container runtime to bring the connector back after any process exit.
 
 SSE disconnects reconnect with backoff when they are retryable. Fatal SSE protocol or size errors stop that project's SSE loop instead of reconnecting forever; prompt polling remains available as the fallback path for permission and question prompts while SSE is down.
 
@@ -252,13 +401,15 @@ SSE disconnects reconnect with backoff when they are retryable. Fatal SSE protoc
 
 After changing runtime/recovery behavior, run the connector under your usual supervisor and check:
 
-1. `/runtime` in a private chat shows managed tasks, Telegram polling, backlog drain, prompt polling, update retry/skip counts, and shutdown state.
+1. `/runtime` in a private chat shows managed tasks, Telegram polling, backlog drain, prompt polling, update retry/skip counts, shutdown state, and Restart/Stop/Close buttons.
 2. `/projects` offers Retry health check and Close for every project, Start only where auto-start is configured and supported, and Show sessions only in private chats.
-3. Stop and restart the supervisor-managed process; bindings, offset, feed mode, model preference, and pending prompts should recover without duplicate actions.
-4. Temporarily stop one opencode server, use `/projects` → Retry health check, then restore the server and retry again to confirm project-scoped recovery works without restarting the connector.
-5. In a group, confirm `/start@OtherBot` is ignored and `/start@<this bot username>` is handled.
-6. If a normal Telegram prompt hits a retryable opencode failure, confirm it is retried and not marked handled until `prompt_async` succeeds.
-7. Send long formatted output and confirm Telegram chunks remain parseable HTML.
+3. Tap `/runtime` Restart or Stop, confirm the warning screen appears, then Cancel once to verify confirmation without stopping the process.
+4. In a supervised environment, confirm `/runtime` Restart exits, is relaunched by the supervisor, and sends the online-again notice; confirm `/runtime` Stop exits cleanly and remains stopped.
+5. Stop and restart the supervisor-managed process; bindings, offset, feed mode, model preference, and pending prompts should recover without duplicate actions.
+6. Temporarily stop one opencode server, use `/projects` → Retry health check, then restore the server and retry again to confirm project-scoped recovery works without restarting the connector.
+7. In a group, confirm `/start@OtherBot` is ignored and `/start@<this bot username>` is handled.
+8. If a normal Telegram prompt hits a retryable opencode failure, confirm it is retried and not marked handled until `prompt_async` succeeds.
+9. Send long formatted output and confirm Telegram chunks remain parseable HTML.
 
 ## Troubleshooting matrix
 
@@ -282,6 +433,7 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 - On first start, it drains old Telegram updates to avoid replaying history.
 - State load and critical state flush/write failures fail closed; the connector should not continue as if durability succeeded.
 - Current-schema state is validated on load, unsupported schema versions fail closed, and schema migrations create bounded `state.json.backup.*` files before writing the migrated state.
+- A confirmed `/runtime` Restart stores a short pending online-notice record in state until the next startup sends and clears it.
 - Feed mode is stored per Telegram thread/topic; the default is `Main + changes`.
 - Large assistant replies may be delivered as `.txt` attachments, and large changed-file diffs may be delivered as `.patch` attachments instead of many chat messages.
 - Telegram HTML messages are split with tag/entity awareness to avoid malformed chunks.

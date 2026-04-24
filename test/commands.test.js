@@ -229,6 +229,8 @@ test("createCommandHandlers handleRuntime renders private runtime status", async
   assert.match(sent[0].text, /managedTasks=3/)
   assert.match(sent[0].text, /Telegram poll:/)
   assert.match(sent[0].text, /Updates: retryable=1 skipped=2/)
+  assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text), ["Restart", "Stop", "Close"])
+  assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.callback_data), ["rt|confirm-restart", "rt|confirm-stop", "rt|close"])
 })
 
 test("createCommandHandlers handleRuntime is private-chat only", async () => {

@@ -57,6 +57,7 @@ export function defaultState() {
     feedByContext: defaultFeedByContext(),
     modelPrefsByContext: defaultModelPrefsByContext(),
     pendingPrompts: defaultPendingPrompts(),
+    pendingRuntimeOnlineNotice: null,
     idempotency: defaultIdempotencyLedger(),
   }
 }
@@ -151,6 +152,25 @@ export class StateStore {
 
   getPendingPrompts() {
     return this.state.pendingPrompts
+  }
+
+  getPendingRuntimeOnlineNotice() {
+    return this.state.pendingRuntimeOnlineNotice || null
+  }
+
+  setPendingRuntimeOnlineNotice(record) {
+    const normalized = normalizePendingRuntimeOnlineNotice(record)
+    if (!normalized) return false
+    this.state.pendingRuntimeOnlineNotice = normalized
+    this.scheduleSave()
+    return true
+  }
+
+  clearPendingRuntimeOnlineNotice() {
+    const existed = !!this.state.pendingRuntimeOnlineNotice
+    this.state.pendingRuntimeOnlineNotice = null
+    if (existed) this.scheduleSave()
+    return existed
   }
 
   getPendingPermission(projectAlias, permissionId, sessionID = "") {
@@ -541,6 +561,7 @@ function migrateStateIfNeeded(loaded, { filePath } = {}) {
         feedByContext: normalizeFeedByContext(loaded.feedByContext),
         modelPrefsByContext: normalizeModelPrefsByContext(loaded.modelPrefsByContext),
         pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
+        pendingRuntimeOnlineNotice: normalizePendingRuntimeOnlineNotice(loaded.pendingRuntimeOnlineNotice),
         idempotency: normalizeIdempotencyLedger(loaded.idempotency),
       },
     }
@@ -555,6 +576,7 @@ function migrateStateIfNeeded(loaded, { filePath } = {}) {
       feedByContext: normalizeFeedByContext(loaded.feedByContext),
       modelPrefsByContext: normalizeModelPrefsByContext(loaded.modelPrefsByContext),
       pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
+      pendingRuntimeOnlineNotice: normalizePendingRuntimeOnlineNotice(loaded.pendingRuntimeOnlineNotice),
       idempotency: normalizeIdempotencyLedger(loaded.idempotency),
     }, { filePath })
   }
@@ -568,6 +590,7 @@ function migrateStateIfNeeded(loaded, { filePath } = {}) {
       feedByContext: normalizeFeedByContext(loaded.feedByContext),
       modelPrefsByContext: defaultModelPrefsByContext(),
       pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
+      pendingRuntimeOnlineNotice: null,
       idempotency: defaultIdempotencyLedger(),
     }, { filePath })
   }
@@ -581,6 +604,7 @@ function migrateStateIfNeeded(loaded, { filePath } = {}) {
       feedByContext: defaultFeedByContext(),
       modelPrefsByContext: defaultModelPrefsByContext(),
       pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
+      pendingRuntimeOnlineNotice: null,
       idempotency: defaultIdempotencyLedger(),
     }, { filePath })
   }
@@ -594,6 +618,7 @@ function migrateStateIfNeeded(loaded, { filePath } = {}) {
       feedByContext: defaultFeedByContext(),
       modelPrefsByContext: defaultModelPrefsByContext(),
       pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
+      pendingRuntimeOnlineNotice: null,
       idempotency: defaultIdempotencyLedger(),
     }, { filePath })
   }
@@ -609,6 +634,7 @@ function migrateStateIfNeeded(loaded, { filePath } = {}) {
       feedByContext: defaultFeedByContext(),
       modelPrefsByContext: defaultModelPrefsByContext(),
       pendingPrompts: defaultPendingPrompts(),
+      pendingRuntimeOnlineNotice: null,
       idempotency: defaultIdempotencyLedger(),
     }, { filePath })
   }
@@ -665,6 +691,7 @@ function validateCurrentState(state) {
   validateFeedByContextSection(state.feedByContext, errors)
   validateModelPrefsByContextSection(state.modelPrefsByContext, errors)
   validatePendingPromptsSection(state.pendingPrompts, errors)
+  validatePendingRuntimeOnlineNoticeSection(state.pendingRuntimeOnlineNotice, errors)
   validateIdempotencySection(state.idempotency, errors)
   return errors
 }
@@ -821,6 +848,14 @@ function validateIdempotencySection(value, errors) {
   }
 }
 
+function validatePendingRuntimeOnlineNoticeSection(value, errors) {
+  if (value == null) return
+  if (!pushRecordError(errors, value, "state.pendingRuntimeOnlineNotice")) return
+  if (value.kind !== "restart") errors.push("state.pendingRuntimeOnlineNotice.kind must be restart")
+  if (!Number.isInteger(value.chatId)) errors.push("state.pendingRuntimeOnlineNotice.chatId must be an integer")
+  if (value.createdAt != null && !isFiniteNumber(value.createdAt)) errors.push("state.pendingRuntimeOnlineNotice.createdAt must be a finite number when present")
+}
+
 function normalizePendingPrompts(value) {
   const base = defaultPendingPrompts()
   if (!value || typeof value !== "object") return base
@@ -829,6 +864,16 @@ function normalizePendingPrompts(value) {
     rejectNotes: normalizeCtxPromptRecords(value.rejectNotes, "permissionId"),
     customAnswers: normalizeCtxPromptRecords(value.customAnswers, "requestId"),
     questionWizards: normalizeQuestionWizardRecords(value.questionWizards),
+  }
+}
+
+function normalizePendingRuntimeOnlineNotice(value) {
+  if (!value || typeof value !== "object") return null
+  if (value.kind !== "restart" || !Number.isInteger(value.chatId)) return null
+  return {
+    kind: "restart",
+    chatId: value.chatId,
+    createdAt: isFiniteNumber(value.createdAt) ? value.createdAt : Date.now(),
   }
 }
 

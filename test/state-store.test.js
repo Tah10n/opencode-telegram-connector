@@ -318,6 +318,27 @@ test("StateStore persists and prunes idempotency ledger entries", async () => {
   assert.equal(store.hasIdempotencyKey("permission-reply:demo:perm_1:once"), false)
 })
 
+test("StateStore persists and clears pending runtime online notices", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  const store = new StateStore({ filePath, logger: makeLogger() })
+
+  assert.equal(store.getPendingRuntimeOnlineNotice(), null)
+  assert.equal(store.setPendingRuntimeOnlineNotice({ kind: "restart", chatId: 42, createdAt: 123 }), true)
+  await store.flush()
+
+  const reloaded = new StateStore({ filePath, logger: makeLogger() })
+  await reloaded.load()
+  assert.deepEqual(reloaded.getPendingRuntimeOnlineNotice(), { kind: "restart", chatId: 42, createdAt: 123 })
+
+  assert.equal(reloaded.clearPendingRuntimeOnlineNotice(), true)
+  await reloaded.flush()
+
+  const cleared = new StateStore({ filePath, logger: makeLogger() })
+  await cleared.load()
+  assert.equal(cleared.getPendingRuntimeOnlineNotice(), null)
+})
+
 test("StateStore migrates schema version 1 state to version 5", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
@@ -340,6 +361,7 @@ test("StateStore migrates schema version 1 state to version 5", async () => {
     customAnswers: {},
     questionWizards: {},
   })
+  assert.equal(loaded.pendingRuntimeOnlineNotice, null)
   assert.deepEqual(loaded.idempotency, { keys: {} })
 })
 
@@ -370,6 +392,7 @@ test("StateStore migrates schema version 2 state to version 5", async () => {
   assert.deepEqual(loaded.feedByContext, {})
   assert.deepEqual(loaded.modelPrefsByContext, {})
   assert.deepEqual(loaded.bindings, { "100:7": { projectAlias: "demo", sessionId: "ses_1" } })
+  assert.equal(loaded.pendingRuntimeOnlineNotice, null)
   assert.deepEqual(loaded.idempotency, { keys: {} })
 })
 
@@ -400,6 +423,7 @@ test("StateStore migrates schema version 3 state to version 5", async () => {
   assert.equal(loaded.updateOffset, 99)
   assert.deepEqual(loaded.feedByContext, { "100:7": { mode: "verbose" } })
   assert.deepEqual(loaded.modelPrefsByContext, {})
+  assert.equal(loaded.pendingRuntimeOnlineNotice, null)
   assert.deepEqual(loaded.idempotency, { keys: {} })
 })
 
@@ -431,6 +455,7 @@ test("StateStore migrates schema version 4 state to version 5", async () => {
   assert.equal(loaded.updateOffset, 100)
   assert.deepEqual(loaded.feedByContext, { "100:7": { mode: "main" } })
   assert.deepEqual(loaded.modelPrefsByContext, { "100:7": { mode: "project-default" } })
+  assert.equal(loaded.pendingRuntimeOnlineNotice, null)
   assert.deepEqual(loaded.idempotency, { keys: {} })
 })
 
@@ -498,6 +523,7 @@ test("StateStore rejects malformed schema version 5 sections with actionable pat
     feedByContext: {},
     modelPrefsByContext: {},
     pendingPrompts: { permissions: {}, rejectNotes: {}, customAnswers: {}, questionWizards: {} },
+    pendingRuntimeOnlineNotice: null,
     idempotency: { keys: {} },
   })
   const backups = (await fs.readdir(dir)).filter((name) => name.startsWith("state.json.backup.") && name.includes(".invalid."))
@@ -529,6 +555,7 @@ test("StateStore migrates legacy state and flush persists the new schema", async
     customAnswers: {},
     questionWizards: {},
   })
+  assert.equal(loaded.pendingRuntimeOnlineNotice, null)
   assert.deepEqual(loaded.idempotency, { keys: {} })
 
   store.scheduleSave = () => {}
@@ -553,6 +580,7 @@ test("StateStore migrates legacy state and flush persists the new schema", async
     customAnswers: {},
     questionWizards: {},
   })
+  assert.equal(persisted.pendingRuntimeOnlineNotice, null)
   assert.deepEqual(persisted.idempotency, { keys: {} })
 })
 

@@ -708,6 +708,22 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     return threadIdOr0 ? `topic ${threadIdOr0}` : "main"
   }
 
+  async function deliverPendingRuntimeOnlineNotice() {
+    const notice = store.getPendingRuntimeOnlineNotice?.()
+    if (notice?.kind !== "restart" || !Number.isInteger(notice.chatId)) return
+
+    try {
+      await sendToThread(
+        { chatId: notice.chatId, threadIdOr0: 0, ctxKey: ctxKeyFrom(notice.chatId, 0) },
+        "Connector is online again after restart.",
+      )
+      store.clearPendingRuntimeOnlineNotice?.()
+      await store.flush?.()
+    } catch (err) {
+      logger.error("Failed to send runtime restart online notice:", err?.message || String(err))
+    }
+  }
+
   async function sendBlocksToThread(ctxMeta, blocks, replyMarkup) {
     if (!ctxMeta?.chatId) return
     try {
@@ -910,6 +926,8 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     return true
   }
 
+  await deliverPendingRuntimeOnlineNotice()
+
   const commandHandlers = createCommandHandlers({
     ...overviewHelpers,
     ...promptHandlers,
@@ -973,6 +991,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     validateProject,
     getStartupSession,
     platform,
+    requestRuntimeShutdown: deps?.requestRuntimeShutdown,
   })
   const { handleTelegramCallback } = callbackHandlers
 

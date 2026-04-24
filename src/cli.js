@@ -73,13 +73,19 @@ export async function runCli({
 
   const { config } = await buildRuntimeConfigImpl({ args })
 
-  const { stop, stateFile } = await startConnectorImpl({ config })
+  const { stop, stateFile } = await startConnectorImpl({
+    config,
+    deps: {
+      requestRuntimeShutdown: ({ action } = {}) => shutdown(action === "restart" ? 1 : 0, { reason: `runtime ${action || "stop"}` }),
+    },
+  })
   stopConnectorRef.current = stop
   stdout("State:", stateFile)
 }
 
-function isCliEntrypoint() {
-  return process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
+export function isCliEntrypoint({ argv = process.argv, env = process.env } = {}) {
+  const candidates = [argv?.[1], env?.pm_exec_path]
+  return candidates.some((entrypoint) => entrypoint && import.meta.url === pathToFileURL(entrypoint).href)
 }
 
 if (isCliEntrypoint()) {

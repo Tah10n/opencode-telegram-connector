@@ -220,6 +220,16 @@ export function createCommandHandlers(runtime) {
     return makeInlineKeyboard([[{ text: "Close", callback_data: runtime.cb.pack("s|close") }]])
   }
 
+  function runtimeControlsKeyboard() {
+    return makeInlineKeyboard([
+      [
+        { text: "Restart", callback_data: runtime.cb.pack("rt|confirm-restart") },
+        { text: "Stop", callback_data: runtime.cb.pack("rt|confirm-stop") },
+      ],
+      [{ text: "Close", callback_data: runtime.cb.pack("rt|close") }],
+    ])
+  }
+
   function attachmentConfirmationKeyboard(token) {
     return makeInlineKeyboard([
       [
@@ -1482,7 +1492,7 @@ export function createCommandHandlers(runtime) {
       return
     }
     const lines = buildGlobalRuntimeStatusLines?.() || ["Runtime status is unavailable."]
-    await sendToThread(ctxMeta, ["Runtime:", ...lines].join("\n"))
+    await sendToThread(ctxMeta, ["Runtime:", ...lines].join("\n"), runtimeControlsKeyboard())
   }
 
   async function handleFeed(ctxMeta, { editMessageId } = {}) {

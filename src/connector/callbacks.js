@@ -60,6 +60,8 @@ export function createCallbackHandlers(runtime) {
     startServerKeyboard,
     platform,
     recordCallbackOutcome,
+    requestRuntimeShutdown,
+    scheduleRuntimeShutdown,
   } = runtime
 
   async function answerCallbackQuery(callbackQueryId, text) {
@@ -163,6 +165,62 @@ export function createCallbackHandlers(runtime) {
     ])
   }
 
+  function runtimeCloseKeyboard() {
+    return makeInlineKeyboard([[{ text: "Close", callback_data: packCallbackData("rt|close") }]])
+  }
+
+  function runtimeConfirmationKeyboard(action) {
+    const label = action === "restart" ? "Confirm restart" : "Confirm stop"
+    return makeInlineKeyboard([
+      [{ text: label, callback_data: packCallbackData(`rt|${action}`) }],
+      [{ text: "Cancel", callback_data: packCallbackData("rt|cancel") }],
+    ])
+  }
+
+  function runtimeConfirmationText(action) {
+    if (action === "restart") {
+      return "Restart connector?\n\nThis will stop the current process and exit with code 1 so your supervisor can start it again."
+    }
+    return "Stop connector?\n\nThis will stop Telegram polling, OpenCode streams, flush state, and exit."
+  }
+
+  function runtimeRequestedText(action) {
+    return action === "restart"
+      ? "Restart requested. Connector is stopping so your supervisor can restart it."
+      : "Stop requested. Connector is shutting down."
+  }
+
+  function canRequestRuntimeShutdown() {
+    return typeof requestRuntimeShutdown === "function"
+  }
+
+  function requestRuntimeShutdownSoon(action) {
+    const run = () =>
+      Promise.resolve(requestRuntimeShutdown({ action })).catch((err) => {
+        runtime.logger?.error?.("Runtime shutdown request failed:", err?.message || String(err))
+      })
+    try {
+      if (typeof scheduleRuntimeShutdown === "function") {
+        scheduleRuntimeShutdown(run)
+        return
+      }
+      const timer = setTimeout(run, 50)
+      timer.unref?.()
+    } catch (err) {
+      runtime.logger?.error?.("Failed to schedule runtime shutdown request:", err?.message || String(err))
+    }
+  }
+
+  async function persistRuntimeRestartNotice(ctxMeta) {
+    if (typeof store?.setPendingRuntimeOnlineNotice !== "function") return
+    try {
+      store.setPendingRuntimeOnlineNotice({ kind: "restart", chatId: ctxMeta.chatId, createdAt: Date.now() })
+      await store.flush?.()
+    } catch (err) {
+      runtime.logger?.error?.("Failed to persist runtime restart notice:", err?.message || String(err))
+    }
+  }
+
   async function handleTelegramCallback(callbackQuery) {
     if (!isAllowedUser(callbackQuery?.from)) return
     const msg = callbackQuery.message
@@ -178,6 +236,53 @@ export function createCallbackHandlers(runtime) {
     const callbackProjectAlias = projects?.[parts[1]] ? parts[1] : store.getBinding(ctxMeta.ctxKey)?.projectAlias || null
 
     try {
+      if (kind === "rt") {
+        const action = parts[1]
+        if (ctxMeta?.chatType !== "private") {
+          await answerCallbackQuery(callbackQuery.id, "Private chat only")
+          return
+        }
+        if (action === "close") {
+          await closeInteractiveMessage(callbackQuery.id, ctxMeta, msg?.message_id)
+          return
+        }
+        if (action === "cancel") {
+          await answerCallbackQuery(callbackQuery.id, "Cancelled")
+          if (msg?.message_id && typeof tg.editMessageText === "function") {
+            await tg.editMessageText(ctxMeta.chatId, msg.message_id, "Runtime action cancelled.", runtimeCloseKeyboard()).catch(ignoreError)
+          }
+          return
+        }
+        if (action === "confirm-stop" || action === "confirm-restart") {
+          const targetAction = action === "confirm-restart" ? "restart" : "stop"
+          await answerCallbackQuery(callbackQuery.id, targetAction === "restart" ? "Confirm restart" : "Confirm stop")
+          if (msg?.message_id && typeof tg.editMessageText === "function") {
+            await tg
+              .editMessageText(ctxMeta.chatId, msg.message_id, runtimeConfirmationText(targetAction), runtimeConfirmationKeyboard(targetAction))
+              .catch(ignoreError)
+          }
+          return
+        }
+        if (action === "stop" || action === "restart") {
+          if (!canRequestRuntimeShutdown()) {
+            await answerCallbackQuery(callbackQuery.id, "Unavailable")
+            if (msg?.message_id && typeof tg.editMessageText === "function") {
+              await tg.editMessageText(ctxMeta.chatId, msg.message_id, "Runtime shutdown control is unavailable for this launcher.", runtimeCloseKeyboard()).catch(ignoreError)
+            }
+            return
+          }
+          await answerCallbackQuery(callbackQuery.id, action === "restart" ? "Restarting…" : "Stopping…")
+          if (msg?.message_id && typeof tg.editMessageText === "function") {
+            await tg.editMessageText(ctxMeta.chatId, msg.message_id, runtimeRequestedText(action), runtimeCloseKeyboard()).catch(ignoreError)
+          }
+          if (action === "restart") await persistRuntimeRestartNotice(ctxMeta)
+          requestRuntimeShutdownSoon(action)
+          return
+        }
+        await answerCallbackQuery(callbackQuery.id, "Invalid")
+        return
+      }
+
       if (kind === "s") {
         if (parts[1] === "close") {
           await closeInteractiveMessage(callbackQuery.id, ctxMeta, msg?.message_id)

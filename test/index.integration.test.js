@@ -1307,6 +1307,7 @@ test("startConnector /runtime shows compact private-chat runtime state", async (
     assert.match(runtimeText, /Backlog drain:/)
     assert.match(runtimeText, /Updates: retryable=0 skipped=0/)
     assert.doesNotMatch(runtimeText, /state\.json|test-token/)
+    assert.deepEqual(harness.tg.sentMessages.at(-1)?.replyMarkup?.inline_keyboard?.flat().map((button) => button.text), ["Restart", "Stop", "Close"])
   } finally {
     await harness.connector.stop()
   }
@@ -1320,6 +1321,26 @@ test("startConnector /runtime refuses group chats", async () => {
     await waitFor(() => harness.tg.sentMessages.length >= 1)
 
     assert.match(harness.tg.sentMessages.at(-1)?.text || "", /Use \/runtime only in a private chat/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector sends pending runtime restart online notice on startup", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 297,
+      pendingRuntimeOnlineNotice: { kind: "restart", chatId: 100, createdAt: 123 },
+    },
+  })
+
+  try {
+    await waitFor(() => harness.tg.sentMessages.some((message) => /online again after restart/.test(message.text || "")))
+
+    const notice = harness.tg.sentMessages.find((message) => /online again after restart/.test(message.text || ""))
+    assert.equal(notice.chatId, 100)
+    const state = await readState(harness.stateFile)
+    assert.equal(state.pendingRuntimeOnlineNotice, null)
   } finally {
     await harness.connector.stop()
   }
