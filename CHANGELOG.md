@@ -10,6 +10,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ### Fixed
 - `/new` with `openAttachOnNewMode: "same-window"` now best-effort switches an attached TUI to the new session via opencode TUI control endpoints (with a manual fallback note on failure).
 - Telegram bindings can now follow TUI-reported active-session changes when the opencode server supports `/tui/active-session`.
+- Retryable user `prompt_async` failures no longer mark Telegram updates handled before delivery succeeds.
+- Group commands addressed to another bot, such as `/start@OtherBot`, are ignored.
+- Telegram HTML output splitting now preserves tags and entities across chunks.
+- Fatal SSE protocol or size errors stop reconnect loops instead of retrying forever.
+- State load and critical state flush/write failures now fail closed instead of silently losing runtime state.
+
+### Security
+- Dynamic opencode path segments are URL-encoded, and user-entered binding/session IDs are validated before persistence or routing.
+- Parent-session route caching is bounded for long-running processes.
+- Atomic state write behavior is covered for replacement failures so existing state is preserved where possible.
 
 ### Added
 - Public-project split with subtree workflow helpers and boundary checks.

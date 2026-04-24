@@ -18,7 +18,7 @@ This Node.js connector binds each Telegram chat or forum topic to a specific `{ 
 - **Prompt handling in chat** — approve or deny permission requests and answer questions with inline buttons.
 - **Multi-project friendly** — different chats/topics can stay bound to different projects at the same time.
 - **Optional local auto-start** — start local opencode servers and optionally open attach/TUI windows.
-- **Restart-safe state** — bindings, feed mode, model preference, and pending prompt state survive restarts.
+- **Restart-safe, fail-closed state** — bindings, feed mode, model preference, pending prompts, offsets, and idempotency survive restarts; corrupt or unwritable state is surfaced instead of silently reset.
 
 ## How it works
 
@@ -103,9 +103,11 @@ export default {
 - `/start`, `/help` — show help.
 - `/bind [projectAlias]` — bind the current chat/topic to a project's startup session. Without an argument, the bot asks for the alias interactively.
 - `/new [title]` — create a new session. With `openAttachOnNewMode: "new-window"` it binds immediately; with `same-window` Telegram stays on the current session until the attached TUI reports the switch, or you switch manually with `/use`.
-- `/use <sessionId|shareLink>` — bind an existing session. Supports `https://opncd.ai/share/<id>` and `https://opncd.ai/s/<id>`.
+- `/use <sessionId|shareLink>` — bind an existing session. Supports `https://opncd.ai/share/<id>` and `https://opncd.ai/s/<id>`. Raw session IDs must be non-empty and cannot contain whitespace or URL path/query separators; use share links for unusual IDs.
 - `/sessions` — list recent sessions and switch with buttons.
 - `/unbind` — remove the current binding.
+
+In groups and forum topics, Telegram commands addressed to another bot are ignored: `/start@OtherBot` is ignored, while `/start@<this bot username>` is handled.
 
 ### Thread settings and control
 
@@ -169,6 +171,8 @@ export default {
 - `DEBUG_SSE_ROUTING=<projectAlias>[:sessionId]` — enable verbose SSE routing logs.
 - `MIRROR_COMPACTION=1` — also mirror compaction messages.
 - `OPENCODE_SERVER_DEBUG=1` — start local `opencode serve` processes with debug logging.
+- `OPENCODE_SSE_MAX_LINE_BYTES`, `OPENCODE_SSE_MAX_EVENT_BYTES`, `OPENCODE_SSE_MAX_EVENT_LINES` — tune SSE safety limits for unusually large upstream events.
+- `OPENCODE_SSE_HEALTHCHECK_MIN_INTERVAL_MS` — tune health-check throttling after SSE disconnects.
 
 ## Platform notes
 
@@ -188,6 +192,8 @@ Recommended options:
 
 Treat the process as a single long-running worker: if a truly fatal runtime error occurs, inspect the logs and let the supervisor restart it instead of trying to keep the broken process alive.
 
+SSE disconnects reconnect with backoff when they are retryable. Fatal SSE protocol or size errors stop that project's SSE loop instead of reconnecting forever; prompt polling remains available as the fallback path for permission and question prompts while SSE is down.
+
 ### Runtime smoke checks
 
 After changing runtime/recovery behavior, run the connector under your usual supervisor and check:
@@ -196,6 +202,9 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 2. `/projects` offers Retry health check and Close for every project, Start only where auto-start is configured and supported, and Show sessions only in private chats.
 3. Stop and restart the supervisor-managed process; bindings, offset, feed mode, model preference, and pending prompts should recover without duplicate actions.
 4. Temporarily stop one opencode server, use `/projects` → Retry health check, then restore the server and retry again to confirm project-scoped recovery works without restarting the connector.
+5. In a group, confirm `/start@OtherBot` is ignored and `/start@<this bot username>` is handled.
+6. If a normal Telegram prompt hits a retryable opencode failure, confirm it is retried and not marked handled until `prompt_async` succeeds.
+7. Send long formatted output and confirm Telegram chunks remain parseable HTML.
 
 ## Troubleshooting matrix
 
@@ -203,6 +212,10 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 | --- | --- | --- |
 | Telegram polling appears stuck | Use `/runtime` in a private chat and inspect `Telegram poll` retries, `lastErrorAt`, and update retry/skip counts. Ensure only one connector instance is running for the bot token. | Fix the Telegram/API/network issue; restart the connector only if the supervisor reports the process is unhealthy. |
 | OpenCode unavailable | Use `/projects` and the project's Retry health check. `/status` also shows the current project's SSE and sanitized base URL. | Start opencode manually, or press Start if the project exposes a Start button. Retry health after the server is up. |
+| State file cannot be read or written | Startup or runtime logs report a state read/write failure. The connector fails closed instead of silently resetting state. | Fix permissions/path/corruption or restore a backup. Do not delete state unless you accept losing bindings, offset, pending prompts, and idempotency history. |
+| Prompt send reports project unavailable | A retryable opencode `prompt_async` failure happened while forwarding a user message. | Restore the project; the Telegram update remains retryable and should be processed again after recovery. |
+| SSE stopped after protocol/size error | Logs show a fatal SSE protocol or size failure for one project. | Inspect upstream event size/protocol, fix the source, then restart the connector or recover the project; prompt polling still handles prompts while SSE is down. |
+| Group command ignored | The command may be addressed to another bot, for example `/start@OtherBot`. | Use `/command@<this bot username>` or an unsuffixed command that Telegram delivers to this bot. |
 | Duplicate prompts or callbacks | Check `/status` for prompt cleanup/recovery and callback outcome counters. Duplicates after restart should be skipped as already handled. | If duplicates continue, keep the connector single-instance and inspect logs around prompt polling/SSE reconnects. |
 | Stale callbacks | Button presses may answer `No longer active` or `Already handled` after a prompt is completed or rejected. | Dismiss the old message with Close and wait for any current prompt to be delivered again if it is still live. |
 | Wrong thread/session | Use `/status` in the thread and `/bindings` in a private chat to compare bindings. | Use `/use <sessionId>`, `/bind <projectAlias>`, `/new`, or `/unbind` in the affected thread. |
@@ -213,8 +226,12 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 - The bot accepts messages from a single Telegram user ID only.
 - The connector is designed to run as a **single instance** per bot token.
 - On first start, it drains old Telegram updates to avoid replaying history.
+- State load and critical state flush/write failures fail closed; the connector should not continue as if durability succeeded.
 - Feed mode is stored per Telegram thread/topic; the default is `Main + changes`.
 - Large replies or diffs may be delivered as `.txt` attachments instead of many chat messages.
+- Telegram HTML messages are split with tag/entity awareness to avoid malformed chunks.
+- OpenCode path IDs are URL-encoded at the HTTP boundary; user-entered binding/session IDs are validated before being persisted.
+- Parent-session routing uses a bounded cache for long-running processes.
 - Basic Auth over non-loopback `http://` is blocked unless `OPENCODE_ALLOW_INSECURE_HTTP=1` is set.
 
 ## Useful local commands

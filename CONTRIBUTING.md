@@ -37,6 +37,12 @@ npm run test:coverage
 - Treat per-thread routing, restart recovery, and feed semantics as core behavior: changes here should come with focused tests.
 - Keep Telegram/OpenCode boundary failures normalized through `src/boundary-errors.js`; avoid scattering new string-matching heuristics across handlers.
 - Preserve the recovery contract when touching prompt flows: `stale` clears local pending state, `retryable` keeps it for manual retry, and `fatal` must be surfaced explicitly.
+- State read/write failures must not silently fall back to empty state or pretend persistence succeeded.
+- Retryable user prompt sends must not advance Telegram offset or mark the message handled until OpenCode delivery succeeds.
+- Commands addressed to other Telegram bots must remain ignored in groups and topics.
+- Telegram HTML output must remain valid when split into multiple messages.
+- Keep SSE retryable disconnects and fatal protocol/size failures distinct.
+- Encode dynamic OpenCode URL path segments and validate persisted/user-entered session IDs before routing.
 
 ## Pull requests
 
