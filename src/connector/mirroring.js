@@ -241,8 +241,17 @@ export function createMirroringHandlers(runtime) {
   function buildAssistantStreamPreviewHtml(text) {
     const body = String(text || "").trim()
     if (!body) return "<i>Streaming reply…</i>"
-    const trimmed = runtime.clampString(body, STREAM_PREVIEW_MAX_CHARS)
-    return `<i>Streaming reply…</i>\n${escapeHtml(trimmed)}`
+    const prefix = "<i>Streaming reply…</i>\n"
+    let escaped = ""
+    for (const ch of body) {
+      const next = escapeHtml(ch)
+      if (escaped.length + next.length > Math.min(STREAM_PREVIEW_MAX_CHARS, 3900 - prefix.length - 1)) {
+        escaped += "…"
+        break
+      }
+      escaped += next
+    }
+    return `${prefix}${escaped}`
   }
 
   async function getAssistantMessageWithRetry(oc, sessionId, messageId, { attempts = 3, initialDelayMs = 150 } = {}) {

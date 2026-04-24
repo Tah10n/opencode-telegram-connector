@@ -455,6 +455,24 @@ test("startConnector binds a thread and forwards only allowed-user messages", as
   }
 })
 
+test("startConnector ignores commands addressed to another bot", async () => {
+  const harness = await createHarness()
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(101, "/start@OtherBot"))
+    harness.tg.enqueue(makeMessageUpdate(102, "/start@test_bot"))
+
+    await waitFor(() => harness.tg.pendingUpdates === 0 && harness.tg.sentMessages.length === 1)
+    await harness.connector.stop()
+
+    assert.match(harness.tg.sentMessages[0].text, /^Telegram connector help:/)
+    const state = await readState(harness.stateFile)
+    assert.equal(state.updateOffset, 103)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
 test("startConnector mirrors assistant SSE output and /sendlast replays the latest assistant message", async () => {
   const completedAt = new Date(Date.now() + 60_000).toISOString()
   const harness = await createHarness({
@@ -2867,6 +2885,52 @@ test("startConnector skips replayed Telegram message updates without duplicate p
   }
 })
 
+test("startConnector retries user prompts after retryable promptAsync failure", async () => {
+  let attempts = 0
+  const update = makeMessageUpdate(625, "hello retry", { messageId: 5050 })
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 625,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    ocOptions: {
+      promptAsyncImpl: async () => {
+        attempts += 1
+        if (attempts === 1) {
+          throw makeBoundaryError({
+            source: "opencode",
+            operation: "POST /session/ses_1/prompt_async",
+            method: "POST",
+            pathname: "/session/ses_1/prompt_async",
+            status: 503,
+            message: "opencode down",
+          })
+        }
+        return { ok: true }
+      },
+    },
+    initialUpdates: [[update], [update]],
+  })
+
+  try {
+    await waitFor(() => harness.ocCalls.promptAsync.length === 2)
+    await waitFor(async () => (await readState(harness.stateFile)).updateOffset === 626)
+
+    assert.deepEqual(harness.ocCalls.promptAsync, [
+      { sessionId: "ses_1", text: "[TG] hello retry" },
+      { sessionId: "ses_1", text: "[TG] hello retry" },
+    ])
+    assert.match(harness.tg.sentMessages[0].text, /Project 'demo' is unavailable/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
 test("startConnector skips duplicate permission callback replays after ledger persistence", async () => {
   const pendingPermission = {
     projectAlias: "demo",
@@ -3942,7 +4006,7 @@ test("startConnector opens an attach window after /new when openAttachOnNewMode 
       openAttachOnNewMode: "new-window",
     },
     ocOptions: {
-      createSessionImpl: async (input) => ({ id: `ses_new:${input.title}` }),
+      createSessionImpl: async () => ({ id: "ses_new_Demo-title" }),
       getConfigImpl: async () => ({ model: "openai/gpt-5", default_agent: "build", agent: { build: { variant: "xhigh" } } }),
     },
     openAttachWindowWindowsImpl: async (args) => {
@@ -3954,7 +4018,7 @@ test("startConnector opens an attach window after /new when openAttachOnNewMode 
   try {
     harness.tg.enqueue(makeMessageUpdate(701, "/new Demo title"))
     await waitFor(() => attachCalls.length === 1)
-    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("Changed: this thread now uses new session ses_new:Demo title.")))
+    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("Changed: this thread now uses new session ses_new_Demo-title.")))
     await harness.connector.stop()
 
     const state = await readState(harness.stateFile)
@@ -3962,16 +4026,16 @@ test("startConnector opens an attach window after /new when openAttachOnNewMode 
       {
         directory: path.join(harness.dir, "demo"),
         baseUrl: "http://127.0.0.1:4312",
-        sessionId: "ses_new:Demo title",
+        sessionId: "ses_new_Demo-title",
         platform: "win32",
       },
     ])
     assert.deepEqual(state.bindings, {
-      "100:7": { projectAlias: "demo", sessionId: "ses_new:Demo title" },
+      "100:7": { projectAlias: "demo", sessionId: "ses_new_Demo-title" },
     })
     assert.ok(
       harness.tg.sentMessages.some(
-        (entry) => entry.text.includes("Changed: this thread now uses new session ses_new:Demo title.") && entry.text.includes("Model: openai/gpt-5 xhigh"),
+        (entry) => entry.text.includes("Changed: this thread now uses new session ses_new_Demo-title.") && entry.text.includes("Model: openai/gpt-5 xhigh"),
       ),
     )
   } finally {
@@ -4298,7 +4362,7 @@ test("startConnector keeps the thread model override after /new", async () => {
       openAttachOnNewMode: "new-window",
     },
     ocOptions: {
-      createSessionImpl: async (input) => ({ id: `ses_new:${input.title}` }),
+      createSessionImpl: async () => ({ id: "ses_new_Demo-model" }),
     },
     openAttachWindowWindowsImpl: async () => {},
     platform: "win32",
@@ -4309,23 +4373,23 @@ test("startConnector keeps the thread model override after /new", async () => {
     await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("Active: openai/gpt-5 xhigh")))
 
     harness.tg.enqueue(makeMessageUpdate(952, "/new Demo model"))
-    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("Changed: this thread now uses new session ses_new:Demo model.")))
+    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("Changed: this thread now uses new session ses_new_Demo-model.")))
 
     harness.tg.enqueue(makeMessageUpdate(953, "prompt after new"))
-    await waitFor(() => harness.ocCalls.promptAsync.some((entry) => entry.sessionId === "ses_new:Demo model"))
+    await waitFor(() => harness.ocCalls.promptAsync.some((entry) => entry.sessionId === "ses_new_Demo-model"))
 
     assert.ok(
       harness.tg.sentMessages.some(
         (entry) =>
-          entry.text.includes("Changed: this thread now uses new session ses_new:Demo model.") &&
+          entry.text.includes("Changed: this thread now uses new session ses_new_Demo-model.") &&
           entry.text.includes("Model: openai/gpt-5 xhigh") &&
           entry.text.includes("Source: Thread custom override"),
       ),
     )
     assert.deepEqual(
-      harness.ocCalls.promptAsync.find((entry) => entry.sessionId === "ses_new:Demo model"),
+      harness.ocCalls.promptAsync.find((entry) => entry.sessionId === "ses_new_Demo-model"),
       {
-        sessionId: "ses_new:Demo model",
+        sessionId: "ses_new_Demo-model",
         text: "[TG] prompt after new",
         options: { model: { providerID: "openai", modelID: "gpt-5" }, variant: "xhigh" },
       },

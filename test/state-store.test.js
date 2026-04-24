@@ -549,6 +549,27 @@ test("StateStore migrates legacy state and flush persists the new schema", async
   assert.deepEqual(persisted.idempotency, { keys: {} })
 })
 
+test("StateStore load fails closed on corrupt persisted state", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  await fs.writeFile(filePath, "{not-json", "utf8")
+
+  const store = new StateStore({ filePath, logger: makeLogger() })
+
+  await assert.rejects(() => store.load(), /JSON/)
+  assert.equal(store.get().updateOffset, null)
+  assert.deepEqual(store.get().bindings, {})
+})
+
+test("StateStore flush rejects write failures", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "bad\u0000state.json")
+  const store = new StateStore({ filePath, logger: makeLogger() })
+  store.setUpdateOffset(123)
+
+  await assert.rejects(() => store.flush())
+})
+
 test("resolveDefaultStatePath appends .data/state.json to the cwd", () => {
   const cwd = path.join("workspace", "demo")
   assert.equal(resolveDefaultStatePath({ cwd }), path.resolve(cwd, ".data", "state.json"))

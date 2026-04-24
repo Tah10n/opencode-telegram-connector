@@ -223,6 +223,7 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
             await onError?.({ projectAlias, err: normalized })
           } catch {}
         }
+        if (!isAbort && !isTransientDisconnect && !isRetryableBoundaryError(normalized)) break
         await waitForRetryBackoff(backoff)
         backoff = Math.min(30_000, backoff * 2)
       } finally {

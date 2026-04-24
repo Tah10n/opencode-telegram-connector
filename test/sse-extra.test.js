@@ -205,6 +205,35 @@ test("startOpenCodeSseLoop aborts oversized SSE events and reports a protocol er
   })
 })
 
+test("startOpenCodeSseLoop stops instead of reconnecting after fatal protocol errors", async (t) => {
+  usePatchedDelay(t, async () => {})
+  swapEnv(t, { OPENCODE_SSE_MAX_EVENT_BYTES: "10" })
+  let fetchCalls = 0
+  useFetchStub(t, async () => {
+    fetchCalls += 1
+    return makeSseResponse([`data: ${"x".repeat(50)}\n`, "\n"])
+  })
+
+  const errors = []
+  const loop = startOpenCodeSseLoop({
+    projectAlias: "demo",
+    ocClient: makeClient(),
+    logger: makeLogger(),
+    onError: async ({ err }) => {
+      errors.push(err)
+    },
+  })
+
+  await Promise.race([
+    loop.done,
+    new Promise((_, reject) => originalGlobalSetTimeout(() => reject(new Error("Timed out waiting for fatal SSE stop")), 1000)),
+  ])
+
+  assert.equal(fetchCalls, 1)
+  assert.equal(errors.length, 1)
+  assert.equal(errors[0].outcome, "fatal")
+})
+
 test("startOpenCodeSseLoop aborts when an SSE line exceeds the buffer limit", async (t) => {
   usePatchedDelay(t, async () => {})
   swapEnv(t, { OPENCODE_SSE_MAX_LINE_BYTES: "10" })

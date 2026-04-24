@@ -46,6 +46,10 @@ export function defaultState() {
   }
 }
 
+function cloneStateForWrite(state) {
+  return JSON.parse(JSON.stringify(state))
+}
+
 export function sessionKey(projectAlias, sessionId) {
   return `${projectAlias}:${sessionId}`
 }
@@ -65,10 +69,13 @@ export class StateStore {
   }
 
   async load() {
-    const loaded = await readJsonFile(this.filePath).catch((err) => {
-      this.logger?.error?.("Failed to read state file, starting fresh:", err?.message || String(err))
-      return null
-    })
+    let loaded
+    try {
+      loaded = await readJsonFile(this.filePath)
+    } catch (err) {
+      this.logger?.error?.("Failed to read state file:", err?.message || String(err))
+      throw err
+    }
     if (!loaded) return this.state
     this.state = migrateStateIfNeeded(loaded)
     return this.state
@@ -188,16 +195,24 @@ export class StateStore {
     if (this._saveTimer) return
     this._saveTimer = setTimeout(() => {
       this._saveTimer = null
-      void this.flush()
+      void this.flush().catch(() => {})
     }, delayMs)
   }
 
   async flush() {
-    const snapshot = this.state
-    this._writeChain = this._writeChain
-      .then(() => writeJsonFileAtomic(this.filePath, snapshot))
-      .catch((err) => this.logger?.error?.("Failed to write state:", err?.message || String(err)))
-    return this._writeChain
+    if (this._saveTimer) {
+      clearTimeout(this._saveTimer)
+      this._saveTimer = null
+    }
+    const snapshot = cloneStateForWrite(this.state)
+    const write = this._writeChain.then(() => writeJsonFileAtomic(this.filePath, snapshot))
+    this._writeChain = write.catch(() => {})
+    try {
+      await write
+    } catch (err) {
+      this.logger?.error?.("Failed to write state:", err?.message || String(err))
+      throw err
+    }
   }
 
   setUpdateOffset(offset) {

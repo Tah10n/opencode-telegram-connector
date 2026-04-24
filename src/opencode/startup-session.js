@@ -1,3 +1,5 @@
+import { isSafeOpenCodeId, normalizeOpenCodeId } from "./ids.js"
+
 export async function ensureStartupSession({
   alias,
   startInProgress,
@@ -9,19 +11,28 @@ export async function ensureStartupSession({
   forceRefresh = false,
   abortSignal,
 }) {
+  function cachedStartupSession() {
+    if (!startupSessionByProject[alias]) return null
+    const cachedId = normalizeOpenCodeId(startupSessionByProject[alias])
+    if (cachedId && isSafeOpenCodeId(cachedId)) return cachedId
+    delete startupSessionByProject[alias]
+    logger?.warn?.(`[${alias}] ignored invalid cached startup session id`)
+    return null
+  }
+
   if (!waitForStart && startInProgress.has(alias)) {
-    return startupSessionByProject[alias] || null
+    return cachedStartupSession()
   }
 
   if (waitForStart && startInProgress.has(alias)) {
     await startInProgress.get(alias).catch(() => {})
   }
-  if (!forceRefresh && startupSessionByProject[alias]) return startupSessionByProject[alias]
+  if (!forceRefresh && startupSessionByProject[alias]) return cachedStartupSession()
   if (startupSessionInProgress.has(alias)) {
     const inFlight = startupSessionInProgress.get(alias)
     if (!waitForStart || !startInProgress.has(alias)) return inFlight
     await inFlight.catch(() => {})
-    if (!forceRefresh && startupSessionByProject[alias]) return startupSessionByProject[alias]
+    if (!forceRefresh && startupSessionByProject[alias]) return cachedStartupSession()
   }
 
   const promise = (async () => {
@@ -30,13 +41,18 @@ export async function ensureStartupSession({
 
     const list = await oc.listSessions({ limit: 1, signal: abortSignal })
     const latest = Array.isArray(list) && list[0] ? list[0] : null
-    if (latest?.id) {
-      startupSessionByProject[alias] = latest.id
+    const latestId = normalizeOpenCodeId(latest?.id)
+    if (latestId && isSafeOpenCodeId(latestId)) {
+      startupSessionByProject[alias] = latestId
     } else {
+      if (latest?.id) logger?.warn?.(`[${alias}] ignored invalid latest session id`)
       const created = await oc.createSession({ signal: abortSignal })
-      if (created?.id) {
-        logger?.info?.(`[${alias}] created startup session:`, created.id)
-        startupSessionByProject[alias] = created.id
+      const createdId = normalizeOpenCodeId(created?.id)
+      if (createdId && isSafeOpenCodeId(createdId)) {
+        logger?.info?.(`[${alias}] created startup session:`, createdId)
+        startupSessionByProject[alias] = createdId
+      } else {
+        logger?.error?.(`[${alias}] opencode returned an invalid startup session id`)
       }
     }
 

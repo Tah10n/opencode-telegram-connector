@@ -126,14 +126,19 @@ function isCommand(text) {
   return typeof text === "string" && text.trim().startsWith("/")
 }
 
-function parseCommand(text) {
+function parseCommand(text, { botUsername } = {}) {
   const trimmed = text.trim()
   const [cmd, ...rest] = trimmed.split(/\s+/)
   // Telegram may send commands as /cmd@BotName in groups.
-  const normalizedCmd = String(cmd || "")
+  const [commandName, targetBot] = String(cmd || "").split("@", 2)
+  const normalizedTargetBot = String(targetBot || "").trim().toLowerCase()
+  const normalizedBotUsername = String(botUsername || "").trim().toLowerCase()
+  if (normalizedTargetBot && normalizedBotUsername && normalizedTargetBot !== normalizedBotUsername) {
+    return { cmd: null, args: rest.join(" ").trim(), argv: rest, targetBot: normalizedTargetBot, isForThisBot: false }
+  }
+  const normalizedCmd = String(commandName || "")
     .toLowerCase()
-    .split("@")[0]
-  return { cmd: normalizedCmd, args: rest.join(" ").trim(), argv: rest }
+  return { cmd: normalizedCmd, args: rest.join(" ").trim(), argv: rest, targetBot: normalizedTargetBot, isForThisBot: true }
 }
 
 function normalizeEpochMs(value) {
@@ -198,6 +203,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const tg = createTelegramClient(config.telegram.botToken)
   const me = await tg.getMe().catch(() => null)
   const hasTopicsEnabled = !!me?.has_topics_enabled
+  const botUsername = typeof me?.username === "string" ? me.username : ""
   logger.info("Telegram bot:", me?.username ? `@${me.username}` : "(unknown)", "topics:", hasTopicsEnabled)
 
   // Best-effort: publish Telegram built-in command menu.
@@ -394,7 +400,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const assistantPreviewBySession = new Map() // bound sessionKey -> { messageId, telegramMessageId, lastPreviewHtml, lastPreviewAt }
   const recentTgPromptsBySession = new LruMap(2000) // sessionKey -> LruSet(hash)
   const lastAssistantBySession = new LruMap(2000) // sessionKey -> { messageId, sessionId, text }
-  const parentSessionBySession = new Map() // key `${projectAlias}:${sessionId}` -> parent session id or null
+  const parentSessionBySession = new LruMap(5000) // key `${projectAlias}:${sessionId}` -> parent session id or null
   const tuiActiveSessionStateByProject = new Map() // alias -> { currentSessionId, followCtxKey }
   const tuiActiveSessionUnsupportedProjects = new Set() // alias values where /tui/active-session is unavailable
   lifecycle.registerStopHook("assistantDebounce-cleanup", () => {
@@ -930,7 +936,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         shutdownState: abortController.signal.aborted ? "stopping" : "running",
       }),
     isCommand,
-    parseCommand,
+    parseCommand: (text) => parseCommand(text, { botUsername }),
     compareNumbers,
     lastAssistantBySession,
     rejectNoteAwaiting,

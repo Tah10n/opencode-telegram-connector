@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { TelegramClient, makeInlineKeyboard, splitTelegramText } from "../src/telegram/client.js"
+import { TelegramClient, makeInlineKeyboard, splitTelegramHtml, splitTelegramText } from "../src/telegram/client.js"
 import { classifyBoundaryError } from "../src/boundary-errors.js"
 
 test("splitTelegramText keeps short lines and splits oversized lines", () => {
@@ -11,6 +11,29 @@ test("splitTelegramText keeps short lines and splits oversized lines", () => {
 test("splitTelegramText carries a short next line into a fresh chunk", () => {
   const chunks = splitTelegramText("aa\nbbb", 3)
   assert.deepEqual(chunks, ["aa", "bbb"])
+})
+
+test("splitTelegramHtml avoids splitting tags and entities", () => {
+  const chunks = splitTelegramHtml(`<b>ok</b>\n${"&lt;".repeat(10)}`, 17)
+
+  assert.ok(chunks.length > 1)
+  assert.equal(chunks.join(""), `<b>ok</b>\n${"&lt;".repeat(10)}`)
+  for (const chunk of chunks) {
+    assert.ok(chunk.length <= 17)
+    assert.doesNotMatch(chunk, /<[^>]*$/)
+    assert.doesNotMatch(chunk, /&(?:l|lt)$/)
+  }
+})
+
+test("splitTelegramHtml keeps chunks well-formed across open tags", () => {
+  const chunks = splitTelegramHtml(`<b>${"a".repeat(20)}</b>`, 12)
+
+  assert.ok(chunks.length > 1)
+  for (const chunk of chunks) {
+    assert.ok(chunk.length <= 12)
+    assert.match(chunk, /^<b>/)
+    assert.match(chunk, /<\/b>$/)
+  }
 })
 
 test("TelegramClient call and callMultipart return Telegram results and surface API errors", async () => {

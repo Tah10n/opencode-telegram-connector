@@ -60,6 +60,69 @@ export function splitTelegramText(text, maxLen = 3900) {
   return chunks
 }
 
+export function splitTelegramHtml(text, maxLen = 3900) {
+  const s = String(text ?? "")
+  if (s.length <= maxLen) return [s]
+  const chunks = []
+  let current = ""
+  const tagStack = []
+
+  const tagNameOf = (token) => {
+    const match = String(token).match(/^<\/?([a-z0-9-]+)/i)
+    return match ? match[1].toLowerCase() : ""
+  }
+  const closingTags = () => tagStack.slice().reverse().map((entry) => `</${entry.name}>`).join("")
+  const openingTags = () => tagStack.map((entry) => entry.open).join("")
+
+  const flush = () => {
+    if (!current) return
+    chunks.push(current + closingTags())
+    current = openingTags()
+  }
+
+  const ensureRoom = (token) => {
+    const closeSuffix = closingTags()
+    if (current && current.length + token.length + closeSuffix.length > maxLen) flush()
+  }
+
+  const readToken = (index) => {
+    const ch = s[index]
+    if (ch === "<") {
+      const end = s.indexOf(">", index + 1)
+      if (end !== -1) return { token: s.slice(index, end + 1), next: end + 1 }
+    }
+    if (ch === "&") {
+      const end = s.indexOf(";", index + 1)
+      if (end !== -1 && end - index <= 16) return { token: s.slice(index, end + 1), next: end + 1 }
+    }
+    return { token: ch, next: index + 1 }
+  }
+
+  for (let i = 0; i < s.length;) {
+    const { token, next } = readToken(i)
+    const isTag = token.startsWith("<") && token.endsWith(">")
+    const isClosingTag = isTag && /^<\//.test(token)
+    const isOpeningTag = isTag && !isClosingTag && !/^<!/.test(token) && !/\/>$/.test(token)
+    ensureRoom(token)
+    if (token.length > maxLen) {
+      for (const chunk of splitTelegramText(token, maxLen)) chunks.push(chunk)
+    } else {
+      current += token
+      if (isClosingTag) {
+        const name = tagNameOf(token)
+        const idx = name ? tagStack.map((entry) => entry.name).lastIndexOf(name) : -1
+        if (idx !== -1) tagStack.splice(idx, 1)
+      } else if (isOpeningTag) {
+        const name = tagNameOf(token)
+        if (name) tagStack.push({ name, open: token })
+      }
+    }
+    i = next
+  }
+  if (current) chunks.push(current + closingTags())
+  return chunks
+}
+
 export class TelegramClient {
   constructor(token, { baseUrl } = {}) {
     this.token = token
@@ -171,7 +234,7 @@ export class TelegramClient {
   }
 
   async sendMessage(chatId, text, replyMarkup, options = {}) {
-    const chunks = splitTelegramText(text)
+    const chunks = options.parse_mode === "HTML" ? splitTelegramHtml(text) : splitTelegramText(text)
     let last = null
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i]

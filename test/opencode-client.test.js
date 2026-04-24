@@ -146,6 +146,42 @@ test("OpenCodeClient convenience methods call the expected endpoints", async () 
   ])
 })
 
+test("OpenCodeClient encodes dynamic path segments", async () => {
+  const client = new OpenCodeClient({ baseUrl: "https://example.com" })
+  const calls = []
+  client.request = async (pathname, options) => {
+    calls.push({ pathname, options })
+    return { ok: true }
+  }
+
+  await client.getSession("ses/a b?#")
+  await client.abortSession("ses/a b?#")
+  await client.promptAsync("ses/a b?#", "hello")
+  await client.getMessage("ses/a b?#", "msg/a b?#")
+  await client.listMessages("ses/a b?#", { limit: 2 })
+  await client.replyPermission("perm/a b?#", { reply: "once" })
+  await client.replyQuestion("q/a b?#", [["ok"]])
+  await client.rejectQuestion("q/a b?#")
+
+  assert.deepEqual(calls.map((call) => call.pathname), [
+    "/session/ses%2Fa%20b%3F%23",
+    "/session/ses%2Fa%20b%3F%23/abort",
+    "/session/ses%2Fa%20b%3F%23/prompt_async",
+    "/session/ses%2Fa%20b%3F%23/message/msg%2Fa%20b%3F%23",
+    "/session/ses%2Fa%20b%3F%23/message",
+    "/permission/perm%2Fa%20b%3F%23/reply",
+    "/question/q%2Fa%20b%3F%23/reply",
+    "/question/q%2Fa%20b%3F%23/reject",
+  ])
+})
+
+test("OpenCodeClient rejects empty dynamic path segments", async () => {
+  const client = new OpenCodeClient({ baseUrl: "https://example.com" })
+
+  assert.throws(() => client.getSession("   "), /Invalid session id/)
+  assert.throws(() => client.getMessage("ses_1", "\u0000"), /Invalid message id/)
+})
+
 test("OpenCodeClient selectTuiSession falls back to /tui/publish on 404", async () => {
   const client = new OpenCodeClient({ baseUrl: "https://example.com" })
   const calls = []

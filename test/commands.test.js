@@ -622,6 +622,32 @@ test("createCommandHandlers handleUseCommand reports moved session conflicts", a
   assert.match(sent[0].text, /already bound to chat 200 \/ topic 3 and was moved to this thread/)
 })
 
+test("createCommandHandlers handleUseCommand rejects unsafe raw session ids", async () => {
+  const getSessionCalls = []
+  const bindCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    ocByAlias: {
+      demo: {
+        async getSession(sessionId) {
+          getSessionCalls.push(sessionId)
+          return { id: sessionId }
+        },
+      },
+    },
+    bindCtxToSession: async (...args) => {
+      bindCalls.push(args)
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleUseCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "../config")
+
+  assert.deepEqual(getSessionCalls, [])
+  assert.deepEqual(bindCalls, [])
+  assert.match(sent[0].text, /Invalid session id/)
+})
+
 test("createCommandHandlers handleUnbind asks for confirmation before removing a binding", async () => {
   let calls = 0
   const { runtime, sent } = makeRuntime({
@@ -706,6 +732,36 @@ test("createCommandHandlers handleNewCommand reports configured model and varian
   ])
   assert.equal(sent.length, 1)
   assert.equal(sent[0].text, "Changed: this thread now uses new session ses_new.\nProject: demo\nSession: ses_new\nFeed: Main + changes\nModel: openai/gpt-5 xhigh\nSource: Inherited from project default")
+})
+
+test("createCommandHandlers handleNewCommand refuses invalid created session ids", async () => {
+  const bindCalls = []
+  const selectCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", openAttachOnNewMode: "same-window" } },
+    ocByAlias: {
+      demo: {
+        async createSession() {
+          return { id: "bad/id" }
+        },
+        async selectTuiSession(sessionId) {
+          selectCalls.push(sessionId)
+        },
+      },
+    },
+    bindCtxToSession: async (...args) => {
+      bindCalls.push(args)
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleNewCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "Demo title")
+
+  assert.deepEqual(selectCalls, [])
+  assert.deepEqual(bindCalls, [])
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Project 'demo' is unavailable/)
 })
 
 test("createCommandHandlers handleNewCommand leaves the old binding until same-window TUI switch is confirmed", async () => {
@@ -1154,6 +1210,45 @@ test("createCommandHandlers handleTelegramMessage forwards the custom model over
       options: { model: { providerID: "openai", modelID: "gpt-5" }, variant: "xhigh" },
     },
   ])
+})
+
+test("createCommandHandlers handleTelegramMessage rethrows retryable promptAsync failures", async () => {
+  const promptCalls = []
+  const err = makeBoundaryError({
+    source: "opencode",
+    operation: "POST /session/ses_current/prompt_async",
+    method: "POST",
+    pathname: "/session/ses_current/prompt_async",
+    status: 503,
+    message: "opencode unavailable",
+  })
+  const { runtime, sent } = makeRuntime({
+    config: { tgPrefix: "[TG] " },
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    ocByAlias: {
+      demo: {
+        async promptAsync(sessionId, text) {
+          promptCalls.push({ sessionId, text })
+          throw err
+        },
+      },
+    },
+    isRetryableProjectError: () => true,
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await assert.rejects(
+    () => handlers.handleTelegramMessage({
+      chat: { id: 100, type: "supergroup" },
+      from: { id: 42 },
+      message_thread_id: 7,
+      text: "retry me",
+    }),
+    /opencode unavailable/,
+  )
+
+  assert.deepEqual(promptCalls, [{ sessionId: "ses_current", text: "[TG] retry me" }])
+  assert.match(sent[0].text, /Project 'demo' is unavailable/)
 })
 
 test("createCommandHandlers handleTelegramMessage serves help and unknown commands", async () => {

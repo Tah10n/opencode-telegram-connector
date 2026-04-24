@@ -1,5 +1,6 @@
 import { normalizeFeedMode } from "../state/store.js"
 import { normalizeModelReference } from "../model-selection.js"
+import { requireSafeOpenCodeId } from "../opencode/ids.js"
 import { classifyBoundaryError, isRetryableBoundaryError, isStaleBoundaryError } from "../boundary-errors.js"
 import { makeInlineKeyboard } from "../telegram/client.js"
 import {
@@ -227,13 +228,20 @@ export function createCallbackHandlers(runtime) {
           await answerCallbackQuery(callbackQuery.id, "Binding changed")
           return
         }
-        if (binding.sessionId === targetSessionId) {
+        let safeTargetSessionId
+        try {
+          safeTargetSessionId = requireSafeOpenCodeId(targetSessionId, "session id")
+        } catch {
+          await answerCallbackQuery(callbackQuery.id, "Invalid")
+          return
+        }
+        if (binding.sessionId === safeTargetSessionId) {
           await answerCallbackQuery(callbackQuery.id, "Already current")
           return
         }
         try {
-          await oc.getSession(targetSessionId)
-          await bindCtxToSession(ctxMeta, projectAlias, targetSessionId)
+          await oc.getSession(safeTargetSessionId)
+          await bindCtxToSession(ctxMeta, projectAlias, safeTargetSessionId)
         } catch (err) {
           await answerCallbackQuery(callbackQuery.id, "Unavailable")
           await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err)).catch(ignoreError)
@@ -242,11 +250,11 @@ export function createCallbackHandlers(runtime) {
 
         await answerCallbackQuery(callbackQuery.id, "Switched")
         await renderSessionsList({ ...ctxMeta, chatId: msg?.chat?.id || ctxMeta.chatId }, {
-          binding: { projectAlias, sessionId: targetSessionId },
+          binding: { projectAlias, sessionId: safeTargetSessionId },
           editMessageId: msg?.message_id,
         }).catch(async (err) => {
           runtime.logger?.error?.("Failed to refresh sessions list:", err?.message || String(err))
-          await sendToThread(ctxMeta, await buildSessionSwitchText(projectAlias, targetSessionId, { ctxKey: ctxMeta.ctxKey })).catch(ignoreError)
+          await sendToThread(ctxMeta, await buildSessionSwitchText(projectAlias, safeTargetSessionId, { ctxKey: ctxMeta.ctxKey })).catch(ignoreError)
         })
         return
       }
@@ -421,11 +429,12 @@ export function createCallbackHandlers(runtime) {
               await answerCallbackQuery(callbackQuery.id, "Unavailable")
               return
             }
+            const safeNextSessionId = requireSafeOpenCodeId(nextSessionId, "session id")
             const targetMeta = { ...targetCtx, ctxKey: targetCtxKey, chatType: ctxMeta.chatType }
-            await bindCtxToSession(targetMeta, projectAlias, nextSessionId)
+            await bindCtxToSession(targetMeta, projectAlias, safeNextSessionId)
             await store.flush?.()
             await answerCallbackQuery(callbackQuery.id, action === "rebind" ? "Rebound" : "Created")
-            await sendToThread(ctxMeta, `${action === "rebind" ? "Rebound" : "Created and bound"} ${describeTargetCtx(targetCtxKey)} to ${projectAlias} / ${nextSessionId}.`).catch(ignoreError)
+            await sendToThread(ctxMeta, `${action === "rebind" ? "Rebound" : "Created and bound"} ${describeTargetCtx(targetCtxKey)} to ${projectAlias} / ${safeNextSessionId}.`).catch(ignoreError)
           } catch (err) {
             await answerCallbackQuery(callbackQuery.id, "Unavailable")
             await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err)).catch(ignoreError)

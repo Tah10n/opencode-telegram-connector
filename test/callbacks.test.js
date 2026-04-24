@@ -258,6 +258,28 @@ test("createCallbackHandlers switches sessions and refreshes the sessions list",
   ])
 })
 
+test("createCallbackHandlers rejects unsafe session switch callback ids", async () => {
+  const getSessionCalls = []
+  const { runtime, callbackAnswers, bindCalls } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    ocByAlias: {
+      demo: {
+        async getSession(sessionId) {
+          getSessionCalls.push(sessionId)
+          return { id: sessionId }
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("s|demo|bad/id"))
+
+  assert.deepEqual(callbackAnswers, [{ callbackQueryId: "cb_1", text: "Invalid" }])
+  assert.deepEqual(getSessionCalls, [])
+  assert.deepEqual(bindCalls, [])
+})
+
 test("createCallbackHandlers falls back to a switch message when refreshing sessions fails", async () => {
   const { runtime, callbackAnswers, bindCalls, sentMessages, loggerErrors } = makeRuntime({
     storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
@@ -626,6 +648,33 @@ test("createCallbackHandlers rebinds and creates replacement sessions for target
   assert.deepEqual(flushCalls, [true, true])
   assert.match(sentMessages[0].text, /Rebound chat 100 \/ topic 7 to demo \/ ses_startup\./)
   assert.match(sentMessages[1].text, /Created and bound chat 100 \/ topic 7 to demo \/ ses_new\./)
+})
+
+test("createCallbackHandlers refuses invalid replacement session ids", async () => {
+  const flushCalls = []
+  const { runtime, callbackAnswers, bindCalls, sentMessages } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_old" } } },
+    store: {
+      flush: async () => {
+        flushCalls.push(true)
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async createSession() {
+          return { id: "bad/id" }
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("b|new|100:7", { chatType: "private", threadIdOr0: 0 }))
+
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Unavailable"])
+  assert.deepEqual(bindCalls, [])
+  assert.deepEqual(flushCalls, [])
+  assert.match(sentMessages[0].text, /Invalid session id/)
 })
 
 test("createCallbackHandlers scopes binding actions to current thread outside private chats", async () => {

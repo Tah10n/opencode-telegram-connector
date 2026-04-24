@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer"
 import { boundaryErrorFromException, boundaryErrorFromHttpResponse } from "../boundary-errors.js"
+import { encodeOpenCodePathSegment, normalizeOpenCodeId } from "./ids.js"
 
 function basicAuthHeader(username, password) {
   const token = Buffer.from(`${username}:${password}`, "utf8").toString("base64")
@@ -137,7 +138,7 @@ export class OpenCodeClient {
   }
 
   getSession(sessionId) {
-    return this.request(`/session/${sessionId}`)
+    return this.request(`/session/${encodeOpenCodePathSegment(sessionId, "session id")}`)
   }
 
   createSession({ title, signal } = {}) {
@@ -145,7 +146,7 @@ export class OpenCodeClient {
   }
 
   abortSession(sessionId) {
-    return this.request(`/session/${sessionId}/abort`, { method: "POST" })
+    return this.request(`/session/${encodeOpenCodePathSegment(sessionId, "session id")}/abort`, { method: "POST" })
   }
 
   promptAsync(sessionId, text, options = {}) {
@@ -158,33 +159,35 @@ export class OpenCodeClient {
     if (options.noReply === true) payload.noReply = true
     if (options.system) payload.system = options.system
     if (options.tools) payload.tools = options.tools
-    return this.request(`/session/${sessionId}/prompt_async`, {
+    return this.request(`/session/${encodeOpenCodePathSegment(sessionId, "session id")}/prompt_async`, {
       method: "POST",
       json: payload,
     })
   }
 
   getMessage(sessionId, messageId) {
-    return this.request(`/session/${sessionId}/message/${messageId}`)
+    return this.request(
+      `/session/${encodeOpenCodePathSegment(sessionId, "session id")}/message/${encodeOpenCodePathSegment(messageId, "message id")}`,
+    )
   }
 
   listMessages(sessionId, { limit } = {}) {
-    return this.request(`/session/${sessionId}/message`, { query: { limit } })
+    return this.request(`/session/${encodeOpenCodePathSegment(sessionId, "session id")}/message`, { query: { limit } })
   }
 
   replyPermission(permissionId, { reply, message }) {
-    return this.request(`/permission/${permissionId}/reply`, {
+    return this.request(`/permission/${encodeOpenCodePathSegment(permissionId, "permission id")}/reply`, {
       method: "POST",
       json: { reply, ...(message ? { message } : {}) },
     })
   }
 
   replyQuestion(questionId, answers) {
-    return this.request(`/question/${questionId}/reply`, { method: "POST", json: { answers } })
+    return this.request(`/question/${encodeOpenCodePathSegment(questionId, "question id")}/reply`, { method: "POST", json: { answers } })
   }
 
   rejectQuestion(questionId) {
-    return this.request(`/question/${questionId}/reject`, { method: "POST" })
+    return this.request(`/question/${encodeOpenCodePathSegment(questionId, "question id")}/reject`, { method: "POST" })
   }
 
   listPermissions({ signal } = {}) {
@@ -196,12 +199,14 @@ export class OpenCodeClient {
   }
 
   async selectTuiSession(sessionId, { timeoutMs = 5000 } = {}) {
+    const normalizedSessionId = normalizeOpenCodeId(sessionId)
+    if (!normalizedSessionId) throw new Error("Invalid session id: expected a non-empty id")
     // Best-effort: the /tui/select-session endpoint is not guaranteed to exist
     // in all opencode versions. Fall back to publishing the equivalent event.
     try {
       return await this.request(`/tui/select-session`, {
         method: "POST",
-        json: { sessionID: String(sessionId) },
+        json: { sessionID: normalizedSessionId },
         timeoutMs,
       })
     } catch (err) {
@@ -212,7 +217,7 @@ export class OpenCodeClient {
             method: "POST",
             json: {
               type: "tui.session.select",
-              properties: { sessionID: String(sessionId) },
+              properties: { sessionID: normalizedSessionId },
             },
             timeoutMs,
           })

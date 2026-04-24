@@ -4,6 +4,7 @@ import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList
 import { sanitizeBaseUrlForDisplay } from "../url-utils.js"
 import { sessionKey } from "../state/store.js"
 import { getLaunchSupport } from "../opencode/launcher.js"
+import { isSafeOpenCodeId, normalizeOpenCodeId, requireSafeOpenCodeId } from "../opencode/ids.js"
 import { permissionNoteIdempotencyKey, telegramMessageIdempotencyKey } from "./idempotency.js"
 import {
   collectModelCandidates,
@@ -103,22 +104,45 @@ export function createCommandHandlers(runtime) {
 
   async function resolveValidStartupSession(alias, oc) {
     let startupSid = startupSessionByProject[alias] || (await resolveStartupSession(alias))
+    if (startupSid && !normalizeSafeSessionId(startupSid)) {
+      if (startupSessionByProject[alias] === startupSid) delete startupSessionByProject[alias]
+      logger.warn?.(`[${alias}] ignored invalid cached startup session id`)
+      startupSid = null
+    }
     if (!startupSid) return null
 
     try {
       await oc.getSession(startupSid)
-      return startupSid
+      return requireSessionIdFromBackend(startupSid, "startup session id")
     } catch (err) {
       if (startupSessionByProject[alias] === startupSid) delete startupSessionByProject[alias]
       startupSid = await resolveStartupSession(alias, { forceRefresh: true })
+      if (startupSid && !normalizeSafeSessionId(startupSid)) {
+        if (startupSessionByProject[alias] === startupSid) delete startupSessionByProject[alias]
+        logger.warn?.(`[${alias}] ignored invalid refreshed startup session id`)
+        startupSid = null
+      }
       if (!startupSid) throw err
       await oc.getSession(startupSid)
-      return startupSid
+      return requireSessionIdFromBackend(startupSid, "startup session id")
     }
   }
 
   async function safeInformThread(ctxMeta, text, replyMarkup, options) {
     await sendToThread(ctxMeta, text, replyMarkup, options).catch(() => {})
+  }
+
+  function normalizeSafeSessionId(value) {
+    const id = normalizeOpenCodeId(value)
+    return id && isSafeOpenCodeId(id) ? id : ""
+  }
+
+  function requireSessionIdFromBackend(value, context) {
+    return requireSafeOpenCodeId(value, context || "session id")
+  }
+
+  function invalidSessionReferenceText() {
+    return "Invalid session id. Use a session id without spaces or URL path/query characters, or provide a supported OpenCode share link."
   }
 
   function threadScopeLabel(ctxMeta) {
@@ -894,10 +918,11 @@ export function createCommandHandlers(runtime) {
         await sendToThread(ctxMeta, appendMoveConflict([`Bound to project '${alias}' (startup session): ${startupSid}`], bindResult).join("\n"))
       } else {
         const created = await oc.createSession({})
-        if (created?.id) logger.info(`[${alias}] created session for bind:`, created.id)
-        startupSessionByProject[alias] = created.id
-        const bindResult = await bindCtxToSession(ctxMeta, alias, created.id)
-        await sendToThread(ctxMeta, appendMoveConflict([`Bound to project '${alias}' with new session: ${created.id}`], bindResult).join("\n"))
+        const createdId = requireSessionIdFromBackend(created?.id, "created session id")
+        logger.info(`[${alias}] created session for bind:`, createdId)
+        startupSessionByProject[alias] = createdId
+        const bindResult = await bindCtxToSession(ctxMeta, alias, createdId)
+        await sendToThread(ctxMeta, appendMoveConflict([`Bound to project '${alias}' with new session: ${createdId}`], bindResult).join("\n"))
       }
     } catch (err) {
       await sendToThread(ctxMeta, formatProjectUnavailable(alias, err)).catch(() => {})
@@ -915,20 +940,21 @@ export function createCommandHandlers(runtime) {
       const p = projects[binding.projectAlias]
       const attachOnNewMode = String(p?.openAttachOnNewMode || "same-window")
       const created = await oc.createSession({ title: title || undefined })
-      if (created?.id) logger.info(`[${binding.projectAlias}] /new created session:`, created.id)
+      const createdId = requireSessionIdFromBackend(created?.id, "created session id")
+      logger.info(`[${binding.projectAlias}] /new created session:`, createdId)
 
       let tuiSwitchErr = null
       const canRequestTuiSwitch = attachOnNewMode === "same-window" && typeof oc?.selectTuiSession === "function"
       if (canRequestTuiSwitch) {
         await oc
-          .selectTuiSession(created.id, { timeoutMs: 2500 })
+          .selectTuiSession(createdId, { timeoutMs: 2500 })
           .then(() => {
-            logger.info(`[${binding.projectAlias}] requested TUI switch to session:`, created.id)
+            logger.info(`[${binding.projectAlias}] requested TUI switch to session:`, createdId)
           })
           .catch((err) => {
             tuiSwitchErr = err
             logger.info(
-              `[${binding.projectAlias}] failed to request TUI switch (same-window) for session=${created.id}: ${err?.message || String(err)}`,
+              `[${binding.projectAlias}] failed to request TUI switch (same-window) for session=${createdId}: ${err?.message || String(err)}`,
             )
           })
       }
@@ -947,11 +973,11 @@ export function createCommandHandlers(runtime) {
       const canAutoFollowSameWindow =
         attachOnNewMode === "same-window" && !sameWindowSwitchFailed && typeof oc?.getActiveTuiSession === "function" && !activeSessionSyncUnsupported
       if (attachOnNewMode === "same-window") {
-        const createdSessionText = await buildCreatedSessionText(binding.projectAlias, created.id, { ctxKey: ctxMeta.ctxKey })
+        const createdSessionText = await buildCreatedSessionText(binding.projectAlias, createdId, { ctxKey: ctxMeta.ctxKey })
         if (!canAutoFollowSameWindow) {
           const sameWindowFallbackNote = sameWindowSwitchFailed
-            ? `Note: Could not switch the existing TUI automatically in same-window mode. Reattach manually if needed, use /use ${created.id}, or change the project to openAttachOnNewMode=new-window.`
-            : `Note: This opencode server does not expose confirmed active TUI session tracking, so Telegram stays on the current session. Use /use ${created.id} after switching in TUI, or change the project to openAttachOnNewMode=new-window.`
+            ? `Note: Could not switch the existing TUI automatically in same-window mode. Reattach manually if needed, use /use ${createdId}, or change the project to openAttachOnNewMode=new-window.`
+            : `Note: This opencode server does not expose confirmed active TUI session tracking, so Telegram stays on the current session. Use /use ${createdId} after switching in TUI, or change the project to openAttachOnNewMode=new-window.`
           await sendToThread(
             ctxMeta,
             [
@@ -967,27 +993,27 @@ export function createCommandHandlers(runtime) {
             [
               createdSessionText,
               `Current thread stays on session: ${binding.sessionId}`,
-              `Requested TUI switch to session: ${created.id}. Telegram will switch after the TUI reports the new active session.`,
+              `Requested TUI switch to session: ${createdId}. Telegram will switch after the TUI reports the new active session.`,
             ].join("\n\n"),
           )
         }
       } else {
-        const bindResult = await bindCtxToSession(ctxMeta, binding.projectAlias, created.id)
-        await sendToThread(ctxMeta, appendMoveConflict([await buildNewSessionText(binding.projectAlias, created.id, { ctxKey: ctxMeta.ctxKey })], bindResult).join("\n"))
+        const bindResult = await bindCtxToSession(ctxMeta, binding.projectAlias, createdId)
+        await sendToThread(ctxMeta, appendMoveConflict([await buildNewSessionText(binding.projectAlias, createdId, { ctxKey: ctxMeta.ctxKey })], bindResult).join("\n"))
       }
 
       if (attachOnNewMode === "new-window") {
         const launchSupport = getLaunchSupport({ project: p, platform })
         const openAttach = openAttachWindowFn || openAttachWindowWindowsFn
         if (launchSupport.canOpenAttachWindow && openAttach) {
-          await openAttach({ directory: p.directory, baseUrl: p.baseUrl, sessionId: created.id, platform }).catch((err) => {
+          await openAttach({ directory: p.directory, baseUrl: p.baseUrl, sessionId: createdId, platform }).catch((err) => {
             logger.error("Failed to open attach window:", binding.projectAlias, err?.message || String(err))
           })
         } else {
           logger.info(`[${binding.projectAlias}] openAttachOnNewMode=new-window is configured, but no attach-window launcher is available on platform=${platform}.`)
         }
       } else if (attachOnNewMode === "same-window") {
-        logger.info(`[${binding.projectAlias}] /new created ${created.id}; openAttachOnNewMode=same-window (no new window spawned).`)
+        logger.info(`[${binding.projectAlias}] /new created ${createdId}; openAttachOnNewMode=same-window (no new window spawned).`)
       }
     } catch (err) {
       await sendToThread(ctxMeta, formatProjectUnavailable(binding.projectAlias, err)).catch(() => {})
@@ -1020,11 +1046,22 @@ export function createCommandHandlers(runtime) {
 
     try {
       let targetSessionId = sessionRef.sessionId
+      if (sessionRef.type === "session-id") {
+        targetSessionId = normalizeSafeSessionId(targetSessionId)
+        if (!targetSessionId) {
+          await safeInformThread(ctxMeta, invalidSessionReferenceText())
+          return
+        }
+      }
       if (sessionRef.type === "share-link") {
         const currentSessions = await listSessionsForShareLookup(binding.projectAlias)
         const currentMatch = findSessionByShareUrl(currentSessions, sessionRef.shareUrl)
         if (currentMatch?.id) {
-          targetSessionId = currentMatch.id
+          targetSessionId = normalizeSafeSessionId(currentMatch.id)
+          if (!targetSessionId) {
+            await safeInformThread(ctxMeta, "Share link resolved to an invalid session id; refusing to bind it.")
+            return
+          }
         } else {
           let mismatch = null
           const otherLookupErrors = []
@@ -1034,7 +1071,7 @@ export function createCommandHandlers(runtime) {
               const otherSessions = await listSessionsForShareLookup(alias)
               const otherMatch = findSessionByShareUrl(otherSessions, sessionRef.shareUrl)
               if (otherMatch?.id) {
-                mismatch = { projectAlias: alias, sessionId: otherMatch.id }
+                mismatch = { projectAlias: alias, sessionId: normalizeSafeSessionId(otherMatch.id) || String(otherMatch.id) }
                 break
               }
             } catch (err) {
@@ -1067,6 +1104,11 @@ export function createCommandHandlers(runtime) {
         }
       }
 
+      targetSessionId = normalizeSafeSessionId(targetSessionId)
+      if (!targetSessionId) {
+        await safeInformThread(ctxMeta, invalidSessionReferenceText())
+        return
+      }
       await oc.getSession(targetSessionId)
       const bindResult = await bindCtxToSession(ctxMeta, binding.projectAlias, targetSessionId)
       await sendToThread(ctxMeta, appendMoveConflict([await buildSessionSwitchText(binding.projectAlias, targetSessionId, { ctxKey: ctxMeta.ctxKey })], bindResult).join("\n"))
@@ -1428,6 +1470,7 @@ export function createCommandHandlers(runtime) {
     if (awaitingBind) {
       if (isCommand(text)) {
         const { cmd, argv } = parseCommand(text)
+        if (!cmd) return
         if (cmd === "/cancel") {
           bindAliasAwaiting.delete(ctxMeta.ctxKey)
           await sendToThread(ctxMeta, "Cancelled.")
@@ -1450,6 +1493,7 @@ export function createCommandHandlers(runtime) {
 
     if (isCommand(text)) {
       const { cmd, args, argv } = parseCommand(text)
+      if (!cmd) return
       if (cmd === "/cancel") {
         const hadBind = bindAliasAwaiting.delete(ctxMeta.ctxKey)
         const hadRejectNote = rejectNoteAwaiting.has(ctxMeta.ctxKey)
@@ -1568,6 +1612,7 @@ export function createCommandHandlers(runtime) {
       const alias = binding.projectAlias
       const withButton = isRetryableProjectError(err) && canAutoStartProject(alias, { platform })
       await sendToThread(ctxMeta, formatProjectUnavailable(alias, err), withButton ? startServerKeyboard(alias) : null).catch(() => {})
+      if (isRetryableProjectError(err)) throw err
     }
   }
 

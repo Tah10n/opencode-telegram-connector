@@ -69,6 +69,37 @@ test("ensureStartupSession creates a session when none exist", async () => {
   assert.equal(createCalls, 1)
 })
 
+test("ensureStartupSession does not cache invalid session ids", async () => {
+  const startInProgress = new Map()
+  const startupSessionByProject = {}
+  const startupSessionInProgress = new Map()
+  let createCalls = 0
+  const ocByAlias = {
+    demo: {
+      async listSessions() {
+        return [{ id: "bad/id" }]
+      },
+      async createSession() {
+        createCalls += 1
+        return { id: "also bad" }
+      },
+    },
+  }
+
+  const sid = await ensureStartupSession({
+    alias: "demo",
+    startInProgress,
+    startupSessionByProject,
+    startupSessionInProgress,
+    ocByAlias,
+    logger: makeLogger(),
+  })
+
+  assert.equal(sid, null)
+  assert.equal(startupSessionByProject.demo, undefined)
+  assert.equal(createCalls, 1)
+})
+
 test("ensureStartupSession deduplicates concurrent calls", async () => {
   const startInProgress = new Map()
   const startupSessionByProject = {}

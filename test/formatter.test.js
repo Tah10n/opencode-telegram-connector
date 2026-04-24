@@ -61,8 +61,23 @@ test("formatMarkdownToTelegramHtmlBlocks falls back to escaped plain text for ex
 
   assert.ok(blocks.length >= 2)
   assert.equal(blocks[0].html, "intro")
-  assert.ok(blocks.some((block) => block.html === "&lt;".repeat(2000)))
-  assert.ok(blocks.some((block) => block.html === "&lt;"))
+  const body = blocks.slice(1).map((block) => block.html).join("")
+  assert.equal(body, "&lt;".repeat(2001))
+  for (const block of blocks) {
+    assert.ok(block.html.length <= 3900)
+    assert.doesNotMatch(block.html, /&(?:l|lt)$/)
+  }
+})
+
+test("formatMarkdownToTelegramHtmlBlocks does not split escaped entities", () => {
+  const blocks = formatMarkdownToTelegramHtmlBlocks(`a${"<".repeat(2000)}&`)
+
+  assert.ok(blocks.length > 1)
+  assert.equal(blocks.map((block) => block.html).join(""), `a${"&lt;".repeat(2000)}&amp;`)
+  for (const block of blocks) {
+    assert.ok(block.html.length <= 3900)
+    assert.doesNotMatch(block.html, /&(?:a|am|amp|l|lt)$/)
+  }
 })
 
 test("formatMarkdownToTelegramHtmlBlocks splits fenced code across mixed line lengths", () => {

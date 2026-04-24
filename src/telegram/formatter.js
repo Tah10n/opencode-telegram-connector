@@ -72,6 +72,21 @@ function splitPlainText(text, maxLen) {
   return chunks
 }
 
+function splitEscapedPlainText(text, maxLen) {
+  const chunks = []
+  let current = ""
+  for (const ch of String(text ?? "")) {
+    const escaped = escapeHtml(ch)
+    if (current && current.length + escaped.length > maxLen) {
+      chunks.push(current)
+      current = ""
+    }
+    current += escaped
+  }
+  if (current) chunks.push(current)
+  return chunks
+}
+
 export function formatMarkdownToTelegramHtmlBlocks(markdownText) {
   const s = String(markdownText ?? "")
   const blocks = []
@@ -121,8 +136,8 @@ export function formatMarkdownToTelegramHtmlBlocks(markdownText) {
             cur = htmlLine
           } else {
             // Extreme fallback: avoid HTML entirely for this long line.
-            for (const plainChunk of splitPlainText(line, maxLen)) {
-              blocks.push({ type: "text", html: escapeHtml(plainChunk) })
+            for (const escapedChunk of splitEscapedPlainText(line, maxLen)) {
+              blocks.push({ type: "text", html: escapedChunk })
             }
           }
         }
