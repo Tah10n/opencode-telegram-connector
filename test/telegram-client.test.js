@@ -1,7 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { TelegramClient, makeInlineKeyboard, splitTelegramHtml, splitTelegramText } from "../src/telegram/client.js"
-import { classifyBoundaryError } from "../src/boundary-errors.js"
+import { classifyBoundaryError, makeBoundaryError } from "../src/boundary-errors.js"
 
 test("splitTelegramText keeps short lines and splits oversized lines", () => {
   const chunks = splitTelegramText(`short\n${"x".repeat(6)}`, 5)
@@ -369,5 +369,39 @@ test("TelegramClient sendHtmlBlocks, sendDocument, and edit helpers use the expe
     },
     { method: "editMessageReplyMarkup", params: { chat_id: 100, message_id: 200, reply_markup: replyMarkup } },
     { method: "answerCallbackQuery", params: { callback_query_id: "cb_1", text: "Done" } },
+  ])
+})
+
+test("TelegramClient editMessageText treats Telegram unchanged edits as no-ops", async () => {
+  const client = new TelegramClient("token")
+  const replyMarkup = makeInlineKeyboard([[{ text: "Refresh", callback_data: "s|refresh" }]])
+  const calls = []
+
+  client.call = async (method, params) => {
+    calls.push({ method, params })
+    throw makeBoundaryError({
+      source: "telegram",
+      operation: "POST editMessageText",
+      method: "POST",
+      pathname: "/editMessageText",
+      status: 400,
+      message: "editMessageText failed: Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message",
+      details: { ok: false, error_code: 400, description: "Bad Request: message is not modified" },
+    })
+  }
+
+  const result = await client.editMessageText(100, 200, "unchanged", replyMarkup)
+
+  assert.equal(result, true)
+  assert.deepEqual(calls, [
+    {
+      method: "editMessageText",
+      params: {
+        chat_id: 100,
+        message_id: 200,
+        text: "unchanged",
+        reply_markup: replyMarkup,
+      },
+    },
   ])
 })

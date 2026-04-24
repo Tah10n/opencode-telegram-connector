@@ -123,6 +123,13 @@ export function splitTelegramHtml(text, maxLen = 3900) {
   return chunks
 }
 
+function isMessageNotModifiedError(err) {
+  const description = [err?.message, err?.details?.description]
+    .filter((value) => typeof value === "string" && value)
+    .join(" ")
+  return /message is not modified/i.test(description)
+}
+
 export class TelegramClient {
   constructor(token, { baseUrl, fileBaseUrl } = {}) {
     this.token = token
@@ -422,7 +429,10 @@ export class TelegramClient {
         ...(options.disable_web_page_preview != null ? { disable_web_page_preview: options.disable_web_page_preview } : {}),
       },
       { timeoutMs: 20_000 },
-    )
+    ).catch((err) => {
+      if (isMessageNotModifiedError(err)) return true
+      throw err
+    })
   }
 
   editMessageReplyMarkup(chatId, messageId, replyMarkup) {
