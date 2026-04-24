@@ -116,6 +116,63 @@ test("TelegramClient getUpdates forwards params and timeout metadata", async () 
   })
 })
 
+test("TelegramClient getFile and downloadFile use Telegram file API", async () => {
+  const originalFetch = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init })
+    if (String(url).includes("/getFile")) {
+      return { ok: true, status: 200, statusText: "OK", json: async () => ({ ok: true, result: { file_path: "docs/a b.txt", file_size: 5 } }) }
+    }
+    return {
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      headers: { get: (name) => (name.toLowerCase() === "content-length" ? "5" : null) },
+      arrayBuffer: async () => new TextEncoder().encode("hello").buffer,
+    }
+  }
+
+  try {
+    const client = new TelegramClient("token", {
+      baseUrl: "https://api.example.test/bottoken",
+      fileBaseUrl: "https://files.example.test/file/bottoken",
+    })
+    assert.deepEqual(await client.getFile("file_1"), { file_path: "docs/a b.txt", file_size: 5 })
+    assert.equal(new TextDecoder().decode(await client.downloadFile("docs/a b.txt", { maxBytes: 10 })), "hello")
+    assert.equal(calls[0].url, "https://api.example.test/bottoken/getFile")
+    assert.equal(calls[1].url, "https://files.example.test/file/bottoken/docs/a%20b.txt")
+    assert.equal(calls[1].init.method, "GET")
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("TelegramClient downloadFile rejects oversized downloads", async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    headers: { get: () => "100" },
+    arrayBuffer: async () => new ArrayBuffer(100),
+  })
+
+  try {
+    const client = new TelegramClient("token", { fileBaseUrl: "https://files.example.test/file/bottoken" })
+    await assert.rejects(async () => client.downloadFile("big.txt", { maxBytes: 10 }), /exceeds limit/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("TelegramClient downloadFile rejects unsafe file paths", async () => {
+  const client = new TelegramClient("token", { fileBaseUrl: "https://files.example.test/file/bottoken" })
+
+  await assert.rejects(async () => client.downloadFile("../secret.txt"), /unsafe/i)
+  await assert.rejects(async () => client.downloadFile("safe/../secret.txt"), /unsafe/i)
+})
+
 test("TelegramClient wrappers forward getMe, setMyCommands, and deleteMessage", async () => {
   const client = new TelegramClient("token")
   const calls = []

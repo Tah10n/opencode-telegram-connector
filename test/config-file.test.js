@@ -5,6 +5,7 @@ import os from "node:os"
 import path from "node:path"
 import crypto from "node:crypto"
 import { buildRuntimeConfig, parseCliArgs } from "../src/config/runtime.js"
+import { DEFAULT_LIMITS } from "../src/limits.js"
 
 async function makeTempDir() {
   const dir = path.join(os.tmpdir(), `telegram-connector-${crypto.randomUUID()}`)
@@ -49,6 +50,14 @@ test("buildRuntimeConfig loads connector.config.mjs and resolves relative paths"
       tgPrefix: "[TG] ",
       echoFilterMode: "recent",
       allowInsecureHttp: true,
+      limits: {
+        userAttachmentConfirmBytes: 1000,
+        userAttachmentMaxBytes: 2000,
+        changedFilesLimit: 3,
+        inlineDiffTextMaxChars: 1200,
+        streamPreviewMaxChars: 1300,
+        textAttachmentThreshold: 1400,
+      },
       projects: {
         demo: {
           directory: "./repo",
@@ -71,6 +80,15 @@ test("buildRuntimeConfig loads connector.config.mjs and resolves relative paths"
   assert.equal(config.cwd, dir)
   assert.equal(config.projects.demo.directory, path.resolve(dir, "repo"))
   assert.equal(config.allowInsecureHttp, true)
+  assert.deepEqual(config.limits, {
+    ...DEFAULT_LIMITS,
+    userAttachmentConfirmBytes: 1000,
+    userAttachmentMaxBytes: 2000,
+    changedFilesLimit: 3,
+    inlineDiffTextMaxChars: 1200,
+    streamPreviewMaxChars: 1300,
+    textAttachmentThreshold: 1400,
+  })
 })
 
 test("buildRuntimeConfig loads .env before evaluating connector.config.mjs", async (t) => {
@@ -107,6 +125,75 @@ test("buildRuntimeConfig loads .env before evaluating connector.config.mjs", asy
   assert.equal(config.telegram.botToken, "env-token")
   assert.equal(config.telegram.allowedUserId, 77)
   assert.equal(config.projects.demo.password, "secret")
+})
+
+test("buildRuntimeConfig loads configurable Telegram workflow limits from env", async (t) => {
+  const dir = await makeTempDir()
+  swapEnv(t, {
+    TELEGRAM_BOT_TOKEN: undefined,
+    TELEGRAM_ALLOWED_USER_ID: undefined,
+    PROJECTS_JSON: undefined,
+    TG_ATTACHMENT_CONFIRM_BYTES: undefined,
+    TG_ATTACHMENT_MAX_BYTES: undefined,
+    TG_CHANGED_FILES_LIMIT: undefined,
+    TG_INLINE_DIFF_TEXT_MAX_CHARS: undefined,
+    TG_STREAM_PREVIEW_MAX_CHARS: undefined,
+    TG_TEXT_ATTACHMENT_THRESHOLD: undefined,
+  })
+  await fs.writeFile(
+    path.join(dir, ".env"),
+    [
+      "TELEGRAM_BOT_TOKEN=env-token",
+      "TELEGRAM_ALLOWED_USER_ID=77",
+      'PROJECTS_JSON={"demo":{"baseUrl":"http://127.0.0.1:4312"}}',
+      "TG_ATTACHMENT_CONFIRM_BYTES=111",
+      "TG_ATTACHMENT_MAX_BYTES=222",
+      "TG_CHANGED_FILES_LIMIT=4",
+      "TG_INLINE_DIFF_TEXT_MAX_CHARS=333",
+      "TG_STREAM_PREVIEW_MAX_CHARS=444",
+      "TG_TEXT_ATTACHMENT_THRESHOLD=555",
+    ].join("\n"),
+    "utf8",
+  )
+
+  const { config } = await buildRuntimeConfig({ cwd: dir })
+
+  assert.deepEqual(config.limits, {
+    userAttachmentConfirmBytes: 111,
+    userAttachmentMaxBytes: 222,
+    changedFilesLimit: 4,
+    inlineDiffTextMaxChars: 333,
+    streamPreviewMaxChars: 444,
+    textAttachmentThreshold: 555,
+  })
+})
+
+test("buildRuntimeConfig rejects invalid Telegram workflow limits", async (t) => {
+  const dir = await makeTempDir()
+  swapEnv(t, {
+    TELEGRAM_BOT_TOKEN: undefined,
+    TELEGRAM_ALLOWED_USER_ID: undefined,
+    PROJECTS_JSON: undefined,
+  })
+  await fs.writeFile(
+    path.join(dir, ".env"),
+    [
+      "TELEGRAM_BOT_TOKEN=env-token",
+      "TELEGRAM_ALLOWED_USER_ID=77",
+      'PROJECTS_JSON={"demo":{"baseUrl":"http://127.0.0.1:4312"}}',
+    ].join("\n"),
+    "utf8",
+  )
+  await fs.writeFile(
+    path.join(dir, "connector.config.mjs"),
+    `export default {
+      limits: { userAttachmentConfirmBytes: 2000, userAttachmentMaxBytes: 1000 },
+      projects: { demo: { baseUrl: "http://127.0.0.1:4312" } }
+    }`,
+    "utf8",
+  )
+
+  await assert.rejects(() => buildRuntimeConfig({ cwd: dir }), /userAttachmentConfirmBytes cannot exceed userAttachmentMaxBytes/)
 })
 
 test("buildRuntimeConfig lets connector.config.mjs override legacy env and projects json", async (t) => {

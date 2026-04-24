@@ -5,7 +5,7 @@ import { sanitizeBaseUrlForDisplay } from "../url-utils.js"
 import { sessionKey } from "../state/store.js"
 import { getLaunchSupport } from "../opencode/launcher.js"
 import { isSafeOpenCodeId, normalizeOpenCodeId, requireSafeOpenCodeId } from "../opencode/ids.js"
-import { permissionNoteIdempotencyKey, telegramMessageIdempotencyKey } from "./idempotency.js"
+import { hashIdempotencyValue, permissionNoteIdempotencyKey, telegramMessageIdempotencyKey } from "./idempotency.js"
 import {
   collectModelCandidates,
   commonVariantsForModel,
@@ -18,7 +18,20 @@ import {
   normalizeVariant,
   pickMostRecentSessionModelInfo,
 } from "../model-selection.js"
-import { isRetryableBoundaryError, isStaleBoundaryError } from "../boundary-errors.js"
+import { classifyBoundaryError, isRetryableBoundaryError, isStaleBoundaryError } from "../boundary-errors.js"
+import { userAttachmentLimitsFromConfig } from "../limits.js"
+import {
+  attachmentConfirmationText,
+  attachmentDownloadFailedText,
+  attachmentSentText,
+  decodeTextAttachment,
+  describeTelegramDocument,
+  formatAttachmentPrompt,
+  shouldConfirmAttachment,
+  unsupportedAttachmentText,
+  unsupportedMediaKind,
+  unsupportedMediaText,
+} from "./incoming-attachments.js"
 
 function helpText({ scopeLabel = "this thread", defaultProject = "", isBound = false } = {}) {
   const next = isBound
@@ -57,6 +70,7 @@ export function createCommandHandlers(runtime) {
     config,
     logger,
     platform,
+    tg,
     getStartupSession,
     openAttachWindowFn,
     openAttachWindowWindowsFn,
@@ -98,6 +112,12 @@ export function createCommandHandlers(runtime) {
     buildGlobalRuntimeStatusLines,
   } = runtime
 
+  const pendingAttachmentConfirmations = new Map()
+  const pendingAttachmentSends = new Set()
+  const ATTACHMENT_CONFIRMATION_TTL_MS = 30 * 60 * 1000
+  const MAX_PENDING_ATTACHMENT_CONFIRMATIONS = 200
+  const userAttachmentLimits = userAttachmentLimitsFromConfig(config?.limits)
+
   async function resolveStartupSession(alias, { forceRefresh = false } = {}) {
     return getStartupSession(alias, { waitForStart: false, forceRefresh }).catch(() => null)
   }
@@ -130,6 +150,11 @@ export function createCommandHandlers(runtime) {
 
   async function safeInformThread(ctxMeta, text, replyMarkup, options) {
     await sendToThread(ctxMeta, text, replyMarkup, options).catch(() => {})
+  }
+
+  async function safeEditMessage(ctxMeta, messageId, text, replyMarkup, options) {
+    if (!messageId || !tg?.editMessageText) return
+    await tg.editMessageText(ctxMeta.chatId, messageId, text, replyMarkup, options).catch(() => {})
   }
 
   function normalizeSafeSessionId(value) {
@@ -191,6 +216,53 @@ export function createCommandHandlers(runtime) {
     ])
   }
 
+  function closeOnlyKeyboard() {
+    return makeInlineKeyboard([[{ text: "Close", callback_data: runtime.cb.pack("s|close") }]])
+  }
+
+  function attachmentConfirmationKeyboard(token) {
+    return makeInlineKeyboard([
+      [
+        { text: "Send file", callback_data: runtime.cb.pack(`att|send|${token}`) },
+        { text: "Cancel", callback_data: runtime.cb.pack(`att|cancel|${token}`) },
+      ],
+      [{ text: "Close", callback_data: runtime.cb.pack(`att|close|${token}`) }],
+    ])
+  }
+
+  function prunePendingAttachmentConfirmations(now = Date.now()) {
+    for (const [token, record] of pendingAttachmentConfirmations.entries()) {
+      if (!record?.expiresAt || record.expiresAt <= now) pendingAttachmentConfirmations.delete(token)
+    }
+    while (pendingAttachmentConfirmations.size > MAX_PENDING_ATTACHMENT_CONFIRMATIONS) {
+      const oldest = pendingAttachmentConfirmations.keys().next().value
+      if (!oldest) break
+      pendingAttachmentConfirmations.delete(oldest)
+    }
+  }
+
+  function rememberPendingAttachmentConfirmation(record) {
+    prunePendingAttachmentConfirmations()
+    const createdAt = Date.now()
+    const token = hashIdempotencyValue(`${record.messageKey}:${record.documentInfo?.fileId}:${createdAt}:${Math.random()}`)
+    pendingAttachmentConfirmations.set(token, {
+      ...record,
+      token,
+      createdAt,
+      expiresAt: createdAt + ATTACHMENT_CONFIRMATION_TTL_MS,
+    })
+    prunePendingAttachmentConfirmations(createdAt)
+    return token
+  }
+
+  function attachmentSendIdempotencyKey(record) {
+    return `tg-attachment-send:${hashIdempotencyValue(`${record?.messageKey || ""}:${record?.projectAlias || ""}:${record?.sessionId || ""}`)}`
+  }
+
+  function bindingMatches(a, b) {
+    return !!a && !!b && a.projectAlias === b.projectAlias && a.sessionId === b.sessionId
+  }
+
   function unbindConfirmationText(ctxMeta, binding) {
     return [
       "Confirm unbind for this thread:",
@@ -231,6 +303,223 @@ export function createCommandHandlers(runtime) {
       return marked
     }
     return false
+  }
+
+  async function loadTelegramAttachment(record) {
+    if (!tg?.getFile || !tg?.downloadFile) throw new Error("Telegram file download API is not available")
+    const file = await tg.getFile(record.documentInfo.fileId)
+    const filePath = typeof file?.file_path === "string" ? file.file_path.trim() : ""
+    const reportedSize = Number.isFinite(Number(file?.file_size)) ? Number(file.file_size) : record.documentInfo.fileSize
+    const documentInfo = { ...record.documentInfo, fileSize: reportedSize ?? record.documentInfo.fileSize }
+    if (documentInfo.fileSize != null && documentInfo.fileSize > userAttachmentLimits.maxBytes) {
+      return { outcome: "too_large", documentInfo: { ...documentInfo, reason: "too_large" } }
+    }
+    if (!filePath) throw new Error("Telegram file path is missing")
+
+    const bytes = await tg.downloadFile(filePath, { maxBytes: userAttachmentLimits.maxBytes })
+    const byteLength = bytes?.byteLength ?? bytes?.length ?? 0
+    if (byteLength > userAttachmentLimits.maxBytes) {
+      return { outcome: "too_large", documentInfo: { ...documentInfo, fileSize: byteLength, reason: "too_large" } }
+    }
+    let text
+    try {
+      text = decodeTextAttachment(bytes)
+    } catch (err) {
+      return { outcome: "unsupported_text", documentInfo, error: err }
+    }
+    return { outcome: "ok", text, byteLength, documentInfo: { ...documentInfo, fileSize: byteLength } }
+  }
+
+  async function sendAttachmentPromptToOpenCode(ctxMeta, binding, record, loaded) {
+    const oc = ocByAlias[binding.projectAlias]
+    const prefix = config.tgPrefix ?? "[TG] "
+    const promptText = formatAttachmentPrompt({
+      prefix,
+      caption: record.caption,
+      documentInfo: loaded.documentInfo,
+      text: loaded.text,
+      byteLength: loaded.byteLength,
+    })
+    const sk = sessionKey(binding.projectAlias, binding.sessionId)
+    ensureRecentPromptSet(sk).add(hashTextForEcho(promptText))
+    const promptOverride = await resolvePromptOverride(ctxMeta.ctxKey, binding)
+    await oc.promptAsync(binding.sessionId, promptText, promptOverride || undefined)
+    return promptText
+  }
+
+  async function requestAttachmentConfirmation(ctxMeta, record, markMessageHandled) {
+    const token = rememberPendingAttachmentConfirmation(record)
+    await sendToThread(ctxMeta, attachmentConfirmationText(record.documentInfo, { limits: userAttachmentLimits }), attachmentConfirmationKeyboard(token))
+    if (markMessageHandled) {
+      await markMessageHandled("attachmentConfirmRequested", {
+        projectAlias: record.projectAlias,
+        sessionId: record.sessionId,
+        action: "confirm-required",
+      })
+    }
+    return token
+  }
+
+  async function handleAttachmentDocumentMessage(ctxMeta, msg, binding, messageKey, markMessageHandled, options = {}) {
+    const documentInfo = describeTelegramDocument(msg.document, { limits: userAttachmentLimits })
+    const record = {
+      ctxKey: ctxMeta.ctxKey,
+      projectAlias: binding.projectAlias,
+      sessionId: binding.sessionId,
+      binding: { projectAlias: binding.projectAlias, sessionId: binding.sessionId },
+      messageKey,
+      updateId: Number.isInteger(options?.updateId) ? options.updateId : undefined,
+      messageId: Number.isInteger(msg?.message_id) ? msg.message_id : undefined,
+      caption: typeof msg?.caption === "string" ? msg.caption : "",
+      documentInfo,
+    }
+
+    if (!documentInfo.supported) {
+      await sendToThread(ctxMeta, unsupportedAttachmentText(documentInfo, { limits: userAttachmentLimits }), closeOnlyKeyboard())
+      await markMessageHandled("unsupportedAttachment", { projectAlias: binding.projectAlias, sessionId: binding.sessionId })
+      return
+    }
+
+    if (shouldConfirmAttachment(documentInfo, { limits: userAttachmentLimits })) {
+      await requestAttachmentConfirmation(ctxMeta, record, markMessageHandled)
+      return
+    }
+
+    let loaded
+    try {
+      loaded = await loadTelegramAttachment(record)
+    } catch (err) {
+      const classification = classifyBoundaryError(err, { source: "telegram", operation: "download attachment" })
+      await safeInformThread(ctxMeta, attachmentDownloadFailedText(documentInfo), closeOnlyKeyboard())
+      if (classification.retryable) throw err
+      await markMessageHandled("attachmentDownloadFailed", { projectAlias: binding.projectAlias, sessionId: binding.sessionId })
+      return
+    }
+
+    if (loaded.outcome === "too_large") {
+      await sendToThread(ctxMeta, unsupportedAttachmentText(loaded.documentInfo, { limits: userAttachmentLimits }), closeOnlyKeyboard())
+      await markMessageHandled("attachmentTooLarge", { projectAlias: binding.projectAlias, sessionId: binding.sessionId })
+      return
+    }
+    if (loaded.outcome === "unsupported_text") {
+      await sendToThread(ctxMeta, `${unsupportedAttachmentText(documentInfo, { limits: userAttachmentLimits })}\nReason: ${loaded.error?.message || "not UTF-8 text"}`, closeOnlyKeyboard())
+      await markMessageHandled("unsupportedAttachmentText", { projectAlias: binding.projectAlias, sessionId: binding.sessionId })
+      return
+    }
+    if (shouldConfirmAttachment(loaded.documentInfo, { limits: userAttachmentLimits })) {
+      await requestAttachmentConfirmation(ctxMeta, { ...record, documentInfo: loaded.documentInfo }, markMessageHandled)
+      return
+    }
+
+    try {
+      await sendAttachmentPromptToOpenCode(ctxMeta, binding, record, loaded)
+      await markMessageHandled("promptAsyncAttachment", { projectAlias: binding.projectAlias, sessionId: binding.sessionId })
+      await safeInformThread(ctxMeta, attachmentSentText(loaded.documentInfo, binding), closeOnlyKeyboard())
+    } catch (err) {
+      const alias = binding.projectAlias
+      const withButton = isRetryableProjectError(err) && canAutoStartProject(alias, { platform })
+      await safeInformThread(ctxMeta, formatProjectUnavailable(alias, err), withButton ? startServerKeyboard(alias) : closeOnlyKeyboard())
+      if (isRetryableProjectError(err)) throw err
+    }
+  }
+
+  async function handleAttachmentConfirmation(ctxMeta, action, token, { editMessageId } = {}) {
+    prunePendingAttachmentConfirmations()
+    const record = pendingAttachmentConfirmations.get(token)
+    if (record && record.ctxKey !== ctxMeta.ctxKey) {
+      return { callbackText: "Wrong thread" }
+    }
+    if (action === "cancel" || action === "close") {
+      if (record) pendingAttachmentConfirmations.delete(token)
+      if (action === "cancel") await safeEditMessage(ctxMeta, editMessageId, "Attachment sending cancelled.", closeOnlyKeyboard())
+      return { callbackText: action === "cancel" ? "Cancelled" : "Closed" }
+    }
+
+    if (!record) {
+      await safeEditMessage(ctxMeta, editMessageId, "Attachment confirmation expired. Send the file again.", closeOnlyKeyboard())
+      return { callbackText: "Expired" }
+    }
+
+    const currentBinding = store.getBinding(ctxMeta.ctxKey)
+    if (!bindingMatches(currentBinding, record.binding)) {
+      pendingAttachmentConfirmations.delete(token)
+      await safeEditMessage(
+        ctxMeta,
+        editMessageId,
+        "Attachment was not sent because this thread's binding changed. Send the file again for the current session.",
+        closeOnlyKeyboard(),
+      )
+      return { callbackText: "Binding changed" }
+    }
+
+    const sendKey = attachmentSendIdempotencyKey(record)
+    if (hasIdempotencyKey(sendKey)) {
+      pendingAttachmentConfirmations.delete(token)
+      await safeEditMessage(ctxMeta, editMessageId, "Attachment was already sent to OpenCode.", closeOnlyKeyboard())
+      return { callbackText: "Already sent" }
+    }
+    if (pendingAttachmentSends.has(sendKey)) {
+      return { callbackText: "Already sending" }
+    }
+    pendingAttachmentSends.add(sendKey)
+
+    try {
+      let loaded
+      try {
+        loaded = await loadTelegramAttachment(record)
+      } catch (err) {
+        const classification = classifyBoundaryError(err, { source: "telegram", operation: "download attachment" })
+        await safeInformThread(ctxMeta, attachmentDownloadFailedText(record.documentInfo), closeOnlyKeyboard())
+        return { callbackText: classification.retryable ? "Try again" : "Download failed" }
+      }
+
+      if (loaded.outcome === "too_large") {
+        pendingAttachmentConfirmations.delete(token)
+        await safeEditMessage(ctxMeta, editMessageId, unsupportedAttachmentText(loaded.documentInfo, { limits: userAttachmentLimits }), closeOnlyKeyboard())
+        return { callbackText: "Too large" }
+      }
+      if (loaded.outcome === "unsupported_text") {
+        pendingAttachmentConfirmations.delete(token)
+        await safeEditMessage(
+          ctxMeta,
+          editMessageId,
+          `${unsupportedAttachmentText(record.documentInfo, { limits: userAttachmentLimits })}\nReason: ${loaded.error?.message || "not UTF-8 text"}`,
+          closeOnlyKeyboard(),
+        )
+        return { callbackText: "Unsupported" }
+      }
+
+      try {
+        await sendAttachmentPromptToOpenCode(ctxMeta, currentBinding, record, loaded)
+      } catch (err) {
+        const alias = currentBinding.projectAlias
+        const withButton = isRetryableProjectError(err) && canAutoStartProject(alias, { platform })
+        await safeInformThread(ctxMeta, formatProjectUnavailable(alias, err), withButton ? startServerKeyboard(alias) : closeOnlyKeyboard())
+        if (isRetryableProjectError(err)) return { callbackText: "Temporarily unavailable" }
+        throw err
+      }
+
+      await markIdempotencyEntries([
+        {
+          key: sendKey,
+          metadata: {
+            kind: "telegram-attachment",
+            ctxKey: ctxMeta.ctxKey,
+            projectAlias: currentBinding.projectAlias,
+            sessionId: currentBinding.sessionId,
+            operation: "promptAsyncAttachment",
+            action: "send-confirmed",
+            updateId: record.updateId,
+            messageId: record.messageId,
+          },
+        },
+      ])
+      pendingAttachmentConfirmations.delete(token)
+      await safeEditMessage(ctxMeta, editMessageId, attachmentSentText(loaded.documentInfo, currentBinding), closeOnlyKeyboard())
+      return { callbackText: "Sent" }
+    } finally {
+      pendingAttachmentSends.delete(sendKey)
+    }
   }
 
   function normalizeEpochMs(value) {
@@ -1331,8 +1620,11 @@ export function createCommandHandlers(runtime) {
     const ctxMeta = runtime.ctxMetaFromMessage(msg)
     if (!ctxMeta.chatId) return
 
-    const text = msg?.text
-    if (typeof text !== "string" || !text.trim()) return
+    const text = typeof msg?.text === "string" ? msg.text : ""
+    const hasText = !!text.trim()
+    const hasDocument = !!msg?.document
+    const mediaKind = unsupportedMediaKind(msg)
+    if (!hasText && !hasDocument && !mediaKind) return
 
     const messageKey = telegramMessageIdempotencyKey(ctxMeta, msg)
     if (hasIdempotencyKey(messageKey)) return
@@ -1355,6 +1647,11 @@ export function createCommandHandlers(runtime) {
 
     const awaitingQ = awaitingCustomAnswer.get(ctxMeta.ctxKey)
     if (awaitingQ) {
+      if (!hasText) {
+        await sendToThread(ctxMeta, "This question expects a text answer. Send text or /cancel.", closeOnlyKeyboard())
+        await markMessageHandled("questionNonText", { projectAlias: awaitingQ.projectAlias })
+        return
+      }
       const wizard = getWizard(awaitingQ.projectAlias, awaitingQ.requestId, awaitingQ.sessionID)
       if (!wizard || wizard.index !== awaitingQ.qIndex) {
         setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
@@ -1388,6 +1685,11 @@ export function createCommandHandlers(runtime) {
 
     const awaiting = rejectNoteAwaiting.get(ctxMeta.ctxKey)
     if (awaiting) {
+      if (!hasText) {
+        await sendToThread(ctxMeta, "This permission flow expects a text rejection note. Send text or /cancel.", closeOnlyKeyboard())
+        await markMessageHandled("permissionNoteNonText", { projectAlias: awaiting.projectAlias })
+        return
+      }
       const oc = ocByAlias[awaiting.projectAlias]
       const noteKey = permissionNoteIdempotencyKey(awaiting.projectAlias, awaiting.sessionID, awaiting.permissionId, text)
       if (hasIdempotencyKey(noteKey)) {
@@ -1468,6 +1770,11 @@ export function createCommandHandlers(runtime) {
 
     const awaitingBind = bindAliasAwaiting.get(ctxMeta.ctxKey)
     if (awaitingBind) {
+      if (!hasText) {
+        await sendToThread(ctxMeta, "This bind flow expects a project alias as text. Send an alias or /cancel.", closeOnlyKeyboard())
+        await markMessageHandled("bindAliasNonText")
+        return
+      }
       if (isCommand(text)) {
         const { cmd, argv } = parseCommand(text)
         if (!cmd) return
@@ -1491,7 +1798,7 @@ export function createCommandHandlers(runtime) {
       }
     }
 
-    if (isCommand(text)) {
+    if (hasText && isCommand(text)) {
       const { cmd, args, argv } = parseCommand(text)
       if (!cmd) return
       if (cmd === "/cancel") {
@@ -1599,6 +1906,19 @@ export function createCommandHandlers(runtime) {
       return
     }
 
+    if (hasDocument) {
+      await handleAttachmentDocumentMessage(ctxMeta, msg, binding, messageKey, markMessageHandled, options)
+      return
+    }
+
+    if (mediaKind) {
+      await sendToThread(ctxMeta, unsupportedMediaText(mediaKind, { limits: userAttachmentLimits }), closeOnlyKeyboard())
+      await markMessageHandled("unsupportedMedia", { projectAlias: binding.projectAlias, sessionId: binding.sessionId, action: mediaKind })
+      return
+    }
+
+    if (!hasText) return
+
     const oc = ocByAlias[binding.projectAlias]
     const prefix = config.tgPrefix ?? "[TG] "
     try {
@@ -1633,6 +1953,7 @@ export function createCommandHandlers(runtime) {
     handleProjects,
     renderProjectSessions,
     handleUnbind,
+    handleAttachmentConfirmation,
     handleTelegramMessage,
     buildSessionSwitchText,
     setThreadModelPreference,

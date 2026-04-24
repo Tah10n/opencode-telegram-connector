@@ -3,6 +3,7 @@ import assert from "node:assert/strict"
 import { makeBoundaryError } from "../src/boundary-errors.js"
 import { createCommandHandlers } from "../src/connector/commands.js"
 import { buildProjectsOverviewText as buildProjectsOverviewTextBase } from "../src/connector/overview.js"
+import { USER_ATTACHMENT_LIMITS } from "../src/connector/incoming-attachments.js"
 
 function makeRuntime(overrides = {}) {
   const { store: storeOverrides, ...runtimeOverrides } = overrides
@@ -1248,6 +1249,306 @@ test("createCommandHandlers handleTelegramMessage rethrows retryable promptAsync
   )
 
   assert.deepEqual(promptCalls, [{ sessionId: "ses_current", text: "[TG] retry me" }])
+  assert.match(sent[0].text, /Project 'demo' is unavailable/)
+})
+
+test("createCommandHandlers handleTelegramMessage forwards small text documents as attachment prompts", async () => {
+  const promptCalls = []
+  const { runtime, sent } = makeRuntime({
+    config: { tgPrefix: "[TG] " },
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    tg: {
+      async getFile(fileId) {
+        assert.equal(fileId, "file_1")
+        return { file_path: "files/app.js", file_size: 16 }
+      },
+      async downloadFile(filePath, options) {
+        assert.equal(filePath, "files/app.js")
+        assert.equal(options.maxBytes, USER_ATTACHMENT_LIMITS.maxBytes)
+        return new TextEncoder().encode("console.log(1)")
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async promptAsync(sessionId, text) {
+          promptCalls.push({ sessionId, text })
+          return { ok: true }
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 10,
+    message_thread_id: 7,
+    caption: "Review this file",
+    document: { file_id: "file_1", file_name: "app.js", mime_type: "text/javascript", file_size: 16 },
+  })
+
+  assert.equal(promptCalls.length, 1)
+  assert.equal(promptCalls[0].sessionId, "ses_current")
+  assert.match(promptCalls[0].text, /^\[TG\] Review this file/)
+  assert.match(promptCalls[0].text, /Filename: app\.js/)
+  assert.match(promptCalls[0].text, /console\.log\(1\)/)
+  assert.match(sent.at(-1).text, /Attachment sent to demo\/ses_current: app\.js/)
+})
+
+test("createCommandHandlers requires confirmation for large text documents and can cancel", async () => {
+  const promptCalls = []
+  const editCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    tg: {
+      async editMessageText(...args) {
+        editCalls.push(args)
+        return true
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async promptAsync(...args) {
+          promptCalls.push(args)
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 11,
+    message_thread_id: 7,
+    document: { file_id: "file_large", file_name: "large.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
+  })
+
+  assert.equal(promptCalls.length, 0)
+  assert.match(sent[0].text, /Confirm sending this file/)
+  const sendButton = sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file")
+  const token = sendButton.callback_data.split("|")[2]
+  const wrongThread = await handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 8, ctxKey: "100:8" }, "cancel", token, { editMessageId: 76 })
+  assert.deepEqual(wrongThread, { callbackText: "Wrong thread" })
+  assert.equal(editCalls.length, 0)
+  const result = await handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "cancel", token, { editMessageId: 77 })
+
+  assert.deepEqual(result, { callbackText: "Cancelled" })
+  assert.equal(promptCalls.length, 0)
+  assert.equal(editCalls[0][2], "Attachment sending cancelled.")
+})
+
+test("createCommandHandlers sends confirmed large text documents", async () => {
+  const promptCalls = []
+  const editCalls = []
+  const storeState = { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } }, marked: [] }
+  const { runtime, sent } = makeRuntime({
+    storeState,
+    store: {
+      hasIdempotencyKey: () => false,
+      markIdempotencyKey: (key, metadata) => {
+        storeState.marked.push({ key, metadata })
+        return true
+      },
+      flush: async () => {},
+    },
+    tg: {
+      async getFile() {
+        return { file_path: "files/large.log", file_size: USER_ATTACHMENT_LIMITS.confirmBytes }
+      },
+      async downloadFile() {
+        return new TextEncoder().encode("log line")
+      },
+      async editMessageText(...args) {
+        editCalls.push(args)
+        return true
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async promptAsync(sessionId, text) {
+          promptCalls.push({ sessionId, text })
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 12,
+    message_thread_id: 7,
+    document: { file_id: "file_large", file_name: "large.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
+  })
+  const token = sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file").callback_data.split("|")[2]
+
+  const result = await handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", token, { editMessageId: 78 })
+
+  assert.deepEqual(result, { callbackText: "Sent" })
+  assert.equal(promptCalls.length, 1)
+  assert.match(promptCalls[0].text, /large\.log/)
+  assert.match(promptCalls[0].text, /log line/)
+  assert.match(editCalls.at(-1)[2], /Attachment sent to demo\/ses_current: large\.log/)
+  assert.equal(storeState.marked.some((entry) => entry.metadata.kind === "telegram-attachment"), true)
+})
+
+test("createCommandHandlers suppresses parallel confirmed attachment sends", async () => {
+  const promptCalls = []
+  let releasePrompt
+  const promptStarted = new Promise((resolve) => {
+    releasePrompt = resolve
+  })
+  let unblockPrompt
+  const promptBlocked = new Promise((resolve) => {
+    unblockPrompt = resolve
+  })
+  const storeState = { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } }
+  const { runtime, sent } = makeRuntime({
+    storeState,
+    store: {
+      hasIdempotencyKey: () => false,
+      markIdempotencyKey: () => true,
+      flush: async () => {},
+    },
+    tg: {
+      async getFile() {
+        return { file_path: "files/large.log", file_size: USER_ATTACHMENT_LIMITS.confirmBytes }
+      },
+      async downloadFile() {
+        return new TextEncoder().encode("log line")
+      },
+      async editMessageText() {
+        return true
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async promptAsync(sessionId, text) {
+          promptCalls.push({ sessionId, text })
+          releasePrompt()
+          await promptBlocked
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 16,
+    message_thread_id: 7,
+    document: { file_id: "file_large", file_name: "large.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
+  })
+  const token = sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file").callback_data.split("|")[2]
+
+  const first = handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", token, { editMessageId: 79 })
+  await promptStarted
+  const second = await handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", token, { editMessageId: 79 })
+  unblockPrompt()
+  await first
+
+  assert.deepEqual(second, { callbackText: "Already sending" })
+  assert.equal(promptCalls.length, 1)
+})
+
+test("createCommandHandlers rejects unsupported media messages", async () => {
+  const promptCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    ocByAlias: {
+      demo: {
+        async promptAsync(...args) {
+          promptCalls.push(args)
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 13,
+    message_thread_id: 7,
+    photo: [{ file_id: "photo_1" }],
+  })
+
+  assert.equal(promptCalls.length, 0)
+  assert.match(sent[0].text, /photo messages are not supported/)
+})
+
+test("createCommandHandlers rethrows retryable Telegram attachment download failures", async () => {
+  const err = makeBoundaryError({ source: "telegram", method: "POST", pathname: "/getFile", status: 503, message: "getFile unavailable" })
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    tg: {
+      async getFile() {
+        throw err
+      },
+      async downloadFile() {
+        throw new Error("should not download")
+      },
+    },
+    ocByAlias: { demo: { async promptAsync() {} } },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await assert.rejects(
+    () => handlers.handleTelegramMessage({
+      chat: { id: 100, type: "supergroup" },
+      from: { id: 42 },
+      message_id: 14,
+      message_thread_id: 7,
+      document: { file_id: "file_1", file_name: "a.txt", mime_type: "text/plain", file_size: 10 },
+    }),
+    /getFile unavailable/,
+  )
+  assert.match(sent[0].text, /could not be downloaded/)
+})
+
+test("createCommandHandlers rethrows retryable OpenCode send failures for attachments", async () => {
+  const err = makeBoundaryError({
+    source: "opencode",
+    operation: "POST /session/ses_current/prompt_async",
+    method: "POST",
+    pathname: "/session/ses_current/prompt_async",
+    status: 503,
+    message: "opencode unavailable",
+  })
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    tg: {
+      async getFile() {
+        return { file_path: "files/a.txt", file_size: 10 }
+      },
+      async downloadFile() {
+        return new TextEncoder().encode("hello")
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async promptAsync() {
+          throw err
+        },
+      },
+    },
+    isRetryableProjectError: () => true,
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await assert.rejects(
+    () => handlers.handleTelegramMessage({
+      chat: { id: 100, type: "supergroup" },
+      from: { id: 42 },
+      message_id: 15,
+      message_thread_id: 7,
+      document: { file_id: "file_1", file_name: "a.txt", mime_type: "text/plain", file_size: 10 },
+    }),
+    /opencode unavailable/,
+  )
   assert.match(sent[0].text, /Project 'demo' is unavailable/)
 })
 

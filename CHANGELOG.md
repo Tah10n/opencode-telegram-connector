@@ -27,6 +27,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Public OSS basics such as license, contributing guide, and CI.
 - Cross-platform desktop launcher support for Windows, Linux, and macOS `tui` / attach flows.
 - Added a unified `connector.config.mjs` configuration path with legacy `.env` / `projects.json` fallback.
+- Telegram document prompts for UTF-8 text/code/log files, including size limits and confirmation before large files are sent to opencode.
+- Changed-file cards can export summaries as `.txt`, full diffs as `.patch`, and selected file diffs when available.
+- Telegram attachment, changed-file, streaming preview, and long-output fallback limits are configurable via `connector.config.mjs` `limits`.
 
 ### Changed
 - Node.js support baseline is now 20+.

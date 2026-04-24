@@ -2,6 +2,7 @@ import path from "node:path"
 import { loadEnvFromFile, envOptional, envRequired, envInt, envBool } from "./env.js"
 import { loadConnectorConfigFile } from "./file.js"
 import { loadProjectsConfig } from "./projects.js"
+import { normalizeLimits } from "../limits.js"
 
 function resolveCliPath(filePath) {
   return filePath ? path.resolve(process.cwd(), filePath) : undefined
@@ -67,6 +68,7 @@ export async function buildRuntimeConfig({ args = {}, cwd = process.cwd() } = {}
     tgPrefix: configFromFile.tgPrefix ?? envOptional("TG_PREFIX", ""),
     echoFilterMode: configFromFile.echoFilterMode ?? envOptional("ECHO_FILTER_MODE", "recent"),
     allowInsecureHttp: configFromFile.allowInsecureHttp ?? envBool("OPENCODE_ALLOW_INSECURE_HTTP", false),
+    limits: normalizeLimits(configFromFile.limits || {}),
     cwd: configFromFile.cwd || configBaseDir,
   }
 

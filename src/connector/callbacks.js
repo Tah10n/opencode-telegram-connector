@@ -586,12 +586,33 @@ export function createCallbackHandlers(runtime) {
         const sessionId = parts[2]
         const opencodeMessageId = parts[3]
         const action = parts[4]
-        if (!projectAlias || !sessionId || !opencodeMessageId || (action !== "show" && action !== "back")) {
+        const validChangedFilesActions = new Set(["show", "back", "summary", "patch", "files", "file", "filepatch"])
+        if (!projectAlias || !sessionId || !opencodeMessageId || !validChangedFilesActions.has(action)) {
           await answerCallbackQuery(callbackQuery.id, "Invalid")
           return
         }
         await answerCallbackQuery(callbackQuery.id)
-        await renderChangedFilesView(ctxMeta, projectAlias, sessionId, opencodeMessageId, action, { editMessageId: msg?.message_id }).catch(ignoreError)
+        const viewOptions = { editMessageId: msg?.message_id }
+        if (parts[5] != null) viewOptions.actionArg = parts[5]
+        await renderChangedFilesView(ctxMeta, projectAlias, sessionId, opencodeMessageId, action, viewOptions)
+        return
+      }
+
+      if (kind === "att") {
+        const action = parts[1]
+        const token = parts[2]
+        if (!token || (action !== "send" && action !== "cancel" && action !== "close")) {
+          await answerCallbackQuery(callbackQuery.id, "Invalid")
+          return
+        }
+        if (action === "close") {
+          await runtime.handleAttachmentConfirmation?.(ctxMeta, action, token, { editMessageId: msg?.message_id })
+          await closeInteractiveMessage(callbackQuery.id, ctxMeta, msg?.message_id)
+          return
+        }
+        if (action === "send") await answerCallbackQuery(callbackQuery.id, "Sending…")
+        const result = await runtime.handleAttachmentConfirmation?.(ctxMeta, action, token, { editMessageId: msg?.message_id })
+        if (action !== "send") await answerCallbackQuery(callbackQuery.id, result?.callbackText || (action === "cancel" ? "Cancelled" : "Closed"))
         return
       }
 

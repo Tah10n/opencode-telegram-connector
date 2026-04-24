@@ -687,7 +687,7 @@ test("startConnector falls back to a .txt attachment for very long assistant out
 
     assert.match(harness.tg.sentMessages[0].text, /attached as a \.txt file/i)
     assert.equal(harness.tg.sentDocuments[0].options.message_thread_id, 7)
-    assert.match(harness.tg.sentDocuments[0].filename, /demo-ses_1-msg_long\.txt/)
+    assert.match(harness.tg.sentDocuments[0].filename, /demo-ses_1-msg_long-assistant\.txt/)
     assert.match(String(harness.tg.sentDocuments[0].contents), /line 0: x{20}/)
   } finally {
     await harness.connector.stop()
@@ -1707,7 +1707,7 @@ test("startConnector changed-files Show diff falls back gracefully when diff is 
   }
 })
 
-test("startConnector changed-files Show diff attaches large diffs as text files", async () => {
+test("startConnector changed-files Show diff attaches large diffs as patch files", async () => {
   const completedAt = new Date(Date.now() + 60_000).toISOString()
   const longDiff = Array.from({ length: 900 }, (_, index) => `+line ${index} ${"x".repeat(10)}`).join("\n")
   const harness = await createHarness({
@@ -1740,7 +1740,7 @@ test("startConnector changed-files Show diff attaches large diffs as text files"
 
     await waitFor(() => harness.tg.editedMessages.length >= 1 && harness.tg.sentDocuments.length >= 1)
     assert.match(harness.tg.editedMessages[0].text, /Diff is too large for an inline preview/)
-    assert.match(harness.tg.sentDocuments[0].filename, /msg_patch_large.*\.diff\.txt/)
+    assert.match(harness.tg.sentDocuments[0].filename, /msg_patch_large.*changed-files\.patch/)
     assert.match(String(harness.tg.sentDocuments[0].contents), /\+line 0/)
   } finally {
     await harness.connector.stop()

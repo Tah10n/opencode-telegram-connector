@@ -176,6 +176,58 @@ test("renderChangedFilesView reports when the changed-files update is no longer 
   assert.equal(calls.editMessageText[0][2], "Changed files update is no longer available.")
 })
 
+test("renderChangedFilesView refuses stale buttons after thread rebind", async () => {
+  const { calls, handlers } = createHarness({
+    store: { getBinding: () => ({ projectAlias: "demo", sessionId: "ses_other" }) },
+    ocByAlias: {
+      demo: {
+        async getMessage() {
+          throw new Error("should not fetch")
+        },
+      },
+    },
+  })
+
+  await handlers.renderChangedFilesView(
+    { chatId: 11, threadIdOr0: 22, ctxKey: "11:22" },
+    "demo",
+    "ses_1",
+    "msg_1",
+    "patch",
+    { editMessageId: 88 },
+  )
+
+  assert.equal(calls.editMessageText.length, 1)
+  assert.match(calls.editMessageText[0][2], /no longer valid/)
+  assert.equal(calls.sendDocument.length, 0)
+})
+
+test("renderChangedFilesView refuses stale buttons after thread unbind", async () => {
+  const { calls, handlers } = createHarness({
+    store: { getBinding: () => null },
+    ocByAlias: {
+      demo: {
+        async getMessage() {
+          throw new Error("should not fetch")
+        },
+      },
+    },
+  })
+
+  await handlers.renderChangedFilesView(
+    { chatId: 11, threadIdOr0: 22, ctxKey: "11:22" },
+    "demo",
+    "ses_1",
+    "msg_1",
+    "patch",
+    { editMessageId: 88 },
+  )
+
+  assert.equal(calls.editMessageText.length, 1)
+  assert.match(calls.editMessageText[0][2], /no longer bound/)
+  assert.equal(calls.sendDocument.length, 0)
+})
+
 test("deliverChangedFilesSummary falls back to sending a new message when edit fails", async () => {
   const { calls, handlers } = createHarness({
     tg: {
@@ -227,7 +279,119 @@ test("deliverAssistantText falls back to a notice message before attaching long 
   assert.equal(calls.sendToThread.length, 1)
   assert.match(calls.sendToThread[0][1], /attached as a \.txt file/)
   assert.equal(calls.sendDocument.length, 1)
-  assert.equal(calls.sendDocument[0][2], "demo-ses_1-msg_1.txt")
+  assert.equal(calls.sendDocument[0][2], "demo-ses_1-msg_1-assistant.txt")
+})
+
+test("renderChangedFilesView sends full patch export as a .patch document", async () => {
+  const { calls, handlers } = createHarness({
+    ocByAlias: {
+      demo: {
+        async getMessage() {
+          return {
+            parts: [{ type: "patch", files: ["/repo/src/app.js"], diff: "diff --git a/src/app.js b/src/app.js\n--- a/src/app.js\n+++ b/src/app.js\n@@ -1 +1 @@\n-old\n+new" }],
+          }
+        },
+      },
+    },
+  })
+
+  await handlers.renderChangedFilesView(
+    { chatId: 11, threadIdOr0: 22, ctxKey: "11:22" },
+    "demo",
+    "ses_1",
+    "msg_1",
+    "patch",
+    { editMessageId: 77 },
+  )
+
+  assert.equal(calls.sendDocument.length, 1)
+  assert.equal(calls.sendDocument[0][2], "demo-ses_1-msg_1-changed-files.patch")
+  assert.match(calls.sendDocument[0][1], /diff --git/)
+  assert.match(calls.sendDocument[0][3], /Changed files diff/)
+})
+
+test("renderChangedFilesView suppresses duplicate changed-files exports", async () => {
+  const sentKeys = new Set()
+  const { calls, handlers } = createHarness({
+    store: {
+      hasIdempotencyKey: (key) => sentKeys.has(key),
+      markIdempotencyKey: (key) => {
+        sentKeys.add(key)
+        return true
+      },
+      flush: async () => {},
+    },
+    ocByAlias: {
+      demo: {
+        async getMessage() {
+          return { parts: [{ type: "patch", files: ["/repo/src/app.js"], diff: "diff --git a/src/app.js b/src/app.js\n+new" }] }
+        },
+      },
+    },
+  })
+
+  const ctxMeta = { chatId: 11, threadIdOr0: 22, ctxKey: "11:22" }
+  await handlers.renderChangedFilesView(ctxMeta, "demo", "ses_1", "msg_1", "patch", { editMessageId: 77 })
+  await handlers.renderChangedFilesView(ctxMeta, "demo", "ses_1", "msg_1", "patch", { editMessageId: 77 })
+
+  assert.equal(calls.sendDocument.length, 1)
+})
+
+test("renderChangedFilesView shows and exports selected file diffs", async () => {
+  const diff = [
+    "diff --git a/src/a.js b/src/a.js",
+    "--- a/src/a.js",
+    "+++ b/src/a.js",
+    "@@ -1 +1 @@",
+    "-old",
+    "+new",
+    "diff --git a/src/b.js b/src/b.js",
+    "--- a/src/b.js",
+    "+++ b/src/b.js",
+    "@@ -2 +2 @@",
+    "-left",
+    "+right",
+  ].join("\n")
+  const { calls, handlers } = createHarness({
+    ocByAlias: {
+      demo: {
+        async getMessage() {
+          return { parts: [{ type: "patch", diff }] }
+        },
+      },
+    },
+  })
+
+  await handlers.renderChangedFilesView(
+    { chatId: 11, threadIdOr0: 22, ctxKey: "11:22" },
+    "demo",
+    "ses_1",
+    "msg_1",
+    "files",
+    { editMessageId: 77 },
+  )
+  await handlers.renderChangedFilesView(
+    { chatId: 11, threadIdOr0: 22, ctxKey: "11:22" },
+    "demo",
+    "ses_1",
+    "msg_1",
+    "file",
+    { editMessageId: 77, actionArg: "1" },
+  )
+  await handlers.renderChangedFilesView(
+    { chatId: 11, threadIdOr0: 22, ctxKey: "11:22" },
+    "demo",
+    "ses_1",
+    "msg_1",
+    "filepatch",
+    { editMessageId: 77, actionArg: "1" },
+  )
+
+  assert.match(calls.editMessageText[0][2], /Changed file diffs:/)
+  assert.match(calls.editMessageText[1][2], /src\/b\.js/)
+  assert.match(calls.editMessageText[1][2], /\+right/)
+  assert.equal(calls.sendDocument.length, 1)
+  assert.match(calls.sendDocument[0][2], /file-diff-b\.js\.patch$/)
 })
 
 test("handleMessageUpdated drops assistant events when there is no bound route", async () => {

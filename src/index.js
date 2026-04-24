@@ -23,6 +23,7 @@ import { createRuntimeObservability } from "./runtime/observability.js"
 import { DEFAULT_FEED_MODE, StateStore, normalizeFeedMode, resolveDefaultStatePath, sessionKey } from "./state/store.js"
 import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "./session-list.js"
 import { sanitizeBaseUrlForDisplay } from "./url-utils.js"
+import { normalizeLimits } from "./limits.js"
 
 function now() {
   return new Date().toISOString()
@@ -185,6 +186,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     const raw = String(process.env.MIRROR_COMPACTION || "").trim().toLowerCase()
     return raw === "1" || raw === "true" || raw === "yes" || raw === "on"
   })()
+  const limits = normalizeLimits(config?.limits ?? {}, { env: {} })
 
   const stateFile = config?.stateFile || resolveDefaultStatePath({ cwd: config?.cwd })
   const store = createStateStore({ filePath: stateFile, logger })
@@ -390,10 +392,10 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   }
 
   const cb = makeCallbackStore()
-  const CHANGED_FILES_LIMIT = 10
-  const INLINE_DIFF_TEXT_MAX_CHARS = 2500
-  const STREAM_PREVIEW_MAX_CHARS = 3500
-  const TEXT_ATTACHMENT_THRESHOLD = 12_000
+  const CHANGED_FILES_LIMIT = limits.changedFilesLimit
+  const INLINE_DIFF_TEXT_MAX_CHARS = limits.inlineDiffTextMaxChars
+  const STREAM_PREVIEW_MAX_CHARS = limits.streamPreviewMaxChars
+  const TEXT_ATTACHMENT_THRESHOLD = limits.textAttachmentThreshold
   // Bound the amount of per-session state we keep.
   const forwardedBySession = new LruMap(2000) // sessionKey -> {user:LruSet, assistant:LruSet, changes:LruSet}
   const assistantDebounce = new Map() // `${projectAlias}:${sessionId}:${msgId}` -> timeout

@@ -52,6 +52,10 @@ export function normalizeConnectorConfig(raw, { configFilePath } = {}) {
   if (raw.tgPrefix != null) out.tgPrefix = String(raw.tgPrefix)
   if (raw.echoFilterMode != null && raw.echoFilterMode !== "") out.echoFilterMode = String(raw.echoFilterMode)
   if (raw.allowInsecureHttp != null) out.allowInsecureHttp = parseConfigBool("allowInsecureHttp", raw.allowInsecureHttp)
+  if (raw.limits != null) {
+    if (!isPlainObject(raw.limits)) throw new Error("Config field 'limits' must be an object")
+    out.limits = { ...raw.limits }
+  }
 
   if (raw.telegram != null) {
     if (!isPlainObject(raw.telegram)) throw new Error("Config field 'telegram' must be an object")

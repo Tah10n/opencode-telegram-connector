@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { extractPatchDiffText, extractPatchFiles, formatChangedFilesText } from "../src/message-display.js"
+import { extractPatchDiffText, extractPatchFileEntries, extractPatchFiles, formatChangedFilesText } from "../src/message-display.js"
 
 test("extractPatchFiles returns unique file list from patch parts", () => {
   const files = extractPatchFiles({
@@ -46,4 +46,38 @@ test("extractPatchDiffText falls back to hunk headers and lines", () => {
   assert.match(diff, /@@ -1 \+1 @@/)
   assert.match(diff, /-old/)
   assert.match(diff, /\+new/)
+})
+
+test("extractPatchFileEntries splits unified diffs by file", () => {
+  const entries = extractPatchFileEntries({
+    parts: [
+      {
+        type: "patch",
+        diff: [
+          "diff --git a/src/a.js b/src/a.js",
+          "--- a/src/a.js",
+          "+++ b/src/a.js",
+          "@@ -1 +1 @@",
+          "-old",
+          "+new",
+          "diff --git a/src/b.js b/src/b.js",
+          "--- a/src/b.js",
+          "+++ b/src/b.js",
+          "@@ -2 +2 @@",
+          "-left",
+          "+right",
+        ].join("\n"),
+      },
+    ],
+  })
+
+  assert.deepEqual(entries.map((entry) => entry.file), ["src/a.js", "src/b.js"])
+  assert.match(entries[0].diff, /\+new/)
+  assert.match(entries[1].diff, /\+right/)
+})
+
+test("extractPatchFileEntries keeps file entries without available diff", () => {
+  const entries = extractPatchFileEntries({ parts: [{ type: "patch", files: ["a.txt", "b.txt"] }] })
+
+  assert.deepEqual(entries, [{ file: "a.txt", diff: "" }, { file: "b.txt", diff: "" }])
 })

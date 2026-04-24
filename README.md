@@ -79,6 +79,15 @@ export default {
 
   defaultProject: "pocket",
 
+  limits: {
+    userAttachmentConfirmBytes: 32 * 1024,
+    userAttachmentMaxBytes: 256 * 1024,
+    changedFilesLimit: 10,
+    inlineDiffTextMaxChars: 2500,
+    streamPreviewMaxChars: 3500,
+    textAttachmentThreshold: 12_000,
+  },
+
   projects: {
     pocket: {
       directory: "./project-a",
@@ -130,6 +139,38 @@ In groups and forum topics, Telegram commands addressed to another bot are ignor
 - `Main + changes` — final assistant replies and changed-file cards.
 - `Verbose` — final replies, streaming previews, user mirror, and changed-file cards.
 
+## File, code, and log workflow
+
+### Incoming Telegram files
+
+When a Telegram thread is bound to a project/session, you can send UTF-8 text-like files as Telegram **documents**. The connector includes the file contents in the prompt text for that thread's bound opencode session; it does not create a global current file or switch any other thread.
+
+Supported document types:
+
+- plain text and logs: `.txt`, `.text`, `.log`, Markdown
+- code and scripts: JavaScript/TypeScript, Python, Go, Rust, Java/Kotlin, C/C++, C#, PHP, Swift, shell, PowerShell, batch/cmd
+- data/config/diffs: JSON/JSONL, YAML, TOML, INI/CFG/CONF, XML/HTML/CSS/SCSS/SASS, SQL, CSV, `.diff`, `.patch`
+- any Telegram document reported as `text/*` MIME type
+
+Limits and intentionally unsupported media:
+
+- Maximum file size defaults to **256 KiB** (`limits.userAttachmentMaxBytes`).
+- Files from **32 KiB** require an inline confirmation before their contents are sent to opencode (`limits.userAttachmentConfirmBytes`).
+- Only UTF-8 text is accepted. Binary or invalid UTF-8 files are rejected.
+- Photos, videos, audio/voice, stickers, contacts, locations, polls, and PDFs/images are intentionally out of scope for now.
+- Filenames are sanitized before being shown or included in prompts; long token-like filename segments are redacted.
+
+If Telegram file download or opencode `prompt_async` is temporarily unavailable, the connector keeps the action retryable instead of pretending the file was delivered.
+
+### Outgoing long text and changed files
+
+Long assistant replies are still delivered as `.txt` attachments instead of oversized Telegram messages. Changed-file cards include buttons to:
+
+- show an inline diff preview when it fits Telegram limits
+- send the changed-file summary as `.txt`
+- send the full diff as `.patch`
+- open per-file diff choices and send a selected file diff as `.patch` when file-level diffs are available
+
 ## Configuration overview
 
 ### Global settings (`connector.config.mjs` or env)
@@ -143,6 +184,19 @@ In groups and forum topics, Telegram commands addressed to another bot are ignor
 - `OPENCODE_ALLOW_INSECURE_HTTP=1` / `allowInsecureHttp`
 - `OPENCODE_TERMINAL` (Linux terminal launcher override)
 - `cwd` (`connector.config.mjs` only; base directory for relative paths)
+
+### Telegram workflow limits
+
+Prefer the `limits` object in `connector.config.mjs`; env fallbacks are available for legacy deployments.
+
+| `connector.config.mjs` key | Env fallback | Default | Purpose |
+| --- | --- | ---: | --- |
+| `limits.userAttachmentConfirmBytes` | `TG_ATTACHMENT_CONFIRM_BYTES` | `32768` | Ask before sending larger Telegram documents to opencode. |
+| `limits.userAttachmentMaxBytes` | `TG_ATTACHMENT_MAX_BYTES` | `262144` | Reject larger incoming Telegram documents. |
+| `limits.changedFilesLimit` | `TG_CHANGED_FILES_LIMIT` | `10` | Number of changed files shown in Telegram lists. |
+| `limits.inlineDiffTextMaxChars` | `TG_INLINE_DIFF_TEXT_MAX_CHARS` | `2500` | Inline diff preview size before `.patch` fallback. |
+| `limits.streamPreviewMaxChars` | `TG_STREAM_PREVIEW_MAX_CHARS` | `3500` | Streaming assistant preview size. |
+| `limits.textAttachmentThreshold` | `TG_TEXT_ATTACHMENT_THRESHOLD` | `12000` | Assistant reply size before `.txt` fallback. |
 
 ### Per-project fields
 
@@ -228,7 +282,7 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 - On first start, it drains old Telegram updates to avoid replaying history.
 - State load and critical state flush/write failures fail closed; the connector should not continue as if durability succeeded.
 - Feed mode is stored per Telegram thread/topic; the default is `Main + changes`.
-- Large replies or diffs may be delivered as `.txt` attachments instead of many chat messages.
+- Large assistant replies may be delivered as `.txt` attachments, and large changed-file diffs may be delivered as `.patch` attachments instead of many chat messages.
 - Telegram HTML messages are split with tag/entity awareness to avoid malformed chunks.
 - OpenCode path IDs are URL-encoded at the HTTP boundary; user-entered binding/session IDs are validated before being persisted.
 - Parent-session routing uses a bounded cache for long-running processes.

@@ -2,8 +2,9 @@ import crypto from "node:crypto"
 import { makeInlineKeyboard } from "../telegram/client.js"
 import { escapeHtml, formatMarkdownToTelegramHtmlBlocks } from "../telegram/formatter.js"
 import { ctxKeyFrom } from "../telegram/routing.js"
-import { extractPatchDiffText, extractPatchFiles, formatChangedFilesText } from "../message-display.js"
+import { extractPatchDiffText, extractPatchFileEntries, extractPatchFiles, formatChangedFilesText } from "../message-display.js"
 import { DEFAULT_FEED_MODE, normalizeFeedMode, sessionKey } from "../state/store.js"
+import { ATTACHMENT_NOTICES, attachmentCaption, sanitizeFilenamePart, scopedAttachmentFilename } from "./attachment-utils.js"
 
 export function createMirroringHandlers(runtime) {
   const {
@@ -34,6 +35,7 @@ export function createMirroringHandlers(runtime) {
 
   const pause = typeof sleep === "function" ? sleep : (ms) => new Promise((resolve) => setTimeout(resolve, ms))
   const isStopping = () => abortSignal?.aborted === true
+  const changedFilesExportInFlight = new Set()
 
   function ensureForwardedSets(sk) {
     let s = forwardedBySession.get(sk)
@@ -56,6 +58,46 @@ export function createMirroringHandlers(runtime) {
   function hashTextForEcho(text) {
     const t = String(text ?? "")
     return crypto.createHash("sha1").update(t, "utf8").digest("hex") + ":" + String(t.length)
+  }
+
+  function changedFilesExportIdempotencyKey(projectAlias, sessionId, messageId, action, actionArg = "") {
+    const hash = crypto
+      .createHash("sha1")
+      .update(JSON.stringify([projectAlias, sessionId, messageId, action, actionArg]), "utf8")
+      .digest("hex")
+      .slice(0, 24)
+    return `changed-files-export:${hash}`
+  }
+
+  async function claimChangedFilesExport(projectAlias, sessionId, messageId, action, actionArg = "") {
+    const key = changedFilesExportIdempotencyKey(projectAlias, sessionId, messageId, action, actionArg)
+    if (store?.hasIdempotencyKey?.(key) || changedFilesExportInFlight.has(key)) return { claimed: false, key }
+    changedFilesExportInFlight.add(key)
+    return { claimed: true, key }
+  }
+
+  async function markChangedFilesExportSent(key, { projectAlias, sessionId, action } = {}) {
+    if (!key) return
+    if (typeof store?.markIdempotencyKey === "function") {
+      const marked = store.markIdempotencyKey(key, {
+        kind: "changed-files-export",
+        projectAlias,
+        sessionId,
+        operation: "sendDocument",
+        action,
+      })
+      if (marked && typeof store?.flush === "function") await store.flush()
+      return
+    }
+    if (typeof store?.markIdempotencyKeyAndFlush === "function") {
+      await store.markIdempotencyKeyAndFlush(key, {
+        kind: "changed-files-export",
+        projectAlias,
+        sessionId,
+        operation: "sendDocument",
+        action,
+      })
+    }
   }
 
   function getFeedMode(ctxKey) {
@@ -112,28 +154,49 @@ export function createMirroringHandlers(runtime) {
     await sendToThread(ctxMeta, text, replyMarkup)
   }
 
-  function changedFilesAttachmentName(projectAlias, sessionId, messageId) {
-    const clean = (value, fallback) => {
-      const s = String(value || fallback)
-        .replace(/[^a-z0-9._-]+/gi, "-")
-        .replace(/^-+|-+$/g, "")
-      return s || fallback
+  function changedFilesAttachmentName(projectAlias, sessionId, messageId, { label = "changed-files", extension = ".patch", fileName = "" } = {}) {
+    return scopedAttachmentFilename({ projectAlias, sessionId, messageId, label, fileName, extension })
+  }
+
+  function changedFilesSummaryKeyboard(projectAlias, sessionId, messageId, msg) {
+    const fileEntries = extractPatchFileEntries(msg).filter((entry) => entry.diff)
+    const rows = [
+      [{ text: "Show diff", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|show`) }],
+      [
+        { text: "Send summary", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|summary`) },
+        { text: "Full .patch", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|patch`) },
+      ],
+    ]
+    if (fileEntries.length) rows.push([{ text: "File diffs", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|files`) }])
+    rows.push([{ text: "Close", callback_data: cb.pack("cf|close") }])
+    return makeInlineKeyboard(rows)
+  }
+
+  function changedFilesDiffKeyboard(projectAlias, sessionId, messageId, { fileIndex = null } = {}) {
+    const rows = [[{ text: "Back", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|back`) }]]
+    if (Number.isInteger(fileIndex)) {
+      rows.push([{ text: "Send file .patch", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|filepatch|${fileIndex}`) }])
     }
-    return `${clean(projectAlias, "project")}-${clean(sessionId, "session")}-${clean(messageId, "reply")}.diff.txt`
+    rows.push([{ text: "Full .patch", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|patch`) }])
+    rows.push([{ text: "Close", callback_data: cb.pack("cf|close") }])
+    return makeInlineKeyboard(rows)
   }
 
-  function changedFilesSummaryKeyboard(projectAlias, sessionId, messageId) {
-    return makeInlineKeyboard([[
-      { text: "Show diff", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|show`) },
-      { text: "Close", callback_data: cb.pack("cf|close") },
-    ]])
-  }
-
-  function changedFilesDiffKeyboard(projectAlias, sessionId, messageId) {
-    return makeInlineKeyboard([[
+  function changedFilesListKeyboard(projectAlias, sessionId, messageId, entries) {
+    const rows = entries.slice(0, CHANGED_FILES_LIMIT).map((entry, index) => [{
+      text: `${index + 1}. ${sanitizeFilenamePart(entry.file, "file")}`.slice(0, 64),
+      callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|file|${index}`),
+    }])
+    rows.push([
       { text: "Back", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|back`) },
-      { text: "Close", callback_data: cb.pack("cf|close") },
-    ]])
+      { text: "Full .patch", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|patch`) },
+    ])
+    rows.push([{ text: "Close", callback_data: cb.pack("cf|close") }])
+    return makeInlineKeyboard(rows)
+  }
+
+  function changedFilesCloseKeyboard() {
+    return makeInlineKeyboard([[{ text: "Close", callback_data: cb.pack("cf|close") }]])
   }
 
   function extractTextParts(message) {
@@ -152,10 +215,14 @@ export function createMirroringHandlers(runtime) {
     return `<b>Changed files diff</b>\n<pre><code>${escapeHtml(diffText)}</code></pre>`
   }
 
+  function renderSelectedFileDiffHtml(entry) {
+    return `<b>Changed file diff: ${escapeHtml(entry?.file || "file")}</b>\n<pre><code>${escapeHtml(entry?.diff || "")}</code></pre>`
+  }
+
   async function deliverChangedFilesSummary(ctxMeta, projectAlias, sessionId, messageId, msg, { replaceMessageId } = {}) {
     const text = extractChangedFilesSummary(projectAlias, msg)
     if (!text) return null
-    const replyMarkup = changedFilesSummaryKeyboard(projectAlias, sessionId, messageId)
+    const replyMarkup = changedFilesSummaryKeyboard(projectAlias, sessionId, messageId, msg)
     if (replaceMessageId) {
       const edited = await tg.editMessageText(ctxMeta.chatId, replaceMessageId, text, replyMarkup).catch(() => null)
       if (edited) return { mode: "edited" }
@@ -164,8 +231,20 @@ export function createMirroringHandlers(runtime) {
     return { mode: "sent" }
   }
 
-  async function renderChangedFilesView(ctxMeta, projectAlias, sessionId, messageId, action, { editMessageId } = {}) {
+  async function renderChangedFilesView(ctxMeta, projectAlias, sessionId, messageId, action, { editMessageId, actionArg } = {}) {
     if (!editMessageId) return
+    if (typeof store.getBinding === "function") {
+      const currentBinding = store.getBinding(ctxMeta.ctxKey)
+      if (!currentBinding || currentBinding.projectAlias !== projectAlias || currentBinding.sessionId !== sessionId) {
+        await tg.editMessageText(
+          ctxMeta.chatId,
+          editMessageId,
+          "Changed files action is no longer valid because this thread is no longer bound to that project/session.",
+          changedFilesCloseKeyboard(),
+        ).catch(() => {})
+        return
+      }
+    }
     const oc = ocByAlias[projectAlias]
     if (!oc) {
       await tg.editMessageText(ctxMeta.chatId, editMessageId, `Unknown project: ${projectAlias}`).catch(() => {})
@@ -179,11 +258,127 @@ export function createMirroringHandlers(runtime) {
 
     if (action === "back") {
       const summary = extractChangedFilesSummary(projectAlias, msg) || "Changed files are unavailable for this update."
-      await tg.editMessageText(ctxMeta.chatId, editMessageId, summary, changedFilesSummaryKeyboard(projectAlias, sessionId, messageId))
+      await tg.editMessageText(ctxMeta.chatId, editMessageId, summary, changedFilesSummaryKeyboard(projectAlias, sessionId, messageId, msg))
       return
     }
 
+    const summary = extractChangedFilesSummary(projectAlias, msg)
     const diffText = extractPatchDiffText(msg)
+    const fileEntries = extractPatchFileEntries(msg).filter((entry) => entry.diff)
+
+    if (action === "summary") {
+      if (!summary) {
+        await tg.editMessageText(ctxMeta.chatId, editMessageId, "Changed files summary is unavailable.", changedFilesSummaryKeyboard(projectAlias, sessionId, messageId, msg)).catch(() => {})
+        return
+      }
+      const claim = await claimChangedFilesExport(projectAlias, sessionId, messageId, action)
+      if (!claim.claimed) return
+      try {
+        await tg.sendDocument(
+          ctxMeta.chatId,
+          summary,
+          changedFilesAttachmentName(projectAlias, sessionId, messageId, { label: "changed-files-summary", extension: ".txt" }),
+          attachmentCaption("changed-files-summary", { projectAlias, sessionId }),
+          { message_thread_id: ctxMeta.threadIdOr0 || undefined },
+        )
+        await markChangedFilesExportSent(claim.key, { projectAlias, sessionId, action })
+      } finally {
+        changedFilesExportInFlight.delete(claim.key)
+      }
+      return
+    }
+
+    if (action === "patch") {
+      if (!diffText) {
+        await tg.editMessageText(ctxMeta.chatId, editMessageId, "Diff unavailable for this update.", changedFilesDiffKeyboard(projectAlias, sessionId, messageId)).catch(() => {})
+        return
+      }
+      const claim = await claimChangedFilesExport(projectAlias, sessionId, messageId, action)
+      if (!claim.claimed) return
+      try {
+        await tg.sendDocument(
+          ctxMeta.chatId,
+          diffText,
+          changedFilesAttachmentName(projectAlias, sessionId, messageId, { label: "changed-files", extension: ".patch" }),
+          attachmentCaption("changed-files-patch", { projectAlias, sessionId }),
+          { message_thread_id: ctxMeta.threadIdOr0 || undefined },
+        )
+        await markChangedFilesExportSent(claim.key, { projectAlias, sessionId, action })
+      } finally {
+        changedFilesExportInFlight.delete(claim.key)
+      }
+      return
+    }
+
+    if (action === "files") {
+      if (!fileEntries.length) {
+        await tg.editMessageText(ctxMeta.chatId, editMessageId, "Selected file diffs are unavailable for this update.", changedFilesSummaryKeyboard(projectAlias, sessionId, messageId, msg))
+        return
+      }
+      const shown = fileEntries.slice(0, CHANGED_FILES_LIMIT)
+      const lines = ["Changed file diffs:", ...shown.map((entry, index) => `${index + 1}. ${entry.file}`)]
+      if (fileEntries.length > shown.length) lines.push(`…and ${fileEntries.length - shown.length} more.`)
+      await tg.editMessageText(ctxMeta.chatId, editMessageId, lines.join("\n"), changedFilesListKeyboard(projectAlias, sessionId, messageId, fileEntries))
+      return
+    }
+
+    if (action === "file" || action === "filepatch") {
+      const fileIndex = Number(actionArg)
+      const entry = Number.isInteger(fileIndex) ? fileEntries[fileIndex] : null
+      if (!entry) {
+        await tg.editMessageText(ctxMeta.chatId, editMessageId, "Selected file diff is unavailable.", changedFilesListKeyboard(projectAlias, sessionId, messageId, fileEntries)).catch(() => {})
+        return
+      }
+      if (action === "filepatch") {
+        const claim = await claimChangedFilesExport(projectAlias, sessionId, messageId, action, String(fileIndex))
+        if (!claim.claimed) return
+        try {
+          await tg.sendDocument(
+            ctxMeta.chatId,
+            entry.diff,
+            changedFilesAttachmentName(projectAlias, sessionId, messageId, { label: "file-diff", extension: ".patch", fileName: entry.file }),
+            attachmentCaption("changed-files-patch", { projectAlias, sessionId, fileName: entry.file }),
+            { message_thread_id: ctxMeta.threadIdOr0 || undefined },
+          )
+          await markChangedFilesExportSent(claim.key, { projectAlias, sessionId, action })
+        } finally {
+          changedFilesExportInFlight.delete(claim.key)
+        }
+        return
+      }
+
+      const fileDiffHtml = renderSelectedFileDiffHtml(entry)
+      if (entry.diff.length > INLINE_DIFF_TEXT_MAX_CHARS || fileDiffHtml.length > 3900) {
+        await tg.editMessageText(
+          ctxMeta.chatId,
+          editMessageId,
+          ATTACHMENT_NOTICES.diffTooLong,
+          changedFilesDiffKeyboard(projectAlias, sessionId, messageId, { fileIndex }),
+        )
+        const claim = await claimChangedFilesExport(projectAlias, sessionId, messageId, "file-large", String(fileIndex))
+        if (!claim.claimed) return
+        try {
+          await tg.sendDocument(
+            ctxMeta.chatId,
+            entry.diff,
+            changedFilesAttachmentName(projectAlias, sessionId, messageId, { label: "file-diff", extension: ".patch", fileName: entry.file }),
+            attachmentCaption("changed-files-patch", { projectAlias, sessionId, fileName: entry.file }),
+            { message_thread_id: ctxMeta.threadIdOr0 || undefined },
+          )
+          await markChangedFilesExportSent(claim.key, { projectAlias, sessionId, action: "file-large" })
+        } finally {
+          changedFilesExportInFlight.delete(claim.key)
+        }
+        return
+      }
+
+      await tg.editMessageText(ctxMeta.chatId, editMessageId, fileDiffHtml, changedFilesDiffKeyboard(projectAlias, sessionId, messageId, { fileIndex }), {
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      })
+      return
+    }
+
     if (!diffText) {
       await tg.editMessageText(
         ctxMeta.chatId,
@@ -199,16 +394,23 @@ export function createMirroringHandlers(runtime) {
       await tg.editMessageText(
         ctxMeta.chatId,
         editMessageId,
-        "Diff is too large for an inline preview. It was attached as a .txt file.",
+        ATTACHMENT_NOTICES.diffTooLong,
         changedFilesDiffKeyboard(projectAlias, sessionId, messageId),
       )
-      await tg.sendDocument(
-        ctxMeta.chatId,
-        diffText,
-        changedFilesAttachmentName(projectAlias, sessionId, messageId),
-        `Changed files diff (${projectAlias}/${sessionId})`,
-        { message_thread_id: ctxMeta.threadIdOr0 || undefined },
-      )
+      const claim = await claimChangedFilesExport(projectAlias, sessionId, messageId, "show-large")
+      if (!claim.claimed) return
+      try {
+        await tg.sendDocument(
+          ctxMeta.chatId,
+          diffText,
+          changedFilesAttachmentName(projectAlias, sessionId, messageId, { label: "changed-files", extension: ".patch" }),
+          attachmentCaption("changed-files-patch", { projectAlias, sessionId }),
+          { message_thread_id: ctxMeta.threadIdOr0 || undefined },
+        )
+        await markChangedFilesExportSent(claim.key, { projectAlias, sessionId, action: "show-large" })
+      } finally {
+        changedFilesExportInFlight.delete(claim.key)
+      }
       return
     }
 
@@ -229,13 +431,7 @@ export function createMirroringHandlers(runtime) {
   }
 
   function assistantAttachmentName(projectAlias, sessionId, messageId) {
-    const clean = (value, fallback) => {
-      const s = String(value || fallback)
-        .replace(/[^a-z0-9._-]+/gi, "-")
-        .replace(/^-+|-+$/g, "")
-      return s || fallback
-    }
-    return `${clean(projectAlias, "project")}-${clean(sessionId, "session")}-${clean(messageId, "reply")}.txt`
+    return scopedAttachmentFilename({ projectAlias, sessionId, messageId, label: "assistant", extension: ".txt" })
   }
 
   function buildAssistantStreamPreviewHtml(text) {
@@ -268,7 +464,7 @@ export function createMirroringHandlers(runtime) {
   async function deliverAssistantText(ctxMeta, projectAlias, sessionId, messageId, text, { replaceMessageId } = {}) {
     if (!text || !text.trim()) return null
     if (shouldSendAssistantAsAttachment(text)) {
-      const notice = "Assistant reply was attached as a .txt file because it is too long for Telegram messages."
+      const notice = ATTACHMENT_NOTICES.assistantTooLong
       if (replaceMessageId) {
         const edited = await tg.editMessageText(ctxMeta.chatId, replaceMessageId, notice, null).catch(() => null)
         if (!edited) await sendToThread(ctxMeta, notice)
@@ -279,7 +475,7 @@ export function createMirroringHandlers(runtime) {
         ctxMeta.chatId,
         text,
         assistantAttachmentName(projectAlias, sessionId, messageId),
-        `Assistant reply (${projectAlias}/${sessionId})`,
+        attachmentCaption("assistant", { projectAlias, sessionId }),
         { message_thread_id: ctxMeta.threadIdOr0 || undefined },
       )
       return { mode: "attachment" }

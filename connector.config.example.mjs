@@ -11,6 +11,16 @@ export default {
   echoFilterMode: "recent",
   allowInsecureHttp: false,
 
+  // Optional Telegram workflow limits. These defaults are used when omitted.
+  limits: {
+    userAttachmentConfirmBytes: 32 * 1024,
+    userAttachmentMaxBytes: 256 * 1024,
+    changedFilesLimit: 10,
+    inlineDiffTextMaxChars: 2500,
+    streamPreviewMaxChars: 3500,
+    textAttachmentThreshold: 12_000,
+  },
+
   projects: {
     pocket: {
       directory: "./project-a",

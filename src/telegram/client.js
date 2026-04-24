@@ -1,5 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises"
-import { boundaryErrorFromException, boundaryErrorFromHttpResponse } from "../boundary-errors.js"
+import { boundaryErrorFromException, boundaryErrorFromHttpResponse, makeBoundaryError } from "../boundary-errors.js"
 
 function makeTimeoutSignal(timeoutMs = 30_000) {
   if (!timeoutMs) return { signal: undefined, cancel: () => {} }
@@ -124,9 +124,10 @@ export function splitTelegramHtml(text, maxLen = 3900) {
 }
 
 export class TelegramClient {
-  constructor(token, { baseUrl } = {}) {
+  constructor(token, { baseUrl, fileBaseUrl } = {}) {
     this.token = token
     this.baseUrl = baseUrl || `https://api.telegram.org/bot${token}`
+    this.fileBaseUrl = fileBaseUrl || deriveTelegramFileBaseUrl(this.baseUrl, token)
   }
 
   async call(method, params, { timeoutMs, signal } = {}) {
@@ -219,6 +220,133 @@ export class TelegramClient {
     const timeoutSec = typeof params?.timeout === "number" ? params.timeout : 0
     const timeoutMs = Math.max(10_000, (timeoutSec + 10) * 1000)
     return this.call("getUpdates", params, { timeoutMs, signal })
+  }
+
+  getFile(fileId) {
+    return this.call("getFile", { file_id: fileId }, { timeoutMs: 20_000 })
+  }
+
+  async downloadFile(filePath, { timeoutMs = 60_000, maxBytes, signal } = {}) {
+    const cleanPath = String(filePath || "").replace(/^\/+/, "")
+    if (!cleanPath) {
+      throw makeBoundaryError({
+        source: "telegram",
+        operation: "GET file",
+        method: "GET",
+        pathname: "/file",
+        message: "Telegram file path is empty",
+      })
+    }
+    const pathParts = cleanPath.split("/")
+    if (pathParts.some((part) => !part || part === "." || part === "..")) {
+      throw makeBoundaryError({
+        source: "telegram",
+        operation: "GET file",
+        method: "GET",
+        pathname: "/file",
+        message: "Telegram file path is unsafe",
+      })
+    }
+    const encodedPath = pathParts.map((part) => encodeURIComponent(part)).join("/")
+    const url = `${this.fileBaseUrl.replace(/\/+$/, "")}/${encodedPath}`
+    const timeout = makeTimeoutSignal(timeoutMs)
+    let res
+    try {
+      const requestSignal = combineSignals(signal, timeout.signal)
+      res = await fetch(url, { method: "GET", signal: requestSignal })
+    } catch (err) {
+      timeout.cancel()
+      throw boundaryErrorFromException(err, {
+        source: "telegram",
+        operation: "GET file",
+        method: "GET",
+        pathname: `/file/${cleanPath}`,
+        didTimeout: timeout.didTimeout?.() === true,
+      })
+    }
+
+    try {
+      if (!res.ok) {
+        const bodyText = await res.text().catch(() => "")
+        throw boundaryErrorFromHttpResponse({
+          source: "telegram",
+          operation: "GET file",
+          method: "GET",
+          pathname: `/file/${cleanPath}`,
+          status: res.status,
+          statusText: res.statusText,
+          bodyText,
+          message: `Telegram file download failed: ${res.status} ${bodyText || res.statusText || "Request failed"}`,
+        })
+      }
+
+      const declaredLength = Number(res.headers?.get?.("content-length"))
+      if (Number.isFinite(declaredLength) && Number.isFinite(Number(maxBytes)) && declaredLength > Number(maxBytes)) {
+        throw makeBoundaryError({
+          source: "telegram",
+          operation: "GET file",
+          method: "GET",
+          pathname: `/file/${cleanPath}`,
+          message: `Telegram file download exceeds limit: ${declaredLength} bytes`,
+        })
+      }
+
+      if (!res.body?.getReader) {
+        const buffer = new Uint8Array(await res.arrayBuffer())
+        if (Number.isFinite(Number(maxBytes)) && buffer.byteLength > Number(maxBytes)) {
+          throw makeBoundaryError({
+            source: "telegram",
+            operation: "GET file",
+            method: "GET",
+            pathname: `/file/${cleanPath}`,
+            message: `Telegram file download exceeds limit: ${buffer.byteLength} bytes`,
+          })
+        }
+        return buffer
+      }
+
+      const reader = res.body.getReader()
+      const chunks = []
+      let total = 0
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          const chunk = value instanceof Uint8Array ? value : new Uint8Array(value)
+          total += chunk.byteLength
+          if (Number.isFinite(Number(maxBytes)) && total > Number(maxBytes)) {
+            await reader.cancel().catch(() => {})
+            throw makeBoundaryError({
+              source: "telegram",
+              operation: "GET file",
+              method: "GET",
+              pathname: `/file/${cleanPath}`,
+              message: `Telegram file download exceeds limit: ${total} bytes`,
+            })
+          }
+          chunks.push(chunk)
+        }
+      } catch (err) {
+        if (err?.isBoundaryError === true) throw err
+        throw boundaryErrorFromException(err, {
+          source: "telegram",
+          operation: "GET file",
+          method: "GET",
+          pathname: `/file/${cleanPath}`,
+          didTimeout: timeout.didTimeout?.() === true,
+        })
+      }
+
+      const out = new Uint8Array(total)
+      let offset = 0
+      for (const chunk of chunks) {
+        out.set(chunk, offset)
+        offset += chunk.byteLength
+      }
+      return out
+    } finally {
+      timeout.cancel()
+    }
   }
 
   setMyCommands(commands, options = {}) {
@@ -315,6 +443,21 @@ export class TelegramClient {
       { callback_query_id: callbackQueryId, ...(text ? { text } : {}) },
       { timeoutMs: 10_000 },
     )
+  }
+}
+
+function deriveTelegramFileBaseUrl(baseUrl, token) {
+  try {
+    const url = new URL(baseUrl)
+    const marker = `/bot${token}`
+    if (url.pathname.endsWith(marker)) {
+      url.pathname = `${url.pathname.slice(0, -marker.length)}/file/bot${token}`
+      return url.toString().replace(/\/+$/, "")
+    }
+    url.pathname = `${url.pathname.replace(/\/+$/, "")}/file/bot${token}`
+    return url.toString().replace(/\/+$/, "")
+  } catch {
+    return `https://api.telegram.org/file/bot${token}`
   }
 }
 
