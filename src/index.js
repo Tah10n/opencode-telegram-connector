@@ -1353,7 +1353,12 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       runtimeObservability.recordLoopSuccess("shutdown")
       await lifecycle.stopAll()
       await Promise.allSettled([telegramLoopPromise, promptPollPromise, tuiActiveSessionSyncPromise])
-      await store.flush().catch(() => {})
+      try {
+        await store.flush()
+      } catch (err) {
+        logger.error("Failed to flush state during shutdown:", err?.message || String(err))
+        throw err
+      }
     })()
     return stopPromise
   }

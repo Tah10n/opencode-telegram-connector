@@ -7,7 +7,7 @@ import crypto from "node:crypto"
 import { setTimeout as delay } from "node:timers/promises"
 import { startConnector } from "../src/index.js"
 import { makeBoundaryError } from "../src/boundary-errors.js"
-import { defaultState } from "../src/state/store.js"
+import { defaultState, StateStore } from "../src/state/store.js"
 import { questionReplyIdempotencyKey } from "../src/connector/idempotency.js"
 
 function makeLogger() {
@@ -327,6 +327,7 @@ async function createHarness({
   delayImpl = shortDelay,
   wizardTtlMs,
   wizardGcIntervalMs,
+  createStateStoreImpl,
 } = {}) {
   const dir = await makeTempDir()
   const stateFile = path.join(dir, "state.json")
@@ -382,6 +383,7 @@ async function createHarness({
     logger: makeLogger(),
     deps: {
       createTelegramClient: () => tg,
+      ...(createStateStoreImpl ? { createStateStore: createStateStoreImpl } : {}),
       createOpenCodeClient: () => ocClientsByAlias[ocAliases.shift()],
       startSseLoop: ({ projectAlias, ...rest }) => {
         sseHandlers.set(projectAlias, rest)
@@ -2644,6 +2646,24 @@ test("startConnector stop stays bounded while auto-start health wait is in fligh
     releaseAbortWait()
     await harness.connector.stop()
   }
+})
+
+test("startConnector surfaces state flush failures during shutdown", async () => {
+  let failShutdownFlush = false
+  const harness = await createHarness({
+    createStateStoreImpl: (options) => {
+      const store = new StateStore(options)
+      const originalFlush = store.flush.bind(store)
+      store.flush = async () => {
+        if (failShutdownFlush) throw new Error("shutdown write failed")
+        return originalFlush()
+      }
+      return store
+    },
+  })
+
+  failShutdownFlush = true
+  await assert.rejects(() => harness.connector.stop(), /shutdown write failed/)
 })
 
 test("startConnector offers a start button on connect errors and recovers after start callback", async () => {

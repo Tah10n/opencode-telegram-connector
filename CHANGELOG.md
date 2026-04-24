@@ -15,11 +15,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Telegram HTML output splitting now preserves tags and entities across chunks.
 - Fatal SSE protocol or size errors stop reconnect loops instead of retrying forever.
 - State load and critical state flush/write failures now fail closed instead of silently losing runtime state.
+- State schema validation now rejects malformed current-schema sections and unknown schema versions with actionable section paths.
 
 ### Security
 - Dynamic opencode path segments are URL-encoded, and user-entered binding/session IDs are validated before persistence or routing.
 - Parent-session route caching is bounded for long-running processes.
 - Atomic state write behavior is covered for replacement failures so existing state is preserved where possible.
+- State migrations and invalid parsed state files are preserved in bounded `state.json.backup.*` files before recovery attempts.
 
 ### Added
 - Public-project split with subtree workflow helpers and boundary checks.

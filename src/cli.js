@@ -1,46 +1,62 @@
 #!/usr/bin/env node
+import { pathToFileURL } from "node:url"
 import { buildRuntimeConfig, parseCliArgs } from "./config/runtime.js"
 import { startConnector } from "./index.js"
 
-async function main() {
-  const supervisorGuidance = "Run the connector under a supervisor (systemd, Docker restart policy, pm2, launchd, etc.) so fatal crashes restart automatically."
-  let shutdownPromise = null
-  let stopConnector = async () => {}
+const supervisorGuidance = "Run the connector under a supervisor (systemd, Docker restart policy, pm2, launchd, etc.) so fatal crashes restart automatically."
 
-  const shutdown = async (exitCode = 0, { reason = "shutdown", fatal = false } = {}) => {
+export function createShutdownHandler({ stopConnectorRef, exit, stderr }) {
+  let shutdownPromise = null
+
+  return async function shutdown(exitCode = 0, { reason = "shutdown", fatal = false } = {}) {
     if (shutdownPromise) return shutdownPromise
     shutdownPromise = (async () => {
+      let finalExitCode = exitCode
       if (fatal) {
-        console.error(`Fatal runtime failure (${reason}). ${supervisorGuidance}`)
+        stderr(`Fatal runtime failure (${reason}). ${supervisorGuidance}`)
       }
       try {
-        await stopConnector()
+        await stopConnectorRef.current()
       } catch (err) {
-        console.error("Failed to stop connector cleanly:", err?.stack || err?.message || String(err))
+        stderr("Failed to stop connector cleanly:", err?.stack || err?.message || String(err))
+        if (finalExitCode === 0) finalExitCode = 1
       }
-      process.exit(exitCode)
+      exit(finalExitCode)
     })()
     return shutdownPromise
   }
+}
 
-  process.on("SIGINT", () => {
+export async function runCli({
+  argv = process.argv.slice(2),
+  processImpl = process,
+  stdout = (...args) => console.log(...args),
+  stderr = (...args) => console.error(...args),
+  exit = (code) => process.exit(code),
+  buildRuntimeConfigImpl = buildRuntimeConfig,
+  startConnectorImpl = startConnector,
+} = {}) {
+  const stopConnectorRef = { current: async () => {} }
+  const shutdown = createShutdownHandler({ stopConnectorRef, exit, stderr })
+
+  processImpl.on("SIGINT", () => {
     void shutdown(0, { reason: "SIGINT" })
   })
-  process.on("SIGTERM", () => {
+  processImpl.on("SIGTERM", () => {
     void shutdown(0, { reason: "SIGTERM" })
   })
-  process.on("unhandledRejection", (reason) => {
-    console.error("Unhandled promise rejection:", reason?.stack || reason?.message || String(reason))
+  processImpl.on("unhandledRejection", (reason) => {
+    stderr("Unhandled promise rejection:", reason?.stack || reason?.message || String(reason))
     void shutdown(1, { reason: "unhandledRejection", fatal: true })
   })
-  process.on("uncaughtException", (err) => {
-    console.error("Uncaught exception:", err?.stack || err?.message || String(err))
+  processImpl.on("uncaughtException", (err) => {
+    stderr("Uncaught exception:", err?.stack || err?.message || String(err))
     void shutdown(1, { reason: "uncaughtException", fatal: true })
   })
 
-  const args = parseCliArgs(process.argv.slice(2))
+  const args = parseCliArgs(argv)
   if (args.help) {
-    console.log(
+    stdout(
       [
         "telegram-opencode-connector",
         "\nOptions:",
@@ -51,17 +67,24 @@ async function main() {
         "  --state-file <path>",
       ].join("\n"),
     )
-    process.exit(0)
+    exit(0)
+    return
   }
 
-  const { config } = await buildRuntimeConfig({ args })
+  const { config } = await buildRuntimeConfigImpl({ args })
 
-  const { stop, stateFile } = await startConnector({ config })
-  stopConnector = stop
-  console.log("State:", stateFile)
+  const { stop, stateFile } = await startConnectorImpl({ config })
+  stopConnectorRef.current = stop
+  stdout("State:", stateFile)
 }
 
-main().catch((err) => {
-  console.error(err?.stack || err?.message || String(err))
-  process.exit(1)
-})
+function isCliEntrypoint() {
+  return process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
+}
+
+if (isCliEntrypoint()) {
+  runCli().catch((err) => {
+    console.error(err?.stack || err?.message || String(err))
+    process.exit(1)
+  })
+}

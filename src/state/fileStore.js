@@ -2,6 +2,8 @@ import fs from "node:fs/promises"
 import path from "node:path"
 import crypto from "node:crypto"
 
+export const DEFAULT_STATE_BACKUP_MAX_FILES = 5
+
 function hasCode(err, ...codes) {
   return !!err && typeof err === "object" && "code" in err && codes.includes(err.code)
 }
@@ -12,6 +14,76 @@ async function unlinkIfExists(fsImpl, filePath) {
   } catch (err) {
     if (!hasCode(err, "ENOENT")) throw err
   }
+}
+
+function backupTimestamp(date = new Date()) {
+  return date.toISOString().replace(/[:.]/g, "-")
+}
+
+function cleanBackupLabel(value, fallback) {
+  const text = String(value || fallback)
+    .replace(/[^a-z0-9._-]+/gi, "-")
+    .replace(/^-+|-+$/g, "")
+  return text || fallback
+}
+
+function backupPrefix(filePath) {
+  return `${path.basename(filePath)}.backup.`
+}
+
+async function listStateBackups(filePath, { fsImpl = fs } = {}) {
+  const dir = path.dirname(filePath)
+  const prefix = backupPrefix(filePath)
+  let names
+  try {
+    names = await fsImpl.readdir(dir)
+  } catch (err) {
+    if (hasCode(err, "ENOENT")) return []
+    throw err
+  }
+
+  const backups = []
+  for (const name of names) {
+    if (!name.startsWith(prefix)) continue
+    const backupPath = path.join(dir, name)
+    let stat = null
+    try {
+      stat = await fsImpl.stat(backupPath)
+    } catch (err) {
+      if (!hasCode(err, "ENOENT")) throw err
+      continue
+    }
+    if (stat?.isFile && !stat.isFile()) continue
+    backups.push({ path: backupPath, name, mtimeMs: Number(stat?.mtimeMs) || 0 })
+  }
+  return backups
+}
+
+export async function rotateStateFileBackups(filePath, { maxBackups = DEFAULT_STATE_BACKUP_MAX_FILES, fsImpl = fs } = {}) {
+  const keep = Math.max(0, Number.isFinite(Number(maxBackups)) ? Math.trunc(Number(maxBackups)) : DEFAULT_STATE_BACKUP_MAX_FILES)
+  const backups = await listStateBackups(filePath, { fsImpl })
+  backups.sort((a, b) => b.mtimeMs - a.mtimeMs || b.name.localeCompare(a.name))
+  const removed = []
+  for (const backup of backups.slice(keep)) {
+    await unlinkIfExists(fsImpl, backup.path)
+    removed.push(backup.path)
+  }
+  return { kept: backups.slice(0, keep).map((entry) => entry.path), removed }
+}
+
+export async function createStateFileBackup(
+  filePath,
+  { reason = "state", schemaVersion, maxBackups = DEFAULT_STATE_BACKUP_MAX_FILES, fsImpl = fs, now = new Date() } = {},
+) {
+  const dir = path.dirname(filePath)
+  await fsImpl.mkdir(dir, { recursive: true })
+  const versionLabel = schemaVersion == null ? "unknown" : `v${cleanBackupLabel(schemaVersion, "unknown")}`
+  const suffix = [backupTimestamp(now), cleanBackupLabel(reason, "state"), versionLabel, crypto.randomBytes(4).toString("hex")].join(".")
+  const backupPath = path.join(dir, `${backupPrefix(filePath)}${suffix}`)
+  const contents = await fsImpl.readFile(filePath)
+  await fsImpl.writeFile(backupPath, contents)
+  await rotateStateFileBackups(filePath, { maxBackups, fsImpl })
+  return backupPath
 }
 
 async function replaceFileWithoutLosingExisting(fsImpl, sourcePath, targetPath) {

@@ -434,7 +434,7 @@ test("StateStore migrates schema version 4 state to version 5", async () => {
   assert.deepEqual(loaded.idempotency, { keys: {} })
 })
 
-test("StateStore normalizes partially malformed schema version 5 sections", async () => {
+test("StateStore rejects malformed schema version 5 sections with actionable paths", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -482,20 +482,27 @@ test("StateStore normalizes partially malformed schema version 5 sections", asyn
   )
 
   const store = new StateStore({ filePath, logger: makeLogger() })
-  const loaded = await store.load()
 
-  assert.deepEqual(loaded.bindings, { "100:7": { projectAlias: "demo", sessionId: "ses_1" } })
-  assert.deepEqual(loaded.sessionIndex, { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } })
-  assert.equal(loaded.feedByContext["100:7"].mode, "verbose")
-  assert.equal(loaded.feedByContext["100:9"].mode, DEFAULT_FEED_MODE)
-  assert.deepEqual(loaded.modelPrefsByContext, {
-    "100:7": { mode: "custom", model: { providerID: "openai", modelID: "gpt-5" }, variant: "xhigh" },
+  await assert.rejects(() => store.load(), (err) => {
+    assert.equal(err.code, "STATE_SCHEMA_INVALID")
+    assert.match(err.message, /state\.bindings\["bad:1"\]\.sessionId/)
+    assert.match(err.message, /state\.sessionIndex\["demo:bad"\]\.chatId/)
+    assert.match(err.message, /Restore a known-good state backup/)
+    return true
   })
-  assert.deepEqual(Object.keys(loaded.pendingPrompts.permissions), ["demo:ses_1:perm_1"])
-  assert.deepEqual(loaded.pendingPrompts.rejectNotes, { "100:7": { projectAlias: "demo", permissionId: "perm_1", sessionID: "" } })
-  assert.deepEqual(loaded.pendingPrompts.customAnswers, { "100:7": { projectAlias: "demo", requestId: "q_1", sessionID: "", qIndex: 0 } })
-  assert.deepEqual(Object.keys(loaded.pendingPrompts.questionWizards), ["demo:ses_1:q_1"])
-  assert.equal(store.hasIdempotencyKey("tg-update:1"), true)
+  assert.deepEqual(store.get(), {
+    schemaVersion: 5,
+    updateOffset: null,
+    bindings: {},
+    sessionIndex: {},
+    feedByContext: {},
+    modelPrefsByContext: {},
+    pendingPrompts: { permissions: {}, rejectNotes: {}, customAnswers: {}, questionWizards: {} },
+    idempotency: { keys: {} },
+  })
+  const backups = (await fs.readdir(dir)).filter((name) => name.startsWith("state.json.backup.") && name.includes(".invalid."))
+  assert.equal(backups.length, 1)
+  assert.match(await fs.readFile(path.join(dir, backups[0]), "utf8"), /bad:1/)
 })
 
 test("StateStore migrates legacy state and flush persists the new schema", async () => {
@@ -547,6 +554,68 @@ test("StateStore migrates legacy state and flush persists the new schema", async
     questionWizards: {},
   })
   assert.deepEqual(persisted.idempotency, { keys: {} })
+})
+
+test("StateStore creates a bounded backup before schema migration", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  await fs.writeFile(
+    filePath,
+    JSON.stringify({ schemaVersion: 4, updateOffset: 222, bindings: {}, sessionIndex: {}, feedByContext: {}, modelPrefsByContext: {}, pendingPrompts: {}, idempotency: {} }, null, 2),
+    "utf8",
+  )
+
+  const store = new StateStore({ filePath, logger: makeLogger(), backupMaxFiles: 2 })
+  const loaded = await store.load()
+
+  assert.equal(loaded.schemaVersion, 5)
+  assert.equal(loaded.updateOffset, 222)
+  const backups = (await fs.readdir(dir)).filter((name) => name.startsWith("state.json.backup.") && name.includes(".migration."))
+  assert.equal(backups.length, 1)
+  const backup = JSON.parse(await fs.readFile(path.join(dir, backups[0]), "utf8"))
+  assert.equal(backup.schemaVersion, 4)
+  const persisted = JSON.parse(await fs.readFile(filePath, "utf8"))
+  assert.equal(persisted.schemaVersion, 5)
+})
+
+test("StateStore rejects unknown schema versions and preserves the file", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  await fs.writeFile(filePath, JSON.stringify({ schemaVersion: 999, updateOffset: 1 }, null, 2), "utf8")
+
+  const store = new StateStore({ filePath, logger: makeLogger() })
+
+  await assert.rejects(() => store.load(), /schemaVersion is unsupported \(999\)/)
+  const current = JSON.parse(await fs.readFile(filePath, "utf8"))
+  assert.equal(current.schemaVersion, 999)
+  const backups = (await fs.readdir(dir)).filter((name) => name.startsWith("state.json.backup.") && name.includes(".invalid."))
+  assert.equal(backups.length, 1)
+})
+
+test("StateStore migration rollback keeps the original file when migrated flush fails", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  const original = { schemaVersion: 4, updateOffset: 333, bindings: {}, sessionIndex: {}, feedByContext: {}, modelPrefsByContext: {}, pendingPrompts: {}, idempotency: {} }
+  await fs.writeFile(filePath, JSON.stringify(original, null, 2), "utf8")
+  const writeErr = new Error("migration write failed")
+  let writeCalls = 0
+
+  const store = new StateStore({
+    filePath,
+    logger: makeLogger(),
+    writeJsonFileAtomicImpl: async () => {
+      writeCalls += 1
+      throw writeErr
+    },
+  })
+
+  await assert.rejects(() => store.load(), /migration write failed/)
+  assert.equal(writeCalls, 1)
+  assert.deepEqual(JSON.parse(await fs.readFile(filePath, "utf8")), original)
+  const backups = (await fs.readdir(dir)).filter((name) => name.startsWith("state.json.backup.") && name.includes(".migration."))
+  assert.equal(backups.length, 1)
+  assert.equal(store.get().schemaVersion, 5)
+  assert.equal(store.get().updateOffset, null)
 })
 
 test("StateStore load fails closed on corrupt persisted state", async () => {

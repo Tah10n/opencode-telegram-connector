@@ -266,7 +266,7 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 | --- | --- | --- |
 | Telegram polling appears stuck | Use `/runtime` in a private chat and inspect `Telegram poll` retries, `lastErrorAt`, and update retry/skip counts. Ensure only one connector instance is running for the bot token. | Fix the Telegram/API/network issue; restart the connector only if the supervisor reports the process is unhealthy. |
 | OpenCode unavailable | Use `/projects` and the project's Retry health check. `/status` also shows the current project's SSE and sanitized base URL. | Start opencode manually, or press Start if the project exposes a Start button. Retry health after the server is up. |
-| State file cannot be read or written | Startup or runtime logs report a state read/write failure. The connector fails closed instead of silently resetting state. | Fix permissions/path/corruption or restore a backup. Do not delete state unless you accept losing bindings, offset, pending prompts, and idempotency history. |
+| State file cannot be read, written, or validated | Startup or runtime logs report a state read/write/schema failure. The connector fails closed instead of silently resetting state. Schema errors include the malformed section path, and migration/invalid-state backups are written next to `state.json` when possible. | Fix permissions/path/corruption, repair the reported section, or restore a known-good `state.json.backup.*` file. Treat backups as sensitive; they contain the same bindings, offset, prompts, and idempotency history as `state.json`. |
 | Prompt send reports project unavailable | A retryable opencode `prompt_async` failure happened while forwarding a user message. | Restore the project; the Telegram update remains retryable and should be processed again after recovery. |
 | SSE stopped after protocol/size error | Logs show a fatal SSE protocol or size failure for one project. | Inspect upstream event size/protocol, fix the source, then restart the connector or recover the project; prompt polling still handles prompts while SSE is down. |
 | Group command ignored | The command may be addressed to another bot, for example `/start@OtherBot`. | Use `/command@<this bot username>` or an unsuffixed command that Telegram delivers to this bot. |
@@ -281,6 +281,7 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 - The connector is designed to run as a **single instance** per bot token.
 - On first start, it drains old Telegram updates to avoid replaying history.
 - State load and critical state flush/write failures fail closed; the connector should not continue as if durability succeeded.
+- Current-schema state is validated on load, unsupported schema versions fail closed, and schema migrations create bounded `state.json.backup.*` files before writing the migrated state.
 - Feed mode is stored per Telegram thread/topic; the default is `Main + changes`.
 - Large assistant replies may be delivered as `.txt` attachments, and large changed-file diffs may be delivered as `.patch` attachments instead of many chat messages.
 - Telegram HTML messages are split with tag/entity awareness to avoid malformed chunks.
