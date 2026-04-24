@@ -1793,6 +1793,49 @@ test("startConnector /bindings lists all active bindings in a private chat", asy
   }
 })
 
+test("startConnector repairs a stale binding index from private binding controls", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 310,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_topic" },
+        "200:0": { projectAlias: "demo", sessionId: "ses_other" },
+      },
+      sessionIndex: {
+        "demo:ses_topic": { chatId: 999, threadIdOr0: 0 },
+        "demo:ghost": { chatId: 1, threadIdOr0: 1 },
+      },
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(311, "/bindings", { chatId: 42, chatType: "private", threadIdOr0: 0 }))
+
+    await waitFor(() => harness.tg.sentMessages.some((entry) => /Index repair available/.test(entry.text)))
+    const bindingsMessage = harness.tg.sentMessages.at(-1)
+    assert.match(bindingsMessage.text, /Index repair available: removedBindings=0 removedIndex=1 rebuilt=2/)
+    const repairButton = bindingsMessage.replyMarkup.inline_keyboard.flat().find((button) => button.text === "Repair index")
+    assert.ok(repairButton)
+
+    harness.tg.enqueue(makeCallbackUpdate(312, repairButton.callback_data, { chatId: 42, chatType: "private", threadIdOr0: 0, messageId: bindingsMessage.result.message_id }))
+
+    await waitFor(() => harness.tg.callbackAnswers.some((entry) => entry.text === "Repaired"))
+    await harness.connector.stop()
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.bindings, {
+      "100:7": { projectAlias: "demo", sessionId: "ses_topic" },
+      "200:0": { projectAlias: "demo", sessionId: "ses_other" },
+    })
+    assert.deepEqual(state.sessionIndex, {
+      "demo:ses_topic": { chatId: 100, threadIdOr0: 7 },
+      "demo:ses_other": { chatId: 200, threadIdOr0: 0 },
+    })
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
 test("startConnector /unbind removes the current binding and blocks further prompts", async () => {
   const harness = await createHarness({
     statePatch: {

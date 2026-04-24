@@ -726,8 +726,9 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   }
 
   async function bindCtxToSession(ctxMeta, projectAlias, sessionId) {
-    store.setBinding(ctxMeta.ctxKey, { projectAlias, sessionId }, { chatId: ctxMeta.chatId, threadIdOr0: ctxMeta.threadIdOr0 })
+    const result = store.setBinding(ctxMeta.ctxKey, { projectAlias, sessionId }, { chatId: ctxMeta.chatId, threadIdOr0: ctxMeta.threadIdOr0 })
     logger.info("Bound", ctxMeta.ctxKey, "->", projectAlias, sessionId)
+    return result
   }
 
   function getBoundCtxForSession(projectAlias, sessionId) {
@@ -955,11 +956,14 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     recordCallbackOutcome: runtimeObservability.recordCallbackOutcome,
     questionWizards,
     ctxMetaFromMessage,
+    parseCtxKey,
+    formatThreadLabel,
     isAllowedUser,
     bindCtxToSession,
     sendToThread,
     ensureProjectStarted,
     validateProject,
+    getStartupSession,
     platform,
   })
   const { handleTelegramCallback } = callbackHandlers

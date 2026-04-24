@@ -233,6 +233,73 @@ export function createCommandHandlers(runtime) {
     }
   }
 
+  function moveConflictNote(result) {
+    if (!result?.movedFromRoute) return ""
+    return `Note: this session was already bound to chat ${result.movedFromRoute.chatId} / ${formatThreadLabel(result.movedFromRoute.threadIdOr0)} and was moved to this thread.`
+  }
+
+  function bindingHealthLabel(health) {
+    if (health?.status === "ok") return "ok"
+    if (health?.status === "stale" && health.reason === "project-missing") return "stale: project missing"
+    if (health?.status === "stale" && health.reason === "session-missing") return "stale: session missing"
+    if (health?.status === "unreachable") return "unreachable"
+    return "unknown"
+  }
+
+  async function resolveBindingHealth(ctxKey, binding) {
+    if (!binding?.projectAlias || !binding?.sessionId) return { status: "stale", reason: "malformed", ctxKey }
+    if (!projects?.[binding.projectAlias] || !ocByAlias?.[binding.projectAlias]) return { status: "stale", reason: "project-missing", ctxKey }
+
+    try {
+      await validateProject(binding.projectAlias)
+    } catch (err) {
+      return { status: "unreachable", reason: "project-unreachable", ctxKey, retryable: isRetryableProjectError(err) }
+    }
+
+    const oc = ocByAlias[binding.projectAlias]
+    if (typeof oc?.getSession !== "function") return { status: "unknown", reason: "session-check-unavailable", ctxKey }
+    try {
+      await oc.getSession(binding.sessionId)
+      return { status: "ok", ctxKey }
+    } catch (err) {
+      if (isStaleBoundaryError(err, { source: "opencode", pathname: `/session/${binding.sessionId}`, method: "GET" })) {
+        return { status: "stale", reason: "session-missing", ctxKey }
+      }
+      return { status: "unreachable", reason: "session-check-failed", ctxKey, retryable: isRetryableProjectError(err) }
+    }
+  }
+
+  async function resolveBindingHealthMap(entries) {
+    const pairs = await Promise.all(entries.map(async (entry) => [entry.ctxKey, await resolveBindingHealth(entry.ctxKey, entry.binding)]))
+    return Object.fromEntries(pairs)
+  }
+
+  function bindingRepairKeyboard(entries, { includeRepair = false } = {}) {
+    const rows = []
+    for (const entry of entries) {
+      const ctxKey = entry.ctxKey
+      const projectAlias = entry.binding?.projectAlias
+      const projectKnown = !!projects?.[projectAlias]
+      rows.push([{ text: `Remove ${ctxKey}`, callback_data: runtime.cb.pack(`b|unbind|${ctxKey}`) }])
+      if (projectKnown) {
+        rows.push([
+          { text: `Rebind startup ${ctxKey}`, callback_data: runtime.cb.pack(`b|rebind|${ctxKey}`) },
+          { text: `New session ${ctxKey}`, callback_data: runtime.cb.pack(`b|new|${ctxKey}`) },
+        ])
+      }
+      rows.push([{ text: `Keep ${ctxKey}`, callback_data: runtime.cb.pack(`b|keep|${ctxKey}`) }])
+    }
+    if (includeRepair) rows.push([{ text: "Repair index", callback_data: runtime.cb.pack("b|repair") }])
+    rows.push([{ text: "Close", callback_data: runtime.cb.pack("b|close") }])
+    return makeInlineKeyboard(rows)
+  }
+
+  function appendMoveConflict(lines, result) {
+    const note = moveConflictNote(result)
+    if (note) lines.push(note)
+    return lines
+  }
+
   function appendEffectiveModelLines(lines, effectiveState) {
     if (!effectiveState?.label) return lines
     lines.push(`Model: ${effectiveState.label}`)
@@ -734,14 +801,14 @@ export function createCommandHandlers(runtime) {
       }
       const startupSid = await resolveValidStartupSession(alias, oc)
       if (startupSid) {
-        await bindCtxToSession(ctxMeta, alias, startupSid)
-        await sendToThread(ctxMeta, `Bound to project '${alias}' (startup session): ${startupSid}`)
+        const bindResult = await bindCtxToSession(ctxMeta, alias, startupSid)
+        await sendToThread(ctxMeta, appendMoveConflict([`Bound to project '${alias}' (startup session): ${startupSid}`], bindResult).join("\n"))
       } else {
         const created = await oc.createSession({})
         if (created?.id) logger.info(`[${alias}] created session for bind:`, created.id)
         startupSessionByProject[alias] = created.id
-        await bindCtxToSession(ctxMeta, alias, created.id)
-        await sendToThread(ctxMeta, `Bound to project '${alias}' with new session: ${created.id}`)
+        const bindResult = await bindCtxToSession(ctxMeta, alias, created.id)
+        await sendToThread(ctxMeta, appendMoveConflict([`Bound to project '${alias}' with new session: ${created.id}`], bindResult).join("\n"))
       }
     } catch (err) {
       await sendToThread(ctxMeta, formatProjectUnavailable(alias, err)).catch(() => {})
@@ -816,8 +883,8 @@ export function createCommandHandlers(runtime) {
           )
         }
       } else {
-        await bindCtxToSession(ctxMeta, binding.projectAlias, created.id)
-        await sendToThread(ctxMeta, await buildNewSessionText(binding.projectAlias, created.id, { ctxKey: ctxMeta.ctxKey }))
+        const bindResult = await bindCtxToSession(ctxMeta, binding.projectAlias, created.id)
+        await sendToThread(ctxMeta, appendMoveConflict([await buildNewSessionText(binding.projectAlias, created.id, { ctxKey: ctxMeta.ctxKey })], bindResult).join("\n"))
       }
 
       if (attachOnNewMode === "new-window") {
@@ -912,8 +979,8 @@ export function createCommandHandlers(runtime) {
       }
 
       await oc.getSession(targetSessionId)
-      await bindCtxToSession(ctxMeta, binding.projectAlias, targetSessionId)
-      await sendToThread(ctxMeta, await buildSessionSwitchText(binding.projectAlias, targetSessionId, { ctxKey: ctxMeta.ctxKey }))
+      const bindResult = await bindCtxToSession(ctxMeta, binding.projectAlias, targetSessionId)
+      await sendToThread(ctxMeta, appendMoveConflict([await buildSessionSwitchText(binding.projectAlias, targetSessionId, { ctxKey: ctxMeta.ctxKey })], bindResult).join("\n"))
     } catch (err) {
       await sendToThread(ctxMeta, formatProjectUnavailable(binding.projectAlias, err)).catch(() => {})
     }
@@ -957,6 +1024,7 @@ export function createCommandHandlers(runtime) {
       await safeInformThread(ctxMeta, "Not bound. Use /bind <projectAlias>.")
       return
     }
+    const health = await resolveBindingHealth(ctxMeta.ctxKey, binding)
     const startupSessionId = startupSessionByProject[binding.projectAlias] || "unknown"
     const sseStatus = getProjectSseStatus(binding.projectAlias)
     const baseUrl = sanitizeBaseUrlForDisplay(projects?.[binding.projectAlias]?.baseUrl) || "unknown"
@@ -973,10 +1041,12 @@ export function createCommandHandlers(runtime) {
           `Feed: ${feedMode}`,
           `SSE: ${sseStatus}`,
           `Base URL: ${baseUrl}`,
+          `Binding health: ${bindingHealthLabel(health)}`,
           ...runtimeLines,
         ],
         effectiveState,
       ).join("\n"),
+      health.status === "ok" ? null : bindingRepairKeyboard([{ ctxKey: ctxMeta.ctxKey, binding, health }]),
     )
   }
 
@@ -1013,13 +1083,21 @@ export function createCommandHandlers(runtime) {
       return
     }
 
+    const repairPreview = store.repairBindingIndex?.({ dryRun: true })
+    const healthByCtx = await resolveBindingHealthMap(entries)
+
     const lines = ["Bindings:"]
     for (const entry of entries) {
       const scope = entry.ctx ? `chat ${entry.ctx.chatId} / ${formatThreadLabel(entry.ctx.threadIdOr0)}` : entry.ctxKey
       const current = entry.ctxKey === ctxMeta.ctxKey ? " (current)" : ""
-      lines.push(`- ${scope}${current} -> ${entry.binding.projectAlias} / ${entry.binding.sessionId}`)
+      lines.push(`- ${scope}${current} -> ${entry.binding.projectAlias} / ${entry.binding.sessionId} [${bindingHealthLabel(healthByCtx[entry.ctxKey])}]`)
     }
-    await sendToThread(ctxMeta, lines.join("\n"))
+    if (repairPreview?.changed) {
+      lines.push(
+        `Index repair available: removedBindings=${repairPreview.removedBindings?.length || 0} removedIndex=${repairPreview.removedIndexEntries?.length || 0} rebuilt=${repairPreview.rebuiltIndexEntries || 0}`,
+      )
+    }
+    await sendToThread(ctxMeta, lines.join("\n"), bindingRepairKeyboard(entries, { includeRepair: true }))
   }
 
   async function handleSendLast(ctxMeta) {
@@ -1066,18 +1144,37 @@ export function createCommandHandlers(runtime) {
   async function handleProjects(ctxMeta) {
     const aliases = Object.keys(projects)
     await Promise.allSettled(aliases.map((a) => resolveStartupSession(a, { forceRefresh: true })))
-    const text = buildProjectsOverviewText({
+    const lines = [buildProjectsOverviewText({
       startupSessionByProject,
       formatThreadLabel,
       previewLimit: 3,
       showBindingScopes: ctxMeta?.chatType === "private",
-    })
+    })]
+    if (ctxMeta?.chatType === "private") {
+      const entries = Object.entries(store.get().bindings || {}).map(([ctxKey, binding]) => ({ ctxKey, binding }))
+      const healthByCtx = await resolveBindingHealthMap(entries)
+      const byProject = new Map()
+      for (const entry of entries) {
+        const alias = entry.binding?.projectAlias || "unknown"
+        const bucket = byProject.get(alias) || { ok: 0, stale: 0, unreachable: 0, unknown: 0 }
+        const status = healthByCtx[entry.ctxKey]?.status || "unknown"
+        if (Object.hasOwn(bucket, status)) bucket[status] += 1
+        else bucket.unknown += 1
+        byProject.set(alias, bucket)
+      }
+      if (byProject.size) {
+        lines.push("Binding health:")
+        for (const [alias, bucket] of [...byProject.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+          lines.push(`- ${alias}: ok=${bucket.ok} stale=${bucket.stale} unreachable=${bucket.unreachable} unknown=${bucket.unknown}`)
+        }
+      }
+    }
     const replyMarkup = buildProjectsOverviewKeyboard?.({
       platform,
       showProjectControls: ctxMeta?.chatType === "private",
       showSessions: ctxMeta?.chatType === "private",
     })
-    await sendToThread(ctxMeta, text, replyMarkup)
+    await sendToThread(ctxMeta, lines.join("\n"), replyMarkup)
   }
 
   async function handleUnbind(ctxMeta) {

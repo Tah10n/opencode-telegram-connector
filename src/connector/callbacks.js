@@ -23,16 +23,20 @@ export function createCallbackHandlers(runtime) {
     projects,
     ocByAlias,
     ctxMetaFromMessage,
+    parseCtxKey,
+    formatThreadLabel,
     isAllowedUser,
     bindCtxToSession,
     sendToThread,
     ensureProjectStarted,
     validateProject,
+    getStartupSession,
     renderFeedSettings,
     renderModelSettings,
     renderChangedFilesView,
     renderSessionsList,
     renderProjectSessions,
+    handleBindings,
     feedModeLabel,
     setRejectNoteAwaitingState,
     sendRejectNotePrompt,
@@ -125,6 +129,16 @@ export function createCallbackHandlers(runtime) {
   function canUseProjectControl(ctxMeta, projectAlias) {
     if (ctxMeta?.chatType === "private") return true
     return store.getBinding(ctxMeta?.ctxKey)?.projectAlias === projectAlias
+  }
+
+  function canUseBindingAction(ctxMeta, targetCtxKey) {
+    return ctxMeta?.chatType === "private" || ctxMeta?.ctxKey === targetCtxKey
+  }
+
+  function describeTargetCtx(ctxKey) {
+    const parsed = parseCtxKey?.(ctxKey)
+    if (!parsed) return ctxKey
+    return `chat ${parsed.chatId} / ${formatThreadLabel?.(parsed.threadIdOr0) || `thread ${parsed.threadIdOr0}`}`
   }
 
   async function handleTelegramCallback(callbackQuery) {
@@ -230,6 +244,83 @@ export function createCallbackHandlers(runtime) {
           })
           return
         }
+        await answerCallbackQuery(callbackQuery.id, "Invalid")
+        return
+      }
+
+      if (kind === "b") {
+        const action = parts[1]
+        if (action === "close") {
+          await closeInteractiveMessage(callbackQuery.id, ctxMeta, msg?.message_id)
+          return
+        }
+        if (action === "repair") {
+          if (ctxMeta?.chatType !== "private") {
+            await answerCallbackQuery(callbackQuery.id, "Private chat only")
+            return
+          }
+          const summary = store.repairBindingIndex?.() || { changed: false }
+          if (summary.changed) await store.flush?.()
+          await answerCallbackQuery(callbackQuery.id, summary.changed ? "Repaired" : "Already clean")
+          if (typeof handleBindings === "function") await handleBindings(ctxMeta).catch(ignoreError)
+          return
+        }
+
+        const targetCtxKey = parts[2]
+        const targetCtx = parseCtxKey?.(targetCtxKey)
+        if (!targetCtxKey || !targetCtx) {
+          await answerCallbackQuery(callbackQuery.id, "Invalid")
+          return
+        }
+        if (!canUseBindingAction(ctxMeta, targetCtxKey)) {
+          await answerCallbackQuery(callbackQuery.id, "Private chat only")
+          return
+        }
+        const binding = store.getBinding(targetCtxKey)
+        if (!binding) {
+          await answerCallbackQuery(callbackQuery.id, "Not bound")
+          return
+        }
+
+        if (action === "keep") {
+          await answerCallbackQuery(callbackQuery.id, "Kept")
+          await sendToThread(ctxMeta, `Kept binding for ${describeTargetCtx(targetCtxKey)} unchanged.`).catch(ignoreError)
+          return
+        }
+        if (action === "unbind") {
+          const ok = store.unbind(targetCtxKey)
+          if (ok) await store.flush?.()
+          await answerCallbackQuery(callbackQuery.id, ok ? "Unbound" : "Not bound")
+          await sendToThread(ctxMeta, ok ? `Removed binding for ${describeTargetCtx(targetCtxKey)}.` : "Binding was already absent.").catch(ignoreError)
+          return
+        }
+        if (action === "rebind" || action === "new") {
+          const projectAlias = binding.projectAlias
+          const oc = ocByAlias[projectAlias]
+          if (!projectAlias || !projects?.[projectAlias] || !oc) {
+            await answerCallbackQuery(callbackQuery.id, "Unknown project")
+            return
+          }
+          try {
+            const nextSessionId = action === "rebind"
+              ? await getStartupSession(projectAlias, { waitForStart: false, forceRefresh: true })
+              : (await oc.createSession({}))?.id
+            if (!nextSessionId) {
+              await answerCallbackQuery(callbackQuery.id, "Unavailable")
+              return
+            }
+            const targetMeta = { ...targetCtx, ctxKey: targetCtxKey, chatType: ctxMeta.chatType }
+            await bindCtxToSession(targetMeta, projectAlias, nextSessionId)
+            await store.flush?.()
+            await answerCallbackQuery(callbackQuery.id, action === "rebind" ? "Rebound" : "Created")
+            await sendToThread(ctxMeta, `${action === "rebind" ? "Rebound" : "Created and bound"} ${describeTargetCtx(targetCtxKey)} to ${projectAlias} / ${nextSessionId}.`).catch(ignoreError)
+          } catch (err) {
+            await answerCallbackQuery(callbackQuery.id, "Unavailable")
+            await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err)).catch(ignoreError)
+          }
+          return
+        }
+
         await answerCallbackQuery(callbackQuery.id, "Invalid")
         return
       }

@@ -107,6 +107,11 @@ function makeRuntime(overrides = {}) {
       threadIdOr0: msg?.message_thread_id || 0,
       ctxKey: `${msg?.chat?.id}:${msg?.message_thread_id || 0}`,
     }),
+    parseCtxKey: (ctxKey) => {
+      const match = String(ctxKey || "").match(/^(-?\d+):(\d+)$/)
+      return match ? { chatId: Number(match[1]), threadIdOr0: Number(match[2]), ctxKey } : null
+    },
+    formatThreadLabel: (threadIdOr0) => (threadIdOr0 ? `topic ${threadIdOr0}` : "main"),
     isAllowedUser: runtimeOverrides.isAllowedUser || (() => true),
     bindCtxToSession: async (ctxMeta, projectAlias, sessionId) => {
       bindCalls.push({ ctxMeta, projectAlias, sessionId })
@@ -117,6 +122,7 @@ function makeRuntime(overrides = {}) {
     ensureProjectStarted: async (projectAlias, ctxMeta) => {
       startCalls.push({ projectAlias, ctxMeta })
     },
+    getStartupSession: async (projectAlias) => `startup_${projectAlias}`,
     renderFeedSettings: async (ctxMeta, options) => {
       feedCalls.push({ type: "render", ctxMeta, options })
     },
@@ -437,6 +443,145 @@ test("createCallbackHandlers blocks project controls in unrelated group threads"
   assert.deepEqual(startCalls, [])
 })
 
+test("createCallbackHandlers repairs binding index from private chats", async () => {
+  const repairCalls = []
+  const flushCalls = []
+  const handleBindingsCalls = []
+  const { runtime, callbackAnswers } = makeRuntime({
+    store: {
+      repairBindingIndex: () => {
+        repairCalls.push(true)
+        return { changed: true }
+      },
+      flush: async () => {
+        flushCalls.push(true)
+      },
+    },
+    handleBindings: async (ctxMeta) => {
+      handleBindingsCalls.push(ctxMeta)
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("b|repair", { chatType: "private", threadIdOr0: 0 }))
+
+  assert.deepEqual(repairCalls, [true])
+  assert.deepEqual(flushCalls, [true])
+  assert.deepEqual(handleBindingsCalls, [{ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Repaired"])
+})
+
+test("createCallbackHandlers blocks binding repair outside private chats", async () => {
+  const repairCalls = []
+  const { runtime, callbackAnswers } = makeRuntime({
+    store: {
+      repairBindingIndex: () => {
+        repairCalls.push(true)
+        return { changed: true }
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("b|repair", { chatType: "supergroup", threadIdOr0: 7 }))
+
+  assert.deepEqual(repairCalls, [])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Private chat only"])
+})
+
+test("createCallbackHandlers keeps and unbinds target bindings", async () => {
+  const unbindCalls = []
+  const flushCalls = []
+  const { runtime, callbackAnswers, sentMessages } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    store: {
+      unbind: (ctxKey) => {
+        unbindCalls.push(ctxKey)
+        return true
+      },
+      flush: async () => {
+        flushCalls.push(true)
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("b|keep|100:7", { chatType: "private", threadIdOr0: 0 }))
+  await handlers.handleTelegramCallback(makeCallback("b|unbind|100:7", { chatType: "private", threadIdOr0: 0 }))
+
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Kept", "Unbound"])
+  assert.deepEqual(unbindCalls, ["100:7"])
+  assert.deepEqual(flushCalls, [true])
+  assert.match(sentMessages[0].text, /Kept binding for chat 100 \/ topic 7 unchanged\./)
+  assert.match(sentMessages[1].text, /Removed binding for chat 100 \/ topic 7\./)
+})
+
+test("createCallbackHandlers rebinds and creates replacement sessions for target bindings", async () => {
+  const flushCalls = []
+  const { runtime, callbackAnswers, bindCalls, sentMessages } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_old" } } },
+    store: {
+      flush: async () => {
+        flushCalls.push(true)
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async createSession() {
+          return { id: "ses_new" }
+        },
+      },
+    },
+    getStartupSession: async (projectAlias, options) => {
+      assert.equal(projectAlias, "demo")
+      assert.deepEqual(options, { waitForStart: false, forceRefresh: true })
+      return "ses_startup"
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("b|rebind|100:7", { chatType: "private", threadIdOr0: 0 }))
+  await handlers.handleTelegramCallback(makeCallback("b|new|100:7", { chatType: "private", threadIdOr0: 0 }))
+
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Rebound", "Created"])
+  assert.deepEqual(bindCalls, [
+    {
+      ctxMeta: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7", chatType: "private" },
+      projectAlias: "demo",
+      sessionId: "ses_startup",
+    },
+    {
+      ctxMeta: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7", chatType: "private" },
+      projectAlias: "demo",
+      sessionId: "ses_new",
+    },
+  ])
+  assert.deepEqual(flushCalls, [true, true])
+  assert.match(sentMessages[0].text, /Rebound chat 100 \/ topic 7 to demo \/ ses_startup\./)
+  assert.match(sentMessages[1].text, /Created and bound chat 100 \/ topic 7 to demo \/ ses_new\./)
+})
+
+test("createCallbackHandlers scopes binding actions to current thread outside private chats", async () => {
+  const unbindCalls = []
+  const { runtime, callbackAnswers } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" }, "200:3": { projectAlias: "demo", sessionId: "ses_other" } } },
+    store: {
+      unbind: (ctxKey) => {
+        unbindCalls.push(ctxKey)
+        return true
+      },
+      flush: async () => {},
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("b|unbind|200:3", { chatType: "supergroup", threadIdOr0: 7 }))
+  await handlers.handleTelegramCallback(makeCallback("b|unbind|100:7", { chatType: "supergroup", threadIdOr0: 7 }))
+
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Private chat only", "Unbound"])
+  assert.deepEqual(unbindCalls, ["100:7"])
+})
+
 test("createCallbackHandlers closes feed and sessions messages", async () => {
   const deletedMessages = []
   const { runtime, callbackAnswers } = makeRuntime({
@@ -452,9 +597,11 @@ test("createCallbackHandlers closes feed and sessions messages", async () => {
   await handlers.handleTelegramCallback(makeCallback("feed|close"))
   await handlers.handleTelegramCallback(makeCallback("s|close"))
   await handlers.handleTelegramCallback(makeCallback("srv|close"))
+  await handlers.handleTelegramCallback(makeCallback("b|close"))
 
-  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Closed", "Closed", "Closed"])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Closed", "Closed", "Closed", "Closed"])
   assert.deepEqual(deletedMessages, [
+    { chatId: 100, messageId: 900 },
     { chatId: 100, messageId: 900 },
     { chatId: 100, messageId: 900 },
     { chatId: 100, messageId: 900 },

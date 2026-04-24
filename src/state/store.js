@@ -321,6 +321,8 @@ export class StateStore {
   }
 
   setBinding(ctxKey, binding, ctxMeta) {
+    let movedFromCtxKey = ""
+    let movedFromRoute = null
     const prev = this.state.bindings[ctxKey]
     if (prev) {
       delete this.state.sessionIndex[sessionKey(prev.projectAlias, prev.sessionId)]
@@ -334,8 +336,13 @@ export class StateStore {
     const existingCtx = this.state.sessionIndex[sk]
     if (existingCtx) {
       const otherKey = `${existingCtx.chatId}:${existingCtx.threadIdOr0}`
-      delete this.state.bindings[otherKey]
-      delete this.state.modelPrefsByContext[otherKey]
+      const otherBinding = this.state.bindings[otherKey]
+      if (otherKey !== ctxKey && otherBinding?.projectAlias === binding.projectAlias && otherBinding?.sessionId === binding.sessionId) {
+        movedFromCtxKey = otherKey
+        movedFromRoute = { chatId: existingCtx.chatId, threadIdOr0: existingCtx.threadIdOr0 }
+        delete this.state.bindings[otherKey]
+        delete this.state.modelPrefsByContext[otherKey]
+      }
     }
 
     this.state.bindings[ctxKey] = {
@@ -347,6 +354,7 @@ export class StateStore {
       threadIdOr0: ctxMeta.threadIdOr0,
     }
     this.scheduleSave()
+    return { movedFromCtxKey, movedFromRoute }
   }
 
   unbind(ctxKey) {
@@ -357,6 +365,72 @@ export class StateStore {
     delete this.state.modelPrefsByContext[ctxKey]
     this.scheduleSave()
     return true
+  }
+
+  repairBindingIndex({ dryRun = false } = {}) {
+    const summary = {
+      changed: false,
+      removedBindings: [],
+      removedIndexEntries: [],
+      rebuiltIndexEntries: 0,
+      conflicts: [],
+    }
+    const nextSessionIndex = {}
+    const nextBindings = {}
+    const bindingsBySession = new Map()
+
+    for (const [ctxKey, binding] of Object.entries(this.state.bindings || {}).sort(([a], [b]) => a.localeCompare(b))) {
+      const ctx = parseStoredCtxKey(ctxKey)
+      if (!ctx || !binding?.projectAlias || !binding?.sessionId) {
+        if (!dryRun) delete this.state.modelPrefsByContext[ctxKey]
+        summary.removedBindings.push(ctxKey)
+        summary.changed = true
+        continue
+      }
+
+      const sk = sessionKey(binding.projectAlias, binding.sessionId)
+      const entries = bindingsBySession.get(sk) || []
+      entries.push({ ctxKey, binding, ctx })
+      bindingsBySession.set(sk, entries)
+    }
+
+    for (const [sk, entries] of bindingsBySession.entries()) {
+      const existing = this.state.sessionIndex?.[sk]
+      const existingCtxKey = existing ? `${existing.chatId}:${existing.threadIdOr0}` : ""
+      const kept = entries.find((entry) => entry.ctxKey === existingCtxKey) || entries[0]
+
+      nextBindings[kept.ctxKey] = {
+        projectAlias: kept.binding.projectAlias,
+        sessionId: kept.binding.sessionId,
+      }
+      nextSessionIndex[sk] = { chatId: kept.ctx.chatId, threadIdOr0: kept.ctx.threadIdOr0 }
+      if (!existing || existing.chatId !== kept.ctx.chatId || existing.threadIdOr0 !== kept.ctx.threadIdOr0) {
+        summary.rebuiltIndexEntries += 1
+        summary.changed = true
+      }
+
+      for (const entry of entries) {
+        if (entry.ctxKey === kept.ctxKey) continue
+        if (!dryRun) delete this.state.modelPrefsByContext[entry.ctxKey]
+        summary.removedBindings.push(entry.ctxKey)
+        summary.conflicts.push({ sessionKey: sk, keptCtxKey: kept.ctxKey, removedCtxKey: entry.ctxKey })
+        summary.changed = true
+      }
+    }
+
+    for (const sk of Object.keys(this.state.sessionIndex || {})) {
+      if (!nextSessionIndex[sk]) {
+        summary.removedIndexEntries.push(sk)
+        summary.changed = true
+      }
+    }
+
+    if (summary.changed && !dryRun) {
+      this.state.bindings = nextBindings
+      this.state.sessionIndex = nextSessionIndex
+      this.scheduleSave()
+    }
+    return summary
   }
 }
 
@@ -471,6 +545,12 @@ function normalizeBindings(value) {
       })
       .map(([ctxKey, binding]) => [ctxKey, { projectAlias: binding.projectAlias, sessionId: binding.sessionId }]),
   )
+}
+
+function parseStoredCtxKey(ctxKey) {
+  const match = String(ctxKey || "").match(/^(-?\d+):(\d+)$/)
+  if (!match) return null
+  return { chatId: Number(match[1]), threadIdOr0: Number(match[2]) }
 }
 
 function normalizeSessionIndex(value) {

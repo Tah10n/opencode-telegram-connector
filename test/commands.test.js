@@ -1,9 +1,11 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import { makeBoundaryError } from "../src/boundary-errors.js"
 import { createCommandHandlers } from "../src/connector/commands.js"
 import { buildProjectsOverviewText as buildProjectsOverviewTextBase } from "../src/connector/overview.js"
 
 function makeRuntime(overrides = {}) {
+  const { store: storeOverrides, ...runtimeOverrides } = overrides
   const sent = []
   const feedCalls = []
 
@@ -26,7 +28,7 @@ function makeRuntime(overrides = {}) {
     },
     get: () => storeState,
     unbind: () => false,
-    ...(overrides.store || {}),
+    ...(storeOverrides || {}),
   }
 
   const projects = overrides.projects || {
@@ -106,7 +108,7 @@ function makeRuntime(overrides = {}) {
     isAllowedUser: () => true,
     ctxMetaFromMessage: (msg) => ({ chatId: msg?.chat?.id, threadIdOr0: msg?.message_thread_id || 0, ctxKey: `${msg?.chat?.id}:${msg?.message_thread_id || 0}` }),
     mirrorCompaction: false,
-    ...overrides,
+    ...runtimeOverrides,
   }
 
   return { runtime, sent, feedCalls }
@@ -131,6 +133,31 @@ test("createCommandHandlers handleWhere renders operator status fields", async (
   assert.match(sent[0].text, /Startup session: ses_startup/)
   assert.match(sent[0].text, /Feed: Verbose/)
   assert.match(sent[0].text, /SSE: connected/)
+})
+
+test("createCommandHandlers handleWhere reports stale session health with repair actions", async () => {
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_missing" } },
+    },
+    ocByAlias: {
+      demo: {
+        async getSession(sessionId) {
+          throw makeBoundaryError({ message: `GET /session/${sessionId} failed: 404`, method: "GET", pathname: `/session/${sessionId}`, status: 404 })
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleWhere({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" })
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Binding health: stale: session missing/)
+  assert.deepEqual(
+    sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text),
+    ["Remove 100:7", "Rebind startup 100:7", "New session 100:7", "Keep 100:7", "Close"],
+  )
 })
 
 test("createCommandHandlers handleProjects renders overview with binding counts and scope preview", async () => {
@@ -158,6 +185,9 @@ test("createCommandHandlers handleProjects renders overview with binding counts 
   assert.match(text, /Bindings: 2 \(chat 100\/main, chat 100\/topic 11\)/)
   assert.match(text, /- other/)
   assert.match(text, /Bindings: 1 \(chat 200\/main\)/)
+  assert.match(text, /Binding health:/)
+  assert.match(text, /- demo: ok=0 stale=2 unreachable=0 unknown=0/)
+  assert.match(text, /- other: ok=0 stale=1 unreachable=0 unknown=0/)
 })
 
 test("createCommandHandlers handleProjects includes project action keyboard", async () => {
@@ -268,6 +298,10 @@ test("createCommandHandlers handleBindings renders sorted bindings in private ch
         "200:3": { projectAlias: "other", sessionId: "ses_other" },
       },
     },
+    ocByAlias: {
+      demo: { async getSession(sessionId) { return { id: sessionId } } },
+      other: { async getSession(sessionId) { return { id: sessionId } } },
+    },
   })
   const handlers = createCommandHandlers(runtime)
 
@@ -278,11 +312,41 @@ test("createCommandHandlers handleBindings renders sorted bindings in private ch
     sent[0].text,
     [
       "Bindings:",
-      "- chat 100 / main -> demo / ses_main",
-      "- chat 100 / topic 11 (current) -> demo / ses_topic",
-      "- chat 200 / topic 3 -> other / ses_other",
+      "- chat 100 / main -> demo / ses_main [ok]",
+      "- chat 100 / topic 11 (current) -> demo / ses_topic [ok]",
+      "- chat 200 / topic 3 -> other / ses_other [ok]",
     ].join("\n"),
   )
+})
+
+test("createCommandHandlers handleBindings shows health labels and index repair preview", async () => {
+  const { runtime, sent } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312" } },
+    storeState: {
+      bindings: {
+        "100:0": { projectAlias: "demo", sessionId: "ses_ok" },
+        "200:0": { projectAlias: "removed", sessionId: "ses_old" },
+      },
+    },
+    store: {
+      repairBindingIndex(options) {
+        assert.deepEqual(options, { dryRun: true })
+        return { changed: true, removedBindings: [], removedIndexEntries: ["demo:ghost"], rebuiltIndexEntries: 1 }
+      },
+    },
+    ocByAlias: {
+      demo: { async getSession(sessionId) { return { id: sessionId } } },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleBindings({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" })
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /demo \/ ses_ok \[ok\]/)
+  assert.match(sent[0].text, /removed \/ ses_old \[stale: project missing\]/)
+  assert.match(sent[0].text, /Index repair available: removedBindings=0 removedIndex=1 rebuilt=1/)
+  assert.equal(sent[0].replyMarkup.inline_keyboard.flat().some((button) => button.text === "Repair index"), true)
 })
 
 test("createCommandHandlers handleBindings rejects non-private chats", async () => {
@@ -503,6 +567,48 @@ test("createCommandHandlers handleBindCommand refreshes a stale startup session"
   assert.equal(startupSessionByProject.demo, "ses_fresh")
   assert.equal(sent.length, 1)
   assert.equal(sent[0].text, "Bound to project 'demo' (startup session): ses_fresh")
+})
+
+test("createCommandHandlers handleBindCommand reports moved session conflicts", async () => {
+  const { runtime, sent } = makeRuntime({
+    startupSessionByProject: { demo: "ses_shared" },
+    ocByAlias: {
+      demo: {
+        async getSession(sessionId) {
+          return { id: sessionId }
+        },
+      },
+    },
+    bindCtxToSession: async () => ({ movedFromCtxKey: "200:3", movedFromRoute: { chatId: 200, threadIdOr0: 3 } }),
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleBindCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, ["demo"])
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Bound to project 'demo' \(startup session\): ses_shared/)
+  assert.match(sent[0].text, /already bound to chat 200 \/ topic 3 and was moved to this thread/)
+})
+
+test("createCommandHandlers handleUseCommand reports moved session conflicts", async () => {
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    ocByAlias: {
+      demo: {
+        async getSession(sessionId) {
+          return { id: sessionId }
+        },
+      },
+    },
+    bindCtxToSession: async () => ({ movedFromCtxKey: "200:3", movedFromRoute: { chatId: 200, threadIdOr0: 3 } }),
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleUseCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "ses_shared")
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Switched to session: ses_shared/)
+  assert.match(sent[0].text, /already bound to chat 200 \/ topic 3 and was moved to this thread/)
 })
 
 test("createCommandHandlers handleUnbind reports whether a binding existed", async () => {

@@ -21,11 +21,120 @@ test("StateStore moves an existing session binding to the new context", () => {
   store.scheduleSave = () => {}
 
   store.setBinding("1:0", { projectAlias: "demo", sessionId: "ses_1" }, { chatId: 1, threadIdOr0: 0 })
-  store.setBinding("2:7", { projectAlias: "demo", sessionId: "ses_1" }, { chatId: 2, threadIdOr0: 7 })
+  const result = store.setBinding("2:7", { projectAlias: "demo", sessionId: "ses_1" }, { chatId: 2, threadIdOr0: 7 })
 
   assert.equal(store.getBinding("1:0"), null)
   assert.deepEqual(store.getBinding("2:7"), { projectAlias: "demo", sessionId: "ses_1" })
   assert.deepEqual(store.get().sessionIndex["demo:ses_1"], { chatId: 2, threadIdOr0: 7 })
+  assert.deepEqual(result, { movedFromCtxKey: "1:0", movedFromRoute: { chatId: 1, threadIdOr0: 0 } })
+})
+
+test("StateStore ignores stale session index routes when moving bindings", () => {
+  const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-state.json"), logger: makeLogger() })
+  store.scheduleSave = () => {}
+
+  store.state.bindings = {
+    "1:0": { projectAlias: "demo", sessionId: "ses_other" },
+  }
+  store.state.sessionIndex = {
+    "demo:ses_1": { chatId: 1, threadIdOr0: 0 },
+    "demo:ses_other": { chatId: 1, threadIdOr0: 0 },
+  }
+
+  const result = store.setBinding("2:7", { projectAlias: "demo", sessionId: "ses_1" }, { chatId: 2, threadIdOr0: 7 })
+
+  assert.deepEqual(result, { movedFromCtxKey: "", movedFromRoute: null })
+  assert.deepEqual(store.getBinding("1:0"), { projectAlias: "demo", sessionId: "ses_other" })
+  assert.deepEqual(store.getBinding("2:7"), { projectAlias: "demo", sessionId: "ses_1" })
+  assert.deepEqual(store.get().sessionIndex["demo:ses_1"], { chatId: 2, threadIdOr0: 7 })
+})
+
+test("StateStore repairBindingIndex supports dry-run previews and repairs stale indexes", () => {
+  const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-state.json"), logger: makeLogger() })
+  let saves = 0
+  store.scheduleSave = () => {
+    saves += 1
+  }
+  store.state.bindings = {
+    "100:0": { projectAlias: "demo", sessionId: "ses_main" },
+    "100:7": { projectAlias: "demo", sessionId: "ses_topic" },
+  }
+  store.state.sessionIndex = {
+    "demo:ses_main": { chatId: 999, threadIdOr0: 0 },
+    "demo:ghost": { chatId: 1, threadIdOr0: 1 },
+  }
+
+  const preview = store.repairBindingIndex({ dryRun: true })
+
+  assert.equal(preview.changed, true)
+  assert.equal(preview.rebuiltIndexEntries, 2)
+  assert.deepEqual(preview.removedIndexEntries, ["demo:ghost"])
+  assert.deepEqual(store.get().sessionIndex, {
+    "demo:ses_main": { chatId: 999, threadIdOr0: 0 },
+    "demo:ghost": { chatId: 1, threadIdOr0: 1 },
+  })
+  assert.equal(saves, 0)
+
+  const repaired = store.repairBindingIndex()
+
+  assert.equal(repaired.changed, true)
+  assert.deepEqual(store.get().sessionIndex, {
+    "demo:ses_main": { chatId: 100, threadIdOr0: 0 },
+    "demo:ses_topic": { chatId: 100, threadIdOr0: 7 },
+  })
+  assert.equal(saves, 1)
+})
+
+test("StateStore repairBindingIndex removes duplicate and malformed bindings", () => {
+  const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-state.json"), logger: makeLogger() })
+  store.scheduleSave = () => {}
+  store.state.bindings = {
+    "bad-key": { projectAlias: "demo", sessionId: "ses_bad" },
+    "100:0": { projectAlias: "demo", sessionId: "ses_1" },
+    "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+  }
+  store.state.modelPrefsByContext = {
+    "bad-key": { mode: "custom", model: { providerID: "openai", modelID: "gpt-5" } },
+    "100:7": { mode: "custom", model: { providerID: "openai", modelID: "gpt-4" } },
+  }
+
+  const summary = store.repairBindingIndex()
+
+  assert.equal(summary.changed, true)
+  assert.deepEqual([...summary.removedBindings].sort(), ["100:7", "bad-key"].sort())
+  assert.deepEqual(summary.conflicts, [{ sessionKey: "demo:ses_1", keptCtxKey: "100:0", removedCtxKey: "100:7" }])
+  assert.deepEqual(store.get().bindings, {
+    "100:0": { projectAlias: "demo", sessionId: "ses_1" },
+  })
+  assert.deepEqual(store.get().sessionIndex, {
+    "demo:ses_1": { chatId: 100, threadIdOr0: 0 },
+  })
+  assert.equal(store.get().modelPrefsByContext["bad-key"], undefined)
+  assert.equal(store.get().modelPrefsByContext["100:7"], undefined)
+})
+
+test("StateStore repairBindingIndex preserves the indexed route when duplicate bindings exist", () => {
+  const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-state.json"), logger: makeLogger() })
+  store.scheduleSave = () => {}
+  store.state.bindings = {
+    "100:0": { projectAlias: "demo", sessionId: "ses_1" },
+    "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+  }
+  store.state.sessionIndex = {
+    "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+  }
+
+  const summary = store.repairBindingIndex()
+
+  assert.equal(summary.changed, true)
+  assert.deepEqual(summary.removedBindings, ["100:0"])
+  assert.deepEqual(summary.conflicts, [{ sessionKey: "demo:ses_1", keptCtxKey: "100:7", removedCtxKey: "100:0" }])
+  assert.deepEqual(store.get().bindings, {
+    "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+  })
+  assert.deepEqual(store.get().sessionIndex, {
+    "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+  })
 })
 
 test("StateStore replaces previous context binding and unbind clears the session index", () => {
