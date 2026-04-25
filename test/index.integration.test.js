@@ -322,6 +322,7 @@ async function createHarness({
   onFatalErrorImpl,
   ensureOpenCodeRunningImpl,
   stopOpenCodeServeOnPortImpl,
+  stopOpenCodeUiOnPortImpl,
   ensureStartupSessionImpl,
   openAttachWindowWindowsImpl,
   platform,
@@ -394,6 +395,7 @@ async function createHarness({
       ...(onFatalErrorImpl ? { onFatalError: onFatalErrorImpl } : {}),
       ...(ensureOpenCodeRunningImpl ? { ensureOpenCodeRunning: ensureOpenCodeRunningImpl } : {}),
       ...(stopOpenCodeServeOnPortImpl ? { stopOpenCodeServeOnPort: stopOpenCodeServeOnPortImpl } : {}),
+      ...(stopOpenCodeUiOnPortImpl ? { stopOpenCodeUiOnPort: stopOpenCodeUiOnPortImpl } : {}),
       ...(ensureStartupSessionImpl ? { ensureStartupSession: ensureStartupSessionImpl } : {}),
       ...(openAttachWindowWindowsImpl ? { openAttachWindowWindows: openAttachWindowWindowsImpl } : {}),
       ...(platform ? { platform } : {}),
@@ -2630,12 +2632,13 @@ test("startConnector watchdog restarts an autoStart project after repeated SSE f
   const startCalls = []
   const stopCalls = []
   const portStopCalls = []
+  const uiStopCalls = []
   let nextHandleId = 0
   const harness = await createHarness({
     projectPatch: {
       autoStart: true,
       port: 4312,
-      openTuiOnAutoStart: false,
+      openTuiOnAutoStart: true,
     },
     opencodeWatchdog: { failureThreshold: 2, windowMs: 60_000, cooldownMs: 0 },
     ensureOpenCodeRunningImpl: async ({ projectAlias }) => {
@@ -2650,6 +2653,10 @@ test("startConnector watchdog restarts an autoStart project after repeated SSE f
     stopOpenCodeServeOnPortImpl: async ({ projectAlias, port }) => {
       portStopCalls.push({ projectAlias, port })
       return { stopped: true, count: 1, pids: [1234] }
+    },
+    stopOpenCodeUiOnPortImpl: async ({ projectAlias, port }) => {
+      uiStopCalls.push({ projectAlias, port })
+      return { stopped: true, count: 1, pids: [5678] }
     },
     ensureStartupSessionImpl: async ({ alias, startupSessionByProject }) => {
       startupSessionByProject[alias] = "ses_startup"
@@ -2676,8 +2683,87 @@ test("startConnector watchdog restarts an autoStart project after repeated SSE f
     await waitFor(() => startCalls.length === 2)
 
     assert.deepEqual(stopCalls, [{ projectAlias: "demo", handleId: 1 }])
+    assert.deepEqual(uiStopCalls, [{ projectAlias: "demo", port: 4312 }])
     assert.deepEqual(portStopCalls, [{ projectAlias: "demo", port: 4312 }])
   } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector watchdog does not kill UI or serve after shutdown abort", async () => {
+  const startCalls = []
+  const stopCalls = []
+  const portStopCalls = []
+  const uiStopCalls = []
+  let releaseHandleStop = () => {}
+  const handleStopGate = new Promise((resolve) => {
+    releaseHandleStop = resolve
+  })
+  let markHandleStopEntered = () => {}
+  const handleStopEntered = new Promise((resolve) => {
+    markHandleStopEntered = resolve
+  })
+  let handleStopPromise = null
+
+  const harness = await createHarness({
+    projectPatch: {
+      autoStart: true,
+      port: 4312,
+      openTuiOnAutoStart: true,
+    },
+    opencodeWatchdog: { failureThreshold: 1, windowMs: 60_000, cooldownMs: 0 },
+    ensureOpenCodeRunningImpl: async ({ projectAlias }) => {
+      startCalls.push(projectAlias)
+      return {
+        stop: async () => {
+          if (!handleStopPromise) {
+            stopCalls.push(projectAlias)
+            markHandleStopEntered()
+            handleStopPromise = handleStopGate
+          }
+          return handleStopPromise
+        },
+      }
+    },
+    stopOpenCodeServeOnPortImpl: async ({ projectAlias, port }) => {
+      portStopCalls.push({ projectAlias, port })
+      return { stopped: true, count: 1, pids: [1234] }
+    },
+    stopOpenCodeUiOnPortImpl: async ({ projectAlias, port }) => {
+      uiStopCalls.push({ projectAlias, port })
+      return { stopped: true, count: 1, pids: [5678] }
+    },
+    ensureStartupSessionImpl: async ({ alias, startupSessionByProject }) => {
+      startupSessionByProject[alias] = "ses_startup"
+      return "ses_startup"
+    },
+  })
+
+  try {
+    await waitFor(() => startCalls.length === 1 && harness.hasSseHandler("demo"))
+    await harness.failSse(
+      "demo",
+      makeBoundaryError({
+        source: "opencode",
+        operation: "GET /event",
+        method: "GET",
+        pathname: "/event",
+        kind: "network",
+        outcome: "retryable",
+        message: "fetch failed",
+      }),
+    )
+    await handleStopEntered
+
+    const stopPromise = harness.connector.stop()
+    releaseHandleStop()
+    await stopPromise
+
+    assert.deepEqual(stopCalls, ["demo"])
+    assert.deepEqual(uiStopCalls, [])
+    assert.deepEqual(portStopCalls, [])
+  } finally {
+    releaseHandleStop()
     await harness.connector.stop()
   }
 })

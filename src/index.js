@@ -14,7 +14,7 @@ import { ctxKeyFrom, threadIdOr0FromMessage } from "./telegram/routing.js"
 import { OpenCodeClient } from "./opencode/client.js"
 import { startOpenCodeSseLoop } from "./opencode/sse.js"
 import { ensureStartupSession } from "./opencode/startup-session.js"
-import { ensureOpenCodeRunning, openAttachWindow, stopOpenCodeServeOnPort } from "./opencode/launcher.js"
+import { ensureOpenCodeRunning, openAttachWindow, stopOpenCodeServeOnPort, stopOpenCodeUiOnPort } from "./opencode/launcher.js"
 import { extractPatchDiffText, extractPatchFiles, formatChangedFilesText } from "./message-display.js"
 import { findSessionByShareUrl, parseSessionReference } from "./session-ref.js"
 import { resolveSessionRoute } from "./session-route.js"
@@ -184,6 +184,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const ensureStartupSessionFn = deps?.ensureStartupSession || ensureStartupSession
   const ensureOpenCodeRunningFn = deps?.ensureOpenCodeRunning || ensureOpenCodeRunning
   const stopOpenCodeServeOnPortFn = deps?.stopOpenCodeServeOnPort || stopOpenCodeServeOnPort
+  const stopOpenCodeUiOnPortFn = deps?.stopOpenCodeUiOnPort || stopOpenCodeUiOnPort
   const openAttachWindowFn = deps?.openAttachWindow || deps?.openAttachWindowWindows || openAttachWindow
   const onFatalError =
     deps?.onFatalError ||
@@ -316,6 +317,21 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       }
 
       const project = projects?.[projectAlias]
+      if (abortController.signal.aborted) return null
+      if (project?.openTuiOnAutoStart !== false) {
+        await Promise.resolve(
+          stopOpenCodeUiOnPortFn({
+            projectAlias,
+            project,
+            port: project?.port,
+            logger,
+            platform,
+          }),
+        ).catch((err) => {
+          logger.warn(`[${projectAlias}] watchdog failed to stop opencode UI on port ${project?.port}: ${err?.message || String(err)}`)
+        })
+      }
+      if (abortController.signal.aborted) return null
       await Promise.resolve(
         stopOpenCodeServeOnPortFn({
           projectAlias,

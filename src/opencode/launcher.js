@@ -183,6 +183,20 @@ function isOpenCodeServeCommandLine(cmdline) {
   return serveIdx !== -1 && serveIdx > openIdx
 }
 
+function isOpenCodeAttachCommandLine(cmdline) {
+  const tokens = tokenizeCmdline(cmdline).map((t) => t.toLowerCase())
+  if (!tokens.length) return false
+
+  const openIdx = tokens.findIndex((t) => {
+    const base = t.split(/[\\/]/).pop() || t
+    return base === "opencode" || base === "opencode.exe" || base === "opencode.cmd"
+  })
+  if (openIdx === -1) return false
+
+  const attachIdx = tokens.indexOf("attach")
+  return attachIdx !== -1 && attachIdx > openIdx
+}
+
 function isTrueEnv(name) {
   const v = String(process.env?.[name] || "").trim().toLowerCase()
   return v === "1" || v === "true" || v === "yes" || v === "y" || v === "on"
@@ -217,8 +231,7 @@ async function isAnyOpenCodeUiRunningWindows({ port } = {}) {
   for (const p of procs) {
     const cmd = String(p?.CommandLine || "")
     if (!cmd) continue
-    // Treat anything that's not `opencode serve ...` as an interactive UI / attach.
-    if (isOpenCodeServeCommandLine(cmd)) continue
+    if (!isOpenCodeAttachCommandLine(cmd)) continue
     if (!wantPort) return true
     const ports = extractPortsFromCommandLine(cmd)
     if (ports.has(wantPort)) return true
@@ -226,18 +239,26 @@ async function isAnyOpenCodeUiRunningWindows({ port } = {}) {
   return false
 }
 
-async function findOpenCodeUiProcessWindows({ port } = {}) {
+async function findOpenCodeUiProcessesWindows({ port } = {}) {
   const wantPort = port == null ? null : String(port)
   const procs = await listOpenCodeProcessesWindows()
+  const matches = []
   for (const p of procs) {
     const cmd = String(p?.CommandLine || "")
     if (!cmd) continue
-    if (isOpenCodeServeCommandLine(cmd)) continue
-    if (!wantPort) return { pid: p?.ProcessId ?? null, cmd }
+    if (!isOpenCodeAttachCommandLine(cmd)) continue
+    if (!wantPort) {
+      matches.push({ pid: p?.ProcessId ?? null, cmd })
+      continue
+    }
     const ports = extractPortsFromCommandLine(cmd)
-    if (ports.has(wantPort)) return { pid: p?.ProcessId ?? null, cmd }
+    if (ports.has(wantPort)) matches.push({ pid: p?.ProcessId ?? null, cmd })
   }
-  return null
+  return matches
+}
+
+async function findOpenCodeUiProcessWindows({ port } = {}) {
+  return (await findOpenCodeUiProcessesWindows({ port }))[0] || null
 }
 
 async function findOpenCodeServeProcessesWindows({ port } = {}) {
@@ -273,6 +294,30 @@ export async function stopOpenCodeServeOnPort({ port, projectAlias, logger, plat
     const shortCmd = cmd.length > 180 ? cmd.slice(0, 179) + "…" : cmd
     logger?.warn?.(`[${projectAlias || "opencode"}] stopping hung opencode serve pid=${match.pid} port=${port}`)
     logger?.debug?.(`[${projectAlias || "opencode"}] opencode serve cmdline: ${shortCmd}`)
+    await killProcessWindows(match.pid)
+    stopped += 1
+  }
+  return { stopped: stopped > 0, count: stopped, pids: matches.map((m) => m.pid).filter(Boolean) }
+}
+
+export async function stopOpenCodeUiOnPort({ port, projectAlias, logger, platform = process.platform } = {}) {
+  if (!port) return { stopped: false, count: 0, reason: "missing-port" }
+  if (platform !== "win32") return { stopped: false, count: 0, reason: "unsupported-platform" }
+
+  let matches = []
+  try {
+    matches = await findOpenCodeUiProcessesWindows({ port })
+  } catch (err) {
+    logger?.warn?.(`[${projectAlias || "opencode"}] failed to inspect opencode UI processes on port=${port}: ${err?.message || String(err)}`)
+    return { stopped: false, count: 0, reason: "inspect-failed" }
+  }
+  let stopped = 0
+  for (const match of matches) {
+    if (!match?.pid) continue
+    const cmd = redactCmdlineSecrets(String(match.cmd || ""))
+    const shortCmd = cmd.length > 180 ? cmd.slice(0, 179) + "…" : cmd
+    logger?.warn?.(`[${projectAlias || "opencode"}] stopping stale opencode UI pid=${match.pid} port=${port}`)
+    logger?.debug?.(`[${projectAlias || "opencode"}] opencode UI cmdline: ${shortCmd}`)
     await killProcessWindows(match.pid)
     stopped += 1
   }
@@ -890,6 +935,7 @@ export async function ensureOpenCodeRunning({ projectAlias, project, ocClient, l
           return { started: false, pid: null, stop: async () => {} }
         } catch (err) {
           if (err?.name === "AbortError" || abortSignal?.aborted) throw err
+          await stopOpenCodeUiOnPort({ port: project.port, projectAlias, logger, platform })
         }
       }
     }

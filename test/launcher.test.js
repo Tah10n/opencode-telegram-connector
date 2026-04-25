@@ -15,6 +15,7 @@ import {
   startOpenCodeServeDetached,
   startOpenCodeServeInNewWindowWindows,
   stopOpenCodeServeOnPort,
+  stopOpenCodeUiOnPort,
   waitForHealth,
 } from "../src/opencode/launcher.js"
 
@@ -258,6 +259,52 @@ test("stopOpenCodeServeOnPort kills only matching Windows opencode serve process
   assert.equal(calls[1].command, "taskkill")
   assert.deepEqual(calls[1].args, ["/PID", "111", "/T", "/F"])
   assert.match(logger.logs.warn[0], /stopping hung opencode serve pid=111 port=4100/)
+})
+
+test("stopOpenCodeUiOnPort kills only matching Windows opencode attach UI processes", async (t) => {
+  const calls = useSpawnPlans(t, [
+    {
+      stdout: JSON.stringify([
+        { ProcessId: 111, Name: "opencode.exe", CommandLine: "opencode.exe serve --port 4100" },
+        { ProcessId: 222, Name: "cmd.exe", CommandLine: "cmd.exe /k opencode attach http://127.0.0.1:4100/ --continue" },
+        { ProcessId: 333, Name: "cmd.exe", CommandLine: "cmd.exe /k opencode attach http://127.0.0.1:4101/ --continue" },
+      ]),
+    },
+    {},
+  ])
+  const logger = makeLogger()
+
+  const result = await stopOpenCodeUiOnPort({ projectAlias: "demo", port: 4100, platform: "win32", logger })
+
+  assert.equal(result.stopped, true)
+  assert.equal(result.count, 1)
+  assert.deepEqual(result.pids, [222])
+  assert.equal(calls[0].command, "powershell")
+  assert.equal(calls[1].command, "taskkill")
+  assert.deepEqual(calls[1].args, ["/PID", "222", "/T", "/F"])
+  assert.match(logger.logs.warn[0], /stopping stale opencode UI pid=222 port=4100/)
+})
+
+test("stopOpenCodeUiOnPort preserves same-port non-attach opencode processes", async (t) => {
+  const calls = useSpawnPlans(t, [
+    {
+      stdout: JSON.stringify([
+        { ProcessId: 111, Name: "opencode.exe", CommandLine: "opencode.exe serve --port 4100" },
+        { ProcessId: 222, Name: "opencode.exe", CommandLine: "opencode.exe run --port 4100" },
+        { ProcessId: 333, Name: "cmd.exe", CommandLine: "cmd.exe /k opencode attach http://127.0.0.1:4101/ --continue" },
+      ]),
+    },
+  ])
+  const logger = makeLogger()
+
+  const result = await stopOpenCodeUiOnPort({ projectAlias: "demo", port: 4100, platform: "win32", logger })
+
+  assert.equal(result.stopped, false)
+  assert.equal(result.count, 0)
+  assert.deepEqual(result.pids, [])
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].command, "powershell")
+  assert.deepEqual(logger.logs.warn, [])
 })
 
 test("getLaunchSupport reports cross-platform TUI and attach support", (t) => {
@@ -651,6 +698,58 @@ test("ensureOpenCodeRunning waits for a running TUI to bring the server back", a
   assert.equal(result.started, false)
   assert.equal(calls.length, 1)
   assert.equal(healthCalls, 3)
+})
+
+test("ensureOpenCodeRunning closes stale Windows attach UI before reopening it", async (t) => {
+  usePatchedPlatform(t, "win32")
+  usePatchedDelay(t, async () => {})
+  const ticks = [0, 1, 20_000]
+  usePatchedDateNow(t, () => ticks.shift() ?? 20_000)
+  usePatchedProcessKill(t, () => {})
+  const calls = useSpawnPlans(t, [
+    { stdout: JSON.stringify([{ ProcessId: 555, Name: "cmd.exe", CommandLine: "cmd.exe /k opencode attach http://127.0.0.1:4312/ --continue" }]) },
+    { stdout: JSON.stringify([{ ProcessId: 555, Name: "cmd.exe", CommandLine: "cmd.exe /k opencode attach http://127.0.0.1:4312/ --continue" }]) },
+    {},
+    { stdout: "[]" },
+    { pid: 900, close: false },
+    { stdout: "[]" },
+    {},
+  ])
+  const logger = makeLogger()
+  let healthCalls = 0
+
+  const result = await ensureOpenCodeRunning({
+    projectAlias: "demo",
+    project: {
+      autoStart: true,
+      openTuiOnAutoStart: true,
+      directory: "C:/repo",
+      port: 4312,
+      baseUrl: "http://127.0.0.1:4312",
+    },
+    ocClient: {
+      async health() {
+        healthCalls += 1
+        if (healthCalls <= 3) throw new Error("stale UI did not recover server")
+        return { ok: true }
+      },
+    },
+    logger,
+    platform: "win32",
+  })
+
+  assert.equal(result.started, true)
+  assert.equal(result.pid, 900)
+  assert.equal(calls[0].command, "powershell")
+  assert.equal(calls[1].command, "powershell")
+  assert.equal(calls[2].command, "taskkill")
+  assert.deepEqual(calls[2].args, ["/PID", "555", "/T", "/F"])
+  assert.equal(calls[3].command, "powershell")
+  assert.equal(calls[4].command, "cmd.exe")
+  assert.equal(calls[5].command, "powershell")
+  assert.equal(calls[6].command, "powershell")
+  assert.match(logger.logs.warn[0], /stopping stale opencode UI pid=555 port=4312/)
+  assert.match(logger.logs.info.at(-1), /opening opencode TUI/)
 })
 
 test("ensureOpenCodeRunning starts background serve mode on Windows and returns a stop handle", async (t) => {
