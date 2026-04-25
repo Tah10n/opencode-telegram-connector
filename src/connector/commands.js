@@ -77,6 +77,7 @@ export function createCommandHandlers(runtime) {
     validateProject,
     bindCtxToSession,
     primeTuiActiveSessionFollow,
+    recordProjectHealthFailure,
     sendToThread,
     parseCtxKey,
     formatThreadLabel,
@@ -117,6 +118,11 @@ export function createCommandHandlers(runtime) {
   const ATTACHMENT_CONFIRMATION_TTL_MS = 30 * 60 * 1000
   const MAX_PENDING_ATTACHMENT_CONFIRMATIONS = 200
   const userAttachmentLimits = userAttachmentLimitsFromConfig(config?.limits)
+
+  function recordRetryableOpenCodeFailure(projectAlias, err, context) {
+    if (!projectAlias || !isRetryableProjectError(err)) return
+    recordProjectHealthFailure?.(projectAlias, err, context)
+  }
 
   async function resolveStartupSession(alias, { forceRefresh = false } = {}) {
     return getStartupSession(alias, { waitForStart: false, forceRefresh }).catch(() => null)
@@ -428,6 +434,11 @@ export function createCommandHandlers(runtime) {
     } catch (err) {
       const alias = binding.projectAlias
       const withButton = isRetryableProjectError(err) && canAutoStartProject(alias, { platform })
+      recordRetryableOpenCodeFailure(alias, err, {
+        operation: "POST /session/:id/prompt_async",
+        method: "POST",
+        pathname: `/session/${binding.sessionId}/prompt_async`,
+      })
       await safeInformThread(ctxMeta, formatProjectUnavailable(alias, err), withButton ? startServerKeyboard(alias) : closeOnlyKeyboard())
       if (isRetryableProjectError(err)) throw err
     }
@@ -504,6 +515,11 @@ export function createCommandHandlers(runtime) {
       } catch (err) {
         const alias = currentBinding.projectAlias
         const withButton = isRetryableProjectError(err) && canAutoStartProject(alias, { platform })
+        recordRetryableOpenCodeFailure(alias, err, {
+          operation: "POST /session/:id/prompt_async",
+          method: "POST",
+          pathname: `/session/${currentBinding.sessionId}/prompt_async`,
+        })
         await safeInformThread(ctxMeta, formatProjectUnavailable(alias, err), withButton ? startServerKeyboard(alias) : closeOnlyKeyboard())
         if (isRetryableProjectError(err)) return { callbackText: "Temporarily unavailable" }
         throw err
@@ -716,17 +732,6 @@ export function createCommandHandlers(runtime) {
       `Changed: this thread now uses new session ${sessionId}.`,
       `Project: ${projectAlias}`,
       `Session: ${sessionId}`,
-    ]
-    if (ctxKey) lines.push(`Feed: ${feedModeLabel(getFeedMode(ctxKey))}`)
-    const effectiveState = await resolveEffectiveModelState(ctxKey, { projectAlias, sessionId })
-    return appendEffectiveModelLines(lines, effectiveState).join("\n")
-  }
-
-  async function buildCreatedSessionText(projectAlias, sessionId, { ctxKey } = {}) {
-    const lines = [
-      `Changed: created session ${sessionId}.`,
-      `Project: ${projectAlias}`,
-      `Created session: ${sessionId}`,
     ]
     if (ctxKey) lines.push(`Feed: ${feedModeLabel(getFeedMode(ctxKey))}`)
     const effectiveState = await resolveEffectiveModelState(ctxKey, { projectAlias, sessionId })
@@ -1263,39 +1268,30 @@ export function createCommandHandlers(runtime) {
         await oc.getActiveTuiSession({ timeoutMs: 1500 }).catch((err) => {
           if (err?.isBoundaryError === true && err.status === 404) {
             activeSessionSyncUnsupported = true
-            logger.info(`[${binding.projectAlias}] /tui/active-session is unavailable; same-window /new will stay in manual mode.`)
+            logger.info(`[${binding.projectAlias}] /tui/active-session is unavailable; same-window /new will bind immediately without TUI auto-follow.`)
           }
         })
       }
 
       const sameWindowSwitchFailed = attachOnNewMode === "same-window" && (!canRequestTuiSwitch || !!tuiSwitchErr)
-      const canAutoFollowSameWindow =
-        attachOnNewMode === "same-window" && !sameWindowSwitchFailed && typeof oc?.getActiveTuiSession === "function" && !activeSessionSyncUnsupported
       if (attachOnNewMode === "same-window") {
-        const createdSessionText = await buildCreatedSessionText(binding.projectAlias, createdId, { ctxKey: ctxMeta.ctxKey })
-        if (!canAutoFollowSameWindow) {
-          const sameWindowFallbackNote = sameWindowSwitchFailed
-            ? `Note: Could not switch the existing TUI automatically in same-window mode. Reattach manually if needed, use /use ${createdId}, or change the project to openAttachOnNewMode=new-window.`
-            : `Note: This opencode server does not expose confirmed active TUI session tracking, so Telegram stays on the current session. Use /use ${createdId} after switching in TUI, or change the project to openAttachOnNewMode=new-window.`
-          await sendToThread(
-            ctxMeta,
-            [
-              createdSessionText,
-              `Current thread stays on session: ${binding.sessionId}`,
-              sameWindowFallbackNote,
-            ].join("\n\n"),
+        const bindResult = await bindCtxToSession(ctxMeta, binding.projectAlias, createdId)
+        primeTuiActiveSessionFollow?.(binding.projectAlias, ctxMeta, binding.sessionId, { pendingTargetSessionId: createdId })
+
+        const lines = [await buildNewSessionText(binding.projectAlias, createdId, { ctxKey: ctxMeta.ctxKey })]
+        if (sameWindowSwitchFailed) {
+          lines.push(
+            `Note: Could not switch the existing TUI automatically in same-window mode. Telegram is already using the new session; switch or reattach the TUI manually if needed.`,
           )
         } else {
-          primeTuiActiveSessionFollow?.(binding.projectAlias, ctxMeta, binding.sessionId)
-          await sendToThread(
-            ctxMeta,
-            [
-              createdSessionText,
-              `Current thread stays on session: ${binding.sessionId}`,
-              `Requested TUI switch to session: ${createdId}. Telegram will switch after the TUI reports the new active session.`,
-            ].join("\n\n"),
+          lines.push(`Requested same-window TUI switch to session: ${createdId}.`)
+        }
+        if (activeSessionSyncUnsupported) {
+          lines.push(
+            `Note: This opencode server does not expose active TUI session tracking; Telegram is already using the new session, but future TUI-only switches will not be followed automatically.`,
           )
         }
+        await sendToThread(ctxMeta, appendMoveConflict(lines, bindResult).join("\n"))
       } else {
         const bindResult = await bindCtxToSession(ctxMeta, binding.projectAlias, createdId)
         await sendToThread(ctxMeta, appendMoveConflict([await buildNewSessionText(binding.projectAlias, createdId, { ctxKey: ctxMeta.ctxKey })], bindResult).join("\n"))
@@ -1941,6 +1937,11 @@ export function createCommandHandlers(runtime) {
     } catch (err) {
       const alias = binding.projectAlias
       const withButton = isRetryableProjectError(err) && canAutoStartProject(alias, { platform })
+      recordRetryableOpenCodeFailure(alias, err, {
+        operation: "POST /session/:id/prompt_async",
+        method: "POST",
+        pathname: `/session/${binding.sessionId}/prompt_async`,
+      })
       await sendToThread(ctxMeta, formatProjectUnavailable(alias, err), withButton ? startServerKeyboard(alias) : null).catch(() => {})
       if (isRetryableProjectError(err)) throw err
     }

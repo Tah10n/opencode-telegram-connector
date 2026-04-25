@@ -1,6 +1,13 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { extractPatchDiffText, extractPatchFileEntries, extractPatchFiles, formatChangedFilesText } from "../src/message-display.js"
+import {
+  extractPatchDiffText,
+  extractPatchFileEntries,
+  extractPatchFiles,
+  extractSummaryFileDiffEntries,
+  formatChangedFilesText,
+  formatFileDiffEntriesPatch,
+} from "../src/message-display.js"
 
 test("extractPatchFiles returns unique file list from patch parts", () => {
   const files = extractPatchFiles({
@@ -80,4 +87,19 @@ test("extractPatchFileEntries keeps file entries without available diff", () => 
   const entries = extractPatchFileEntries({ parts: [{ type: "patch", files: ["a.txt", "b.txt"] }] })
 
   assert.deepEqual(entries, [{ file: "a.txt", diff: "" }, { file: "b.txt", diff: "" }])
+})
+
+test("extractSummaryFileDiffEntries reads current opencode user summary diffs", () => {
+  const entries = extractSummaryFileDiffEntries({
+    info: {
+      summary: {
+        diffs: [
+          { file: "src/app.js", patch: "Index: src/app.js\n--- src/app.js\n+++ src/app.js\n@@ -1 +1 @@\n-old\n+new" },
+        ],
+      },
+    },
+  })
+
+  assert.deepEqual(entries.map((entry) => entry.file), ["src/app.js"])
+  assert.match(formatFileDiffEntriesPatch(entries), /\+new/)
 })

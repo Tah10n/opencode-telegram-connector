@@ -240,6 +240,45 @@ async function findOpenCodeUiProcessWindows({ port } = {}) {
   return null
 }
 
+async function findOpenCodeServeProcessesWindows({ port } = {}) {
+  const wantPort = port == null ? null : String(port)
+  if (!wantPort) return []
+  const matches = []
+  const procs = await listOpenCodeProcessesWindows()
+  for (const p of procs) {
+    const cmd = String(p?.CommandLine || "")
+    if (!cmd || !isOpenCodeServeCommandLine(cmd)) continue
+    const ports = extractPortsFromCommandLine(cmd)
+    if (!ports.has(wantPort)) continue
+    matches.push({ pid: p?.ProcessId ?? null, cmd })
+  }
+  return matches
+}
+
+export async function stopOpenCodeServeOnPort({ port, projectAlias, logger, platform = process.platform } = {}) {
+  if (!port) return { stopped: false, count: 0, reason: "missing-port" }
+  if (platform !== "win32") return { stopped: false, count: 0, reason: "unsupported-platform" }
+
+  let matches = []
+  try {
+    matches = await findOpenCodeServeProcessesWindows({ port })
+  } catch (err) {
+    logger?.warn?.(`[${projectAlias || "opencode"}] failed to inspect opencode serve processes on port=${port}: ${err?.message || String(err)}`)
+    return { stopped: false, count: 0, reason: "inspect-failed" }
+  }
+  let stopped = 0
+  for (const match of matches) {
+    if (!match?.pid) continue
+    const cmd = redactCmdlineSecrets(String(match.cmd || ""))
+    const shortCmd = cmd.length > 180 ? cmd.slice(0, 179) + "…" : cmd
+    logger?.warn?.(`[${projectAlias || "opencode"}] stopping hung opencode serve pid=${match.pid} port=${port}`)
+    logger?.debug?.(`[${projectAlias || "opencode"}] opencode serve cmdline: ${shortCmd}`)
+    await killProcessWindows(match.pid)
+    stopped += 1
+  }
+  return { stopped: stopped > 0, count: stopped, pids: matches.map((m) => m.pid).filter(Boolean) }
+}
+
 export async function waitForHealth(ocClient, { timeoutMs = 30_000, logger, projectAlias, abortSignal } = {}) {
   const started = Date.now()
   let backoff = 250
@@ -854,6 +893,8 @@ export async function ensureOpenCodeRunning({ projectAlias, project, ocClient, l
         }
       }
     }
+
+    await stopOpenCodeServeOnPort({ port: project.port, projectAlias, logger, platform })
 
     const res =
       serverLaunchMode === "window"

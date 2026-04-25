@@ -310,6 +310,57 @@ test("renderChangedFilesView sends full patch export as a .patch document", asyn
   assert.match(calls.sendDocument[0][3], /Changed files diff/)
 })
 
+test("renderChangedFilesView loads current opencode diffs from parent user summary", async () => {
+  const fetched = []
+  const { calls, handlers } = createHarness({
+    ocByAlias: {
+      demo: {
+        async getMessage(_sessionId, messageId) {
+          fetched.push(messageId)
+          if (messageId === "msg_1") {
+            return {
+              info: { id: "msg_1", role: "assistant", parentID: "user_1" },
+              parts: [{ type: "patch", hash: "abc", files: ["/repo/src/app.js"] }],
+            }
+          }
+          if (messageId === "user_1") {
+            return {
+              info: {
+                id: "user_1",
+                role: "user",
+                summary: {
+                  diffs: [
+                    {
+                      file: "src/app.js",
+                      patch: "Index: src/app.js\n--- src/app.js\n+++ src/app.js\n@@ -1 +1 @@\n-old\n+new",
+                    },
+                  ],
+                },
+              },
+              parts: [],
+            }
+          }
+          return null
+        },
+      },
+    },
+  })
+
+  await handlers.renderChangedFilesView(
+    { chatId: 11, threadIdOr0: 22, ctxKey: "11:22" },
+    "demo",
+    "ses_1",
+    "msg_1",
+    "show",
+    { editMessageId: 77 },
+  )
+
+  assert.deepEqual(fetched, ["msg_1", "user_1"])
+  assert.equal(calls.editMessageText.length, 1)
+  assert.match(calls.editMessageText[0][2], /Changed files diff/)
+  assert.match(calls.editMessageText[0][2], /\+new/)
+})
+
 test("renderChangedFilesView suppresses duplicate changed-files exports", async () => {
   const sentKeys = new Set()
   const { calls, handlers } = createHarness({
@@ -457,8 +508,8 @@ test("handleMessageUpdated edits an existing assistant preview in verbose mode",
   assert.equal(calls.editMessageText.length, 1)
   assert.equal(calls.editMessageText[0][0], 11)
   assert.equal(calls.editMessageText[0][1], 77)
-  assert.match(calls.editMessageText[0][2], /Streaming reply…/)
   assert.match(calls.editMessageText[0][2], /Hello &lt;world&gt;/)
+  assert.doesNotMatch(calls.editMessageText[0][2], /Streaming reply/)
   assert.deepEqual(calls.editMessageText[0][4], {
     parse_mode: "HTML",
     disable_web_page_preview: true,
@@ -467,6 +518,32 @@ test("handleMessageUpdated edits an existing assistant preview in verbose mode",
   assert.equal(preview.telegramMessageId, 77)
   assert.match(preview.lastPreviewHtml, /Hello &lt;world&gt;/)
   assert.equal(typeof preview.lastPreviewAt, "number")
+})
+
+test("handleMessageUpdated suppresses empty assistant previews in verbose mode", async () => {
+  const { calls, runtime, handlers } = createHarness({
+    store: { getFeedMode: () => "verbose" },
+    ocByAlias: {
+      demo: {
+        async getMessage() {
+          return {
+            info: { id: "msg_1", role: "assistant" },
+            parts: [{ type: "text", text: "   " }],
+          }
+        },
+      },
+    },
+  })
+
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant" } },
+  })
+
+  assert.equal(calls.sendMessage.length, 0)
+  assert.equal(calls.editMessageText.length, 0)
+  assert.equal(runtime.assistantPreviewBySession.has(sessionKey("demo", "ses_1")), false)
+  assert.equal(calls.logSseDebug.at(-1)?.[2], "drop=assistant_preview_empty msg=msg_1")
 })
 
 test("handleMessageUpdated keeps the preview message when final assistant content cannot be fetched", async (t) => {

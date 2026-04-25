@@ -269,8 +269,31 @@ test("createCallbackHandlers asks for confirmation before runtime restart", asyn
   assert.deepEqual(editCalls[0][3].inline_keyboard.flat().map((button) => button.callback_data), ["rt|restart", "rt|cancel"])
 })
 
+test("createCallbackHandlers deletes runtime confirmation after cancel", async () => {
+  const editCalls = []
+  const deletedMessages = []
+  const { runtime, callbackAnswers } = makeRuntime({
+    tg: {
+      editMessageText: async (...args) => {
+        editCalls.push(args)
+      },
+      deleteMessage: async (chatId, messageId) => {
+        deletedMessages.push({ chatId, messageId })
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("rt|cancel", { chatType: "private", threadIdOr0: 0, messageId: 78 }))
+
+  assert.deepEqual(callbackAnswers, [{ callbackQueryId: "cb_1", text: "Cancelled" }])
+  assert.deepEqual(editCalls, [])
+  assert.deepEqual(deletedMessages, [{ chatId: 100, messageId: 78 }])
+})
+
 test("createCallbackHandlers schedules confirmed runtime shutdown actions", async () => {
   const editCalls = []
+  const deletedMessages = []
   const scheduled = []
   const shutdownRequests = []
   const runtimeNotices = []
@@ -295,6 +318,9 @@ test("createCallbackHandlers schedules confirmed runtime shutdown actions", asyn
       editMessageText: async (...args) => {
         editCalls.push(args)
       },
+      deleteMessage: async (chatId, messageId) => {
+        deletedMessages.push({ chatId, messageId })
+      },
     },
   })
   const handlers = createCallbackHandlers(runtime)
@@ -306,8 +332,11 @@ test("createCallbackHandlers schedules confirmed runtime shutdown actions", asyn
     { callbackQueryId: "cb_1", text: "Stopping…" },
     { callbackQueryId: "cb_2", text: "Restarting…" },
   ])
-  assert.match(editCalls[0][2], /Stop requested/)
-  assert.match(editCalls[1][2], /Restart requested/)
+  assert.deepEqual(editCalls, [])
+  assert.deepEqual(deletedMessages, [
+    { chatId: 100, messageId: 79 },
+    { chatId: 100, messageId: 80 },
+  ])
   assert.equal(runtimeNotices.length, 1)
   assert.equal(runtimeNotices[0].kind, "restart")
   assert.equal(runtimeNotices[0].chatId, 100)
@@ -666,6 +695,7 @@ test("createCallbackHandlers blocks binding repair outside private chats", async
 test("createCallbackHandlers keeps and unbinds target bindings", async () => {
   const unbindCalls = []
   const flushCalls = []
+  const deletedMessages = []
   const { runtime, callbackAnswers, sentMessages } = makeRuntime({
     storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
     store: {
@@ -675,6 +705,11 @@ test("createCallbackHandlers keeps and unbinds target bindings", async () => {
       },
       flush: async () => {
         flushCalls.push(true)
+      },
+    },
+    tg: {
+      deleteMessage: async (chatId, messageId) => {
+        deletedMessages.push({ chatId, messageId })
       },
     },
   })
@@ -687,6 +722,7 @@ test("createCallbackHandlers keeps and unbinds target bindings", async () => {
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Kept", "Confirm", "Unbound"])
   assert.deepEqual(unbindCalls, ["100:7"])
   assert.deepEqual(flushCalls, [true])
+  assert.deepEqual(deletedMessages, [{ chatId: 100, messageId: 900 }])
   assert.match(sentMessages[0].text, /Kept binding for chat 100 \/ topic 7 unchanged\./)
   assert.match(sentMessages[1].text, /Confirm unbind for this thread:/)
   assert.deepEqual(sentMessages[1].replyMarkup.inline_keyboard.flat().map((button) => button.text), ["Remove this thread binding", "Close"])
@@ -697,6 +733,7 @@ test("createCallbackHandlers keeps and unbinds target bindings", async () => {
 test("createCallbackHandlers refuses stale unbind confirmations after binding changes", async () => {
   const storeState = { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_old" } } }
   const unbindCalls = []
+  const deletedMessages = []
   const { runtime, callbackAnswers, sentMessages } = makeRuntime({
     storeState,
     store: {
@@ -705,6 +742,11 @@ test("createCallbackHandlers refuses stale unbind confirmations after binding ch
         return true
       },
       flush: async () => {},
+    },
+    tg: {
+      deleteMessage: async (chatId, messageId) => {
+        deletedMessages.push({ chatId, messageId })
+      },
     },
   })
   const handlers = createCallbackHandlers(runtime)
@@ -716,6 +758,7 @@ test("createCallbackHandlers refuses stale unbind confirmations after binding ch
 
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Confirm", "Binding changed"])
   assert.deepEqual(unbindCalls, [])
+  assert.deepEqual(deletedMessages, [{ chatId: 100, messageId: 900 }])
   assert.match(sentMessages[1].text, /Binding changed for chat 100 \/ topic 7/)
 })
 
@@ -793,6 +836,7 @@ test("createCallbackHandlers refuses invalid replacement session ids", async () 
 
 test("createCallbackHandlers scopes binding actions to current thread outside private chats", async () => {
   const unbindCalls = []
+  const deletedMessages = []
   const { runtime, callbackAnswers } = makeRuntime({
     storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" }, "200:3": { projectAlias: "demo", sessionId: "ses_other" } } },
     store: {
@@ -802,6 +846,11 @@ test("createCallbackHandlers scopes binding actions to current thread outside pr
       },
       flush: async () => {},
     },
+    tg: {
+      deleteMessage: async (chatId, messageId) => {
+        deletedMessages.push({ chatId, messageId })
+      },
+    },
   })
   const handlers = createCallbackHandlers(runtime)
 
@@ -810,6 +859,7 @@ test("createCallbackHandlers scopes binding actions to current thread outside pr
 
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Private chat only", "Unbound"])
   assert.deepEqual(unbindCalls, ["100:7"])
+  assert.deepEqual(deletedMessages, [{ chatId: 100, messageId: 900 }])
 })
 
 test("createCallbackHandlers closes feed and sessions messages", async () => {
@@ -837,6 +887,39 @@ test("createCallbackHandlers closes feed and sessions messages", async () => {
     { chatId: 100, messageId: 900 },
     { chatId: 100, messageId: 900 },
     { chatId: 100, messageId: 900 },
+  ])
+})
+
+test("createCallbackHandlers deletes attachment confirmation after terminal button actions", async () => {
+  const deletedMessages = []
+  const attachmentCalls = []
+  const { runtime, callbackAnswers } = makeRuntime({
+    tg: {
+      deleteMessage: async (chatId, messageId) => {
+        deletedMessages.push({ chatId, messageId })
+      },
+    },
+    handleAttachmentConfirmation: async (ctxMeta, action, token, options) => {
+      attachmentCalls.push({ ctxMeta, action, token, options })
+      return { callbackText: action === "send" ? "Sent" : "Cancelled" }
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("att|cancel|tok_1", { messageId: 901 }))
+  await handlers.handleTelegramCallback(makeCallback("att|send|tok_2", { id: "cb_2", messageId: 902 }))
+
+  assert.deepEqual(callbackAnswers, [
+    { callbackQueryId: "cb_1", text: "Cancelled" },
+    { callbackQueryId: "cb_2", text: "Sending…" },
+  ])
+  assert.deepEqual(attachmentCalls.map((entry) => ({ action: entry.action, token: entry.token, editMessageId: entry.options.editMessageId })), [
+    { action: "cancel", token: "tok_1", editMessageId: 901 },
+    { action: "send", token: "tok_2", editMessageId: 902 },
+  ])
+  assert.deepEqual(deletedMessages, [
+    { chatId: 100, messageId: 901 },
+    { chatId: 100, messageId: 902 },
   ])
 })
 
@@ -963,7 +1046,13 @@ test("createCallbackHandlers rejects malformed model apply callbacks without cha
 })
 
 test("createCallbackHandlers resolves permission callbacks including stale and reject-note flows", async () => {
+  const deletedMessages = []
   const { runtime, callbackAnswers, deletedPermissions, rejectStateCalls, rejectedNotes } = makeRuntime({
+    tg: {
+      deleteMessage: async (chatId, messageId) => {
+        deletedMessages.push({ chatId, messageId })
+      },
+    },
     ocByAlias: {
       demo: {
         async replyPermission(permissionId) {
@@ -984,10 +1073,10 @@ test("createCallbackHandlers resolves permission callbacks including stale and r
   })
   const handlers = createCallbackHandlers(runtime)
 
-  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_ok|once"))
-  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_stale|reject"))
-  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_note|reject_note"))
-  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_note|cancel_note"))
+  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_ok|once", { messageId: 901 }))
+  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_stale|reject", { messageId: 902 }))
+  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_note|reject_note", { messageId: 903 }))
+  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_note|cancel_note", { messageId: 904 }))
 
   assert.deepEqual(deletedPermissions, [
     { projectAlias: "demo", permissionId: "perm_ok" },
@@ -1003,6 +1092,12 @@ test("createCallbackHandlers resolves permission callbacks including stale and r
     { ctxMeta: { chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" }, projectAlias: "demo", permissionId: "perm_note" },
   ])
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["OK", "No longer active", "Send note", "Cancelled"])
+  assert.deepEqual(deletedMessages, [
+    { chatId: 100, messageId: 901 },
+    { chatId: 100, messageId: 902 },
+    { chatId: 100, messageId: 903 },
+    { chatId: 100, messageId: 904 },
+  ])
 })
 
 test("createCallbackHandlers skips duplicate permission callbacks via idempotency ledger", async () => {
@@ -1039,7 +1134,13 @@ test("createCallbackHandlers skips duplicate permission callbacks via idempotenc
 })
 
 test("createCallbackHandlers degrades transient permission callback failures without blocking the user", async () => {
+  const deletedMessages = []
   const { runtime, callbackAnswers, sentMessages, loggerErrors } = makeRuntime({
+    tg: {
+      deleteMessage: async (chatId, messageId) => {
+        deletedMessages.push({ chatId, messageId })
+      },
+    },
     ocByAlias: {
       demo: {
         async replyPermission() {
@@ -1063,6 +1164,7 @@ test("createCallbackHandlers degrades transient permission callback failures wit
   assert.equal(callbackAnswers.at(-1)?.text, "Temporarily unavailable")
   assert.equal(sentMessages.at(-1)?.text, "Action is temporarily unavailable. Please try again.")
   assert.equal(loggerErrors.length, 0)
+  assert.deepEqual(deletedMessages, [])
 })
 
 test("createCallbackHandlers handles permission guard branches and fatal callback failures", async () => {
@@ -1089,7 +1191,13 @@ test("createCallbackHandlers handles permission guard branches and fatal callbac
 
 test("createCallbackHandlers rejects stale and successful question callbacks", async () => {
   const wizard = makeWizard()
+  const deletedMessages = []
   const { runtime, callbackAnswers, clearedQuestionIds, customStateCalls, questionWizards } = makeRuntime({
+    tg: {
+      deleteMessage: async (chatId, messageId) => {
+        deletedMessages.push({ chatId, messageId })
+      },
+    },
     questionWizards: new Map([["demo:q_1", wizard]]),
     getWizard: () => wizard,
     ocByAlias: {
@@ -1112,8 +1220,8 @@ test("createCallbackHandlers rejects stale and successful question callbacks", a
   })
   const handlers = createCallbackHandlers(runtime)
 
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_stale|reject"))
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_1|reject"))
+  await handlers.handleTelegramCallback(makeCallback("q|demo|q_stale|reject", { messageId: 905 }))
+  await handlers.handleTelegramCallback(makeCallback("q|demo|q_1|reject", { messageId: 906 }))
 
   assert.equal(questionWizards.has("demo:q_1"), false)
   assert.deepEqual(clearedQuestionIds, [
@@ -1125,6 +1233,10 @@ test("createCallbackHandlers rejects stale and successful question callbacks", a
     { ctxKey: "100:7", value: null },
   ])
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["No longer active", "Rejected"])
+  assert.deepEqual(deletedMessages, [
+    { chatId: 100, messageId: 905 },
+    { chatId: 100, messageId: 906 },
+  ])
 })
 
 test("createCallbackHandlers skips duplicate question reject callbacks via idempotency ledger", async () => {
@@ -1181,14 +1293,20 @@ test("createCallbackHandlers clears persisted question state even without an in-
 
 test("createCallbackHandlers starts and cancels custom-answer question flows", async () => {
   const wizard = makeWizard({ questions: [{ header: "Reason", question: "Why?", custom: true, options: [] }] })
+  const deletedMessages = []
   const { runtime, callbackAnswers, customPrompts, customStateCalls } = makeRuntime({
+    tg: {
+      deleteMessage: async (chatId, messageId) => {
+        deletedMessages.push({ chatId, messageId })
+      },
+    },
     getWizard: () => wizard,
     ocByAlias: { demo: {} },
   })
   const handlers = createCallbackHandlers(runtime)
 
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_1|0|custom"))
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_1|0|cancel_custom"))
+  await handlers.handleTelegramCallback(makeCallback("q|demo|q_1|0|custom", { messageId: 907 }))
+  await handlers.handleTelegramCallback(makeCallback("q|demo|q_1|0|cancel_custom", { messageId: 908 }))
 
   assert.deepEqual(customPrompts, [
     {
@@ -1204,6 +1322,10 @@ test("createCallbackHandlers starts and cancels custom-answer question flows", a
     { ctxKey: "100:7", value: null },
   ])
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Send answer", "Cancelled"])
+  assert.deepEqual(deletedMessages, [
+    { chatId: 100, messageId: 907 },
+    { chatId: 100, messageId: 908 },
+  ])
 })
 
 test("createCallbackHandlers reports prompt bootstrap failures for reject-note and custom-answer flows", async () => {
@@ -1236,15 +1358,21 @@ test("createCallbackHandlers handles single-choice and multi-choice question ste
     selectedByIndex: { 0: ["test"] },
   })
   const getWizard = (projectAlias, questionId) => (questionId === "q_single" ? singleWizard : questionId === "q_multi" ? multiWizard : null)
+  const deletedMessages = []
   const { runtime, callbackAnswers, persistedWizards, finishCalls, sendQuestionStepCalls } = makeRuntime({
+    tg: {
+      deleteMessage: async (chatId, messageId) => {
+        deletedMessages.push({ chatId, messageId })
+      },
+    },
     getWizard,
     ocByAlias: { demo: {} },
   })
   const handlers = createCallbackHandlers(runtime)
 
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_single|0|o|0"))
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_multi|0|t|0"))
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_multi|0|done"))
+  await handlers.handleTelegramCallback(makeCallback("q|demo|q_single|0|o|0", { messageId: 909 }))
+  await handlers.handleTelegramCallback(makeCallback("q|demo|q_multi|0|t|0", { messageId: 910 }))
+  await handlers.handleTelegramCallback(makeCallback("q|demo|q_multi|0|done", { messageId: 910 }))
 
   assert.deepEqual(finishCalls, [
     {
@@ -1254,11 +1382,15 @@ test("createCallbackHandlers handles single-choice and multi-choice question ste
       messageIdByIndex: {},
     },
   ])
-  assert.equal(sendQuestionStepCalls[0].options.editMessageId, 900)
+  assert.equal(sendQuestionStepCalls[0].options.editMessageId, 910)
   assert.equal(sendQuestionStepCalls[0].wizard.selectedByIndex[0].sort().join(","), "lint,test")
   assert.equal(sendQuestionStepCalls[1].wizard.index, 1)
   assert.equal(persistedWizards.length, 3)
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Selected", undefined, "Done"])
+  assert.deepEqual(deletedMessages, [
+    { chatId: 100, messageId: 909 },
+    { chatId: 100, messageId: 910 },
+  ])
 })
 
 test("createCallbackHandlers rejects invalid question callback shapes and options", async () => {

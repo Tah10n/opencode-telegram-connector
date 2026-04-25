@@ -321,12 +321,14 @@ async function createHarness({
   startSseLoopImpl,
   onFatalErrorImpl,
   ensureOpenCodeRunningImpl,
+  stopOpenCodeServeOnPortImpl,
   ensureStartupSessionImpl,
   openAttachWindowWindowsImpl,
   platform,
   delayImpl = shortDelay,
   wizardTtlMs,
   wizardGcIntervalMs,
+  opencodeWatchdog,
   createStateStoreImpl,
 } = {}) {
   const dir = await makeTempDir()
@@ -391,11 +393,13 @@ async function createHarness({
       },
       ...(onFatalErrorImpl ? { onFatalError: onFatalErrorImpl } : {}),
       ...(ensureOpenCodeRunningImpl ? { ensureOpenCodeRunning: ensureOpenCodeRunningImpl } : {}),
+      ...(stopOpenCodeServeOnPortImpl ? { stopOpenCodeServeOnPort: stopOpenCodeServeOnPortImpl } : {}),
       ...(ensureStartupSessionImpl ? { ensureStartupSession: ensureStartupSessionImpl } : {}),
       ...(openAttachWindowWindowsImpl ? { openAttachWindowWindows: openAttachWindowWindowsImpl } : {}),
       ...(platform ? { platform } : {}),
       ...(wizardTtlMs != null ? { wizardTtlMs } : {}),
       ...(wizardGcIntervalMs != null ? { wizardGcIntervalMs } : {}),
+      ...(opencodeWatchdog ? { opencodeWatchdog } : {}),
       delay: delayImpl,
     },
   })
@@ -616,8 +620,8 @@ test("startConnector streams assistant replies in isolated threads and finalizes
 
     const previewAlpha = harness.tg.sentMessages[0]
     const previewBeta = harness.tg.sentMessages[1]
-    assert.match(previewAlpha.text, /Streaming reply/)
-    assert.match(previewBeta.text, /Streaming reply/)
+    assert.equal(previewAlpha.text, "alpha partial")
+    assert.equal(previewBeta.text, "beta partial")
     assert.equal(previewAlpha.options.message_thread_id, 7)
     assert.equal(previewBeta.options.message_thread_id, 9)
 
@@ -1638,10 +1642,10 @@ test("startConnector applies feed modes per thread for assistant, user, and chan
     assert.ok(!htmlByThread.some((entry) => entry.threadId === 9 && entry.first === "<b>User</b>"))
 
     assert.ok(textByThread.some((entry) => entry.threadId === 9 && /Changed files:/.test(entry.text)))
-    assert.ok(textByThread.some((entry) => entry.threadId === 11 && /Streaming reply/.test(entry.text)))
+    assert.ok(textByThread.some((entry) => entry.threadId === 11 && entry.text === "Streaming verbose reply"))
     assert.ok(textByThread.some((entry) => entry.threadId === 11 && /Changed files:/.test(entry.text)))
     assert.ok(!textByThread.some((entry) => entry.threadId === 7 && /Changed files:/.test(entry.text)))
-    assert.ok(!textByThread.some((entry) => entry.threadId === 9 && /Streaming reply/.test(entry.text)))
+    assert.ok(!textByThread.some((entry) => entry.threadId === 9 && /Streaming verbose reply/.test(entry.text)))
     assert.ok(!textByThread.some((entry) => /internal/.test(entry.text)))
   } finally {
     await harness.connector.stop()
@@ -2502,12 +2506,14 @@ test("startConnector delivers permission prompts and handles allow callbacks", a
     assert.match(prompt.blocks[0].html, /Permission: shell/)
     assert.deepEqual(prompt.replyMarkup.inline_keyboard[0].map((button) => button.text), ["Allow once", "Always allow"])
 
-    harness.tg.enqueue(makeCallbackUpdate(301, "p|demo|perm_1|once"))
+    const promptMessageId = prompt.result.message_id
+    harness.tg.enqueue(makeCallbackUpdate(301, "p|demo|perm_1|once", { messageId: promptMessageId }))
     await waitFor(() => harness.ocCalls.replyPermission.length === 1)
     await waitFor(() => harness.tg.callbackAnswers.length === 1)
 
     assert.deepEqual(harness.ocCalls.replyPermission, [{ permissionId: "perm_1", payload: { reply: "once" } }])
     assert.deepEqual(harness.tg.callbackAnswers, [{ callbackQueryId: "cb_301", text: "OK" }])
+    assert.deepEqual(harness.tg.deletedMessages, [{ chatId: 100, messageId: promptMessageId }])
   } finally {
     await harness.connector.stop()
   }
@@ -2561,11 +2567,13 @@ test("startConnector completes multi-step question wizard flows", async () => {
     harness.tg.enqueue(makeCallbackUpdate(402, "q|demo|q_1|0|done", { messageId: firstStepMessageId }))
     await waitFor(() => harness.tg.sentMessages.length >= 2)
     assert.match(harness.tg.sentMessages[1].text, /Reason \(2\/2\)/)
+    await waitFor(() => harness.tg.deletedMessages.some((entry) => entry.messageId === firstStepMessageId))
 
     const secondStepMessageId = harness.tg.sentMessages[1].result.message_id
     harness.tg.enqueue(makeCallbackUpdate(403, "q|demo|q_1|1|custom", { messageId: secondStepMessageId }))
     await waitFor(() => harness.tg.sentMessages.length >= 3)
     assert.match(harness.tg.sentMessages[2].text, /Send your answer for: Reason/)
+    await waitFor(() => harness.tg.deletedMessages.some((entry) => entry.messageId === secondStepMessageId))
 
     harness.tg.enqueue(makeMessageUpdate(404, "because safety matters"))
     await waitFor(() => harness.ocCalls.replyQuestion.length === 1)
@@ -2575,6 +2583,10 @@ test("startConnector completes multi-step question wizard flows", async () => {
       { questionId: "q_1", answers: [["lint"], ["because safety matters"]] },
     ])
     assert.ok(harness.tg.sentMessages.some((entry) => entry.text === "Answered: q_1"))
+    assert.deepEqual(harness.tg.deletedMessages, [
+      { chatId: 100, messageId: firstStepMessageId },
+      { chatId: 100, messageId: secondStepMessageId },
+    ])
   } finally {
     await harness.connector.stop()
   }
@@ -2610,6 +2622,132 @@ test("startConnector defers SSE startup until the initial auto-start settles", a
     await waitFor(() => harness.hasSseHandler("demo"))
   } finally {
     releaseStart?.()
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector watchdog restarts an autoStart project after repeated SSE failures", async () => {
+  const startCalls = []
+  const stopCalls = []
+  const portStopCalls = []
+  let nextHandleId = 0
+  const harness = await createHarness({
+    projectPatch: {
+      autoStart: true,
+      port: 4312,
+      openTuiOnAutoStart: false,
+    },
+    opencodeWatchdog: { failureThreshold: 2, windowMs: 60_000, cooldownMs: 0 },
+    ensureOpenCodeRunningImpl: async ({ projectAlias }) => {
+      startCalls.push(projectAlias)
+      const handleId = ++nextHandleId
+      return {
+        stop: async () => {
+          stopCalls.push({ projectAlias, handleId })
+        },
+      }
+    },
+    stopOpenCodeServeOnPortImpl: async ({ projectAlias, port }) => {
+      portStopCalls.push({ projectAlias, port })
+      return { stopped: true, count: 1, pids: [1234] }
+    },
+    ensureStartupSessionImpl: async ({ alias, startupSessionByProject }) => {
+      startupSessionByProject[alias] = "ses_startup"
+      return "ses_startup"
+    },
+  })
+
+  try {
+    await waitFor(() => startCalls.length === 1 && harness.hasSseHandler("demo"))
+    const err = makeBoundaryError({
+      source: "opencode",
+      operation: "GET /event",
+      method: "GET",
+      pathname: "/event",
+      kind: "network",
+      outcome: "retryable",
+      message: "fetch failed",
+    })
+
+    await harness.failSse("demo", err)
+    assert.equal(startCalls.length, 1)
+
+    await harness.failSse("demo", err)
+    await waitFor(() => startCalls.length === 2)
+
+    assert.deepEqual(stopCalls, [{ projectAlias: "demo", handleId: 1 }])
+    assert.deepEqual(portStopCalls, [{ projectAlias: "demo", port: 4312 }])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector watchdog restarts an autoStart project after repeated prompt poll failures", async () => {
+  const startCalls = []
+  const portStopCalls = []
+  let pollHealthy = false
+  let permissionCalls = 0
+  let questionCalls = 0
+  const retryablePermissionError = () =>
+    makeBoundaryError({
+      source: "opencode",
+      operation: "GET /permission",
+      method: "GET",
+      pathname: "/permission",
+      kind: "timeout",
+      outcome: "retryable",
+      message: "This operation was aborted",
+    })
+  const retryableQuestionError = () =>
+    makeBoundaryError({
+      source: "opencode",
+      operation: "GET /question",
+      method: "GET",
+      pathname: "/question",
+      kind: "timeout",
+      outcome: "retryable",
+      message: "This operation was aborted",
+    })
+
+  const harness = await createHarness({
+    statePatch: { updateOffset: null },
+    projectPatch: {
+      autoStart: true,
+      port: 4312,
+      openTuiOnAutoStart: false,
+    },
+    opencodeWatchdog: { failureThreshold: 2, windowMs: 60_000, cooldownMs: 0 },
+    ocOptions: {
+      listPermissionsImpl: async () => {
+        permissionCalls += 1
+        if (permissionCalls === 1 || pollHealthy) return []
+        throw retryablePermissionError()
+      },
+      listQuestionsImpl: async () => {
+        questionCalls += 1
+        if (questionCalls === 1 || pollHealthy) return []
+        throw retryableQuestionError()
+      },
+    },
+    ensureOpenCodeRunningImpl: async ({ projectAlias }) => {
+      startCalls.push(projectAlias)
+      if (startCalls.length >= 2) pollHealthy = true
+      return { stop() {} }
+    },
+    stopOpenCodeServeOnPortImpl: async ({ projectAlias, port }) => {
+      portStopCalls.push({ projectAlias, port })
+      return { stopped: true, count: 1, pids: [1234] }
+    },
+    ensureStartupSessionImpl: async ({ alias, startupSessionByProject }) => {
+      startupSessionByProject[alias] = "ses_startup"
+      return "ses_startup"
+    },
+  })
+
+  try {
+    await waitFor(() => startCalls.length === 2)
+    assert.deepEqual(portStopCalls, [{ projectAlias: "demo", port: 4312 }])
+  } finally {
     await harness.connector.stop()
   }
 })
@@ -4133,9 +4271,9 @@ test("startConnector opens an attach window after /new on Linux when openAttachO
   }
 })
 
-test("startConnector does not open another attach window after /new when openAttachOnNewMode is same-window", async () => {
+test("startConnector binds /new immediately in same-window mode without opening another attach window", async () => {
   const attachCalls = []
-  const activeSessions = [{ id: "ses_1" }, { id: "ses_same_window" }]
+  const activeSessions = [{ id: "ses_1" }, null, { id: "ses_1" }]
   const harness = await createHarness({
     statePatch: {
       updateOffset: 820,
@@ -4162,12 +4300,19 @@ test("startConnector does not open another attach window after /new when openAtt
 
   try {
     harness.tg.enqueue(makeMessageUpdate(821, "/new Same window title"))
+    harness.tg.enqueue(makeMessageUpdate(822, "prompt after same-window new"))
     await waitFor(() => harness.ocCalls.selectTuiSession.length === 1)
-    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("TUI switched to session: ses_same_window")))
+    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("Changed: this thread now uses new session ses_same_window.")))
+    await waitFor(() => harness.ocCalls.promptAsync.some((entry) => entry.sessionId === "ses_same_window"))
+    await waitFor(() => harness.ocCalls.getActiveTuiSession.length >= 3)
     await harness.connector.stop()
 
     assert.deepEqual(attachCalls, [])
     assert.deepEqual(harness.ocCalls.selectTuiSession, [{ sessionId: "ses_same_window", options: { timeoutMs: 2500 } }])
+    assert.deepEqual(harness.ocCalls.promptAsync.find((entry) => entry.sessionId === "ses_same_window"), {
+      sessionId: "ses_same_window",
+      text: "[TG] prompt after same-window new",
+    })
     const state = await readState(harness.stateFile)
     assert.deepEqual(state.bindings, {
       "100:7": { projectAlias: "demo", sessionId: "ses_same_window" },
@@ -4177,7 +4322,7 @@ test("startConnector does not open another attach window after /new when openAtt
   }
 })
 
-test("startConnector keeps the old binding after /new when same-window TUI switch fails", async () => {
+test("startConnector keeps the new binding after /new when same-window TUI switch fails", async () => {
   const harness = await createHarness({
     statePatch: {
       updateOffset: 830,
@@ -4203,21 +4348,21 @@ test("startConnector keeps the old binding after /new when same-window TUI switc
   })
 
   try {
-    harness.tg.enqueue(makeMessageUpdate(831, "/new Keep old binding"))
+    harness.tg.enqueue(makeMessageUpdate(831, "/new Switch failure"))
     await waitFor(() => harness.ocCalls.selectTuiSession.length === 1)
-    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("Current thread stays on session: ses_old")))
+    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("Changed: this thread now uses new session ses_created_but_not_switched.")))
     await harness.connector.stop()
 
     const state = await readState(harness.stateFile)
     assert.deepEqual(state.bindings, {
-      "100:7": { projectAlias: "demo", sessionId: "ses_old" },
+      "100:7": { projectAlias: "demo", sessionId: "ses_created_but_not_switched" },
     })
   } finally {
     await harness.connector.stop()
   }
 })
 
-test("startConnector keeps the old binding after /new when active TUI session tracking is unavailable", async () => {
+test("startConnector keeps the new binding after /new when active TUI session tracking is unavailable", async () => {
   const harness = await createHarness({
     statePatch: {
       updateOffset: 835,
@@ -4245,12 +4390,12 @@ test("startConnector keeps the old binding after /new when active TUI session tr
   try {
     harness.tg.enqueue(makeMessageUpdate(836, "/new No active tracking"))
     await waitFor(() => harness.ocCalls.selectTuiSession.length === 1)
-    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("Current thread stays on session: ses_old")))
+    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("Changed: this thread now uses new session ses_created_without_active_tracking.")))
     await harness.connector.stop()
 
     const state = await readState(harness.stateFile)
     assert.deepEqual(state.bindings, {
-      "100:7": { projectAlias: "demo", sessionId: "ses_old" },
+      "100:7": { projectAlias: "demo", sessionId: "ses_created_without_active_tracking" },
     })
   } finally {
     await harness.connector.stop()

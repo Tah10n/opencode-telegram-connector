@@ -68,8 +68,8 @@ export function createCallbackHandlers(runtime) {
     await tg.answerCallbackQuery(callbackQueryId, text).catch(ignoreError)
   }
 
-  async function closeInteractiveMessage(callbackQueryId, ctxMeta, messageId) {
-    await answerCallbackQuery(callbackQueryId, "Closed")
+  async function deleteInteractiveMessage(ctxMeta, messageId) {
+    if (!messageId) return
     if (typeof tg.deleteMessage === "function") {
       await tg.deleteMessage(ctxMeta.chatId, messageId).catch(ignoreError)
       return
@@ -77,6 +77,11 @@ export function createCallbackHandlers(runtime) {
     if (typeof tg.editMessageReplyMarkup === "function") {
       await tg.editMessageReplyMarkup(ctxMeta.chatId, messageId, null).catch(ignoreError)
     }
+  }
+
+  async function closeInteractiveMessage(callbackQueryId, ctxMeta, messageId) {
+    await answerCallbackQuery(callbackQueryId, "Closed")
+    await deleteInteractiveMessage(ctxMeta, messageId)
   }
 
   function hasIdempotencyKey(key) {
@@ -184,12 +189,6 @@ export function createCallbackHandlers(runtime) {
     return "Stop connector?\n\nThis will stop Telegram polling, OpenCode streams, flush state, and exit."
   }
 
-  function runtimeRequestedText(action) {
-    return action === "restart"
-      ? "Restart requested. Connector is stopping so your supervisor can restart it."
-      : "Stop requested. Connector is shutting down."
-  }
-
   function canRequestRuntimeShutdown() {
     return typeof requestRuntimeShutdown === "function"
   }
@@ -248,9 +247,7 @@ export function createCallbackHandlers(runtime) {
         }
         if (action === "cancel") {
           await answerCallbackQuery(callbackQuery.id, "Cancelled")
-          if (msg?.message_id && typeof tg.editMessageText === "function") {
-            await tg.editMessageText(ctxMeta.chatId, msg.message_id, "Runtime action cancelled.", runtimeCloseKeyboard()).catch(ignoreError)
-          }
+          await deleteInteractiveMessage(ctxMeta, msg?.message_id)
           return
         }
         if (action === "confirm-stop" || action === "confirm-restart") {
@@ -272,9 +269,7 @@ export function createCallbackHandlers(runtime) {
             return
           }
           await answerCallbackQuery(callbackQuery.id, action === "restart" ? "Restarting…" : "Stopping…")
-          if (msg?.message_id && typeof tg.editMessageText === "function") {
-            await tg.editMessageText(ctxMeta.chatId, msg.message_id, runtimeRequestedText(action), runtimeCloseKeyboard()).catch(ignoreError)
-          }
+          await deleteInteractiveMessage(ctxMeta, msg?.message_id)
           if (action === "restart") await persistRuntimeRestartNotice(ctxMeta)
           requestRuntimeShutdownSoon(action)
           return
@@ -506,16 +501,19 @@ export function createCallbackHandlers(runtime) {
               ].join("\n"),
               unbindConfirmationKeyboard(targetCtxKey, binding),
             ).catch(ignoreError)
+            await deleteInteractiveMessage(ctxMeta, msg?.message_id)
             return
           }
           if (binding.projectAlias !== expectedProjectAlias || binding.sessionId !== expectedSessionId) {
             await answerCallbackQuery(callbackQuery.id, "Binding changed")
+            await deleteInteractiveMessage(ctxMeta, msg?.message_id)
             await sendToThread(ctxMeta, `Binding changed for ${describeTargetCtx(targetCtxKey)}. Open /status or /bindings and confirm again.`).catch(ignoreError)
             return
           }
           const ok = store.unbind(targetCtxKey)
           if (ok) await store.flush?.()
           await answerCallbackQuery(callbackQuery.id, ok ? "Unbound" : "Not bound")
+          await deleteInteractiveMessage(ctxMeta, msg?.message_id)
           await sendToThread(ctxMeta, ok ? `Changed: binding removed.\nRemoved binding for ${describeTargetCtx(targetCtxKey)}.` : "Binding was already absent.").catch(ignoreError)
           return
         }
@@ -718,6 +716,9 @@ export function createCallbackHandlers(runtime) {
         if (action === "send") await answerCallbackQuery(callbackQuery.id, "Sending…")
         const result = await runtime.handleAttachmentConfirmation?.(ctxMeta, action, token, { editMessageId: msg?.message_id })
         if (action !== "send") await answerCallbackQuery(callbackQuery.id, result?.callbackText || (action === "cancel" ? "Cancelled" : "Closed"))
+        if (result?.callbackText === "Sent" || result?.callbackText === "Cancelled" || result?.callbackText === "Already sent") {
+          await deleteInteractiveMessage(ctxMeta, msg?.message_id)
+        }
         return
       }
 
@@ -734,6 +735,7 @@ export function createCallbackHandlers(runtime) {
             cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, sessionID)
             await store.flush?.()
             await answerCallbackQuery(callbackQuery.id, "Already handled")
+            await deleteInteractiveMessage(ctxMeta, msg?.message_id)
             return
           }
           try {
@@ -751,6 +753,7 @@ export function createCallbackHandlers(runtime) {
               await store.flush?.()
               recordCallbackOutcome?.(projectAlias, "stale")
               await answerCallbackQuery(callbackQuery.id, "No longer active")
+              await deleteInteractiveMessage(ctxMeta, msg?.message_id)
               return
             }
             if (isRetryableBoundaryError(err, { source: "opencode", pathname: `/permission/${permissionId}/reply`, method: "POST" })) {
@@ -771,6 +774,7 @@ export function createCallbackHandlers(runtime) {
           cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, sessionID)
           await store.flush?.()
           await answerCallbackQuery(callbackQuery.id, "OK")
+          await deleteInteractiveMessage(ctxMeta, msg?.message_id)
           return
         }
         if (action === "reject_note") {
@@ -778,6 +782,7 @@ export function createCallbackHandlers(runtime) {
             cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, sessionID)
             await store.flush?.()
             await answerCallbackQuery(callbackQuery.id, "Already handled")
+            await deleteInteractiveMessage(ctxMeta, msg?.message_id)
             return
           }
           setRejectNoteAwaitingState(ctxMeta.ctxKey, { projectAlias, permissionId, ...(sessionID ? { sessionID } : {}) })
@@ -791,11 +796,13 @@ export function createCallbackHandlers(runtime) {
           }
           await store.flush?.()
           await answerCallbackQuery(callbackQuery.id, "Send note")
+          await deleteInteractiveMessage(ctxMeta, msg?.message_id)
           return
         }
         if (action === "cancel_note") {
           setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
           await answerCallbackQuery(callbackQuery.id, "Cancelled")
+          await deleteInteractiveMessage(ctxMeta, msg?.message_id)
           return
         }
         await answerCallbackQuery(callbackQuery.id, "Invalid")
@@ -817,6 +824,7 @@ export function createCallbackHandlers(runtime) {
             cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, sessionID)
             await store.flush?.()
             await answerCallbackQuery(callbackQuery.id, "Already handled")
+            await deleteInteractiveMessage(ctxMeta, msg?.message_id)
             return
           }
           try {
@@ -833,6 +841,7 @@ export function createCallbackHandlers(runtime) {
               await store.flush?.()
               recordCallbackOutcome?.(projectAlias, "stale")
               await answerCallbackQuery(callbackQuery.id, "No longer active")
+              await deleteInteractiveMessage(ctxMeta, msg?.message_id)
               return
             }
             if (isRetryableBoundaryError(err, { source: "opencode", pathname: `/question/${questionId}/reject`, method: "POST" })) {
@@ -852,6 +861,7 @@ export function createCallbackHandlers(runtime) {
           cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, sessionID)
           await store.flush?.()
           await answerCallbackQuery(callbackQuery.id, "Rejected")
+          await deleteInteractiveMessage(ctxMeta, msg?.message_id)
           return
         }
 
@@ -860,6 +870,7 @@ export function createCallbackHandlers(runtime) {
             cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, sessionID)
             await store.flush?.()
             await answerCallbackQuery(callbackQuery.id, "Already handled")
+            await deleteInteractiveMessage(ctxMeta, msg?.message_id)
             return
           }
           await answerCallbackQuery(callbackQuery.id, "Not found")
@@ -900,11 +911,13 @@ export function createCallbackHandlers(runtime) {
           }
           await store.flush?.()
           await answerCallbackQuery(callbackQuery.id, "Send answer")
+          await deleteInteractiveMessage(ctxMeta, msg?.message_id)
           return
         }
         if (action === "cancel_custom") {
           setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
           await answerCallbackQuery(callbackQuery.id, "Cancelled")
+          await deleteInteractiveMessage(ctxMeta, msg?.message_id)
           return
         }
         if (action === "o") {
@@ -927,6 +940,8 @@ export function createCallbackHandlers(runtime) {
             )
             if (result?.outcome === "retryable") {
               await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(ignoreError)
+            } else {
+              await deleteInteractiveMessage(ctxMeta, msg?.message_id)
             }
             return
           } else {
@@ -934,6 +949,7 @@ export function createCallbackHandlers(runtime) {
             await runtime.sendCurrentQuestionStep(nextWizard)
             applyWizardState(wizard, nextWizard)
             persistQuestionWizard(wizard)
+            await deleteInteractiveMessage(ctxMeta, msg?.message_id)
           }
           await answerCallbackQuery(callbackQuery.id, "Selected")
           return
@@ -979,6 +995,8 @@ export function createCallbackHandlers(runtime) {
             )
             if (result?.outcome === "retryable") {
               await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(ignoreError)
+            } else {
+              await deleteInteractiveMessage(ctxMeta, msg?.message_id)
             }
             return
           } else {
@@ -986,6 +1004,7 @@ export function createCallbackHandlers(runtime) {
             await runtime.sendCurrentQuestionStep(nextWizard)
             applyWizardState(wizard, nextWizard)
             persistQuestionWizard(wizard)
+            await deleteInteractiveMessage(ctxMeta, msg?.message_id)
           }
           await answerCallbackQuery(callbackQuery.id, "Done")
           return

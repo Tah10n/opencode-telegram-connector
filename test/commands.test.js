@@ -767,7 +767,7 @@ test("createCommandHandlers handleNewCommand refuses invalid created session ids
   assert.match(sent[0].text, /Project 'demo' is unavailable/)
 })
 
-test("createCommandHandlers handleNewCommand leaves the old binding until same-window TUI switch is confirmed", async () => {
+test("createCommandHandlers handleNewCommand binds immediately in same-window mode after requesting TUI switch", async () => {
   const bindCalls = []
   const primeCalls = []
   const { runtime, sent } = makeRuntime({
@@ -800,15 +800,15 @@ test("createCommandHandlers handleNewCommand leaves the old binding until same-w
 
   await handlers.handleNewCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "Demo title")
 
-  assert.deepEqual(bindCalls, [])
-  assert.deepEqual(primeCalls, [["demo", { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "ses_current"]])
+  assert.deepEqual(bindCalls, [[{ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "demo", "ses_new"]])
+  assert.deepEqual(primeCalls, [["demo", { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "ses_current", { pendingTargetSessionId: "ses_new" }]])
   assert.equal(sent.length, 1)
-  assert.match(sent[0].text, /Created session: ses_new/)
-  assert.match(sent[0].text, /Current thread stays on session: ses_current/)
-  assert.match(sent[0].text, /Requested TUI switch to session: ses_new/)
+  assert.match(sent[0].text, /Changed: this thread now uses new session ses_new/)
+  assert.match(sent[0].text, /Requested same-window TUI switch to session: ses_new/)
 })
 
-test("createCommandHandlers handleNewCommand falls back to manual mode when active TUI session tracking is unavailable", async () => {
+test("createCommandHandlers handleNewCommand still binds when active TUI session tracking is unavailable", async () => {
+  const bindCalls = []
   const primeCalls = []
   const { runtime, sent } = makeRuntime({
     storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
@@ -829,6 +829,9 @@ test("createCommandHandlers handleNewCommand falls back to manual mode when acti
         },
       },
     },
+    bindCtxToSession: async (...args) => {
+      bindCalls.push(args)
+    },
     primeTuiActiveSessionFollow: (...args) => {
       primeCalls.push(args)
     },
@@ -837,14 +840,15 @@ test("createCommandHandlers handleNewCommand falls back to manual mode when acti
 
   await handlers.handleNewCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "Demo title")
 
-  assert.deepEqual(primeCalls, [])
+  assert.deepEqual(bindCalls, [[{ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "demo", "ses_new"]])
+  assert.deepEqual(primeCalls, [["demo", { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "ses_current", { pendingTargetSessionId: "ses_new" }]])
   assert.equal(sent.length, 1)
-  assert.match(sent[0].text, /Created session: ses_new/)
-  assert.match(sent[0].text, /Current thread stays on session: ses_current/)
-  assert.match(sent[0].text, /does not expose confirmed active TUI session tracking/i)
+  assert.match(sent[0].text, /Changed: this thread now uses new session ses_new/)
+  assert.match(sent[0].text, /does not expose active TUI session tracking/i)
+  assert.match(sent[0].text, /Telegram is already using the new session/i)
 })
 
-test("createCommandHandlers handleNewCommand includes a fallback note when TUI switching fails in same-window mode", async () => {
+test("createCommandHandlers handleNewCommand binds and includes a note when TUI switching fails in same-window mode", async () => {
   const bindCalls = []
   const { runtime, sent } = makeRuntime({
     storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
@@ -870,11 +874,11 @@ test("createCommandHandlers handleNewCommand includes a fallback note when TUI s
 
   await handlers.handleNewCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "Demo title")
 
-  assert.deepEqual(bindCalls, [])
+  assert.deepEqual(bindCalls, [[{ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "demo", "ses_new"]])
   assert.equal(sent.length, 1)
-  assert.match(sent[0].text, /Created session: ses_new/)
-  assert.match(sent[0].text, /Current thread stays on session: ses_current/)
+  assert.match(sent[0].text, /Changed: this thread now uses new session ses_new/)
   assert.match(sent[0].text, /Could not switch the existing TUI automatically/i)
+  assert.match(sent[0].text, /Telegram is already using the new session/i)
 })
 
 test("createCommandHandlers renderSessionsList shows the current model when available", async () => {

@@ -54,6 +54,7 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
   })
 
   const HEALTH_CHECK_MIN_INTERVAL_MS = readIntEnv("OPENCODE_SSE_HEALTHCHECK_MIN_INTERVAL_MS", 15_000)
+  const CONNECT_TIMEOUT_MS = readIntEnv("OPENCODE_SSE_CONNECT_TIMEOUT_MS", 15_000)
   let lastHealthCheckAt = 0
 
   const IDLE_TIMEOUT_MS = 30 * 60 * 1000
@@ -100,13 +101,22 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
       activeCtrl = ctrl
       forwardAbort = () => ctrl.abort()
       abortSignal?.addEventListener?.("abort", forwardAbort)
+      let connectTimer = null
+      let connectTimedOut = false
       try {
         const url = new URL(ocClient.baseUrl + "/event")
+        connectTimer = setTimeout(() => {
+          connectTimedOut = true
+          ctrl.abort()
+        }, CONNECT_TIMEOUT_MS)
+        connectTimer.unref?.()
         const res = await fetch(url, {
           method: "GET",
           headers: ocClient.headers({ accept: "text/event-stream" }),
           signal: ctrl.signal,
         })
+        if (connectTimer) clearTimeout(connectTimer)
+        connectTimer = null
         if (!res.ok) {
           const text = await res.text().catch(() => "")
           throw boundaryErrorFromHttpResponse({
@@ -188,6 +198,7 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
           operation: "GET /event",
           method: "GET",
           pathname: "/event",
+          didTimeout: connectTimedOut,
         })
         const msg = normalized.message
         const isAbort = isAbortBoundaryError(normalized)
@@ -227,6 +238,7 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
         await waitForRetryBackoff(backoff)
         backoff = Math.min(30_000, backoff * 2)
       } finally {
+        if (connectTimer) clearTimeout(connectTimer)
         abortSignal?.removeEventListener?.("abort", forwardAbort)
         clearIdleTimer()
         ctrl.abort()

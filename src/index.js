@@ -14,7 +14,7 @@ import { ctxKeyFrom, threadIdOr0FromMessage } from "./telegram/routing.js"
 import { OpenCodeClient } from "./opencode/client.js"
 import { startOpenCodeSseLoop } from "./opencode/sse.js"
 import { ensureStartupSession } from "./opencode/startup-session.js"
-import { ensureOpenCodeRunning, openAttachWindow } from "./opencode/launcher.js"
+import { ensureOpenCodeRunning, openAttachWindow, stopOpenCodeServeOnPort } from "./opencode/launcher.js"
 import { extractPatchDiffText, extractPatchFiles, formatChangedFilesText } from "./message-display.js"
 import { findSessionByShareUrl, parseSessionReference } from "./session-ref.js"
 import { resolveSessionRoute } from "./session-route.js"
@@ -151,6 +151,24 @@ function normalizeEpochMs(value) {
   return null
 }
 
+function readPositiveNumber(value, fallback) {
+  const n = Number(value)
+  return Number.isFinite(n) && n > 0 ? n : fallback
+}
+
+function readNonNegativeNumber(value, fallback) {
+  const n = Number(value)
+  return Number.isFinite(n) && n >= 0 ? n : fallback
+}
+
+function normalizeOpenCodeWatchdogOptions(options = {}) {
+  return {
+    failureThreshold: Math.max(1, Math.floor(readPositiveNumber(options.failureThreshold ?? process.env.OPENCODE_WATCHDOG_FAILURE_THRESHOLD, 6))),
+    windowMs: Math.max(1, Math.floor(readPositiveNumber(options.windowMs ?? process.env.OPENCODE_WATCHDOG_WINDOW_MS, 120_000))),
+    cooldownMs: Math.max(0, Math.floor(readNonNegativeNumber(options.cooldownMs ?? process.env.OPENCODE_WATCHDOG_COOLDOWN_MS, 60_000))),
+  }
+}
+
 function extractTextParts(message) {
   if (!message || !Array.isArray(message.parts)) return ""
   const parts = message.parts.filter((p) => p && p.type === "text" && typeof p.text === "string" && !p.ignored)
@@ -165,6 +183,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const startSseLoop = deps?.startSseLoop || startOpenCodeSseLoop
   const ensureStartupSessionFn = deps?.ensureStartupSession || ensureStartupSession
   const ensureOpenCodeRunningFn = deps?.ensureOpenCodeRunning || ensureOpenCodeRunning
+  const stopOpenCodeServeOnPortFn = deps?.stopOpenCodeServeOnPort || stopOpenCodeServeOnPort
   const openAttachWindowFn = deps?.openAttachWindow || deps?.openAttachWindowWindows || openAttachWindow
   const onFatalError =
     deps?.onFatalError ||
@@ -177,6 +196,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const sleep = deps?.delay || delay
   const wizardTtlMs = Number.isFinite(deps?.wizardTtlMs) ? Math.max(0, Number(deps.wizardTtlMs)) : 2 * 60 * 60 * 1000
   const wizardGcIntervalMs = Number.isFinite(deps?.wizardGcIntervalMs) ? Math.max(1, Number(deps.wizardGcIntervalMs)) : 10 * 60 * 1000
+  const openCodeWatchdog = normalizeOpenCodeWatchdogOptions(deps?.opencodeWatchdog ?? config?.opencodeWatchdog ?? {})
   const startedAt = Date.now()
   const sseDebugFilter = parseSseDebugFilter(process.env.DEBUG_SSE_ROUTING)
   if (sseDebugFilter?.projectAlias) {
@@ -247,8 +267,108 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   // Auto-start opencode servers (best-effort) and pick a startup session per project.
   // Important: do not block connector startup on auto-start (Telegram should stay responsive).
   const startInProgress = new Map() // alias -> Promise
+  const autoStartHandleByProject = new Map() // alias -> latest auto-start handle
+  const watchdogStateByProject = new Map() // alias -> { count, firstFailureAt, lastFailureAt, lastRestartAt }
+  const watchdogRestartInProgress = new Map() // alias -> Promise
   const startupSessionByProject = {} // alias -> sessionId
   const startupSessionInProgress = new Map() // alias -> Promise<sessionId|null>
+
+  function resetProjectHealthFailures(projectAlias) {
+    if (!projectAlias) return
+    const previous = watchdogStateByProject.get(projectAlias)
+    if (!previous) return
+    watchdogStateByProject.set(projectAlias, {
+      count: 0,
+      firstFailureAt: 0,
+      lastFailureAt: 0,
+      lastRestartAt: previous.lastRestartAt || 0,
+    })
+  }
+
+  function shouldWatchProjectHealth(projectAlias) {
+    const project = projects?.[projectAlias]
+    return !!(project?.autoStart && project?.directory && project?.port)
+  }
+
+  function scheduleProjectWatchdogRestart(projectAlias, reason) {
+    if (!shouldWatchProjectHealth(projectAlias) || abortController.signal.aborted) return
+    if (startInProgress.has(projectAlias) || watchdogRestartInProgress.has(projectAlias)) return
+
+    const state = watchdogStateByProject.get(projectAlias) || {}
+    const elapsedSinceRestart = Date.now() - (state.lastRestartAt || 0)
+    if (state.lastRestartAt && elapsedSinceRestart < openCodeWatchdog.cooldownMs) return
+
+    watchdogStateByProject.set(projectAlias, {
+      count: 0,
+      firstFailureAt: 0,
+      lastFailureAt: 0,
+      lastRestartAt: Date.now(),
+    })
+
+    const task = (async () => {
+      logger.warn(`[${projectAlias}] watchdog restarting opencode after repeated retryable failures: ${reason || "unhealthy"}`)
+      const previousHandle = autoStartHandleByProject.get(projectAlias)
+      autoStartHandleByProject.delete(projectAlias)
+      if (previousHandle?.stop) {
+        await Promise.resolve(previousHandle.stop()).catch((err) => {
+          logger.warn(`[${projectAlias}] watchdog failed to stop managed opencode handle: ${err?.message || String(err)}`)
+        })
+      }
+
+      const project = projects?.[projectAlias]
+      await Promise.resolve(
+        stopOpenCodeServeOnPortFn({
+          projectAlias,
+          project,
+          port: project?.port,
+          logger,
+          platform,
+        }),
+      ).catch((err) => {
+        logger.warn(`[${projectAlias}] watchdog failed to stop opencode serve on port ${project?.port}: ${err?.message || String(err)}`)
+      })
+
+      if (abortController.signal.aborted) return null
+      return startProjectInBackground(projectAlias, { notifyOnFailure: true })
+    })().finally(() => {
+      watchdogRestartInProgress.delete(projectAlias)
+    })
+
+    watchdogRestartInProgress.set(projectAlias, task)
+    trackManagedPromise(`opencodeWatchdogRestart:${projectAlias}:${Date.now()}`, task, {
+      kind: "task",
+      metadata: { projectAlias, source: "opencode", operation: "watchdog restart" },
+    })
+  }
+
+  function recordProjectHealthFailure(projectAlias, err, context = {}) {
+    if (!shouldWatchProjectHealth(projectAlias) || abortController.signal.aborted) return
+    const classification = classifyBoundaryError(err, {
+      source: "opencode",
+      operation: context.operation,
+      method: context.method,
+      pathname: context.pathname,
+    })
+    if (!classification.retryable) return
+    if (startInProgress.has(projectAlias) || watchdogRestartInProgress.has(projectAlias)) return
+
+    const nowMs = Date.now()
+    const previous = watchdogStateByProject.get(projectAlias) || {}
+    const firstFailureAt = previous.firstFailureAt && nowMs - previous.firstFailureAt <= openCodeWatchdog.windowMs ? previous.firstFailureAt : nowMs
+    const count = firstFailureAt === previous.firstFailureAt ? (previous.count || 0) + 1 : 1
+    const next = {
+      count,
+      firstFailureAt,
+      lastFailureAt: nowMs,
+      lastRestartAt: previous.lastRestartAt || 0,
+    }
+    watchdogStateByProject.set(projectAlias, next)
+
+    if (count >= openCodeWatchdog.failureThreshold) {
+      const where = [context.operation || classification.error?.operation, classification.kind].filter(Boolean).join(" / ")
+      scheduleProjectWatchdogRestart(projectAlias, `${count} failures within ${Math.round(openCodeWatchdog.windowMs / 1000)}s${where ? ` (${where})` : ""}`)
+    }
+  }
 
   async function getStartupSession(alias, options) {
     try {
@@ -305,8 +425,10 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
           abortSignal: abortController.signal,
         })
         if (handle?.stop) {
+          autoStartHandleByProject.set(alias, handle)
           trackManagedHandle(`autoStart-handle:${alias}`, handle, { kind: "task", metadata: { projectAlias: alias } })
         }
+        resetProjectHealthFailures(alias)
         runtimeObservability.recordLoopSuccess("autoStart", { projectAlias: alias })
         markProjectUp(alias)
         await getStartupSession(alias, { waitForStart: false })
@@ -745,6 +867,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     const oc = ocByAlias[alias]
     if (!oc) throw new Error(`Unknown project: ${alias}`)
     await oc.health()
+    resetProjectHealthFailures(alias)
     markProjectUp(alias)
     return oc
   }
@@ -771,11 +894,14 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     return { chatId: Number(match[1]), threadIdOr0: Number(match[2]), ctxKey: String(ctxKey) }
   }
 
-  function primeTuiActiveSessionFollow(projectAlias, ctxMeta, sessionId) {
+  function primeTuiActiveSessionFollow(projectAlias, ctxMeta, sessionId, options = {}) {
     if (!projectAlias || !ctxMeta?.ctxKey || !sessionId) return
+    const pendingTargetSessionId =
+      typeof options?.pendingTargetSessionId === "string" && options.pendingTargetSessionId.trim() ? options.pendingTargetSessionId.trim() : null
     tuiActiveSessionStateByProject.set(projectAlias, {
       currentSessionId: sessionId,
       followCtxKey: ctxMeta.ctxKey,
+      ...(pendingTargetSessionId ? { pendingTargetSessionId } : {}),
     })
   }
 
@@ -802,7 +928,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     }
 
     const activeSessionId = typeof activeSession?.id === "string" && activeSession.id.trim() ? activeSession.id.trim() : null
-    const previous = tuiActiveSessionStateByProject.get(projectAlias)
+    let previous = tuiActiveSessionStateByProject.get(projectAlias)
     if (!previous) {
       const activeCtx = activeSessionId ? getBoundCtxForSession(projectAlias, activeSessionId) : null
       tuiActiveSessionStateByProject.set(projectAlias, {
@@ -810,6 +936,37 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         followCtxKey: activeCtx?.ctxKey || null,
       })
       return
+    }
+
+    const pendingTargetSessionId =
+      typeof previous.pendingTargetSessionId === "string" && previous.pendingTargetSessionId.trim() ? previous.pendingTargetSessionId.trim() : null
+    if (pendingTargetSessionId) {
+      const followCtxKey = previous.followCtxKey || getBoundCtxForSession(projectAlias, pendingTargetSessionId)?.ctxKey || null
+      const followBinding = followCtxKey ? store.getBinding(followCtxKey) : null
+      if (followBinding?.projectAlias === projectAlias && followBinding.sessionId === pendingTargetSessionId) {
+        if (activeSessionId === pendingTargetSessionId) {
+          tuiActiveSessionStateByProject.set(projectAlias, {
+            currentSessionId: activeSessionId,
+            followCtxKey,
+          })
+          logger.info(`[${projectAlias}] confirmed pending TUI switch to session: ${activeSessionId}`)
+          return
+        }
+        if (!activeSessionId || activeSessionId === previous.currentSessionId) {
+          tuiActiveSessionStateByProject.set(projectAlias, {
+            currentSessionId: previous.currentSessionId,
+            followCtxKey,
+            pendingTargetSessionId,
+          })
+          return
+        }
+      } else {
+        tuiActiveSessionStateByProject.set(projectAlias, {
+          currentSessionId: previous.currentSessionId,
+          followCtxKey: previous.followCtxKey || null,
+        })
+        previous = tuiActiveSessionStateByProject.get(projectAlias)
+      }
     }
 
     if (previous.currentSessionId === activeSessionId) {
@@ -946,6 +1103,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     validateProject,
     bindCtxToSession,
     primeTuiActiveSessionFollow,
+    recordProjectHealthFailure,
     sendToThread,
     parseCtxKey,
     formatThreadLabel,
@@ -1201,6 +1359,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
           logger,
           onConnect: ({ projectAlias }) => {
             markProjectSseConnected(projectAlias)
+            resetProjectHealthFailures(projectAlias)
             runtimeObservability.recordLoopSuccess("sse", { projectAlias, connected: true })
           },
           onEvent: onSseEvent,
@@ -1217,6 +1376,11 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
                 projectAlias,
                 retryable: true,
                 source: "opencode",
+                operation: "GET /event",
+                method: "GET",
+                pathname: "/event",
+              })
+              recordProjectHealthFailure(projectAlias, classification.error, {
                 operation: "GET /event",
                 method: "GET",
                 pathname: "/event",
@@ -1276,6 +1440,11 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
               method: "GET",
               pathname: "/permission",
             })
+            recordProjectHealthFailure(alias, classification.error, {
+              operation: "GET /permission",
+              method: "GET",
+              pathname: "/permission",
+            })
           }
           if (questionsResult.status === "rejected") {
             const classification = classifyBoundaryError(questionsResult.reason, {
@@ -1292,9 +1461,15 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
               method: "GET",
               pathname: "/question",
             })
+            recordProjectHealthFailure(alias, classification.error, {
+              operation: "GET /question",
+              method: "GET",
+              pathname: "/question",
+            })
           }
 
           if (Array.isArray(perms) || Array.isArray(questions)) {
+            resetProjectHealthFailures(alias)
             markProjectUp(alias)
             runtimeObservability.recordLoopSuccess("promptPoll", { projectAlias: alias })
           }

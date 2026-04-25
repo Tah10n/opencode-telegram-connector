@@ -46,6 +46,20 @@ function inferFileFromDiffSection(section) {
   return ""
 }
 
+function normalizeOpenCodeFileDiffEntries(diffs) {
+  const list = Array.isArray(diffs) ? diffs : []
+  const entries = []
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue
+    const diff = cleanString(item.patch || item.diff || item.text || item.content)
+    const rawFile = cleanString(item.file || item.path || item.filename)
+    if (!diff && !rawFile) continue
+    const file = rawFile || inferFileFromDiffSection(diff) || "changed-file"
+    entries.push({ file, diff })
+  }
+  return entries
+}
+
 function splitUnifiedDiffByFile(diffText) {
   const lines = String(diffText || "").split("\n")
   const sections = []
@@ -144,6 +158,18 @@ export function extractPatchFileEntries(message) {
     }
   }
   return [...byFile.values()]
+}
+
+export function extractSummaryFileDiffEntries(message) {
+  return normalizeOpenCodeFileDiffEntries(message?.info?.summary?.diffs || message?.summary?.diffs)
+}
+
+export function formatFileDiffEntriesPatch(entries) {
+  return (Array.isArray(entries) ? entries : [])
+    .map((entry) => cleanString(entry?.diff))
+    .filter(Boolean)
+    .join("\n\n")
+    .trim()
 }
 
 export function formatChangedFilesText(files, { baseDir, limit = 10 } = {}) {

@@ -14,6 +14,7 @@ import {
   startOpenCodeInNewWindowWindows,
   startOpenCodeServeDetached,
   startOpenCodeServeInNewWindowWindows,
+  stopOpenCodeServeOnPort,
   waitForHealth,
 } from "../src/opencode/launcher.js"
 
@@ -233,6 +234,30 @@ test("waitForHealth aborts promptly when abortSignal is triggered", async () => 
     return true
   })
   assert.ok(calls >= 1)
+})
+
+test("stopOpenCodeServeOnPort kills only matching Windows opencode serve processes", async (t) => {
+  const calls = useSpawnPlans(t, [
+    {
+      stdout: JSON.stringify([
+        { ProcessId: 111, Name: "opencode.exe", CommandLine: "opencode.exe serve --port 4100" },
+        { ProcessId: 222, Name: "cmd.exe", CommandLine: "cmd.exe /k opencode attach http://127.0.0.1:4100/ --continue" },
+        { ProcessId: 333, Name: "opencode.exe", CommandLine: "opencode.exe serve --port 4101" },
+      ]),
+    },
+    {},
+  ])
+  const logger = makeLogger()
+
+  const result = await stopOpenCodeServeOnPort({ projectAlias: "demo", port: 4100, platform: "win32", logger })
+
+  assert.equal(result.stopped, true)
+  assert.equal(result.count, 1)
+  assert.deepEqual(result.pids, [111])
+  assert.equal(calls[0].command, "powershell")
+  assert.equal(calls[1].command, "taskkill")
+  assert.deepEqual(calls[1].args, ["/PID", "111", "/T", "/F"])
+  assert.match(logger.logs.warn[0], /stopping hung opencode serve pid=111 port=4100/)
 })
 
 test("getLaunchSupport reports cross-platform TUI and attach support", (t) => {
@@ -555,7 +580,7 @@ test("ensureOpenCodeRunning does not auto-open attach UI when the server is alre
 
 test("ensureOpenCodeRunning skips auto-open after start when the baseUrl is sensitive", async (t) => {
   usePatchedDelay(t, async () => {})
-  const calls = useSpawnPlans(t, [{ pid: 900, close: false }])
+  const calls = useSpawnPlans(t, [{ stdout: "[]" }, { stdout: "[]" }, { pid: 900, close: false }, { stdout: "[]" }])
   const logger = makeLogger()
   let healthCalls = 0
 
@@ -579,10 +604,11 @@ test("ensureOpenCodeRunning skips auto-open after start when the baseUrl is sens
   })
 
   assert.equal(result.started, true)
-  assert.equal(calls.length, 3)
+  assert.equal(calls.length, 4)
   assert.equal(calls[0].command, "powershell")
-  assert.equal(calls[1].command, "cmd.exe")
-  assert.equal(calls[2].command, "powershell")
+  assert.equal(calls[1].command, "powershell")
+  assert.equal(calls[2].command, "cmd.exe")
+  assert.equal(calls[3].command, "powershell")
   assert.equal(logger.logs.warn.length, 1)
   assert.match(logger.logs.warn[0], /baseUrl contains sensitive URL parts/)
 })
@@ -632,7 +658,7 @@ test("ensureOpenCodeRunning starts background serve mode on Windows and returns 
   usePatchedProcessKill(t, () => {
     throw new Error("missing pid")
   })
-  const calls = useSpawnPlans(t, [{ pid: 900, close: false }, { code: 0 }])
+  const calls = useSpawnPlans(t, [{ stdout: "[]" }, { pid: 900, close: false }, { code: 0 }])
   const logger = makeLogger()
 
   let healthCalls = 0
@@ -662,17 +688,18 @@ test("ensureOpenCodeRunning starts background serve mode on Windows and returns 
   assert.equal(result.started, true)
   assert.equal(result.pid, 900)
   assert.equal(healthCalls, 2)
-  assert.equal(calls.length, 1)
-  assert.equal(calls[0].command, "cmd.exe")
-  assert.deepEqual(calls[0].args.slice(0, 3), ["/c", "opencode", "serve"])
+  assert.equal(calls.length, 2)
+  assert.equal(calls[0].command, "powershell")
+  assert.equal(calls[1].command, "cmd.exe")
+  assert.deepEqual(calls[1].args.slice(0, 3), ["/c", "opencode", "serve"])
   assert.equal(logger.logs.error.length, 1)
   assert.match(logger.logs.error[0], /opencode serve exited immediately/)
   assert.match(logger.logs.info.at(-1), /started opencode \(background\+serve\) pid=900 port=4312/)
 
   await result.stop()
-  assert.equal(calls.length, 2)
-  assert.equal(calls[1].command, "taskkill")
-  assert.deepEqual(calls[1].args, ["/PID", "900", "/T", "/F"])
+  assert.equal(calls.length, 3)
+  assert.equal(calls[2].command, "taskkill")
+  assert.deepEqual(calls[2].args, ["/PID", "900", "/T", "/F"])
 })
 
 test("ensureOpenCodeRunning starts a visible server window on Linux when configured", async (t) => {

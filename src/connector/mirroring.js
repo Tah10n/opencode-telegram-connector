@@ -2,7 +2,14 @@ import crypto from "node:crypto"
 import { makeInlineKeyboard } from "../telegram/client.js"
 import { escapeHtml, formatMarkdownToTelegramHtmlBlocks } from "../telegram/formatter.js"
 import { ctxKeyFrom } from "../telegram/routing.js"
-import { extractPatchDiffText, extractPatchFileEntries, extractPatchFiles, formatChangedFilesText } from "../message-display.js"
+import {
+  extractPatchDiffText,
+  extractPatchFileEntries,
+  extractPatchFiles,
+  extractSummaryFileDiffEntries,
+  formatChangedFilesText,
+  formatFileDiffEntriesPatch,
+} from "../message-display.js"
 import { DEFAULT_FEED_MODE, normalizeFeedMode, sessionKey } from "../state/store.js"
 import { ATTACHMENT_NOTICES, attachmentCaption, sanitizeFilenamePart, scopedAttachmentFilename } from "./attachment-utils.js"
 
@@ -160,6 +167,7 @@ export function createMirroringHandlers(runtime) {
 
   function changedFilesSummaryKeyboard(projectAlias, sessionId, messageId, msg) {
     const fileEntries = extractPatchFileEntries(msg).filter((entry) => entry.diff)
+    const canLoadFileDiffs = fileEntries.length > 0 || !!msg?.info?.parentID
     const rows = [
       [{ text: "Show diff", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|show`) }],
       [
@@ -167,7 +175,7 @@ export function createMirroringHandlers(runtime) {
         { text: "Full .patch", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|patch`) },
       ],
     ]
-    if (fileEntries.length) rows.push([{ text: "File diffs", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|files`) }])
+    if (canLoadFileDiffs) rows.push([{ text: "File diffs", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|files`) }])
     rows.push([{ text: "Close", callback_data: cb.pack("cf|close") }])
     return makeInlineKeyboard(rows)
   }
@@ -209,6 +217,22 @@ export function createMirroringHandlers(runtime) {
     const files = extractPatchFiles(msg)
     if (!files.length) return ""
     return formatChangedFilesText(files, { baseDir: projects?.[projectAlias]?.directory, limit: CHANGED_FILES_LIMIT })
+  }
+
+  async function loadChangedFilesDiffData(oc, sessionId, msg) {
+    const inlineDiffText = extractPatchDiffText(msg)
+    const inlineFileEntries = extractPatchFileEntries(msg).filter((entry) => entry.diff)
+    if (inlineDiffText || inlineFileEntries.length) return { diffText: inlineDiffText, fileEntries: inlineFileEntries }
+
+    const parentId = typeof msg?.info?.parentID === "string" ? msg.info.parentID.trim() : ""
+    if (!parentId || typeof oc?.getMessage !== "function") return { diffText: "", fileEntries: [] }
+
+    const parentMsg = await oc.getMessage(sessionId, parentId).catch(() => null)
+    const fileEntries = extractSummaryFileDiffEntries(parentMsg).filter((entry) => entry.diff)
+    return {
+      diffText: formatFileDiffEntriesPatch(fileEntries),
+      fileEntries,
+    }
   }
 
   function renderChangedFilesDiffHtml(diffText) {
@@ -263,8 +287,6 @@ export function createMirroringHandlers(runtime) {
     }
 
     const summary = extractChangedFilesSummary(projectAlias, msg)
-    const diffText = extractPatchDiffText(msg)
-    const fileEntries = extractPatchFileEntries(msg).filter((entry) => entry.diff)
 
     if (action === "summary") {
       if (!summary) {
@@ -287,6 +309,8 @@ export function createMirroringHandlers(runtime) {
       }
       return
     }
+
+    const { diffText, fileEntries } = await loadChangedFilesDiffData(oc, sessionId, msg)
 
     if (action === "patch") {
       if (!diffText) {
@@ -436,18 +460,18 @@ export function createMirroringHandlers(runtime) {
 
   function buildAssistantStreamPreviewHtml(text) {
     const body = String(text || "").trim()
-    if (!body) return "<i>Streaming reply…</i>"
-    const prefix = "<i>Streaming reply…</i>\n"
+    if (!body) return ""
+    const maxLen = Math.min(STREAM_PREVIEW_MAX_CHARS, 3900)
     let escaped = ""
     for (const ch of body) {
       const next = escapeHtml(ch)
-      if (escaped.length + next.length > Math.min(STREAM_PREVIEW_MAX_CHARS, 3900 - prefix.length - 1)) {
-        escaped += "…"
+      if (escaped.length + next.length > maxLen) {
+        escaped = `${escaped.slice(0, Math.max(0, maxLen - 1))}…`
         break
       }
       escaped += next
     }
-    return `${prefix}${escaped}`
+    return escaped
   }
 
   async function getAssistantMessageWithRetry(oc, sessionId, messageId, { attempts = 3, initialDelayMs = 150 } = {}) {
@@ -609,6 +633,10 @@ export function createMirroringHandlers(runtime) {
         return
       }
       const text = extractTextParts(msg)
+      if (!text || !text.trim()) {
+        logSseDebug(projectAlias, sessionId, `drop=assistant_preview_empty msg=${info.id}`)
+        return
+      }
       const previewHtml = buildAssistantStreamPreviewHtml(text)
       const state = previewState?.messageId === info.id ? previewState : { messageId: info.id, telegramMessageId: null, lastPreviewHtml: "", lastPreviewAt: 0 }
       if (state.lastPreviewHtml === previewHtml) return

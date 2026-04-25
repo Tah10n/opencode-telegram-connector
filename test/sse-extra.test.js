@@ -272,7 +272,7 @@ test("startOpenCodeSseLoop aborts an idle connection and logs it as a normal sto
     })
 
     const poll = () => {
-      const idleTimer = timers[0]
+      const idleTimer = timers.find((timer) => !timer.cleared && timer.ms > 60_000)
       if (idleTimer) {
         idleTimer.fn()
         return

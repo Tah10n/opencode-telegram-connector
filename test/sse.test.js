@@ -17,6 +17,21 @@ function useFetchStub(t, impl) {
   })
 }
 
+function swapEnv(t, patch) {
+  const previous = new Map()
+  for (const key of Object.keys(patch)) previous.set(key, process.env[key])
+  for (const [key, value] of Object.entries(patch)) {
+    if (value == null) delete process.env[key]
+    else process.env[key] = value
+  }
+  t.after(() => {
+    for (const [key, value] of previous.entries()) {
+      if (value == null) delete process.env[key]
+      else process.env[key] = value
+    }
+  })
+}
+
 function makeSseResponse(chunks) {
   const encoder = new TextEncoder()
   const stream = new ReadableStream({
@@ -116,4 +131,45 @@ test("startOpenCodeSseLoop reports disconnects only after a failed health check"
 
   assert.equal(fetchCalls, 1)
   assert.equal(healthCalls, 1)
+})
+
+test("startOpenCodeSseLoop times out a hung initial SSE fetch", async (t) => {
+  swapEnv(t, { OPENCODE_SSE_CONNECT_TIMEOUT_MS: "1" })
+  let fetchCalls = 0
+  useFetchStub(t, async (_url, options = {}) => {
+    fetchCalls += 1
+    return new Promise((_resolve, reject) => {
+      options.signal?.addEventListener?.(
+        "abort",
+        () => reject(Object.assign(new Error("This operation was aborted"), { name: "AbortError" })),
+        { once: true },
+      )
+    })
+  })
+
+  const ocClient = {
+    baseUrl: "http://127.0.0.1:4312",
+    headers: () => ({}),
+    health: async () => ({ ok: true }),
+  }
+
+  let loop
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Timed out waiting for SSE timeout")), 1500)
+    loop = startOpenCodeSseLoop({
+      projectAlias: "demo",
+      ocClient,
+      logger: makeLogger(),
+      onError: async ({ err }) => {
+        const classification = classifyBoundaryError(err)
+        assert.equal(classification.retryable, true)
+        assert.equal(classification.kind, "timeout")
+        loop.stop()
+        clearTimeout(timeout)
+        resolve()
+      },
+    })
+  })
+
+  assert.equal(fetchCalls, 1)
 })
