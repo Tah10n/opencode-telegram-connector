@@ -111,7 +111,7 @@ export default {
 
 - `/start`, `/help` — show help.
 - `/bind [projectAlias]` — bind the current chat/topic to a project's startup session. Without an argument, the bot asks for the alias interactively.
-- `/new [title]` — create a new session. With `openAttachOnNewMode: "new-window"` it binds immediately; with `same-window` Telegram stays on the current session until the attached TUI reports the switch, or you switch manually with `/use`.
+- `/new [title]` — create a new session and bind the current Telegram thread to it. With `openAttachOnNewMode: "new-window"` it also opens a fresh attach window; with `same-window` it requests the existing attached TUI to switch to the new session.
 - `/use <sessionId|shareLink>` — bind an existing session. Supports `https://opncd.ai/share/<id>` and `https://opncd.ai/s/<id>`. Raw session IDs must be non-empty and cannot contain whitespace or URL path/query separators; use share links for unusual IDs.
 - `/sessions` — list recent sessions and switch with buttons.
 - `/unbind` — remove the current binding.
@@ -132,6 +132,10 @@ In groups and forum topics, Telegram commands addressed to another bot are ignor
 
 - `/projects` — show projects, startup sessions, SSE status, active-binding summary, and safe action buttons: Start where auto-start is supported, Retry health check, Show sessions in private chats, and Close. Binding scopes are hidden outside private chats.
 - `/bindings` — list all active bindings (**private chat only**).
+
+### Prompt requests
+
+When opencode asks for a permission decision or a question answer, the connector sends Telegram inline buttons in the bound thread. After a final action is accepted, the original prompt message is removed to keep the chat tidy. Multi-select question prompts stay visible while you toggle options and are removed only after you press **Done**.
 
 ## Feed modes
 
@@ -206,8 +210,8 @@ Prefer the `limits` object in `connector.config.mjs`; env fallbacks are availabl
 - `serverLaunchMode`: `background` or `window`
 - `openTuiOnAutoStart`
 - `openAttachOnNewMode`: `same-window` or `new-window`
-  - `same-window` does not open a new window; it requests a switch for the existing attached TUI and keeps Telegram on the current session until the TUI reports the new active session.
-    When the opencode server exposes the TUI active-session API, Telegram can follow both Telegram-driven and TUI-driven session switches in the same thread.
+  - `same-window` does not open a new window; it binds Telegram to the new session immediately and requests a switch for the existing attached TUI.
+    When the opencode server exposes the TUI active-session API, Telegram can also follow later TUI-driven session switches in the same thread.
   - `new-window` opens a fresh `opencode attach --session ...` window for the new session.
 - `username` / `password` or `usernameEnv` / `passwordEnv`
 - `displayName`
@@ -226,7 +230,9 @@ Prefer the `limits` object in `connector.config.mjs`; env fallbacks are availabl
 - `MIRROR_COMPACTION=1` — also mirror compaction messages.
 - `OPENCODE_SERVER_DEBUG=1` — start local `opencode serve` processes with debug logging.
 - `OPENCODE_SSE_MAX_LINE_BYTES`, `OPENCODE_SSE_MAX_EVENT_BYTES`, `OPENCODE_SSE_MAX_EVENT_LINES` — tune SSE safety limits for unusually large upstream events.
+- `OPENCODE_SSE_CONNECT_TIMEOUT_MS` — timeout for an initial SSE `/event` connection that accepts TCP but never returns headers.
 - `OPENCODE_SSE_HEALTHCHECK_MIN_INTERVAL_MS` — tune health-check throttling after SSE disconnects.
+- `OPENCODE_WATCHDOG_FAILURE_THRESHOLD`, `OPENCODE_WATCHDOG_WINDOW_MS`, `OPENCODE_WATCHDOG_COOLDOWN_MS` — tune the autoStart watchdog that restarts a configured opencode server after repeated retryable health/SSE/prompt-poll failures.
 
 ## Platform notes
 
@@ -408,8 +414,9 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 5. Stop and restart the supervisor-managed process; bindings, offset, feed mode, model preference, and pending prompts should recover without duplicate actions.
 6. Temporarily stop one opencode server, use `/projects` → Retry health check, then restore the server and retry again to confirm project-scoped recovery works without restarting the connector.
 7. In a group, confirm `/start@OtherBot` is ignored and `/start@<this bot username>` is handled.
-8. If a normal Telegram prompt hits a retryable opencode failure, confirm it is retried and not marked handled until `prompt_async` succeeds.
-9. Send long formatted output and confirm Telegram chunks remain parseable HTML.
+8. Answer an opencode permission or question prompt and confirm the handled prompt message is removed; for multi-select questions, confirm the message remains while toggling options and is removed after **Done**.
+9. If a normal Telegram prompt hits a retryable opencode failure, confirm it is retried and not marked handled until `prompt_async` succeeds.
+10. Send long formatted output and confirm Telegram chunks remain parseable HTML.
 
 ## Troubleshooting matrix
 
@@ -422,7 +429,7 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 | SSE stopped after protocol/size error | Logs show a fatal SSE protocol or size failure for one project. | Inspect upstream event size/protocol, fix the source, then restart the connector or recover the project; prompt polling still handles prompts while SSE is down. |
 | Group command ignored | The command may be addressed to another bot, for example `/start@OtherBot`. | Use `/command@<this bot username>` or an unsuffixed command that Telegram delivers to this bot. |
 | Duplicate prompts or callbacks | Check `/status` for prompt cleanup/recovery and callback outcome counters. Duplicates after restart should be skipped as already handled. | If duplicates continue, keep the connector single-instance and inspect logs around prompt polling/SSE reconnects. |
-| Stale callbacks | Button presses may answer `No longer active` or `Already handled` after a prompt is completed or rejected. | Dismiss the old message with Close and wait for any current prompt to be delivered again if it is still live. |
+| Stale callbacks | Button presses may answer `No longer active` or `Already handled` after a prompt is completed or rejected. | Prompt messages are removed automatically when possible; otherwise dismiss any remaining old interactive message with Close and wait for the current prompt to be delivered again if it is still live. |
 | Wrong thread/session | Use `/status` in the thread and `/bindings` in a private chat to compare bindings. | Use `/use <sessionId>`, `/bind <projectAlias>`, `/new`, or `/unbind` in the affected thread. |
 | Failed auto-start | `/projects` shows Start only when local launch is supported. Logs include launcher errors without exposing secrets. | Verify `opencode` is on `PATH`, the project `directory` and `port` are configured, and a GUI terminal is available if you configured window/TUI launch. |
 

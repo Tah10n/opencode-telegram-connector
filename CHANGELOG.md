@@ -8,7 +8,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ## [Unreleased]
 
 ### Fixed
-- `/new` with `openAttachOnNewMode: "same-window"` now best-effort switches an attached TUI to the new session via opencode TUI control endpoints (with a manual fallback note on failure).
+- Handled opencode permission and question prompt messages are now removed after the user presses a final inline button, while multi-select prompts stay visible until **Done**.
+- `/new` with `openAttachOnNewMode: "same-window"` now binds Telegram to the created session immediately while best-effort switching the attached TUI.
+- Auto-start projects now have a watchdog that restarts a hung opencode server after repeated retryable SSE/prompt-poll/user-prompt failures.
+- Initial SSE connections now time out instead of hanging forever when the opencode server accepts the connection but never returns headers.
 - Telegram bindings can now follow TUI-reported active-session changes when the opencode server supports `/tui/active-session`.
 - Retryable user `prompt_async` failures no longer mark Telegram updates handled before delivery succeeds.
 - Group commands addressed to another bot, such as `/start@OtherBot`, are ignored.
