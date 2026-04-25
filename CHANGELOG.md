@@ -9,6 +9,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 - Handled opencode permission and question prompt messages are now removed after the user presses a final inline button, while multi-select prompts stay visible until **Done**.
+- Windows auto-start now closes stale matching `opencode attach` UI windows before reopening them when a TUI fails to recover the server or the watchdog restarts a hung project.
 - `/new` with `openAttachOnNewMode: "same-window"` now binds Telegram to the created session immediately while best-effort switching the attached TUI.
 - Auto-start projects now have a watchdog that restarts a hung opencode server after repeated retryable SSE/prompt-poll/user-prompt failures.
 - Initial SSE connections now time out instead of hanging forever when the opencode server accepts the connection but never returns headers.

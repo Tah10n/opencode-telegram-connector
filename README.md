@@ -233,6 +233,7 @@ Prefer the `limits` object in `connector.config.mjs`; env fallbacks are availabl
 - `OPENCODE_SSE_CONNECT_TIMEOUT_MS` — timeout for an initial SSE `/event` connection that accepts TCP but never returns headers.
 - `OPENCODE_SSE_HEALTHCHECK_MIN_INTERVAL_MS` — tune health-check throttling after SSE disconnects.
 - `OPENCODE_WATCHDOG_FAILURE_THRESHOLD`, `OPENCODE_WATCHDOG_WINDOW_MS`, `OPENCODE_WATCHDOG_COOLDOWN_MS` — tune the autoStart watchdog that restarts a configured opencode server after repeated retryable health/SSE/prompt-poll failures.
+  On Windows, watchdog restarts also close matching stale `opencode attach` UI windows before reopening the TUI for that project.
 
 ## Platform notes
 
@@ -424,6 +425,7 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 | --- | --- | --- |
 | Telegram polling appears stuck | Use `/runtime` in a private chat and inspect `Telegram poll` retries, `lastErrorAt`, and update retry/skip counts. Ensure only one connector instance is running for the bot token. | Fix the Telegram/API/network issue; restart the connector only if the supervisor reports the process is unhealthy. |
 | OpenCode unavailable | Use `/projects` and the project's Retry health check. `/status` also shows the current project's SSE and sanitized base URL. | Start opencode manually, or press Start if the project exposes a Start button. Retry health after the server is up. |
+| Windows TUI/attach window appears hung | Check logs for watchdog restarts or repeated retryable SSE/prompt-poll failures. A stale attach window can remain after a server restart. | Let the auto-start watchdog recover the project; it closes matching stale attach windows and opens a fresh one. If needed, close the old TUI window manually and use `/projects` → Start/Retry health. |
 | State file cannot be read, written, or validated | Startup or runtime logs report a state read/write/schema failure. The connector fails closed instead of silently resetting state. Schema errors include the malformed section path, and migration/invalid-state backups are written next to `state.json` when possible. | Fix permissions/path/corruption, repair the reported section, or restore a known-good `state.json.backup.*` file. Treat backups as sensitive; they contain the same bindings, offset, prompts, and idempotency history as `state.json`. |
 | Prompt send reports project unavailable | A retryable opencode `prompt_async` failure happened while forwarding a user message. | Restore the project; the Telegram update remains retryable and should be processed again after recovery. |
 | SSE stopped after protocol/size error | Logs show a fatal SSE protocol or size failure for one project. | Inspect upstream event size/protocol, fix the source, then restart the connector or recover the project; prompt polling still handles prompts while SSE is down. |
