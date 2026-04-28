@@ -148,11 +148,19 @@ export class TelegramClient {
     this._messageContexts = new Map()
   }
 
-  // Observability contract: sendMessage, sendDocument, editMessageText, and
-  // editMessageReplyMarkup call recordApiFailure on error so delivery failures
-  // appear in /runtime counters. Read-only and non-data-bearing methods (getMe,
-  // getUpdates, getFile, downloadFile, deleteMessage, answerCallbackQuery, etc.)
-  // intentionally do not record failures — callers either retry or ignore them.
+  /**
+   * Observability contract:
+   * 1) Recordable outbound-delivery API failures:
+   *    `sendMessage`, `sendDocument`, `editMessageText`, `editMessageReplyMarkup`.
+   *    These are the only Telegram API failures reflected in `/runtime` counters.
+   *
+   * 2) Non-recorded methods on purpose:
+   *    polling/control and cleanup helpers (`getMe`, `getUpdates`, `getFile`,
+   *    `downloadFile`, `setMyCommands`, `deleteMessage`, `answerCallbackQuery`) and
+   *    transport primitives (`call`, `callMultipart`) do not call `onApiFailure`.
+   *    Their callers own retry/ignore handling, and we keep failure counters focused
+   *    on user-visible send/edit delivery health only.
+   */
   recordApiFailure(method, params, err) {
     if (!this.onApiFailure) return
     try {
