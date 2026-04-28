@@ -36,14 +36,98 @@ function inferFileFromDiffSection(section) {
     if (match) return stripDiffPrefix(match[2] || match[1])
   }
   for (const line of lines) {
-    const match = line.match(/^\+\+\+\s+(.+)$/)
-    if (match) return stripDiffPrefix(match[1].split(/\t/)[0])
+    const match = line.match(/^Index:\s+(.+)$/)
+    if (match) {
+      const file = stripDiffPrefix(match[1].split(/\t/)[0])
+      if (file) return file
+    }
   }
-  for (const line of lines) {
-    const match = line.match(/^---\s+(.+)$/)
-    if (match) return stripDiffPrefix(match[1].split(/\t/)[0])
+  const hunkState = { oldRemaining: 0, newRemaining: 0 }
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]
+    if (!hasActiveUnifiedHunk(hunkState) && isUnifiedFileHeaderPair(lines, index)) {
+      const oldPath = diffHeaderPath(line, "---")
+      const newPath = diffHeaderPath(lines[index + 1], "+++")
+      return newPath || oldPath
+    }
+    const hunk = parseUnifiedHunkHeader(line)
+    if (hunk) {
+      hunkState.oldRemaining = hunk.oldRemaining
+      hunkState.newRemaining = hunk.newRemaining
+      continue
+    }
+    consumeUnifiedHunkLine(hunkState, line)
   }
   return ""
+}
+
+function rawDiffHeaderPath(line, marker) {
+  const re = marker === "---" ? /^---\s+(.+)$/ : /^\+\+\+\s+(.+)$/
+  const match = String(line || "").match(re)
+  if (!match) return ""
+  return match[1].split(/\t/)[0].trim()
+}
+
+function diffHeaderPath(line, marker) {
+  return stripDiffPrefix(rawDiffHeaderPath(line, marker))
+}
+
+function hasDiffPathMarker(rawPath) {
+  const path = String(rawPath || "").trim()
+  return path === "/dev/null"
+    || /^(?:a|b|\.{1,2})\//.test(path)
+    || path.includes("/")
+    || path.includes("\\")
+    || /\.[^/\\\s]+$/.test(path)
+}
+
+function isPlausibleFileHeaderPathPair(lines, index) {
+  const rawOldPath = rawDiffHeaderPath(lines[index], "---")
+  const rawNewPath = rawDiffHeaderPath(lines[index + 1], "+++")
+  const oldPath = stripDiffPrefix(rawOldPath)
+  const newPath = stripDiffPrefix(rawNewPath)
+  if (!oldPath && !newPath) return false
+  if (oldPath && newPath && oldPath === newPath) return true
+  return hasDiffPathMarker(rawOldPath) || hasDiffPathMarker(rawNewPath)
+}
+
+function isUnifiedFileHeaderPair(lines, index) {
+  if (!isPlausibleFileHeaderPathPair(lines, index)) return false
+  const oldPath = diffHeaderPath(lines[index], "---")
+  const newPath = diffHeaderPath(lines[index + 1], "+++")
+  if (!oldPath && !newPath) return false
+  const after = String(lines[index + 2] || "")
+  return after.startsWith("@@")
+    || after.startsWith("Binary files ")
+    || after.startsWith("GIT binary patch")
+    || after.startsWith("literal ")
+    || after.startsWith("delta ")
+}
+
+function parseUnifiedHunkHeader(line) {
+  const match = String(line || "").match(/^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/)
+  if (!match) return null
+  return {
+    oldRemaining: match[2] == null ? 1 : Number(match[2]),
+    newRemaining: match[4] == null ? 1 : Number(match[4]),
+  }
+}
+
+function hasActiveUnifiedHunk(state) {
+  return state.oldRemaining > 0 || state.newRemaining > 0
+}
+
+function consumeUnifiedHunkLine(state, line) {
+  if (!hasActiveUnifiedHunk(state)) return
+  const marker = String(line || "")[0]
+  if (marker === " ") {
+    state.oldRemaining = Math.max(0, state.oldRemaining - 1)
+    state.newRemaining = Math.max(0, state.newRemaining - 1)
+  } else if (marker === "-") {
+    state.oldRemaining = Math.max(0, state.oldRemaining - 1)
+  } else if (marker === "+") {
+    state.newRemaining = Math.max(0, state.newRemaining - 1)
+  }
 }
 
 function normalizeOpenCodeFileDiffEntries(diffs) {
@@ -64,12 +148,33 @@ function splitUnifiedDiffByFile(diffText) {
   const lines = String(diffText || "").split("\n")
   const sections = []
   let current = []
-  for (const line of lines) {
-    if (line.startsWith("diff --git ") && current.length) {
+  let currentHasFileBody = false
+  const hunkState = { oldRemaining: 0, newRemaining: 0 }
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]
+    const startsExplicitSection = line.startsWith("diff --git ") || line.startsWith("Index: ")
+    const startsHeaderPairSection = !hasActiveUnifiedHunk(hunkState) && currentHasFileBody && isUnifiedFileHeaderPair(lines, index)
+    if ((startsExplicitSection || startsHeaderPairSection) && current.length) {
       sections.push(current.join("\n").trim())
       current = []
+      currentHasFileBody = false
+      hunkState.oldRemaining = 0
+      hunkState.newRemaining = 0
     }
     current.push(line)
+    const hunk = parseUnifiedHunkHeader(line)
+    if (hunk) {
+      hunkState.oldRemaining = hunk.oldRemaining
+      hunkState.newRemaining = hunk.newRemaining
+    } else {
+      consumeUnifiedHunkLine(hunkState, line)
+    }
+    if (isUnifiedFileHeaderPair(lines, index)
+      || line.startsWith("@@")
+      || line.startsWith("Binary files ")
+      || line.startsWith("GIT binary patch")) {
+      currentHasFileBody = true
+    }
   }
   if (current.length) sections.push(current.join("\n").trim())
   return sections.filter(Boolean)
@@ -81,11 +186,24 @@ export function extractPatchFiles(message) {
   for (const part of parts) {
     if (!part || part.type !== "patch") continue
     const files = Array.isArray(part.files) ? part.files : []
+    let hasExplicitFile = false
     for (const f of files) {
       if (typeof f !== "string") continue
       const v = f.trim()
       if (!v) continue
+      hasExplicitFile = true
       out.push(v)
+    }
+    const diffText = patchPartText(part)
+    if (!diffText || hasExplicitFile) continue
+    const sections = splitUnifiedDiffByFile(diffText)
+    const inferred = (sections.length ? sections : [diffText])
+      .map((section) => inferFileFromDiffSection(section))
+      .filter(Boolean)
+    if (inferred.length) {
+      out.push(...inferred)
+    } else if (!hasExplicitFile) {
+      out.push("changed-file")
     }
   }
   // Preserve order but de-duplicate.

@@ -1,5 +1,6 @@
 import crypto from "node:crypto"
 import { makeInlineKeyboard } from "../telegram/client.js"
+import { formatUnifiedDiffHtml } from "../telegram/diff-formatter.js"
 import { escapeHtml, formatMarkdownToTelegramHtmlBlocks } from "../telegram/formatter.js"
 import { ctxKeyFrom } from "../telegram/routing.js"
 import {
@@ -241,11 +242,11 @@ export function createMirroringHandlers(runtime) {
   }
 
   function renderChangedFilesDiffHtml(diffText) {
-    return `<b>Changed files diff</b>\n<pre><code>${escapeHtml(diffText)}</code></pre>`
+    return formatUnifiedDiffHtml(diffText, { title: "Changed files diff" })
   }
 
   function renderSelectedFileDiffHtml(entry) {
-    return `<b>Changed file diff: ${escapeHtml(entry?.file || "file")}</b>\n<pre><code>${escapeHtml(entry?.diff || "")}</code></pre>`
+    return formatUnifiedDiffHtml(entry?.diff || "", { title: `Changed file diff: ${entry?.file || "file"}` })
   }
 
   async function deliverChangedFilesSummary(ctxMeta, projectAlias, sessionId, messageId, msg, { replaceMessageId } = {}) {

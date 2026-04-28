@@ -428,7 +428,12 @@ test("renderChangedFilesView loads current opencode diffs from parent user summa
   assert.deepEqual(fetched, ["msg_1", "user_1"])
   assert.equal(calls.editMessageText.length, 1)
   assert.match(calls.editMessageText[0][2], /Changed files diff/)
-  assert.match(calls.editMessageText[0][2], /\+new/)
+  assert.match(calls.editMessageText[0][2], /🔴 -old/)
+  assert.match(calls.editMessageText[0][2], /🟢 \+new/)
+  assert.deepEqual(calls.editMessageText[0][4], {
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  })
 })
 
 test("renderChangedFilesView suppresses duplicate changed-files exports", async () => {
@@ -510,7 +515,12 @@ test("renderChangedFilesView shows and exports selected file diffs", async () =>
 
   assert.match(calls.editMessageText[0][2], /Changed file diffs:/)
   assert.match(calls.editMessageText[1][2], /src\/b\.js/)
-  assert.match(calls.editMessageText[1][2], /\+right/)
+  assert.match(calls.editMessageText[1][2], /🔴 -left/)
+  assert.match(calls.editMessageText[1][2], /🟢 \+right/)
+  assert.deepEqual(calls.editMessageText[1][4], {
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  })
   assert.equal(calls.sendDocument.length, 1)
   assert.match(calls.sendDocument[0][2], /file-diff-b\.js\.patch$/)
 })
@@ -707,6 +717,48 @@ test("handleMessageUpdated records mirrored final assistant replies", async (t) 
   assert.deepEqual(mirrored, [["demo"]])
   const sets = runtime.forwardedBySession.get(sessionKey("demo", "ses_1"))
   assert.equal(sets.assistant.has("msg_1"), true)
+})
+
+test("handleMessageUpdated sends changed-files card in main+changes when patch files are inferred from diff", async (t) => {
+  useImmediateTimeouts(t)
+  const { calls, runtime, handlers } = createHarness({
+    ocByAlias: {
+      demo: {
+        async getMessage() {
+          return {
+            info: { id: "msg_1", role: "assistant", time: { completed: 1 } },
+            parts: [
+              { type: "text", text: "Final answer" },
+              {
+                type: "patch",
+                diff: [
+                  "diff --git a/src/app.js b/src/app.js",
+                  "--- a/src/app.js",
+                  "+++ b/src/app.js",
+                  "@@ -1 +1 @@",
+                  "-old",
+                  "+new",
+                ].join("\n"),
+              },
+            ],
+          }
+        },
+      },
+    },
+  })
+
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", time: { completed: 1 } } },
+  })
+  await flushAsyncWork()
+
+  assert.equal(calls.sendBlocksToThread.length, 1)
+  assert.equal(calls.sendToThread.length, 1)
+  assert.match(calls.sendToThread[0][1], /Changed files:/)
+  assert.match(calls.sendToThread[0][1], /src\/app\.js/)
+  const sets = runtime.forwardedBySession.get(sessionKey("demo", "ses_1"))
+  assert.equal(sets.changes.has("msg_1"), true)
 })
 
 test("handleMessageUpdated logs final assistant delivery failures without marking the reply forwarded", async (t) => {

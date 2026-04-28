@@ -1719,6 +1719,12 @@ test("startConnector changed-files cards support Show diff and Back", async () =
     harness.tg.enqueue(makeCallbackUpdate(302, "cf|demo|ses_1|msg_patch|show", { threadIdOr0: 7, messageId: summary.result.message_id }))
     await waitFor(() => harness.tg.editedMessages.length >= 1)
     assert.match(harness.tg.editedMessages[0].text, /Changed files diff/)
+    assert.match(harness.tg.editedMessages[0].text, /🔴 -old/)
+    assert.match(harness.tg.editedMessages[0].text, /🟢 \+new/)
+    assert.deepEqual(harness.tg.editedMessages[0].options, {
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+    })
 
     harness.tg.enqueue(makeCallbackUpdate(303, "cf|demo|ses_1|msg_patch|back", { threadIdOr0: 7, messageId: summary.result.message_id }))
     await waitFor(() => harness.tg.editedMessages.length >= 2)
