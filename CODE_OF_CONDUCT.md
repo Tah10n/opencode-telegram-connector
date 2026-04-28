@@ -28,6 +28,6 @@ Project maintainers may edit or remove content, close threads, reject contributi
 
 ## Reporting
 
-Please report conduct problems privately to the maintainer through an existing private contact channel.
+Please report conduct problems privately to the maintainer through an existing private contact channel when one is available.
 
-Until a dedicated public contact address is added, avoid posting personal or sensitive details in public issues. If a report overlaps with a security concern, follow the guidance in `SECURITY.md`.
+Until a dedicated contact address is added, you may open a minimal public issue asking for a maintainer contact path. Do not include personal details, sensitive context, or allegations in that issue. If a report overlaps with a security concern, follow the guidance in `SECURITY.md`.

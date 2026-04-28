@@ -17,9 +17,11 @@ Describe the problem in 1-3 sentences.
 
 ## Configuration
 
-- Using `PROJECTS_FILE` or `PROJECTS_JSON`:
+- Using preferred `connector.config.mjs`: yes / no
+- If possible, paste a redacted project entry or describe `baseUrl` / `directory` / `port` / `autoStart`:
+- Using legacy `PROJECTS_FILE` or `PROJECTS_JSON`: no / `PROJECTS_FILE` / `PROJECTS_JSON`
 - Using Basic Auth: yes / no
-- Relevant optional flags (`TG_PREFIX`, `ECHO_FILTER_MODE`, etc.):
+- Relevant optional flags (`TG_PREFIX`, `ECHO_FILTER_MODE`, `STATE_FILE`, `CONNECTOR_LOG_FORMAT`, etc.):
 
 ## Steps to reproduce
 

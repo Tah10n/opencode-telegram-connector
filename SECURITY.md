@@ -14,7 +14,8 @@ Please report suspected vulnerabilities privately.
 
 - Do **not** post secrets, tokens, passwords, or private state files in public issues.
 - Prefer GitHub private vulnerability reporting if it is enabled for the repository.
-- If private reporting is not available, contact the maintainer through a private channel you already have.
+- If GitHub private vulnerability reporting is not available, open a minimal public issue asking for a private security contact path. Do not include vulnerability details, logs, tokens, URLs with credentials, or state/config contents in that issue.
+- If you already have a private maintainer contact, you may use that channel instead.
 
 When reporting, include:
 

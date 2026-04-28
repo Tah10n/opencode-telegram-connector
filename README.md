@@ -64,6 +64,16 @@ Sanity check:
 npm run check
 ```
 
+## Runtime file locations
+
+When you follow the quick start from the connector directory, local runtime files live next to this README:
+
+- `.env` — secrets and env-only overrides; create it from `.env.example` and do not commit it.
+- `connector.config.mjs` — preferred project configuration; create it from `connector.config.example.mjs` and keep secrets in `.env`.
+- `.data/state.json` — default persisted state path; treat it as sensitive because it contains bindings, offsets, pending prompts, and idempotency history.
+
+If you launch the connector from another working directory, pass explicit `--env-file`, `--config-file`, and/or `--state-file` paths, or set `cwd` / `stateFile` in `connector.config.mjs` so relative paths resolve where you expect.
+
 ## Minimal config example
 
 `connector.config.mjs` is the preferred configuration entrypoint.
