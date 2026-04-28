@@ -90,6 +90,37 @@ test("startOpenCodeSseLoop forwards parsed SSE events and connects once", async 
   assert.equal(errorCalls, 0)
 })
 
+test("startOpenCodeSseLoop appends event path after a base path", async (t) => {
+  const fetchUrls = []
+  useFetchStub(t, async (url) => {
+    fetchUrls.push(String(url))
+    return makeSseResponse(['data: {"id":"evt_1","type":"message"}\n', "\n"])
+  })
+
+  const ocClient = {
+    baseUrl: "https://example.com/api",
+    headers: () => ({}),
+    health: async () => ({ ok: true }),
+  }
+
+  let loop
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Timed out waiting for SSE event")), 500)
+    loop = startOpenCodeSseLoop({
+      projectAlias: "demo",
+      ocClient,
+      logger: makeLogger(),
+      onEvent: async () => {
+        loop.stop()
+        clearTimeout(timeout)
+        resolve()
+      },
+    })
+  })
+
+  assert.deepEqual(fetchUrls, ["https://example.com/api/event"])
+})
+
 test("startOpenCodeSseLoop reports disconnects only after a failed health check", async (t) => {
   let fetchCalls = 0
   useFetchStub(t, async () => {

@@ -45,7 +45,7 @@ function parseMethod(message) {
 
 function isResourceNotFoundPath(pathname) {
   const path = cleanString(pathname)
-  return /^\/(session|permission|question)(?:\/|$)/.test(path)
+  return /(?:^|\/)\b(session|permission|question)\b(?:\/|$)/.test(path)
 }
 
 function messageLooksLikeDisconnect(message) {

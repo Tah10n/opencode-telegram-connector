@@ -81,6 +81,16 @@ test("OpenCodeClient rejects insecure basic auth to non-loopback http", () => {
     () => new OpenCodeClient({ baseUrl: "http://example.com", username: "u", password: "p" }),
     /Refusing to send Basic Auth credentials over insecure HTTP/,
   )
+  assert.throws(
+    () => new OpenCodeClient({ baseUrl: "http://127.attacker.example", username: "u", password: "p" }),
+    /Refusing to send Basic Auth credentials over insecure HTTP/,
+  )
+})
+
+test("OpenCodeClient allows insecure basic auth only for literal loopback hosts", () => {
+  assert.equal(new OpenCodeClient({ baseUrl: "http://localhost:4312", password: "p" }).baseUrl, "http://localhost:4312")
+  assert.equal(new OpenCodeClient({ baseUrl: "http://127.0.0.1:4312", password: "p" }).baseUrl, "http://127.0.0.1:4312")
+  assert.equal(new OpenCodeClient({ baseUrl: "http://[::1]:4312", password: "p" }).baseUrl, "http://[::1]:4312")
 })
 
 test("OpenCodeClient allows insecure basic auth override", () => {

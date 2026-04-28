@@ -31,6 +31,21 @@ test("classifyBoundaryError marks resource 404s as stale", () => {
   })
 })
 
+test("classifyBoundaryError marks path-prefixed resource 404s as stale", () => {
+  const err = makeBoundaryError({
+    source: "opencode",
+    operation: "POST /api/permission/perm_1/reply",
+    method: "POST",
+    pathname: "/api/permission/perm_1/reply",
+    status: 404,
+    message: "POST /api/permission/perm_1/reply failed: 404 not found",
+  })
+
+  const classification = classifyBoundaryError(err)
+  assert.equal(classification.stale, true)
+  assert.equal(err.kind, "stale")
+})
+
 test("normalizeBoundaryError lifts retryable network failures from plain errors", () => {
   const err = normalizeBoundaryError(new Error("fetch failed"), {
     source: "opencode",

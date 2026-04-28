@@ -81,6 +81,26 @@ test("loadProjectsConfig reads basic auth from usernameEnv/passwordEnv", async (
   assert.equal(projects.demo.directory, path.resolve(path.join("workspace", "configs"), "../repo"))
 })
 
+test("loadProjectsConfig rejects baseUrl query strings and fragments", async () => {
+  await assert.rejects(
+    loadProjectsConfig({
+      projectsJson: JSON.stringify({
+        demo: { baseUrl: "http://127.0.0.1:4312?token=abc" },
+      }),
+    }),
+    /invalid baseUrl.*must not include query strings or fragments/,
+  )
+
+  await assert.rejects(
+    loadProjectsConfig({
+      projectsJson: JSON.stringify({
+        demo: { baseUrl: "http://127.0.0.1:4312#frag" },
+      }),
+    }),
+    /invalid baseUrl.*must not include query strings or fragments/,
+  )
+})
+
 test("loadProjectsConfig reports a Windows backslash hint for invalid JSON", async () => {
   await assert.rejects(
     loadProjectsConfig({

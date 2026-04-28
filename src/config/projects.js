@@ -1,5 +1,6 @@
 import fs from "node:fs/promises"
 import path from "node:path"
+import { normalizeEndpointBaseUrl } from "../url-utils.js"
 
 function isPlainObject(v) {
   return !!v && typeof v === "object" && !Array.isArray(v)
@@ -56,13 +57,14 @@ export function normalizeProjectsConfig(raw, { baseDir, sourceLabel } = {}) {
     if (port != null && (port < 1 || port > 65535)) throw new Error(`Project '${alias}' invalid port range`)
 
     const baseUrlRaw = String(cfg.baseUrl ?? "").trim()
-    const baseUrl = baseUrlRaw || (port ? `http://127.0.0.1:${port}` : "")
-    if (!baseUrl) throw new Error(`Project '${alias}' missing baseUrl (or port)`)
+    const baseUrlCandidate = baseUrlRaw || (port ? `http://127.0.0.1:${port}` : "")
+    if (!baseUrlCandidate) throw new Error(`Project '${alias}' missing baseUrl (or port)`)
+    let baseUrl
     try {
       // Validate early to fail fast.
-      new URL(baseUrl)
-    } catch {
-      throw new Error(`Project '${alias}' invalid baseUrl: ${baseUrl}`)
+      baseUrl = normalizeEndpointBaseUrl(baseUrlCandidate, { label: `Project '${alias}' baseUrl` })
+    } catch (err) {
+      throw new Error(`Project '${alias}' invalid baseUrl: ${err?.message || baseUrlCandidate}`)
     }
 
     const autoStart = cfg.autoStart === true

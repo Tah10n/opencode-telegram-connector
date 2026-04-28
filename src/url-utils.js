@@ -1,3 +1,36 @@
+import net from "node:net"
+
+export function normalizeEndpointBaseUrl(baseUrl, { label = "baseUrl" } = {}) {
+  const s = String(baseUrl || "").trim()
+  if (!s) return s
+  const u = new URL(s)
+  if (u.search || u.hash) throw new Error(`${label} must not include query strings or fragments`)
+  u.search = ""
+  u.hash = ""
+  u.pathname = u.pathname.replace(/\/+$/g, "") || "/"
+  const normalized = u.toString()
+  return normalized.endsWith("/") ? normalized.slice(0, -1) : normalized
+}
+
+export function appendPathToBaseUrl(baseUrl, pathname) {
+  const base = new URL(normalizeEndpointBaseUrl(baseUrl))
+  const suffix = String(pathname || "")
+  if (!suffix.startsWith("/")) throw new Error(`Endpoint path must start with '/': ${suffix}`)
+  const basePath = base.pathname.replace(/\/+$/g, "")
+  base.pathname = `${basePath === "/" ? "" : basePath}${suffix}`
+  base.search = ""
+  base.hash = ""
+  return base
+}
+
+export function isLoopbackHostname(hostname) {
+  let host = String(hostname || "").trim().toLowerCase()
+  if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1)
+  if (host === "localhost" || host === "::1") return true
+  if (net.isIP(host) === 4) return host.split(".")[0] === "127"
+  return false
+}
+
 export function sanitizeBaseUrlForDisplay(baseUrl) {
   const s = String(baseUrl || "").trim()
   if (!s) return s

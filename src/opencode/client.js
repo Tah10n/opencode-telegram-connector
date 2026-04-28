@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer"
 import { boundaryErrorFromException, boundaryErrorFromHttpResponse } from "../boundary-errors.js"
+import { appendPathToBaseUrl, isLoopbackHostname, normalizeEndpointBaseUrl } from "../url-utils.js"
 import { encodeOpenCodePathSegment, normalizeOpenCodeId } from "./ids.js"
 
 function basicAuthHeader(username, password) {
@@ -38,17 +39,16 @@ function combineSignals(...signals) {
 
 export class OpenCodeClient {
   constructor({ baseUrl, username, password, allowInsecureHttp = false }) {
-    this.baseUrl = String(baseUrl).replace(/\/$/, "")
+    this.baseUrl = normalizeEndpointBaseUrl(baseUrl, { label: "OpenCode baseUrl" })
     this.username = username || ""
     this.password = password || ""
     this.allowInsecureHttp = allowInsecureHttp === true
 
     if (this.password) {
       const u = new URL(this.baseUrl)
-      const host = (u.hostname || "").toLowerCase()
       // Treat only true loopback names/addresses as safe for insecure HTTP.
       // NOTE: 0.0.0.0 is a bind-all address, not loopback.
-      const isLoopback = host === "localhost" || host === "::1" || host.startsWith("127.")
+      const isLoopback = isLoopbackHostname(u.hostname)
       const isHttps = u.protocol === "https:"
       if (!isHttps && !isLoopback && !this.allowInsecureHttp) {
         throw new Error(
@@ -70,7 +70,7 @@ export class OpenCodeClient {
   }
 
   async request(pathname, { method = "GET", query, json, timeoutMs = 30_000, signal } = {}) {
-    const url = new URL(this.baseUrl + pathname)
+    const url = appendPathToBaseUrl(this.baseUrl, pathname)
     if (query) {
       for (const [k, v] of Object.entries(query)) {
         if (v === undefined || v === null) continue

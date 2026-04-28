@@ -40,6 +40,11 @@ test("OpenCodeClient request sends query params, auth headers, and JSON bodies",
   }
 })
 
+test("OpenCodeClient rejects baseUrl query strings and fragments", () => {
+  assert.throws(() => new OpenCodeClient({ baseUrl: "https://example.com/api?token=abc" }), /must not include query strings or fragments/)
+  assert.throws(() => new OpenCodeClient({ baseUrl: "https://example.com/api#frag" }), /must not include query strings or fragments/)
+})
+
 test("OpenCodeClient request handles 204, text responses, and backend errors", async () => {
   const originalFetch = globalThis.fetch
   const queue = [
@@ -81,6 +86,28 @@ test("OpenCodeClient request wraps resource 404s as stale boundary errors", asyn
       const classification = classifyBoundaryError(err)
       assert.equal(err.isBoundaryError, true)
       assert.equal(err.pathname, "/session/ses_missing")
+      assert.equal(classification.stale, true)
+      return true
+    })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("OpenCodeClient keeps prefixed resource 404s stale", async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => ({
+    ok: false,
+    status: 404,
+    statusText: "Not Found",
+    text: async () => "not found",
+  })
+
+  try {
+    const client = new OpenCodeClient({ baseUrl: "https://example.com/api" })
+    await assert.rejects(async () => client.getSession("ses_missing"), (err) => {
+      const classification = classifyBoundaryError(err)
+      assert.equal(err.pathname, "/api/session/ses_missing")
       assert.equal(classification.stale, true)
       return true
     })

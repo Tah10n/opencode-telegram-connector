@@ -7,6 +7,7 @@ import {
   isRetryableBoundaryError,
   makeBoundaryError,
 } from "../boundary-errors.js"
+import { appendPathToBaseUrl } from "../url-utils.js"
 
 function readIntEnv(name, fallback) {
   const raw = process.env?.[name]
@@ -104,7 +105,7 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
       let connectTimer = null
       let connectTimedOut = false
       try {
-        const url = new URL(ocClient.baseUrl + "/event")
+        const url = appendPathToBaseUrl(ocClient.baseUrl, "/event")
         connectTimer = setTimeout(() => {
           connectTimedOut = true
           ctrl.abort()
