@@ -178,9 +178,9 @@ test("startOpenCodeSseLoop skips invalid JSON events and logs handler failures",
 
   assert.deepEqual(seen, [{ id: "evt_2", type: "message" }])
   assert.equal(logger.logs.error.length, 1)
-  assert.equal(logger.logs.error[0][0], "SSE event handler error:")
-  assert.equal(logger.logs.error[0][1], "demo")
-  assert.equal(logger.logs.error[0][2], "handler failed")
+  assert.equal(logger.logs.error[0][0], "SSE event handler error")
+  assert.equal(logger.logs.error[0][1].projectAlias, "demo")
+  assert.equal(logger.logs.error[0][1].error, "handler failed")
 })
 
 test("startOpenCodeSseLoop aborts oversized SSE events and reports a protocol error", async (t) => {
@@ -282,7 +282,7 @@ test("startOpenCodeSseLoop aborts an idle connection and logs it as a normal sto
     poll()
 
     const waitForAbortLog = () => {
-      if (logger.logs.info.some((entry) => entry[0] === "SSE aborted:")) {
+      if (logger.logs.info.some((entry) => entry[0] === "SSE aborted")) {
         loop.stop()
         clearTimeout(timeout)
         resolve()
@@ -293,7 +293,7 @@ test("startOpenCodeSseLoop aborts an idle connection and logs it as a normal sto
     waitForAbortLog()
   })
 
-  assert.equal(logger.logs.info.some((entry) => entry[0] === "SSE aborted:" && entry[1] === "demo"), true)
+  assert.equal(logger.logs.info.some((entry) => entry[0] === "SSE aborted" && entry[1]?.projectAlias === "demo"), true)
 })
 
 test("startOpenCodeSseLoop exposes done for explicit stop without reporting an error", async (t) => {

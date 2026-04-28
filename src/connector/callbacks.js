@@ -60,6 +60,7 @@ export function createCallbackHandlers(runtime) {
     startServerKeyboard,
     platform,
     recordCallbackOutcome,
+    recordPromptAnswered,
     requestRuntimeShutdown,
     scheduleRuntimeShutdown,
   } = runtime
@@ -771,6 +772,7 @@ export function createCallbackHandlers(runtime) {
             operation: "replyPermission",
             action,
           })
+          recordPromptAnswered?.(projectAlias, "permission", "ok")
           cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, sessionID)
           await store.flush?.()
           await answerCallbackQuery(callbackQuery.id, "OK")
@@ -858,6 +860,7 @@ export function createCallbackHandlers(runtime) {
             ctxKey: ctxMeta.ctxKey,
             operation: "rejectQuestion",
           })
+          recordPromptAnswered?.(projectAlias, "question", "rejected")
           cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, sessionID)
           await store.flush?.()
           await answerCallbackQuery(callbackQuery.id, "Rejected")

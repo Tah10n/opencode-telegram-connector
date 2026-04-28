@@ -22,12 +22,17 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - State schema validation now rejects malformed current-schema sections and unknown schema versions with actionable section paths.
 
 ### Security
+- Logs now redact bot tokens, Basic Auth credentials, URL userinfo/query/hash values, auth-like command-line flags, and sensitive state/config paths before writing text or JSON output.
+- High-entropy token strings of 32 or more characters are automatically redacted even when the token type is not pre-listed in the known-secrets configuration.
+- Logged `Error` objects include a `stack_redacted: true` field instead of the raw stack trace so sensitive paths in stacks are not leaked while the omission remains visible.
 - Dynamic opencode path segments are URL-encoded, and user-entered binding/session IDs are validated before persistence or routing.
 - Parent-session route caching is bounded for long-running processes.
 - Atomic state write behavior is covered for replacement failures so existing state is preserved where possible.
 - State migrations and invalid parsed state files are preserved in bounded `state.json.backup.*` files before recovery attempts.
 
 ### Added
+- Optional JSON log mode for supervisors and hosted runtimes via `CONNECTOR_LOG_FORMAT=json` or `logFormat: "json"`.
+- Runtime counters for mirrored assistant messages, skipped noisy events, prompt delivery/answers, Telegram send/edit failures, and attachment fallbacks in `/status` and `/runtime`.
 - Public-project split with subtree workflow helpers and boundary checks.
 - Manual preflight and smoke-test helper scripts.
 - Public OSS basics such as license, contributing guide, and CI.

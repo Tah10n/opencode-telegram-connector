@@ -38,6 +38,9 @@ export function createMirroringHandlers(runtime) {
     eventStartedAfterLaunch,
     sleep,
     abortSignal,
+    recordAssistantMirrored,
+    recordNoisyEventSkipped,
+    recordAttachmentFallback,
   } = runtime
 
   const pause = typeof sleep === "function" ? sleep : (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -389,6 +392,7 @@ export function createMirroringHandlers(runtime) {
             attachmentCaption("changed-files-patch", { projectAlias, sessionId, fileName: entry.file }),
             { message_thread_id: ctxMeta.threadIdOr0 || undefined },
           )
+          recordAttachmentFallback?.(projectAlias, "changed-file-diff-too-long")
           await markChangedFilesExportSent(claim.key, { projectAlias, sessionId, action: "file-large" })
         } finally {
           changedFilesExportInFlight.delete(claim.key)
@@ -431,6 +435,7 @@ export function createMirroringHandlers(runtime) {
           attachmentCaption("changed-files-patch", { projectAlias, sessionId }),
           { message_thread_id: ctxMeta.threadIdOr0 || undefined },
         )
+        recordAttachmentFallback?.(projectAlias, "changed-files-diff-too-long")
         await markChangedFilesExportSent(claim.key, { projectAlias, sessionId, action: "show-large" })
       } finally {
         changedFilesExportInFlight.delete(claim.key)
@@ -452,6 +457,10 @@ export function createMirroringHandlers(runtime) {
 
   function shouldSendAssistantAsAttachment(text) {
     return typeof text === "string" && text.length >= TEXT_ATTACHMENT_THRESHOLD
+  }
+
+  function recordNoisySkip(projectAlias, reason) {
+    recordNoisyEventSkipped?.(projectAlias, reason)
   }
 
   function assistantAttachmentName(projectAlias, sessionId, messageId) {
@@ -502,6 +511,7 @@ export function createMirroringHandlers(runtime) {
         attachmentCaption("assistant", { projectAlias, sessionId }),
         { message_thread_id: ctxMeta.threadIdOr0 || undefined },
       )
+      recordAttachmentFallback?.(projectAlias, "assistant-long-output")
       return { mode: "attachment" }
     }
 
@@ -563,6 +573,7 @@ export function createMirroringHandlers(runtime) {
       const text = extractTextParts(msg)
       if (!text || !text.trim()) {
         logSseDebug(projectAlias, sessionId, `drop=user_empty msg=${info.id}`)
+        recordNoisySkip(projectAlias, "user-empty")
         return
       }
       const mode = config.echoFilterMode ?? "recent"
@@ -578,11 +589,13 @@ export function createMirroringHandlers(runtime) {
       }
       if (isEcho) {
         logSseDebug(projectAlias, sessionId, `drop=user_echo msg=${info.id}`)
+        recordNoisySkip(projectAlias, "user-echo")
         return
       }
       if (!shouldMirrorToFeed(routeCtx.ctxKey, "user-mirror")) {
         sets.user.add(info.id)
         logSseDebug(projectAlias, sessionId, `drop=user_feed msg=${info.id} mode=${getFeedMode(routeCtx.ctxKey)}`)
+        recordNoisySkip(projectAlias, "user-feed-filtered")
         return
       }
       const blocks = [{ type: "text", html: "<b>User</b>" }, ...formatMarkdownToTelegramHtmlBlocks(text)]
@@ -594,6 +607,7 @@ export function createMirroringHandlers(runtime) {
     if (info.role !== "assistant") return
     if (!runtime.mirrorCompaction && (info.mode === "compaction" || info.agent === "compaction")) {
       logSseDebug(projectAlias, sessionId, `drop=compaction msg=${info.id}`)
+      recordNoisySkip(projectAlias, "compaction")
       return
     }
 
@@ -614,12 +628,14 @@ export function createMirroringHandlers(runtime) {
     if (!completed) {
       if (!shouldMirrorToFeed(routeCtx.ctxKey, "assistant-stream")) {
         logSseDebug(projectAlias, sessionId, `drop=assistant_preview_feed msg=${info.id} mode=${getFeedMode(routeCtx.ctxKey)}`)
+        recordNoisySkip(projectAlias, "assistant-preview-feed-filtered")
         return
       }
       const previewState = assistantPreviewBySession.get(boundKey)
       const lastPreviewAt = previewState?.messageId === info.id ? previewState.lastPreviewAt || 0 : 0
       if (Date.now() - lastPreviewAt < 200) {
         logSseDebug(projectAlias, sessionId, `drop=assistant_preview_throttled msg=${info.id}`)
+        recordNoisySkip(projectAlias, "assistant-preview-throttled")
         return
       }
       const msg = await oc.getMessage(sessionId, info.id).catch(() => null)
@@ -630,11 +646,13 @@ export function createMirroringHandlers(runtime) {
       }
       if (!runtime.mirrorCompaction && (msg?.info?.mode === "compaction" || msg?.info?.agent === "compaction")) {
         logSseDebug(projectAlias, sessionId, `drop=assistant_preview_compaction msg=${info.id}`)
+        recordNoisySkip(projectAlias, "assistant-preview-compaction")
         return
       }
       const text = extractTextParts(msg)
       if (!text || !text.trim()) {
         logSseDebug(projectAlias, sessionId, `drop=assistant_preview_empty msg=${info.id}`)
+        recordNoisySkip(projectAlias, "assistant-preview-empty")
         return
       }
       const previewHtml = buildAssistantStreamPreviewHtml(text)
@@ -700,6 +718,7 @@ export function createMirroringHandlers(runtime) {
         }
         if (!runtime.mirrorCompaction && (msg?.info?.mode === "compaction" || msg?.info?.agent === "compaction")) {
           logSseDebug(projectAlias, sessionId, `drop=compaction_message msg=${info.id}`)
+          recordNoisySkip(projectAlias, "assistant-compaction")
           return
         }
 
@@ -716,6 +735,7 @@ export function createMirroringHandlers(runtime) {
           }
           sets.assistant.add(info.id)
           logSseDebug(projectAlias, sessionId, `drop=assistant_empty msg=${info.id}`)
+          recordNoisySkip(projectAlias, "assistant-empty")
           return
         }
 
@@ -726,21 +746,22 @@ export function createMirroringHandlers(runtime) {
 
         if (hasAssistantText) {
           if (isStopping()) return
-          await deliverAssistantText(routeCtx, projectAlias, sessionId, info.id, text, { replaceMessageId })
-          visibleOutputSent = true
+          const delivered = await deliverAssistantText(routeCtx, projectAlias, sessionId, info.id, text, { replaceMessageId })
+          visibleOutputSent = visibleOutputSent || !!delivered
         }
 
         if (allowChangedFiles) {
           if (isStopping()) return
-          await deliverChangedFilesSummary(routeCtx, projectAlias, sessionId, info.id, msg, {
+          const deliveredChanges = await deliverChangedFilesSummary(routeCtx, projectAlias, sessionId, info.id, msg, {
             replaceMessageId: !hasAssistantText ? replaceMessageId : undefined,
           })
-          visibleOutputSent = true
+          visibleOutputSent = visibleOutputSent || !!deliveredChanges
           sets.changes.add(info.id)
           logSseDebug(projectAlias, sessionId, `send=changed_files msg=${info.id} thread=${route.threadIdOr0 || 0}`)
         } else if (hasChangedFiles) {
           sets.changes.add(info.id)
           logSseDebug(projectAlias, sessionId, `drop=changed_files_feed msg=${info.id} mode=${getFeedMode(routeCtx.ctxKey)}`)
+          recordNoisySkip(projectAlias, "changed-files-feed-filtered")
         }
 
         if (replaceMessageId && !visibleOutputSent) {
@@ -751,6 +772,7 @@ export function createMirroringHandlers(runtime) {
 
         if (replaceMessageId) assistantPreviewBySession.delete(boundKey)
         sets.assistant.add(info.id)
+        if (visibleOutputSent) recordAssistantMirrored?.(projectAlias)
         logSseDebug(projectAlias, sessionId, `send=assistant msg=${info.id} thread=${route.threadIdOr0 || 0}`)
       })().catch((err) => {
         const message = err?.message || String(err)

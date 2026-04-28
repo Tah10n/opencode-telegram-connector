@@ -130,7 +130,7 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
             message: `SSE ${res.status}: ${text || res.statusText}`,
           })
         }
-        logger?.info?.(`[${projectAlias}] SSE connected`)
+        logger?.info?.("SSE connected", { projectAlias, source: "opencode", operation: "GET /event", method: "GET", pathname: "/event" })
         try {
           await onConnect?.({ projectAlias })
         } catch {}
@@ -161,7 +161,7 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
             try {
               await onEvent({ projectAlias, evt })
             } catch (err) {
-              logger?.error?.("SSE event handler error:", projectAlias, err?.message || String(err))
+              logger?.error?.("SSE event handler error", { projectAlias, source: "opencode", operation: "handle SSE event", error: err?.message || String(err) })
             }
             continue
           }
@@ -206,12 +206,12 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
 
         if (isAbort) {
           // Normal: stop/idle-timeout abort.
-          logger?.info?.("SSE aborted:", projectAlias, msg)
+          logger?.info?.("SSE aborted", { projectAlias, source: "opencode", operation: "GET /event", kind: normalized.kind, outcome: normalized.outcome, error: msg })
           try {
             await onAbort?.({ projectAlias, err: normalized })
           } catch {}
         } else if (isTransientDisconnect) {
-          logger?.info?.("SSE disconnected:", projectAlias, msg)
+          logger?.info?.("SSE disconnected", { projectAlias, source: "opencode", operation: "GET /event", kind: normalized.kind, outcome: normalized.outcome, error: msg })
           // Transient disconnects happen; only escalate if the server is actually unhealthy.
           const now = Date.now()
           if (now - lastHealthCheckAt >= HEALTH_CHECK_MIN_INTERVAL_MS) {
@@ -226,9 +226,9 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
           }
         } else {
           if (isRetryableBoundaryError(normalized)) {
-            logger?.info?.("SSE retryable error:", projectAlias, msg)
+            logger?.info?.("SSE retryable error", { projectAlias, source: "opencode", operation: "GET /event", kind: normalized.kind, outcome: normalized.outcome, status: normalized.status, code: normalized.code, retryable: true, error: msg })
           } else {
-            logger?.error?.("SSE error:", projectAlias, msg)
+            logger?.error?.("SSE error", { projectAlias, source: "opencode", operation: "GET /event", kind: normalized.kind, outcome: normalized.outcome, status: normalized.status, code: normalized.code, retryable: false, error: msg })
           }
           try {
             await onError?.({ projectAlias, err: normalized })
@@ -253,7 +253,7 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
       pathname: "/event",
     })
     if (!stopped && !(abortSignal?.aborted)) {
-      logger?.error?.("SSE loop crashed:", projectAlias, normalized.message)
+      logger?.error?.("SSE loop crashed", { projectAlias, source: "opencode", operation: "GET /event", kind: normalized.kind, outcome: normalized.outcome, status: normalized.status, code: normalized.code, error: normalized.message })
       try {
         await onError?.({ projectAlias, err: normalized })
       } catch {}

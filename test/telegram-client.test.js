@@ -405,3 +405,62 @@ test("TelegramClient editMessageText treats Telegram unchanged edits as no-ops",
     },
   ])
 })
+
+test("TelegramClient reports send and edit delivery failures to observer", async () => {
+  const failures = []
+  const client = new TelegramClient("token", { onApiFailure: (entry) => failures.push(entry) })
+
+  client.call = async (method, params) => {
+    throw makeBoundaryError({
+      source: "telegram",
+      operation: `POST ${method}`,
+      method: "POST",
+      pathname: `/${method}`,
+      status: 500,
+      message: `${method} failed`,
+      details: { params },
+    })
+  }
+
+  await assert.rejects(() => client.sendMessage(100, "hello", null, { message_thread_id: 7 }))
+  await assert.rejects(() => client.editMessageText(100, 200, "hello", null))
+
+  assert.equal(failures.length, 2)
+  assert.equal(failures[0].method, "sendMessage")
+  assert.equal(failures[0].params.chat_id, 100)
+  assert.equal(failures[0].params.message_thread_id, 7)
+  assert.equal(failures[1].method, "editMessageText")
+  assert.equal(failures[1].params.message_id, 200)
+})
+
+test("TelegramClient reports edit failures with remembered topic context", async () => {
+  const failures = []
+  const calls = []
+  const client = new TelegramClient("token", { onApiFailure: (entry) => failures.push(entry) })
+
+  client.call = async (method, params) => {
+    calls.push({ method, params })
+    if (method === "sendMessage") return { message_id: 200 }
+    throw makeBoundaryError({
+      source: "telegram",
+      operation: `POST ${method}`,
+      method: "POST",
+      pathname: `/${method}`,
+      status: 500,
+      message: `${method} failed`,
+      details: { params },
+    })
+  }
+
+  await client.sendMessage(100, "hello", null, { message_thread_id: 7 })
+  await assert.rejects(() => client.editMessageText(100, 200, "updated", null))
+  await assert.rejects(() => client.editMessageReplyMarkup(100, 200, null))
+
+  assert.equal(calls[1].method, "editMessageText")
+  assert.equal(calls[1].params.message_thread_id, undefined, "thread context must not be sent to Telegram edit APIs")
+  assert.equal(failures.length, 2)
+  assert.equal(failures[0].method, "editMessageText")
+  assert.equal(failures[0].params.message_thread_id, 7)
+  assert.equal(failures[1].method, "editMessageReplyMarkup")
+  assert.equal(failures[1].params.message_thread_id, 7)
+})

@@ -98,7 +98,9 @@ const logSseDebug = () => {}
 
 test("handlePermissionAsked retries after Telegram prompt delivery fails", async () => {
   let fail = true
+  const delivered = []
   const { calls, runtime, handlers } = makePromptRuntime({
+    recordPromptDelivered: (...args) => delivered.push(args),
     async sendBlocksToThread(...args) {
       calls.sendBlocksToThread.push(args)
       if (fail) {
@@ -123,6 +125,7 @@ test("handlePermissionAsked retries after Telegram prompt delivery fails", async
   assert.equal(calls.sendBlocksToThread.length, 2)
   assert.equal(runtime.prompted.demo.permission.has("ses_1:perm_1"), true)
   assert.equal(calls.setPendingPermission.length, 2)
+  assert.deepEqual(delivered, [["demo", "permission"]])
 })
 
 test("handlePermissionAsked does not baseline-suppress a first SSE prompt after Telegram delivery fails", async () => {
@@ -164,7 +167,9 @@ test("handlePermissionAsked does not baseline-suppress a first SSE prompt after 
 
 test("handleQuestionAsked retries after Telegram question step delivery fails", async () => {
   let fail = true
+  const delivered = []
   const { calls, runtime, handlers } = makePromptRuntime({
+    recordPromptDelivered: (...args) => delivered.push(args),
     tg: {
       async sendMessage(...args) {
         calls.sendMessage.push(args)
@@ -191,6 +196,7 @@ test("handleQuestionAsked retries after Telegram question step delivery fails", 
   assert.equal(calls.sendMessage.length, 2)
   assert.equal(runtime.prompted.demo.question.has("ses_1:q_1"), true)
   assert.equal(runtime.questionWizards.has("demo:ses_1:q_1"), true)
+  assert.deepEqual(delivered, [["demo", "question"]])
 })
 
 test("handleQuestionAsked does not baseline-suppress a first SSE prompt after Telegram delivery fails", async () => {

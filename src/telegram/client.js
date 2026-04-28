@@ -130,11 +130,57 @@ function isMessageNotModifiedError(err) {
   return /message is not modified/i.test(description)
 }
 
+const MESSAGE_CONTEXT_LIMIT = 2000
+
+function messageContextKey(chatId, messageId) {
+  const chat = String(chatId ?? "").trim()
+  const message = String(messageId ?? "").trim()
+  return chat && message ? `${chat}:${message}` : ""
+}
+
 export class TelegramClient {
-  constructor(token, { baseUrl, fileBaseUrl } = {}) {
+  constructor(token, { baseUrl, fileBaseUrl, onApiFailure, logger } = {}) {
     this.token = token
     this.baseUrl = baseUrl || `https://api.telegram.org/bot${token}`
     this.fileBaseUrl = fileBaseUrl || deriveTelegramFileBaseUrl(this.baseUrl, token)
+    this.onApiFailure = typeof onApiFailure === "function" ? onApiFailure : null
+    this._logger = logger || null
+    this._messageContexts = new Map()
+  }
+
+  // Observability contract: sendMessage, sendDocument, editMessageText, and
+  // editMessageReplyMarkup call recordApiFailure on error so delivery failures
+  // appear in /runtime counters. Read-only and non-data-bearing methods (getMe,
+  // getUpdates, getFile, downloadFile, deleteMessage, answerCallbackQuery, etc.)
+  // intentionally do not record failures — callers either retry or ignore them.
+  recordApiFailure(method, params, err) {
+    if (!this.onApiFailure) return
+    try {
+      this.onApiFailure({ method, params, err })
+    } catch (observabilityErr) {
+      // Observability must never change Telegram API behavior.
+      this._logger?.warn("onApiFailure callback threw", { error: observabilityErr?.message })
+    }
+  }
+
+  rememberMessageContext(message, params) {
+    const key = messageContextKey(params?.chat_id, message?.message_id)
+    if (!key) return
+    if (this._messageContexts.has(key)) this._messageContexts.delete(key)
+    this._messageContexts.set(key, {
+      chat_id: params.chat_id,
+      ...(params.message_thread_id ? { message_thread_id: params.message_thread_id } : {}),
+    })
+    while (this._messageContexts.size > MESSAGE_CONTEXT_LIMIT) {
+      const oldest = this._messageContexts.keys().next().value
+      this._messageContexts.delete(oldest)
+    }
+  }
+
+  paramsWithRememberedMessageContext(params) {
+    const context = this._messageContexts.get(messageContextKey(params?.chat_id, params?.message_id))
+    if (!context?.message_thread_id || params?.message_thread_id) return params
+    return { ...params, message_thread_id: context.message_thread_id }
   }
 
   async call(method, params, { timeoutMs, signal } = {}) {
@@ -374,20 +420,23 @@ export class TelegramClient {
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i]
       const markup = i === chunks.length - 1 ? replyMarkup : null
-      last = await this.call(
-        "sendMessage",
-        {
-          chat_id: chatId,
-          text: chunk,
-          ...(options.message_thread_id ? { message_thread_id: options.message_thread_id } : {}),
-          ...(markup ? { reply_markup: markup } : {}),
-          ...(options.parse_mode ? { parse_mode: options.parse_mode } : {}),
-          ...(options.disable_web_page_preview != null
-            ? { disable_web_page_preview: options.disable_web_page_preview }
-            : {}),
-        },
-        { timeoutMs: 20_000 },
-      )
+      const params = {
+        chat_id: chatId,
+        text: chunk,
+        ...(options.message_thread_id ? { message_thread_id: options.message_thread_id } : {}),
+        ...(markup ? { reply_markup: markup } : {}),
+        ...(options.parse_mode ? { parse_mode: options.parse_mode } : {}),
+        ...(options.disable_web_page_preview != null
+          ? { disable_web_page_preview: options.disable_web_page_preview }
+          : {}),
+      }
+      try {
+        last = await this.call("sendMessage", params, { timeoutMs: 20_000 })
+        this.rememberMessageContext(last, params)
+      } catch (err) {
+        this.recordApiFailure("sendMessage", params, err)
+        throw err
+      }
       // be nice to Telegram
       await delay(60)
     }
@@ -414,33 +463,34 @@ export class TelegramClient {
     if (options.message_thread_id) formData.set("message_thread_id", String(options.message_thread_id))
     if (caption) formData.set("caption", String(caption))
     formData.set("document", new Blob([contents], { type: "text/plain;charset=utf-8" }), filename || "output.txt")
-    return this.callMultipart("sendDocument", formData, { timeoutMs: 60_000 })
+    return this.callMultipart("sendDocument", formData, { timeoutMs: 60_000 }).catch((err) => {
+      this.recordApiFailure("sendDocument", formData, err)
+      throw err
+    })
   }
 
   editMessageText(chatId, messageId, text, replyMarkup, options = {}) {
-    return this.call(
-      "editMessageText",
-      {
-        chat_id: chatId,
-        message_id: messageId,
-        text,
-        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-        ...(options.parse_mode ? { parse_mode: options.parse_mode } : {}),
-        ...(options.disable_web_page_preview != null ? { disable_web_page_preview: options.disable_web_page_preview } : {}),
-      },
-      { timeoutMs: 20_000 },
-    ).catch((err) => {
+    const params = {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+      ...(options.parse_mode ? { parse_mode: options.parse_mode } : {}),
+      ...(options.disable_web_page_preview != null ? { disable_web_page_preview: options.disable_web_page_preview } : {}),
+    }
+    return this.call("editMessageText", params, { timeoutMs: 20_000 }).catch((err) => {
       if (isMessageNotModifiedError(err)) return true
+      this.recordApiFailure("editMessageText", this.paramsWithRememberedMessageContext(params), err)
       throw err
     })
   }
 
   editMessageReplyMarkup(chatId, messageId, replyMarkup) {
-    return this.call(
-      "editMessageReplyMarkup",
-      { chat_id: chatId, message_id: messageId, reply_markup: replyMarkup },
-      { timeoutMs: 20_000 },
-    )
+    const params = { chat_id: chatId, message_id: messageId, reply_markup: replyMarkup }
+    return this.call("editMessageReplyMarkup", params, { timeoutMs: 20_000 }).catch((err) => {
+      this.recordApiFailure("editMessageReplyMarkup", this.paramsWithRememberedMessageContext(params), err)
+      throw err
+    })
   }
 
   deleteMessage(chatId, messageId) {

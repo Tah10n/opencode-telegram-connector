@@ -37,6 +37,7 @@ test("buildRuntimeConfig loads connector.config.mjs and resolves relative paths"
     STATE_FILE: undefined,
     TG_PREFIX: undefined,
     ECHO_FILTER_MODE: undefined,
+    CONNECTOR_LOG_FORMAT: undefined,
     OPENCODE_ALLOW_INSECURE_HTTP: undefined,
     PROJECTS_FILE: undefined,
     PROJECTS_JSON: undefined,
@@ -49,6 +50,7 @@ test("buildRuntimeConfig loads connector.config.mjs and resolves relative paths"
       stateFile: "./state/custom.json",
       tgPrefix: "[TG] ",
       echoFilterMode: "recent",
+      logFormat: "json",
       allowInsecureHttp: true,
       limits: {
         userAttachmentConfirmBytes: 1000,
@@ -78,6 +80,7 @@ test("buildRuntimeConfig loads connector.config.mjs and resolves relative paths"
   assert.equal(config.defaultProject, "demo")
   assert.equal(config.stateFile, path.resolve(dir, "state/custom.json"))
   assert.equal(config.cwd, dir)
+  assert.equal(config.logFormat, "json")
   assert.equal(config.projects.demo.directory, path.resolve(dir, "repo"))
   assert.equal(config.allowInsecureHttp, true)
   assert.deepEqual(config.limits, {
@@ -173,6 +176,7 @@ test("buildRuntimeConfig rejects invalid Telegram workflow limits", async (t) =>
   swapEnv(t, {
     TELEGRAM_BOT_TOKEN: undefined,
     TELEGRAM_ALLOWED_USER_ID: undefined,
+    CONNECTOR_LOG_FORMAT: undefined,
     PROJECTS_JSON: undefined,
   })
   await fs.writeFile(
@@ -180,6 +184,7 @@ test("buildRuntimeConfig rejects invalid Telegram workflow limits", async (t) =>
     [
       "TELEGRAM_BOT_TOKEN=env-token",
       "TELEGRAM_ALLOWED_USER_ID=77",
+      "CONNECTOR_LOG_FORMAT=json",
       'PROJECTS_JSON={"demo":{"baseUrl":"http://127.0.0.1:4312"}}',
     ].join("\n"),
     "utf8",
@@ -246,6 +251,7 @@ test("buildRuntimeConfig lets CLI projects json override config file projects", 
   swapEnv(t, {
     TELEGRAM_BOT_TOKEN: undefined,
     TELEGRAM_ALLOWED_USER_ID: undefined,
+    CONNECTOR_LOG_FORMAT: undefined,
     PROJECTS_JSON: undefined,
   })
   await fs.writeFile(
@@ -285,6 +291,7 @@ test("buildRuntimeConfig falls back to legacy env and projects json when config 
     [
       "TELEGRAM_BOT_TOKEN=env-token",
       "TELEGRAM_ALLOWED_USER_ID=77",
+      "CONNECTOR_LOG_FORMAT=json",
       'PROJECTS_JSON={"demo":{"baseUrl":"http://127.0.0.1:4312"}}',
     ].join("\n"),
     "utf8",
@@ -295,6 +302,7 @@ test("buildRuntimeConfig falls back to legacy env and projects json when config 
   assert.equal(loadedConfigFile, false)
   assert.equal(config.telegram.botToken, "env-token")
   assert.equal(config.telegram.allowedUserId, 77)
+  assert.equal(config.logFormat, "json")
   assert.equal(config.projects.demo.baseUrl, "http://127.0.0.1:4312")
 })
 

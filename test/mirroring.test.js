@@ -256,6 +256,7 @@ test("deliverChangedFilesSummary falls back to sending a new message when edit f
 })
 
 test("deliverAssistantText falls back to a notice message before attaching long output", async () => {
+  const fallbacks = []
   const { calls, handlers } = createHarness({
     tg: {
       async editMessageText(...args) {
@@ -263,6 +264,7 @@ test("deliverAssistantText falls back to a notice message before attaching long 
         throw new Error("cannot edit")
       },
     },
+    recordAttachmentFallback: (...args) => fallbacks.push(args),
   })
 
   const result = await handlers.deliverAssistantText(
@@ -280,6 +282,7 @@ test("deliverAssistantText falls back to a notice message before attaching long 
   assert.match(calls.sendToThread[0][1], /attached as a \.txt file/)
   assert.equal(calls.sendDocument.length, 1)
   assert.equal(calls.sendDocument[0][2], "demo-ses_1-msg_1-assistant.txt")
+  assert.deepEqual(fallbacks, [["demo", "assistant-long-output"]])
 })
 
 test("renderChangedFilesView sends full patch export as a .patch document", async () => {
@@ -521,8 +524,10 @@ test("handleMessageUpdated edits an existing assistant preview in verbose mode",
 })
 
 test("handleMessageUpdated suppresses empty assistant previews in verbose mode", async () => {
+  const noisy = []
   const { calls, runtime, handlers } = createHarness({
     store: { getFeedMode: () => "verbose" },
+    recordNoisyEventSkipped: (...args) => noisy.push(args),
     ocByAlias: {
       demo: {
         async getMessage() {
@@ -544,6 +549,7 @@ test("handleMessageUpdated suppresses empty assistant previews in verbose mode",
   assert.equal(calls.editMessageText.length, 0)
   assert.equal(runtime.assistantPreviewBySession.has(sessionKey("demo", "ses_1")), false)
   assert.equal(calls.logSseDebug.at(-1)?.[2], "drop=assistant_preview_empty msg=msg_1")
+  assert.deepEqual(noisy, [["demo", "assistant-preview-empty"]])
 })
 
 test("handleMessageUpdated keeps the preview message when final assistant content cannot be fetched", async (t) => {
@@ -603,6 +609,35 @@ test("handleMessageUpdated reports when the completed assistant reply has no vis
   assert.equal(calls.editMessageText[0][1], 82)
   assert.match(calls.editMessageText[0][2], /no Telegram-visible content/)
   assert.equal(runtime.assistantPreviewBySession.has(sessionKey("demo", "ses_1")), false)
+  const sets = runtime.forwardedBySession.get(sessionKey("demo", "ses_1"))
+  assert.equal(sets.assistant.has("msg_1"), true)
+})
+
+test("handleMessageUpdated records mirrored final assistant replies", async (t) => {
+  useImmediateTimeouts(t)
+  const mirrored = []
+  const { calls, runtime, handlers } = createHarness({
+    recordAssistantMirrored: (...args) => mirrored.push(args),
+    ocByAlias: {
+      demo: {
+        async getMessage() {
+          return {
+            info: { id: "msg_1", role: "assistant", time: { completed: 1 } },
+            parts: [{ type: "text", text: "Final answer" }],
+          }
+        },
+      },
+    },
+  })
+
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", time: { completed: 1 } } },
+  })
+  await flushAsyncWork()
+
+  assert.equal(calls.sendBlocksToThread.length, 1)
+  assert.deepEqual(mirrored, [["demo"]])
   const sets = runtime.forwardedBySession.get(sessionKey("demo", "ses_1"))
   assert.equal(sets.assistant.has("msg_1"), true)
 })

@@ -12,6 +12,13 @@ function resolveRuntimePath(filePath, runtimeBaseDir) {
   return filePath ? path.resolve(runtimeBaseDir, filePath) : undefined
 }
 
+function normalizeLogFormat(value) {
+  const raw = String(value ?? "text").trim().toLowerCase()
+  const format = raw || "text"
+  if (format !== "text" && format !== "json") throw new Error("Invalid logFormat / CONNECTOR_LOG_FORMAT (expected 'text' or 'json')")
+  return format
+}
+
 export function parseCliArgs(argv) {
   const out = {}
   const takeValue = (flag, i) => {
@@ -68,6 +75,7 @@ export async function buildRuntimeConfig({ args = {}, cwd = process.cwd() } = {}
     tgPrefix: configFromFile.tgPrefix ?? envOptional("TG_PREFIX", ""),
     echoFilterMode: configFromFile.echoFilterMode ?? envOptional("ECHO_FILTER_MODE", "recent"),
     allowInsecureHttp: configFromFile.allowInsecureHttp ?? envBool("OPENCODE_ALLOW_INSECURE_HTTP", false),
+    logFormat: normalizeLogFormat(configFromFile.logFormat ?? envOptional("CONNECTOR_LOG_FORMAT", "text")),
     limits: normalizeLimits(configFromFile.limits || {}),
     cwd: configFromFile.cwd || configBaseDir,
   }

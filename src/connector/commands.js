@@ -109,6 +109,7 @@ export function createCommandHandlers(runtime) {
     sendCurrentQuestionStep,
     setRejectNoteAwaitingState,
     setAwaitingCustomAnswerState,
+    recordPromptAnswered,
     buildRuntimeStatusLines,
     buildGlobalRuntimeStatusLines,
   } = runtime
@@ -1767,6 +1768,7 @@ export function createCommandHandlers(runtime) {
           },
         },
       ], { flush: false })
+      recordPromptAnswered?.(awaiting.projectAlias, "permission", "ok")
       store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId, awaiting.sessionID)
       setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
       await store.flush?.()

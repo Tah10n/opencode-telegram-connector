@@ -9,6 +9,7 @@ export default {
   stateFile: "./.data/state.json",
   tgPrefix: "",
   echoFilterMode: "recent",
+  logFormat: "text", // "text" or "json"
   allowInsecureHttp: false,
 
   // Optional Telegram workflow limits. These defaults are used when omitted.

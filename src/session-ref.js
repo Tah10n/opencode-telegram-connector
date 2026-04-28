@@ -3,6 +3,10 @@ function normalizePathname(pathname) {
   return trimmed || "/"
 }
 
+// Safety: normalizeShareUrl only returns a URL if it matches the strict
+// /share/<id> or /s/<id> pattern. Query params and hash are stripped.
+// The returned URL is used only for equality comparison in findSessionByShareUrl,
+// never as a fetch target, so there is no SSRF risk here.
 export function normalizeShareUrl(input) {
   const raw = String(input || "").trim()
   if (!raw) return ""

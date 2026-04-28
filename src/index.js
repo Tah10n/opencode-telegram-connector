@@ -19,24 +19,12 @@ import { extractPatchDiffText, extractPatchFiles, formatChangedFilesText } from 
 import { findSessionByShareUrl, parseSessionReference } from "./session-ref.js"
 import { resolveSessionRoute } from "./session-route.js"
 import { createLifecycleManager } from "./runtime/lifecycle.js"
+import { collectLoggerRedactionOptions, createConnectorLogger } from "./runtime/logger.js"
 import { createRuntimeObservability } from "./runtime/observability.js"
 import { DEFAULT_FEED_MODE, StateStore, normalizeFeedMode, resolveDefaultStatePath, sessionKey } from "./state/store.js"
 import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "./session-list.js"
 import { sanitizeBaseUrlForDisplay } from "./url-utils.js"
 import { normalizeLimits } from "./limits.js"
-
-function now() {
-  return new Date().toISOString()
-}
-
-function defaultLogger() {
-  return {
-    info: (...args) => console.log(now(), ...args),
-    warn: (...args) => console.warn(now(), ...args),
-    error: (...args) => console.error(now(), ...args),
-    debug: (...args) => console.debug(now(), ...args),
-  }
-}
 
 function parseSseDebugFilter(rawValue) {
   const raw = String(rawValue || "").trim()
@@ -176,9 +164,10 @@ function extractTextParts(message) {
 }
 
 export async function startConnector({ config, logger: loggerIn, deps } = {}) {
-  const logger = loggerIn || defaultLogger()
+  if (!config?.telegram?.botToken) throw new Error("config.telegram.botToken is required")
+  const logger = loggerIn || createConnectorLogger({ format: config?.logFormat, ...collectLoggerRedactionOptions(config) })
   const createStateStore = deps?.createStateStore || ((options) => new StateStore(options))
-  const createTelegramClient = deps?.createTelegramClient || ((token) => new TelegramClient(token))
+  const createTelegramClient = deps?.createTelegramClient || ((token, options) => new TelegramClient(token, options))
   const createOpenCodeClient = deps?.createOpenCodeClient || ((options) => new OpenCodeClient(options))
   const startSseLoop = deps?.startSseLoop || startOpenCodeSseLoop
   const ensureStartupSessionFn = deps?.ensureStartupSession || ensureStartupSession
@@ -208,6 +197,8 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     return raw === "1" || raw === "true" || raw === "yes" || raw === "on"
   })()
   const limits = normalizeLimits(config?.limits ?? {}, { env: {} })
+  const projects = config.projects
+  const runtimeObservability = createRuntimeObservability({ projectAliases: Object.keys(projects) })
 
   const stateFile = config?.stateFile || resolveDefaultStatePath({ cwd: config?.cwd })
   const store = createStateStore({ filePath: stateFile, logger })
@@ -223,7 +214,21 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     // ignore
   }
 
-  const tg = createTelegramClient(config.telegram.botToken)
+  function projectAliasFromTelegramParams(params) {
+    const readParam = (name) => typeof params?.get === "function" ? params.get(name) : params?.[name]
+    const chatId = Number(readParam("chat_id"))
+    if (!Number.isFinite(chatId)) return undefined
+    const threadIdOr0 = Number(readParam("message_thread_id") || 0)
+    const binding = store.getBinding?.(ctxKeyFrom(chatId, Number.isFinite(threadIdOr0) ? threadIdOr0 : 0))
+    return binding?.projectAlias
+  }
+
+  const tg = createTelegramClient(config.telegram.botToken, {
+    logger,
+    onApiFailure: ({ method, params }) => {
+      runtimeObservability.recordTelegramFailure({ projectAlias: projectAliasFromTelegramParams(params), operation: method })
+    },
+  })
   const me = await tg.getMe().catch(() => null)
   const hasTopicsEnabled = !!me?.has_topics_enabled
   const botUsername = typeof me?.username === "string" ? me.username : ""
@@ -251,7 +256,6 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     ])
     .catch((err) => logger.error("Failed to set bot commands:", err?.message || String(err)))
 
-  const projects = config.projects
   const ocByAlias = {}
   for (const [alias, p] of Object.entries(projects)) {
     ocByAlias[alias] = createOpenCodeClient({
@@ -262,7 +266,6 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     })
   }
   const lifecycle = createLifecycleManager()
-  const runtimeObservability = createRuntimeObservability({ projectAliases: Object.keys(projects) })
   const abortController = new AbortController()
 
   // Auto-start opencode servers (best-effort) and pick a startup session per project.
@@ -597,6 +600,8 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     clampString,
     recoverPendingPromptsOnStartup,
     markProjectUp,
+    recordPromptDelivered: runtimeObservability.recordPromptDelivered,
+    recordPromptAnswered: runtimeObservability.recordPromptAnswered,
   })
   const {
     getWizard,
@@ -667,24 +672,50 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     })
     if (retryable) {
       runtimeObservability.recordLoopRetry(loopName, { projectAlias, err: normalized })
-      logger.warn(`${loopName} retryable${projectAlias ? ` [${projectAlias}]` : ""}:`, normalized.message)
+      logger.warn("Loop retryable error", {
+        loop: loopName,
+        projectAlias,
+        source: normalized.source,
+        operation: normalized.operation,
+        method: normalized.method,
+        pathname: normalized.pathname,
+        outcome: normalized.outcome,
+        kind: normalized.kind,
+        status: normalized.status,
+        code: normalized.code,
+        retryable: true,
+        error: normalized.message,
+      })
     } else {
       runtimeObservability.recordLoopError(loopName, { projectAlias, err: normalized })
-      logger.error(`${loopName} error${projectAlias ? ` [${projectAlias}]` : ""}:`, normalized.message)
+      logger.error("Loop error", {
+        loop: loopName,
+        projectAlias,
+        source: normalized.source,
+        operation: normalized.operation,
+        method: normalized.method,
+        pathname: normalized.pathname,
+        outcome: normalized.outcome,
+        kind: normalized.kind,
+        status: normalized.status,
+        code: normalized.code,
+        retryable: false,
+        error: normalized.message,
+      })
     }
     return normalized
   }
 
   function recordLoopAbort(loopName, { projectAlias, reason } = {}) {
     runtimeObservability.recordLoopAbort(loopName, { projectAlias, reason })
-    logger.info(`${loopName} aborted${projectAlias ? ` [${projectAlias}]` : ""}:`, reason || "stopped")
+    logger.info("Loop aborted", { loop: loopName, projectAlias, operation: "abort loop", reason: reason || "stopped" })
   }
 
   function reportFatalRuntimeError(err, { name, projectAlias } = {}) {
     if (fatalRuntimeErrorReported || abortController.signal.aborted) return
     fatalRuntimeErrorReported = true
     abortController.abort()
-    logger.error(`Fatal runtime error${name ? ` in ${name}` : ""}${projectAlias ? ` [${projectAlias}]` : ""}:`, err.message)
+    logger.error("Fatal runtime error", { name, projectAlias, source: err?.source || "runtime", operation: err?.operation, kind: err?.kind, outcome: err?.outcome, error: err?.message || String(err) })
     onFatalError(err)
   }
 
@@ -793,6 +824,9 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     normalizeEpochMs,
     sleep,
     abortSignal: abortController.signal,
+    recordAssistantMirrored: runtimeObservability.recordAssistantMirrored,
+    recordNoisyEventSkipped: runtimeObservability.recordNoisyEventSkipped,
+    recordAttachmentFallback: runtimeObservability.recordAttachmentFallback,
   })
   const {
     ensureRecentPromptSet,
@@ -890,7 +924,15 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
 
   async function bindCtxToSession(ctxMeta, projectAlias, sessionId) {
     const result = store.setBinding(ctxMeta.ctxKey, { projectAlias, sessionId }, { chatId: ctxMeta.chatId, threadIdOr0: ctxMeta.threadIdOr0 })
-    logger.info("Bound", ctxMeta.ctxKey, "->", projectAlias, sessionId)
+    logger.info("Telegram context bound to session", {
+      source: "telegram",
+      operation: "bind session",
+      projectAlias,
+      sessionId,
+      ctxKey: ctxMeta.ctxKey,
+      chatId: ctxMeta.chatId,
+      threadIdOr0: ctxMeta.threadIdOr0,
+    })
     return result
   }
 
@@ -1136,6 +1178,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     rejectNoteAwaiting,
     awaitingCustomAnswer,
     bindAliasAwaiting,
+    recordPromptAnswered: runtimeObservability.recordPromptAnswered,
     isAllowedUser,
     ctxMetaFromMessage,
     mirrorCompaction,
@@ -1154,6 +1197,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     cb,
     logger,
     recordCallbackOutcome: runtimeObservability.recordCallbackOutcome,
+    recordPromptAnswered: runtimeObservability.recordPromptAnswered,
     questionWizards,
     ctxMetaFromMessage,
     parseCtxKey,
@@ -1308,21 +1352,30 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
           const classification = classifyBoundaryError(err)
           if (classification.retryable) {
             runtimeObservability.recordUpdateRetry()
-            logger.warn(
-              "Retryable update handler error:",
-              `update=${u.update_id}`,
-              `kind=${classification.kind}`,
-              classification.error.message,
-            )
+            logger.warn("Retryable update handler error", {
+              source: "telegram",
+              operation: u.message ? "message" : u.callback_query ? "callback" : "unknown",
+              updateId: u.update_id,
+              outcome: classification.outcome,
+              kind: classification.kind,
+              status: classification.status,
+              code: classification.code,
+              retryable: true,
+              error: classification.error.message,
+            })
           } else {
             runtimeObservability.recordUpdateSkip()
-            logger.error(
-              "Skipping non-retryable update:",
-              `update=${u.update_id}`,
-              `outcome=${classification.outcome}`,
-              `kind=${classification.kind}`,
-              classification.error.message,
-            )
+            logger.error("Skipping non-retryable update", {
+              source: "telegram",
+              operation: u.message ? "message" : u.callback_query ? "callback" : "unknown",
+              updateId: u.update_id,
+              outcome: classification.outcome,
+              kind: classification.kind,
+              status: classification.status,
+              code: classification.code,
+              retryable: false,
+              error: classification.error.message,
+            })
             shouldAdvanceOffset = true
           }
         }

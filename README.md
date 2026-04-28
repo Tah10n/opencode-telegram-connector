@@ -19,6 +19,7 @@ This Node.js connector binds each Telegram chat or forum topic to a specific `{ 
 - **Multi-project friendly** — different chats/topics can stay bound to different projects at the same time.
 - **Optional local auto-start** — start local opencode servers and optionally open attach/TUI windows.
 - **Restart-safe, fail-closed state** — bindings, feed mode, model preference, pending prompts, offsets, and idempotency survive restarts; corrupt or unwritable state is surfaced instead of silently reset.
+- **Operator-safe observability** — compact Telegram runtime counters plus redacted text or JSON logs for supervisors.
 
 ## How it works
 
@@ -78,6 +79,7 @@ export default {
   },
 
   defaultProject: "pocket",
+  logFormat: "text",
 
   limits: {
     userAttachmentConfirmBytes: 32 * 1024,
@@ -123,7 +125,7 @@ In groups and forum topics, Telegram commands addressed to another bot are ignor
 - `/model`, `/model default`, `/model reset`, `/model <provider/model> [variant]` — show or change the model for the current thread.
 - `/feed` — choose mirrored updates for the current thread.
 - `/status` — show the current binding, model, feed mode, SSE status, and base URL.
-- `/runtime` or `/health` — show compact connector runtime counters (**private chat only**): managed tasks, Telegram polling, backlog drain, update retry/skip counts, prompt polling, and shutdown state. The message includes **Restart**, **Stop**, and **Close** buttons. Restart and Stop always ask for confirmation first; after a supervised Restart, the bot sends a private-chat notice when the connector is online again.
+- `/runtime` or `/health` — show compact connector runtime counters (**private chat only**): managed tasks, Telegram polling, backlog drain, update retry/skip counts, prompt polling, mirrored/skipped message counts, prompt delivery/answer counts, Telegram send/edit failures, attachment fallbacks, and shutdown state. The message includes **Restart**, **Stop**, and **Close** buttons. Restart and Stop always ask for confirmation first; after a supervised Restart, the bot sends a private-chat notice when the connector is online again.
 - `/abort` — abort the active run in the current thread.
 - `/sendlast` — resend the latest assistant reply for the bound session.
 - `/cancel` — cancel the current Telegram-side flow.
@@ -185,6 +187,7 @@ Long assistant replies are still delivered as `.txt` attachments instead of over
 - `STATE_FILE` / `stateFile` (default: `./.data/state.json`)
 - `TG_PREFIX` / `tgPrefix`
 - `ECHO_FILTER_MODE` / `echoFilterMode` (`recent` or `prefix`)
+- `CONNECTOR_LOG_FORMAT` / `logFormat` (`text` or `json`, default `text`)
 - `OPENCODE_ALLOW_INSECURE_HTTP=1` / `allowInsecureHttp`
 - `OPENCODE_TERMINAL` (Linux terminal launcher override)
 - `cwd` (`connector.config.mjs` only; base directory for relative paths)
@@ -234,6 +237,12 @@ Prefer the `limits` object in `connector.config.mjs`; env fallbacks are availabl
 - `OPENCODE_SSE_HEALTHCHECK_MIN_INTERVAL_MS` — tune health-check throttling after SSE disconnects.
 - `OPENCODE_WATCHDOG_FAILURE_THRESHOLD`, `OPENCODE_WATCHDOG_WINDOW_MS`, `OPENCODE_WATCHDOG_COOLDOWN_MS` — tune the autoStart watchdog that restarts a configured opencode server after repeated retryable health/SSE/prompt-poll failures.
   On Windows, watchdog restarts also close matching stale `opencode attach` UI windows before reopening the TUI for that project.
+
+### Logging and redaction
+
+Logs default to compact text. Set `CONNECTOR_LOG_FORMAT=json` or `logFormat: "json"` to emit one JSON object per line for supervisors and hosted runtimes. Runtime logs include structured fields such as `projectAlias`, Telegram context, `sessionId`, `operation`, retry outcome, and boundary error classification where available.
+
+Before writing logs, the connector redacts bot tokens, Basic Auth credentials, URL userinfo/query/hash values, auth-like command-line flags, and sensitive state/config paths. Telegram `/status` and `/runtime` expose only compact counters and sanitized operational summaries.
 
 ## Platform notes
 
@@ -408,7 +417,7 @@ SSE disconnects reconnect with backoff when they are retryable. Fatal SSE protoc
 
 After changing runtime/recovery behavior, run the connector under your usual supervisor and check:
 
-1. `/runtime` in a private chat shows managed tasks, Telegram polling, backlog drain, prompt polling, update retry/skip counts, shutdown state, and Restart/Stop/Close buttons.
+1. `/runtime` in a private chat shows managed tasks, Telegram polling, backlog drain, prompt polling, update retry/skip counts, message/prompt/Telegram-delivery/attachment counters, shutdown state, and Restart/Stop/Close buttons.
 2. `/projects` offers Retry health check and Close for every project, Start only where auto-start is configured and supported, and Show sessions only in private chats.
 3. Tap `/runtime` Restart or Stop, confirm the warning screen appears, then Cancel once to verify confirmation without stopping the process.
 4. In a supervised environment, confirm `/runtime` Restart exits, is relaunched by the supervisor, and sends the online-again notice; confirm `/runtime` Stop exits cleanly and remains stopped.

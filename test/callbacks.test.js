@@ -1047,7 +1047,9 @@ test("createCallbackHandlers rejects malformed model apply callbacks without cha
 
 test("createCallbackHandlers resolves permission callbacks including stale and reject-note flows", async () => {
   const deletedMessages = []
+  const answered = []
   const { runtime, callbackAnswers, deletedPermissions, rejectStateCalls, rejectedNotes } = makeRuntime({
+    recordPromptAnswered: (...args) => answered.push(args),
     tg: {
       deleteMessage: async (chatId, messageId) => {
         deletedMessages.push({ chatId, messageId })
@@ -1092,6 +1094,7 @@ test("createCallbackHandlers resolves permission callbacks including stale and r
     { ctxMeta: { chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" }, projectAlias: "demo", permissionId: "perm_note" },
   ])
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["OK", "No longer active", "Send note", "Cancelled"])
+  assert.deepEqual(answered, [["demo", "permission", "ok"]])
   assert.deepEqual(deletedMessages, [
     { chatId: 100, messageId: 901 },
     { chatId: 100, messageId: 902 },

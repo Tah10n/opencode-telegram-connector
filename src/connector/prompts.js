@@ -28,6 +28,8 @@ export function createPromptHandlers(runtime) {
     parseCtxKey,
     clampString,
     markProjectUp,
+    recordPromptDelivered,
+    recordPromptAnswered,
   } = runtime
 
   const wizardKey = (projectAlias, requestId, sessionID = "") => promptKey(projectAlias, requestId, sessionID)
@@ -306,6 +308,7 @@ export function createPromptHandlers(runtime) {
       sessionId: wizard.sessionID,
       operation: "replyQuestion",
     })
+    recordPromptAnswered?.(wizard.projectAlias, "question", "ok")
     clearQuestionWizardState(wizard)
     await store.flush?.()
     await sendToThread(wizard.ctx, `Answered: ${wizard.request.id}`).catch(() => {})
@@ -363,6 +366,7 @@ export function createPromptHandlers(runtime) {
     })
     try {
       await sendPermissionPrompt(projectAlias, props, ctxMeta)
+      recordPromptDelivered?.(projectAlias, "permission")
       await store.flush?.()
     } catch (err) {
       prompted[projectAlias].permission.delete(permissionIdentity)
@@ -407,6 +411,7 @@ export function createPromptHandlers(runtime) {
         { type: "text", html: `<b>Question request</b>\n<code>${escapeHtml(props.id)}</code>\n\n${escapeHtml(`Project: ${projectAlias}`)}` },
       ])
       await sendCurrentQuestionStep(wizard)
+      recordPromptDelivered?.(projectAlias, "question")
       await store.flush?.()
     } catch (err) {
       prompted[projectAlias].question.delete(questionIdentity)

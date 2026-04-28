@@ -2,23 +2,61 @@
 import { pathToFileURL } from "node:url"
 import { buildRuntimeConfig, parseCliArgs } from "./config/runtime.js"
 import { startConnector } from "./index.js"
+import { redactSensitiveText } from "./url-utils.js"
 
 const supervisorGuidance = "Run the connector under a supervisor (systemd, Docker restart policy, pm2, launchd, etc.) so fatal crashes restart automatically."
 
-export function createShutdownHandler({ stopConnectorRef, exit, stderr }) {
+export function safeErrorText(err) {
+  return redactSensitiveText(err?.stack || err?.message || String(err))
+}
+
+function normalizeCliLogFormat(format) {
+  return String(format || "").trim().toLowerCase() === "json" ? "json" : "text"
+}
+
+function envForProcess(processImpl) {
+  return processImpl?.env || (processImpl === process ? process.env : {})
+}
+
+function markCliLogged(err) {
+  if (err && typeof err === "object") err.cliLogged = true
+  return err
+}
+
+function createCliReporter({ stderr, getLogFormat, now = () => new Date().toISOString() }) {
+  return {
+    error(message, err) {
+      const msg = String(message || "")
+      if (normalizeCliLogFormat(getLogFormat?.()) === "json") {
+        stderr(JSON.stringify({
+          ts: now(),
+          level: "error",
+          msg: msg.replace(/:\s*$/, ""),
+          ...(err == null ? {} : { error: safeErrorText(err) }),
+        }))
+        return
+      }
+      if (err == null) stderr(msg)
+      else stderr(msg, safeErrorText(err))
+    },
+  }
+}
+
+export function createShutdownHandler({ stopConnectorRef, exit, stderr, reporter }) {
   let shutdownPromise = null
+  const report = reporter || createCliReporter({ stderr, getLogFormat: () => "text" })
 
   return async function shutdown(exitCode = 0, { reason = "shutdown", fatal = false } = {}) {
     if (shutdownPromise) return shutdownPromise
     shutdownPromise = (async () => {
       let finalExitCode = exitCode
       if (fatal) {
-        stderr(`Fatal runtime failure (${reason}). ${supervisorGuidance}`)
+        report.error(`Fatal runtime failure (${reason}). ${supervisorGuidance}`)
       }
       try {
         await stopConnectorRef.current()
       } catch (err) {
-        stderr("Failed to stop connector cleanly:", err?.stack || err?.message || String(err))
+        report.error("Failed to stop connector cleanly:", err)
         if (finalExitCode === 0) finalExitCode = 1
       }
       exit(finalExitCode)
@@ -37,7 +75,9 @@ export async function runCli({
   startConnectorImpl = startConnector,
 } = {}) {
   const stopConnectorRef = { current: async () => {} }
-  const shutdown = createShutdownHandler({ stopConnectorRef, exit, stderr })
+  let cliLogFormat = normalizeCliLogFormat(envForProcess(processImpl).CONNECTOR_LOG_FORMAT)
+  const reporter = createCliReporter({ stderr, getLogFormat: () => cliLogFormat })
+  const shutdown = createShutdownHandler({ stopConnectorRef, exit, stderr, reporter })
 
   processImpl.on("SIGINT", () => {
     void shutdown(0, { reason: "SIGINT" })
@@ -46,11 +86,11 @@ export async function runCli({
     void shutdown(0, { reason: "SIGTERM" })
   })
   processImpl.on("unhandledRejection", (reason) => {
-    stderr("Unhandled promise rejection:", reason?.stack || reason?.message || String(reason))
+    reporter.error("Unhandled promise rejection:", reason)
     void shutdown(1, { reason: "unhandledRejection", fatal: true })
   })
   processImpl.on("uncaughtException", (err) => {
-    stderr("Uncaught exception:", err?.stack || err?.message || String(err))
+    reporter.error("Uncaught exception:", err)
     void shutdown(1, { reason: "uncaughtException", fatal: true })
   })
 
@@ -71,16 +111,30 @@ export async function runCli({
     return
   }
 
-  const { config } = await buildRuntimeConfigImpl({ args })
+  let config
+  let stop
+  let stateFile
+  try {
+    ;({ config } = await buildRuntimeConfigImpl({ args }))
+    cliLogFormat = normalizeCliLogFormat(config?.logFormat)
 
-  const { stop, stateFile } = await startConnectorImpl({
-    config,
-    deps: {
-      requestRuntimeShutdown: ({ action } = {}) => shutdown(action === "restart" ? 1 : 0, { reason: `runtime ${action || "stop"}` }),
-    },
-  })
+    ;({ stop, stateFile } = await startConnectorImpl({
+      config,
+      deps: {
+        requestRuntimeShutdown: ({ action } = {}) => shutdown(action === "restart" ? 1 : 0, { reason: `runtime ${action || "stop"}` }),
+      },
+    }))
+  } catch (err) {
+    reporter.error("Connector startup failed:", err)
+    throw markCliLogged(err)
+  }
   stopConnectorRef.current = stop
-  stdout("State:", stateFile)
+  const stateFileDisplay = redactSensitiveText(stateFile, { sensitivePaths: [{ path: stateFile, label: "state-file" }] })
+  if (config?.logFormat === "json") {
+    stdout(JSON.stringify({ ts: new Date().toISOString(), level: "info", msg: "State file configured", stateFile: stateFileDisplay }))
+  } else {
+    stdout("State:", stateFileDisplay)
+  }
 }
 
 export function isCliEntrypoint({ argv = process.argv, env = process.env } = {}) {
@@ -90,7 +144,10 @@ export function isCliEntrypoint({ argv = process.argv, env = process.env } = {})
 
 if (isCliEntrypoint()) {
   runCli().catch((err) => {
-    console.error(err?.stack || err?.message || String(err))
+    if (!err?.cliLogged) {
+      const reporter = createCliReporter({ stderr: console.error, getLogFormat: () => process.env.CONNECTOR_LOG_FORMAT })
+      reporter.error("Connector startup failed:", err)
+    }
     process.exit(1)
   })
 }

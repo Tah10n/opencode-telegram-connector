@@ -11,11 +11,83 @@ export function sanitizeBaseUrlForDisplay(baseUrl) {
     for (const [k] of u.searchParams) u.searchParams.set(k, "***")
     return u.toString()
   } catch {
-    return s
+    return redactCmdlineSecrets(s)
   }
 }
 
-export function redactCmdlineSecrets(cmdline) {
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function shannonEntropy(str) {
+  const freq = {}
+  for (const ch of str) freq[ch] = (freq[ch] || 0) + 1
+  const len = str.length
+  return -Object.values(freq).reduce((sum, count) => {
+    const p = count / len
+    return sum + p * Math.log2(p)
+  }, 0)
+}
+
+// Matches 32+ char token-like strings, including URL-safe/base64 segments.
+// Keeping entropy-based filtering prevents common short IDs and low-entropy IDs
+// (like ULIDs and UUID-like strings) from being redacted too aggressively.
+const TOKEN_LIKE_RE = /[A-Za-z0-9_+\-.=]{32,}/g
+const JWT_LIKE_RE = /\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\b/g
+
+function redactHighEntropyTokens(text) {
+  // Entropy threshold 4.0 bits/char: filters hex UUIDs (~3.7) while catching
+  // real API tokens and secrets (GitHub PATs, Anthropic keys, etc. — 4.5+).
+  let out = String(text || "")
+  out = out.replace(TOKEN_LIKE_RE, (match) => (shannonEntropy(match) >= 4.0 ? "***" : match))
+  out = out.replace(JWT_LIKE_RE, "***")
+  return out
+}
+
+function redactKnownSecrets(text, knownSecrets = []) {
+  let out = String(text || "")
+  for (const secret of knownSecrets || []) {
+    const raw = String(secret ?? "")
+    // Avoid replacing short common words such as project aliases or usernames.
+    if (raw.length < 6) continue
+    out = out.replace(new RegExp(escapeRegExp(raw), "g"), "***")
+  }
+  return out
+}
+
+function redactTelegramBotTokens(text) {
+  return String(text || "")
+    // URL-path form /bot<id>:<secret>. 6+ chars after the colon covers all known Telegram
+    // token formats (real tokens have ~33 chars); the /bot prefix provides context to avoid
+    // false positives from short numeric strings.
+    .replace(/(\/bot)\d{5,}:[A-Za-z0-9_-]{6,}/g, "$1***")
+    // Bare token form <id>:<secret> without URL context. 20+ chars avoids false positives
+    // on short numeric ratios like "12345:abc123" that are not bot tokens.
+    .replace(/\b\d{5,}:[A-Za-z0-9_-]{20,}\b/g, "***")
+}
+
+function redactSensitivePaths(text, sensitivePaths = []) {
+  let out = String(text || "")
+  for (const entry of sensitivePaths || []) {
+    const rawPath = typeof entry === "string" ? entry : entry?.path
+    const label = typeof entry === "string" ? "sensitive-path" : entry?.label || "sensitive-path"
+    const raw = String(rawPath || "").trim()
+    if (!raw) continue
+    out = out.replace(new RegExp(escapeRegExp(raw), "g"), `<${label}>`)
+    const slashNormalized = raw.replace(/\\/g, "/")
+    if (slashNormalized !== raw) out = out.replace(new RegExp(escapeRegExp(slashNormalized), "g"), `<${label}>`)
+  }
+
+  // Generic path redaction for runtime-sensitive connector files. These files can
+  // contain bot tokens, Basic Auth credentials, chat/session bindings, offsets,
+  // pending prompts, and idempotency history.
+  out = out.replace(/(?:(?:[A-Za-z]:)?[^\s"'<>]*[\\/])?\.env(?![.\w-])/g, "<env-file>")
+  out = out.replace(/(?:(?:[A-Za-z]:)?[^\s"'<>]*[\\/])?connector\.config\.mjs\b/g, "<config-file>")
+  out = out.replace(/(?:(?:[A-Za-z]:)?[^\s"'<>]*[\\/])?state\.json(?:\.backup\.[^\s"'<>]+)?\b/g, "<state-file>")
+  return out
+}
+
+export function redactCmdlineSecrets(cmdline, options = {}) {
   const s = String(cmdline || "")
   if (!s) return s
   let out = s
@@ -29,7 +101,15 @@ export function redactCmdlineSecrets(cmdline) {
   out = out.replace(flagRe, "$1=***")
 
   out = out.replace(/(Authorization:)(\s*)(Basic|Bearer)\s+\S+/gi, "$1$2$3 ***")
+  out = redactTelegramBotTokens(out)
+  out = redactKnownSecrets(out, options.knownSecrets)
+  out = redactSensitivePaths(out, options.sensitivePaths)
+  out = redactHighEntropyTokens(out)
   return out
+}
+
+export function redactSensitiveText(value, options = {}) {
+  return redactCmdlineSecrets(value, options)
 }
 
 export function sanitizeBaseUrlForCli(baseUrl) {

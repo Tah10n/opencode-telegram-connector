@@ -27,6 +27,10 @@ function createProjectState() {
     promptRecovery: { restored: 0, stale: 0, retryable: 0, fatal: 0 },
     promptCleanup: { stale: 0 },
     callbacks: { stale: 0, retryable: 0, fatal: 0 },
+    messages: { assistantMirrored: 0, noisySkipped: 0 },
+    prompts: { delivered: 0, answered: 0 },
+    telegram: { sendFailures: 0, editFailures: 0 },
+    attachments: { fallbacks: 0 },
   }
 }
 
@@ -42,6 +46,10 @@ function createGlobalState() {
       retryable: 0,
       skipped: 0,
     },
+    messages: { assistantMirrored: 0, noisySkipped: 0 },
+    prompts: { delivered: 0, answered: 0 },
+    telegram: { sendFailures: 0, editFailures: 0 },
+    attachments: { fallbacks: 0 },
   }
 }
 
@@ -88,6 +96,17 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
   function getLoop(loopName, { projectAlias } = {}) {
     if (projectAlias) return getProjectState(projectAlias)?.loops?.[loopName] || null
     return globalState.loops?.[loopName] || null
+  }
+
+  function increment(bucketName, counterName, { projectAlias, by = 1 } = {}) {
+    const amount = Number.isFinite(Number(by)) ? Number(by) : 1
+    if (globalState[bucketName] && Object.hasOwn(globalState[bucketName], counterName)) {
+      globalState[bucketName][counterName] += amount
+    }
+    const project = getProjectState(projectAlias)
+    if (project?.[bucketName] && Object.hasOwn(project[bucketName], counterName)) {
+      project[bucketName][counterName] += amount
+    }
   }
 
   function recordLoopRetry(loopName, { projectAlias, err } = {}) {
@@ -155,6 +174,40 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
     globalState.updates.skipped += 1
   }
 
+  function recordAssistantMirrored(projectAlias) {
+    increment("messages", "assistantMirrored", { projectAlias })
+  }
+
+  function recordNoisyEventSkipped(projectAlias, _reason) {
+    increment("messages", "noisySkipped", { projectAlias })
+  }
+
+  function recordPromptDelivered(projectAlias, _type) {
+    increment("prompts", "delivered", { projectAlias })
+  }
+
+  function recordPromptAnswered(projectAlias, _type, _outcome = "ok") {
+    increment("prompts", "answered", { projectAlias })
+  }
+
+  function recordTelegramFailure({ projectAlias, operation } = {}) {
+    const op = String(operation || "").toLowerCase()
+    const counter = op.includes("edit") ? "editFailures" : "sendFailures"
+    increment("telegram", counter, { projectAlias })
+  }
+
+  function recordAttachmentFallback(projectAlias, _kind) {
+    increment("attachments", "fallbacks", { projectAlias })
+  }
+
+  function formatCounterLines(state) {
+    return [
+      `Messages: assistant=${state.messages.assistantMirrored} skipped=${state.messages.noisySkipped} attachmentFallbacks=${state.attachments.fallbacks}`,
+      `Prompts: delivered=${state.prompts.delivered} answered=${state.prompts.answered}`,
+      `Telegram delivery: sendFailures=${state.telegram.sendFailures} editFailures=${state.telegram.editFailures}`,
+    ]
+  }
+
   function buildStatusLines(projectAlias) {
     const project = getProjectState(projectAlias)
     if (!project) {
@@ -166,6 +219,7 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
     const lines = [
       `Prompt recovery: restored=${project.promptRecovery.restored} stale=${project.promptRecovery.stale} retryable=${project.promptRecovery.retryable} fatal=${project.promptRecovery.fatal}`,
       `Callback outcomes: stale=${project.callbacks.stale} retryable=${project.callbacks.retryable} fatal=${project.callbacks.fatal}`,
+      ...formatCounterLines(project),
     ]
 
     if (project.promptCleanup.stale > 0) {
@@ -206,6 +260,7 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
       formatLoopLine("Prompt poll", globalState.loops.promptPoll, { includeFallback: true }),
       formatLoopLine("Shutdown", globalState.loops.shutdown),
       `Updates: retryable=${globalState.updates.retryable} skipped=${globalState.updates.skipped}`,
+      ...formatCounterLines(globalState),
     ]
   }
 
@@ -220,6 +275,12 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
     recordCallbackOutcome,
     recordUpdateRetry,
     recordUpdateSkip,
+    recordAssistantMirrored,
+    recordNoisyEventSkipped,
+    recordPromptDelivered,
+    recordPromptAnswered,
+    recordTelegramFailure,
+    recordAttachmentFallback,
     buildStatusLines,
     buildRuntimeStatusLines,
   }
