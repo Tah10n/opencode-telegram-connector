@@ -153,6 +153,72 @@ test("renderChangedFilesView reports an unknown project", async () => {
   assert.equal(calls.editMessageText[0][2], "Unknown project: missing")
 })
 
+test("handleMessageUpdated suppresses TUI user messages unless runtime mirroring is enabled", async () => {
+  const { calls, handlers } = createHarness({
+    store: { getFeedMode: () => "verbose" },
+    ocByAlias: {
+      demo: {
+        async getMessage() {
+          return { parts: [{ type: "text", text: "typed in tui" }] }
+        },
+      },
+    },
+  })
+
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: { sessionID: "ses_1", info: { id: "user_1", role: "user", time: { completed: Date.now() } } },
+  })
+
+  assert.equal(calls.sendHtmlBlocks.length, 0)
+  assert.ok(calls.logSseDebug.some((entry) => /drop=user_mirror_disabled/.test(entry[2])))
+})
+
+test("handleMessageUpdated mirrors TUI user messages independently of feed mode", async () => {
+  const { calls, handlers } = createHarness({
+    config: { mirrorTuiUserMessages: true },
+    store: { getFeedMode: () => "main" },
+    ocByAlias: {
+      demo: {
+        async getMessage() {
+          return { parts: [{ type: "text", text: "typed in tui" }] }
+        },
+      },
+    },
+  })
+
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: { sessionID: "ses_1", info: { id: "user_1", role: "user", time: { completed: Date.now() } } },
+  })
+
+  assert.equal(calls.sendHtmlBlocks.length, 1)
+  assert.equal(calls.sendHtmlBlocks[0][0], 11)
+  assert.equal(calls.sendHtmlBlocks[0][1][0].html, "<b>User</b>")
+  assert.equal(calls.sendHtmlBlocks[0][3].message_thread_id, 22)
+})
+
+test("handleMessageUpdated still suppresses Telegram-origin user echoes when TUI mirroring is enabled", async () => {
+  const { calls, handlers } = createHarness({
+    config: { mirrorTuiUserMessages: true, echoFilterMode: "prefix", tgPrefix: "[TG] " },
+    ocByAlias: {
+      demo: {
+        async getMessage() {
+          return { parts: [{ type: "text", text: "[TG] from telegram" }] }
+        },
+      },
+    },
+  })
+
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: { sessionID: "ses_1", info: { id: "user_echo", role: "user", time: { completed: Date.now() } } },
+  })
+
+  assert.equal(calls.sendHtmlBlocks.length, 0)
+  assert.ok(calls.logSseDebug.some((entry) => /drop=user_echo/.test(entry[2])))
+})
+
 test("renderChangedFilesView reports when the changed-files update is no longer available", async () => {
   const { calls, handlers } = createHarness({
     ocByAlias: {

@@ -37,6 +37,7 @@ test("buildRuntimeConfig loads connector.config.mjs and resolves relative paths"
     STATE_FILE: undefined,
     TG_PREFIX: undefined,
     ECHO_FILTER_MODE: undefined,
+    MIRROR_TUI_USER_MESSAGES: undefined,
     CONNECTOR_LOG_FORMAT: undefined,
     OPENCODE_ALLOW_INSECURE_HTTP: undefined,
     PROJECTS_FILE: undefined,
@@ -50,6 +51,7 @@ test("buildRuntimeConfig loads connector.config.mjs and resolves relative paths"
       stateFile: "./state/custom.json",
       tgPrefix: "[TG] ",
       echoFilterMode: "recent",
+      mirrorTuiUserMessages: true,
       logFormat: "json",
       allowInsecureHttp: true,
       limits: {
@@ -81,6 +83,7 @@ test("buildRuntimeConfig loads connector.config.mjs and resolves relative paths"
   assert.equal(config.stateFile, path.resolve(dir, "state/custom.json"))
   assert.equal(config.cwd, dir)
   assert.equal(config.logFormat, "json")
+  assert.equal(config.mirrorTuiUserMessages, true)
   assert.equal(config.projects.demo.directory, path.resolve(dir, "repo"))
   assert.equal(config.allowInsecureHttp, true)
   assert.deepEqual(config.limits, {
@@ -208,6 +211,7 @@ test("buildRuntimeConfig lets connector.config.mjs override legacy env and proje
     TELEGRAM_ALLOWED_USER_ID: undefined,
     DEFAULT_PROJECT: undefined,
     TG_PREFIX: undefined,
+    MIRROR_TUI_USER_MESSAGES: undefined,
     PROJECTS_JSON: undefined,
   })
   await fs.writeFile(
@@ -243,6 +247,7 @@ test("buildRuntimeConfig lets connector.config.mjs override legacy env and proje
   assert.equal(config.telegram.allowedUserId, 42)
   assert.equal(config.defaultProject, "cfg-default")
   assert.equal(config.tgPrefix, "[CFG] ")
+  assert.equal(config.mirrorTuiUserMessages, false)
   assert.deepEqual(Object.keys(config.projects), ["cfgdemo"])
 })
 
@@ -284,6 +289,7 @@ test("buildRuntimeConfig falls back to legacy env and projects json when config 
   swapEnv(t, {
     TELEGRAM_BOT_TOKEN: undefined,
     TELEGRAM_ALLOWED_USER_ID: undefined,
+    MIRROR_TUI_USER_MESSAGES: undefined,
     PROJECTS_JSON: undefined,
   })
   await fs.writeFile(
@@ -292,6 +298,7 @@ test("buildRuntimeConfig falls back to legacy env and projects json when config 
       "TELEGRAM_BOT_TOKEN=env-token",
       "TELEGRAM_ALLOWED_USER_ID=77",
       "CONNECTOR_LOG_FORMAT=json",
+      "MIRROR_TUI_USER_MESSAGES=1",
       'PROJECTS_JSON={"demo":{"baseUrl":"http://127.0.0.1:4312"}}',
     ].join("\n"),
     "utf8",
@@ -303,6 +310,7 @@ test("buildRuntimeConfig falls back to legacy env and projects json when config 
   assert.equal(config.telegram.botToken, "env-token")
   assert.equal(config.telegram.allowedUserId, 77)
   assert.equal(config.logFormat, "json")
+  assert.equal(config.mirrorTuiUserMessages, true)
   assert.equal(config.projects.demo.baseUrl, "http://127.0.0.1:4312")
 })
 

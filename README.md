@@ -91,6 +91,9 @@ export default {
   defaultProject: "pocket",
   logFormat: "text",
 
+  // Optional: mirror user messages typed directly in opencode TUI to Telegram.
+  // mirrorTuiUserMessages: true,
+
   limits: {
     userAttachmentConfirmBytes: 32 * 1024,
     userAttachmentMaxBytes: 256 * 1024,
@@ -154,7 +157,9 @@ When opencode asks for a permission decision or a question answer, the connector
 
 - `Main` — final assistant replies only.
 - `Main + changes` — final assistant replies and changed-file cards.
-- `Verbose` — final replies, streaming previews, user mirror, and changed-file cards.
+- `Verbose` — final replies, streaming previews, and changed-file cards.
+
+User messages typed directly in opencode TUI are mirrored separately from `/feed`; enable `mirrorTuiUserMessages: true` or `MIRROR_TUI_USER_MESSAGES=1` to duplicate them into the bound Telegram thread.
 
 ## File, code, and log workflow
 
@@ -198,6 +203,7 @@ Long assistant replies are still delivered as `.txt` attachments instead of over
 - `STATE_FILE` / `stateFile` (default: `./.data/state.json`)
 - `TG_PREFIX` / `tgPrefix`
 - `ECHO_FILTER_MODE` / `echoFilterMode` (`recent` or `prefix`)
+- `MIRROR_TUI_USER_MESSAGES=1` / `mirrorTuiUserMessages` (default `false`)
 - `CONNECTOR_LOG_FORMAT` / `logFormat` (`text` or `json`, default `text`)
 - `OPENCODE_ALLOW_INSECURE_HTTP=1` / `allowInsecureHttp`
 - `OPENCODE_TERMINAL` (Linux terminal launcher override)

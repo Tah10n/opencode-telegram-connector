@@ -127,7 +127,7 @@ export function createMirroringHandlers(runtime) {
     if (kind === "internal") return false
     if (mode === "main") return kind === "assistant-final"
     if (mode === "main+changes") return kind === "assistant-final" || kind === "changed-files"
-    return kind === "assistant-final" || kind === "assistant-stream" || kind === "user-mirror" || kind === "changed-files"
+    return kind === "assistant-final" || kind === "assistant-stream" || kind === "changed-files"
   }
 
   function renderFeedSettingsText(ctxKey) {
@@ -137,7 +137,8 @@ export function createMirroringHandlers(runtime) {
       "",
       "Main — final assistant replies only.",
       "Main + changes — final assistant replies and changed files.",
-      "Verbose — final replies, streaming previews, user mirror, and changed files.",
+      "Verbose — final replies, streaming previews, and changed files.",
+      "TUI user-message mirroring is controlled by the runtime mirrorTuiUserMessages setting.",
       "",
       "Internal compaction output stays hidden in all modes.",
     ].join("\n")
@@ -593,10 +594,10 @@ export function createMirroringHandlers(runtime) {
         recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.USER_ECHO)
         return
       }
-      if (!shouldMirrorToFeed(routeCtx.ctxKey, "user-mirror")) {
+      if (config.mirrorTuiUserMessages !== true) {
         sets.user.add(info.id)
-        logSseDebug(projectAlias, sessionId, `drop=user_feed msg=${info.id} mode=${getFeedMode(routeCtx.ctxKey)}`)
-        recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.USER_FEED_FILTERED)
+        logSseDebug(projectAlias, sessionId, `drop=user_mirror_disabled msg=${info.id}`)
+        recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.USER_MIRROR_DISABLED)
         return
       }
       const blocks = [{ type: "text", html: "<b>User</b>" }, ...formatMarkdownToTelegramHtmlBlocks(text)]

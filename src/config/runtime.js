@@ -74,6 +74,7 @@ export async function buildRuntimeConfig({ args = {}, cwd = process.cwd() } = {}
       : configFromFile.stateFile ?? resolveRuntimePath(envOptional("STATE_FILE"), envBaseDir),
     tgPrefix: configFromFile.tgPrefix ?? envOptional("TG_PREFIX", ""),
     echoFilterMode: configFromFile.echoFilterMode ?? envOptional("ECHO_FILTER_MODE", "recent"),
+    mirrorTuiUserMessages: configFromFile.mirrorTuiUserMessages ?? envBool("MIRROR_TUI_USER_MESSAGES", false),
     allowInsecureHttp: configFromFile.allowInsecureHttp ?? envBool("OPENCODE_ALLOW_INSECURE_HTTP", false),
     logFormat: normalizeLogFormat(configFromFile.logFormat ?? envOptional("CONNECTOR_LOG_FORMAT", "text")),
     limits: normalizeLimits(configFromFile.limits || {}),

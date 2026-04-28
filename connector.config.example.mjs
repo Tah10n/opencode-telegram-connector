@@ -9,6 +9,8 @@ export default {
   stateFile: "./.data/state.json",
   tgPrefix: "",
   echoFilterMode: "recent",
+  // Optional: mirror user messages typed directly in opencode TUI to Telegram.
+  // mirrorTuiUserMessages: true,
   logFormat: "text", // "text" or "json"
   allowInsecureHttp: false,
 

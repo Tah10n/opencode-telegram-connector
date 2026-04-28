@@ -331,6 +331,7 @@ async function createHarness({
   wizardGcIntervalMs,
   opencodeWatchdog,
   createStateStoreImpl,
+  configPatch,
 } = {}) {
   const dir = await makeTempDir()
   const stateFile = path.join(dir, "state.json")
@@ -377,6 +378,7 @@ async function createHarness({
       allowedUserId: 42,
     },
     projects,
+    ...(configPatch || {}),
   }
 
   const ocAliases = Object.keys(projects)
@@ -1631,17 +1633,17 @@ test("startConnector applies feed modes per thread for assistant, user, and chan
       properties: { sessionID: "ses_verbose", info: { id: "asst_compaction", role: "assistant", mode: "compaction", time: { completed: completedAt } } },
     })
 
-    await waitFor(() => harness.tg.sentHtmlBlocks.length >= 3 && harness.tg.sentMessages.length >= 3 && harness.tg.editedMessages.length >= 1)
+    await waitFor(() => harness.tg.sentHtmlBlocks.length >= 2 && harness.tg.sentMessages.length >= 3 && harness.tg.editedMessages.length >= 1)
 
     const htmlByThread = harness.tg.sentHtmlBlocks.map((entry) => ({ threadId: entry.options.message_thread_id, first: entry.blocks[0]?.html }))
     const textByThread = harness.tg.sentMessages.map((entry) => ({ threadId: entry.options.message_thread_id, text: entry.text }))
 
     assert.ok(htmlByThread.some((entry) => entry.threadId === 7 && entry.first === "Main answer"))
     assert.ok(htmlByThread.some((entry) => entry.threadId === 9 && entry.first === "Changes answer"))
-    assert.ok(htmlByThread.some((entry) => entry.threadId === 11 && entry.first === "<b>User</b>"))
     assert.ok(harness.tg.editedMessages.some((entry) => entry.kind === "text" && entry.messageId && entry.text === "Verbose answer"))
     assert.ok(!htmlByThread.some((entry) => entry.threadId === 7 && entry.first === "<b>User</b>"))
     assert.ok(!htmlByThread.some((entry) => entry.threadId === 9 && entry.first === "<b>User</b>"))
+    assert.ok(!htmlByThread.some((entry) => entry.threadId === 11 && entry.first === "<b>User</b>"))
 
     assert.ok(textByThread.some((entry) => entry.threadId === 9 && /Changed files:/.test(entry.text)))
     assert.ok(textByThread.some((entry) => entry.threadId === 11 && entry.text === "Streaming verbose reply"))
@@ -1649,6 +1651,33 @@ test("startConnector applies feed modes per thread for assistant, user, and chan
     assert.ok(!textByThread.some((entry) => entry.threadId === 7 && /Changed files:/.test(entry.text)))
     assert.ok(!textByThread.some((entry) => entry.threadId === 9 && /Streaming verbose reply/.test(entry.text)))
     assert.ok(!textByThread.some((entry) => /internal/.test(entry.text)))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector mirrors TUI user messages when runtime setting is enabled", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const messagesById = {
+    user_main: { info: { id: "user_main", role: "user", time: { created: completedAt, completed: completedAt } }, parts: [{ type: "text", text: "typed in tui" }] },
+  }
+  const harness = await createHarness({
+    configPatch: { mirrorTuiUserMessages: true },
+    statePatch: {
+      updateOffset: 300,
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_main" } },
+      sessionIndex: { "demo:ses_main": { chatId: 100, threadIdOr0: 7 } },
+      feedByContext: { "100:7": { mode: "main" } },
+    },
+    messagesById,
+  })
+
+  try {
+    await harness.emitSse("demo", { type: "message.updated", properties: { sessionID: "ses_main", info: { id: "user_main", role: "user", time: { completed: completedAt } } } })
+
+    await waitFor(() => harness.tg.sentHtmlBlocks.some((entry) => entry.options.message_thread_id === 7 && entry.blocks[0]?.html === "<b>User</b>"))
+    const mirrored = harness.tg.sentHtmlBlocks.find((entry) => entry.options.message_thread_id === 7 && entry.blocks[0]?.html === "<b>User</b>")
+    assert.ok(mirrored.blocks.some((block) => /typed in tui/.test(block.html)))
   } finally {
     await harness.connector.stop()
   }

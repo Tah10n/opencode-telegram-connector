@@ -1,7 +1,7 @@
 export const NOISY_SKIP_REASONS = Object.freeze({
   USER_EMPTY: "user-empty",
   USER_ECHO: "user-echo",
-  USER_FEED_FILTERED: "user-feed-filtered",
+  USER_MIRROR_DISABLED: "user-mirror-disabled",
   COMPACTION: "compaction",
   ASSISTANT_PREVIEW_FEED_FILTERED: "assistant-preview-feed-filtered",
   ASSISTANT_PREVIEW_THROTTLED: "assistant-preview-throttled",

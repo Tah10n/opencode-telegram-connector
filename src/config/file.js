@@ -51,6 +51,7 @@ export function normalizeConnectorConfig(raw, { configFilePath } = {}) {
   if (raw.defaultProject != null && raw.defaultProject !== "") out.defaultProject = String(raw.defaultProject)
   if (raw.tgPrefix != null) out.tgPrefix = String(raw.tgPrefix)
   if (raw.echoFilterMode != null && raw.echoFilterMode !== "") out.echoFilterMode = String(raw.echoFilterMode)
+  if (raw.mirrorTuiUserMessages != null) out.mirrorTuiUserMessages = parseConfigBool("mirrorTuiUserMessages", raw.mirrorTuiUserMessages)
   if (raw.logFormat != null && raw.logFormat !== "") out.logFormat = String(raw.logFormat)
   if (raw.allowInsecureHttp != null) out.allowInsecureHttp = parseConfigBool("allowInsecureHttp", raw.allowInsecureHttp)
   if (raw.limits != null) {
