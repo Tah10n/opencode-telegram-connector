@@ -1,7 +1,7 @@
 import { makeInlineKeyboard } from "../telegram/client.js"
 import { sessionKey } from "../state/store.js"
 import { permissionNoteIdempotencyKey, telegramMessageIdempotencyKey } from "./idempotency.js"
-import { classifyBoundaryError, isRetryableBoundaryError, isStaleBoundaryError } from "../boundary-errors.js"
+import { classifyBoundaryError, isRetryableBoundaryError, isStaleBoundaryError, makeBoundaryError } from "../boundary-errors.js"
 import { userAttachmentLimitsFromConfig } from "../limits.js"
 import { createAttachmentHandlers } from "./commands/attachments.js"
 import { createModelCommandHandlers } from "./commands/model.js"
@@ -211,7 +211,23 @@ export function createCommandHandlers(runtime) {
     return !!key && typeof store?.hasIdempotencyKey === "function" && store.hasIdempotencyKey(key)
   }
 
-  async function markIdempotencyEntries(entries, { flush = true } = {}) {
+  async function flushDurableState(operation) {
+    if (typeof store?.flush !== "function") return
+    try {
+      await store.flush()
+    } catch (err) {
+      throw makeBoundaryError({
+        source: "state",
+        operation,
+        kind: "durability",
+        outcome: "retryable",
+        message: `${operation} failed: ${err?.message || String(err)}`,
+        cause: err,
+      })
+    }
+  }
+
+  async function markIdempotencyEntries(entries, { flush = true, rollbackOnFlushFailure = false } = {}) {
     const normalized = entries.filter((entry) => !!entry?.key)
     if (!normalized.length) return false
     if (typeof store?.markIdempotencyKey === "function") {
@@ -219,17 +235,45 @@ export function createCommandHandlers(runtime) {
       for (const entry of normalized) {
         marked = store.markIdempotencyKey(entry.key, entry.metadata || {}) || marked
       }
-      if (marked && flush && typeof store?.flush === "function") await store.flush()
+      if (marked && flush) {
+        try {
+          await flushDurableState("persist idempotency entries")
+        } catch (err) {
+          if (rollbackOnFlushFailure) {
+            await Promise.all(normalized.map((entry) => deleteIdempotencyEntry(entry.key, { flush: false }).catch(() => false)))
+          }
+          throw err
+        }
+      }
       return marked
     }
     if (typeof store?.markIdempotencyKeyAndFlush === "function") {
       let marked = false
       for (const entry of normalized) {
-        marked = (await store.markIdempotencyKeyAndFlush(entry.key, entry.metadata || {})) || marked
+        try {
+          marked = (await store.markIdempotencyKeyAndFlush(entry.key, entry.metadata || {})) || marked
+        } catch (err) {
+          if (rollbackOnFlushFailure) await deleteIdempotencyEntry(entry.key, { flush: false }).catch(() => {})
+          throw makeBoundaryError({
+            source: "state",
+            operation: "persist idempotency entries",
+            kind: "durability",
+            outcome: "retryable",
+            message: `persist idempotency entries failed: ${err?.message || String(err)}`,
+            cause: err,
+          })
+        }
       }
       return marked
     }
     return false
+  }
+
+  async function deleteIdempotencyEntry(key, { flush = true } = {}) {
+    if (!key || typeof store?.deleteIdempotencyKey !== "function") return false
+    const deleted = store.deleteIdempotencyKey(key)
+    if (deleted && flush) await flushDurableState("delete idempotency entry")
+    return deleted
   }
 
   function moveConflictNote(result) {
@@ -339,22 +383,27 @@ export function createCommandHandlers(runtime) {
     if (!hasText && !hasDocument && !mediaKind) return
 
     const messageKey = telegramMessageIdempotencyKey(ctxMeta, msg)
-    if (hasIdempotencyKey(messageKey)) return
+    if (hasIdempotencyKey(messageKey)) {
+      await flushDurableState("persist replayed telegram message idempotency")
+      return
+    }
+
+    function messageIdempotencyEntry(operation, metadata = {}) {
+      return {
+        key: messageKey,
+        metadata: {
+          kind: "telegram-message",
+          ctxKey: ctxMeta.ctxKey,
+          operation,
+          updateId: Number.isInteger(options?.updateId) ? options.updateId : undefined,
+          messageId: Number.isInteger(msg?.message_id) ? msg.message_id : undefined,
+          ...metadata,
+        },
+      }
+    }
 
     async function markMessageHandled(operation, metadata = {}) {
-      await markIdempotencyEntries([
-        {
-          key: messageKey,
-          metadata: {
-            kind: "telegram-message",
-            ctxKey: ctxMeta.ctxKey,
-            operation,
-            updateId: Number.isInteger(options?.updateId) ? options.updateId : undefined,
-            messageId: Number.isInteger(msg?.message_id) ? msg.message_id : undefined,
-            ...metadata,
-          },
-        },
-      ])
+      return markIdempotencyEntries([messageIdempotencyEntry(operation, metadata)])
     }
 
     const awaitingQ = awaitingCustomAnswer.get(ctxMeta.ctxKey)
@@ -377,19 +426,20 @@ export function createCommandHandlers(runtime) {
       if (nextIndex >= wizard.request.questions.length) {
         applyWizardState(wizard, nextWizard)
         persistQuestionWizard(wizard)
-        const result = await finishQuestionWizard(wizard)
+        const result = await finishQuestionWizard(wizard, {
+          idempotencyEntries: [messageIdempotencyEntry("replyQuestion", { projectAlias: awaitingQ.projectAlias, sessionId: wizard.sessionID })],
+        })
         if (result?.outcome === "retryable") {
           await sendToThread(ctxMeta, "Question answer is temporarily unavailable. Send the answer again or /cancel.").catch(() => {})
           return
         }
-        await markMessageHandled("replyQuestion", { projectAlias: awaitingQ.projectAlias, sessionId: wizard.sessionID })
       } else {
         nextWizard.index = nextIndex
         await sendCurrentQuestionStep(nextWizard)
         applyWizardState(wizard, nextWizard)
         persistQuestionWizard(wizard)
         setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
-        await store.flush?.()
+        await flushDurableState("persist question wizard state")
         await markMessageHandled("questionNextStep", { projectAlias: awaitingQ.projectAlias, sessionId: wizard.sessionID })
       }
       return
@@ -440,7 +490,7 @@ export function createCommandHandlers(runtime) {
           ], { flush: false })
           store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId, awaiting.sessionID)
           setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
-          await store.flush?.()
+          await flushDurableState("persist stale permission note state")
           await sendToThread(ctxMeta, "Permission request is no longer active.").catch(() => {})
           return
         }
@@ -476,7 +526,7 @@ export function createCommandHandlers(runtime) {
       recordPromptAnswered?.(awaiting.projectAlias, "permission", "ok")
       store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId, awaiting.sessionID)
       setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
-      await store.flush?.()
+      await flushDurableState("persist permission note state")
       await sendToThread(ctxMeta, "Rejection note sent.").catch(() => {})
       return
     }
@@ -634,14 +684,25 @@ export function createCommandHandlers(runtime) {
 
     const oc = ocByAlias[binding.projectAlias]
     const prefix = config.tgPrefix ?? "[TG] "
+    const promptText = `${prefix}${text}`
+    const sk = sessionKey(binding.projectAlias, binding.sessionId)
+    ensureRecentPromptSet(sk).add(hashTextForEcho(promptText))
+    const promptOverride = await resolvePromptOverride(ctxMeta.ctxKey, binding)
+    // Persist message idempotency before the external side effect. If opencode
+    // accepts the prompt and the process crashes immediately after, replayed
+    // Telegram updates will skip instead of sending a duplicate prompt.
+    await markIdempotencyEntries([messageIdempotencyEntry("promptAsync", { projectAlias: binding.projectAlias, sessionId: binding.sessionId })], {
+      rollbackOnFlushFailure: true,
+    })
     try {
-      const promptText = `${prefix}${text}`
-      const sk = sessionKey(binding.projectAlias, binding.sessionId)
-      ensureRecentPromptSet(sk).add(hashTextForEcho(promptText))
-      const promptOverride = await resolvePromptOverride(ctxMeta.ctxKey, binding)
       await oc.promptAsync(binding.sessionId, promptText, promptOverride || undefined)
-      await markMessageHandled("promptAsync", { projectAlias: binding.projectAlias, sessionId: binding.sessionId })
     } catch (err) {
+      let cleanupErr = null
+      try {
+        await deleteIdempotencyEntry(messageKey)
+      } catch (deleteErr) {
+        cleanupErr = deleteErr
+      }
       const alias = binding.projectAlias
       const withButton = isRetryableProjectError(err) && canAutoStartProject(alias, { platform })
       recordRetryableOpenCodeFailure(alias, err, {
@@ -650,7 +711,9 @@ export function createCommandHandlers(runtime) {
         pathname: `/session/${binding.sessionId}/prompt_async`,
       })
       await sendToThread(ctxMeta, formatProjectUnavailable(alias, err), withButton ? startServerKeyboard(alias) : null).catch(() => {})
+      if (cleanupErr) throw cleanupErr
       if (isRetryableProjectError(err)) throw err
+      return
     }
   }
 

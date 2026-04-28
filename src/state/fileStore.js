@@ -31,6 +31,66 @@ function backupPrefix(filePath) {
   return `${path.basename(filePath)}.backup.`
 }
 
+function emergencyBackupPrefix(filePath) {
+  return `${path.basename(filePath)}.bak.`
+}
+
+async function listEmergencyStateBackups(filePath, { fsImpl = fs } = {}) {
+  const dir = path.dirname(filePath)
+  const prefix = emergencyBackupPrefix(filePath)
+  let names
+  try {
+    names = await fsImpl.readdir(dir)
+  } catch (err) {
+    if (hasCode(err, "ENOENT")) return []
+    throw err
+  }
+
+  const backups = []
+  for (const name of names) {
+    if (!name.startsWith(prefix)) continue
+    const backupPath = path.join(dir, name)
+    let stat = null
+    try {
+      stat = await fsImpl.stat(backupPath)
+    } catch (err) {
+      if (!hasCode(err, "ENOENT")) throw err
+      continue
+    }
+    if (stat?.isFile && !stat.isFile()) continue
+    backups.push({ path: backupPath, name, mtimeMs: Number(stat?.mtimeMs) || 0 })
+  }
+  backups.sort((a, b) => b.mtimeMs - a.mtimeMs || b.name.localeCompare(a.name))
+  return backups
+}
+
+async function recoverEmergencyJsonBackup(filePath, { fsImpl = fs } = {}) {
+  const backups = await listEmergencyStateBackups(filePath, { fsImpl })
+  if (backups.length === 0) return null
+
+  const backup = backups[0]
+  let parsed
+  try {
+    const txt = await fsImpl.readFile(backup.path, "utf8")
+    parsed = JSON.parse(txt)
+  } catch (err) {
+    throw new Error(
+      `State file ${filePath} is missing, and emergency backup ${backup.path} could not be loaded (${err?.message || String(err)}). Refusing to start with empty state.`,
+      { cause: err },
+    )
+  }
+
+  try {
+    await fsImpl.copyFile(backup.path, filePath)
+  } catch (err) {
+    throw new Error(
+      `State file ${filePath} is missing, and emergency backup ${backup.path} could not be restored (${err?.message || String(err)}). Refusing to start with empty state.`,
+      { cause: err },
+    )
+  }
+  return parsed
+}
+
 async function listStateBackups(filePath, { fsImpl = fs } = {}) {
   const dir = path.dirname(filePath)
   const prefix = backupPrefix(filePath)
@@ -123,7 +183,7 @@ export async function readJsonFile(filePath) {
     const txt = await fs.readFile(filePath, "utf8")
     return JSON.parse(txt)
   } catch (err) {
-    if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return null
+    if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return recoverEmergencyJsonBackup(filePath)
     throw err
   }
 }

@@ -1113,6 +1113,57 @@ test("createCommandHandlers advances awaiting custom-answer wizards to the next 
   assert.equal(awaitingCustomAnswer.has("100:7"), false)
 })
 
+test("createCommandHandlers passes message idempotency into final custom-answer persistence", async () => {
+  const awaitingCustomAnswer = new Map([[
+    "100:7",
+    { projectAlias: "demo", requestId: "q_final", qIndex: 0, sessionID: "ses_1" },
+  ]])
+  const wizard = {
+    projectAlias: "demo",
+    id: "q_final",
+    sessionID: "ses_1",
+    index: 0,
+    request: { questions: [{ header: "Only", question: "one" }] },
+    answers: [[]],
+  }
+  const finishCalls = []
+  const { runtime } = makeRuntime({
+    awaitingCustomAnswer,
+    getWizard: () => wizard,
+    applyWizardState: (target, nextWizard) => {
+      target.answers = nextWizard.answers
+    },
+    persistQuestionWizard: () => {},
+    finishQuestionWizard: async (currentWizard, options) => {
+      finishCalls.push({ currentWizard, options })
+      return { outcome: "ok" }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 777,
+    message_thread_id: 7,
+    text: "final answer",
+  })
+
+  assert.equal(finishCalls.length, 1)
+  assert.deepEqual(finishCalls[0].currentWizard.answers, [["final answer"]])
+  assert.equal(finishCalls[0].options.idempotencyEntries.length, 1)
+  assert.match(finishCalls[0].options.idempotencyEntries[0].key, /tg-message:100:7:777$/)
+  assert.deepEqual(finishCalls[0].options.idempotencyEntries[0].metadata, {
+    kind: "telegram-message",
+    ctxKey: "100:7",
+    operation: "replyQuestion",
+    updateId: undefined,
+    messageId: 777,
+    projectAlias: "demo",
+    sessionId: "ses_1",
+  })
+})
+
 test("createCommandHandlers handleModelCommand stores a custom per-thread override", async () => {
   const storeState = {
     bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } },
@@ -1256,6 +1307,191 @@ test("createCommandHandlers handleTelegramMessage rethrows retryable promptAsync
 
   assert.deepEqual(promptCalls, [{ sessionId: "ses_current", text: "[TG] retry me" }])
   assert.match(sent[0].text, /Project 'demo' is unavailable/)
+})
+
+test("createCommandHandlers clears preflight prompt idempotency after promptAsync failure", async () => {
+  const keys = new Set()
+  const deletes = []
+  const { runtime } = makeRuntime({
+    config: { tgPrefix: "[TG] " },
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    store: {
+      markIdempotencyKey(key) {
+        keys.add(key)
+        return true
+      },
+      deleteIdempotencyKey(key) {
+        deletes.push(key)
+        return keys.delete(key)
+      },
+      async flush() {},
+    },
+    ocByAlias: {
+      demo: {
+        async promptAsync() {
+          throw makeBoundaryError({ source: "opencode", method: "POST", pathname: "/session/ses_current/prompt_async", status: 503, message: "down" })
+        },
+      },
+    },
+    isRetryableProjectError: () => true,
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await assert.rejects(() => handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 320,
+    message_thread_id: 7,
+    text: "retry me",
+  }), /down/)
+
+  assert.equal(deletes.length, 1)
+  assert.equal(keys.size, 0)
+})
+
+test("createCommandHandlers persists prompt idempotency before promptAsync", async () => {
+  const promptCalls = []
+  const marked = []
+  const keys = new Set()
+  const { runtime, sent } = makeRuntime({
+    config: { tgPrefix: "[TG] " },
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    store: {
+      markIdempotencyKey(key, metadata) {
+        marked.push({ key, metadata })
+        keys.add(key)
+        return true
+      },
+      deleteIdempotencyKey(key) {
+        return keys.delete(key)
+      },
+      async flush() {
+        throw new Error("disk full")
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async promptAsync(sessionId, text) {
+          promptCalls.push({ sessionId, text })
+          return { ok: true }
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await assert.rejects(
+    () => handlers.handleTelegramMessage({
+      chat: { id: 100, type: "supergroup" },
+      from: { id: 42 },
+      message_id: 321,
+      message_thread_id: 7,
+      text: "persist me",
+    }),
+    (err) => {
+      assert.equal(err.isBoundaryError, true)
+      assert.equal(err.source, "state")
+      assert.equal(err.outcome, "retryable")
+      assert.match(err.message, /disk full/)
+      return true
+    },
+  )
+
+  assert.deepEqual(promptCalls, [])
+  assert.equal(marked.length, 1)
+  assert.equal(keys.size, 0)
+  assert.deepEqual(sent, [])
+})
+
+test("createCommandHandlers retries replayed message idempotency until it is durable", async () => {
+  const flushCalls = []
+  const promptCalls = []
+  const { runtime } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    store: {
+      hasIdempotencyKey: () => true,
+      async flush() {
+        flushCalls.push(true)
+        throw new Error("disk still full")
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async promptAsync(...args) {
+          promptCalls.push(args)
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await assert.rejects(
+    () => handlers.handleTelegramMessage({
+      chat: { id: 100, type: "supergroup" },
+      from: { id: 42 },
+      message_id: 321,
+      message_thread_id: 7,
+      text: "already sent",
+    }),
+    (err) => {
+      assert.equal(err.isBoundaryError, true)
+      assert.equal(err.outcome, "retryable")
+      assert.match(err.message, /disk still full/)
+      return true
+    },
+  )
+
+  assert.deepEqual(flushCalls, [true])
+  assert.deepEqual(promptCalls, [])
+})
+
+test("createCommandHandlers rethrows reject-note durability failures after accepted replies", async () => {
+  const replyCalls = []
+  const marked = []
+  const rejectNoteAwaiting = new Map([
+    ["100:7", { projectAlias: "demo", permissionId: "perm_1", sessionID: "ses_1" }],
+  ])
+  const { runtime } = makeRuntime({
+    rejectNoteAwaiting,
+    store: {
+      markIdempotencyKey(key, metadata) {
+        marked.push({ key, metadata })
+        return true
+      },
+      deletePendingPermission: () => true,
+      async flush() {
+        throw new Error("state write failed")
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async replyPermission(permissionId, payload) {
+          replyCalls.push({ permissionId, payload })
+          return { ok: true }
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await assert.rejects(
+    () => handlers.handleTelegramMessage({
+      chat: { id: 100, type: "supergroup" },
+      from: { id: 42 },
+      message_id: 322,
+      message_thread_id: 7,
+      text: "no, thanks",
+    }),
+    (err) => {
+      assert.equal(err.isBoundaryError, true)
+      assert.equal(err.source, "state")
+      assert.equal(err.outcome, "retryable")
+      return true
+    },
+  )
+
+  assert.deepEqual(replyCalls, [{ permissionId: "perm_1", payload: { reply: "reject", message: "no, thanks" } }])
+  assert.equal(marked.length, 2)
 })
 
 test("createCommandHandlers handleTelegramMessage forwards small text documents as attachment prompts", async () => {

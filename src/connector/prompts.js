@@ -2,7 +2,7 @@ import { makeInlineKeyboard } from "../telegram/client.js"
 import { escapeHtml } from "../telegram/formatter.js"
 import { ctxKeyFrom } from "../telegram/routing.js"
 import { promptKey } from "../state/store.js"
-import { isRetryableBoundaryError, isStaleBoundaryError } from "../boundary-errors.js"
+import { isRetryableBoundaryError, isStaleBoundaryError, makeBoundaryError } from "../boundary-errors.js"
 import {
   permissionNoteIdempotencyPrefix,
   permissionReplyIdempotencyPrefix,
@@ -91,9 +91,40 @@ export function createPromptHandlers(runtime) {
       return store.markIdempotencyKey(key, metadata)
     }
     if (typeof store?.markIdempotencyKeyAndFlush === "function") {
-      return store.markIdempotencyKeyAndFlush(key, metadata)
+      try {
+        return await store.markIdempotencyKeyAndFlush(key, metadata)
+      } catch (err) {
+        throw makeStateDurabilityError(err, "persist question idempotency")
+      }
     }
     return false
+  }
+
+  async function markIdempotencyEntries(entries = []) {
+    for (const entry of entries) {
+      if (!entry?.key) continue
+      await markIdempotencyKey(entry.key, entry.metadata || {})
+    }
+  }
+
+  function makeStateDurabilityError(err, operation) {
+    return makeBoundaryError({
+      source: "state",
+      operation,
+      kind: "durability",
+      outcome: "retryable",
+      message: `${operation} failed: ${err?.message || String(err)}`,
+      cause: err,
+    })
+  }
+
+  async function flushDurableState(operation) {
+    if (typeof store?.flush !== "function") return
+    try {
+      await store.flush()
+    } catch (err) {
+      throw makeStateDurabilityError(err, operation)
+    }
   }
 
   function clearQuestionWizardState(wizard) {
@@ -203,12 +234,10 @@ export function createPromptHandlers(runtime) {
     const { chatId, threadIdOr0 } = wizard.ctx
 
     if (editMessageId) {
-      await tg
-        .editMessageText(chatId, editMessageId, rendered.html, rendered.replyMarkup, {
-          parse_mode: "HTML",
-          disable_web_page_preview: true,
-        })
-        .catch(() => {})
+      await tg.editMessageText(chatId, editMessageId, rendered.html, rendered.replyMarkup, {
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      })
       wizard.messageIdByIndex[idx] = editMessageId
       return
     }
@@ -272,12 +301,13 @@ export function createPromptHandlers(runtime) {
     )
   }
 
-  async function finishQuestionWizard(wizard) {
+  async function finishQuestionWizard(wizard, { idempotencyEntries = [] } = {}) {
     const oc = ocByAlias[wizard.projectAlias]
     const replyKey = questionReplyIdempotencyKey(wizard.projectAlias, wizard.sessionID, wizard.request.id, wizard.answers)
     if (hasIdempotencyKey(replyKey)) {
+      await markIdempotencyEntries(idempotencyEntries)
       clearQuestionWizardState(wizard)
-      await store.flush?.()
+      await flushDurableState("persist duplicate question reply state")
       return { outcome: "duplicate", duplicate: true }
     }
     try {
@@ -291,8 +321,9 @@ export function createPromptHandlers(runtime) {
           sessionId: wizard.sessionID,
           operation: "replyQuestion",
         })
+        await markIdempotencyEntries(idempotencyEntries)
         clearQuestionWizardState(wizard)
-        await store.flush?.()
+        await flushDurableState("persist stale question reply state")
         await sendToThread(wizard.ctx, "Question is no longer active.").catch(() => {})
         return { outcome: "stale", stale: true }
       }
@@ -308,9 +339,10 @@ export function createPromptHandlers(runtime) {
       sessionId: wizard.sessionID,
       operation: "replyQuestion",
     })
+    await markIdempotencyEntries(idempotencyEntries)
     recordPromptAnswered?.(wizard.projectAlias, "question", "ok")
     clearQuestionWizardState(wizard)
-    await store.flush?.()
+    await flushDurableState("persist question reply state")
     await sendToThread(wizard.ctx, `Answered: ${wizard.request.id}`).catch(() => {})
     return { outcome: "ok", stale: false }
   }
@@ -367,7 +399,7 @@ export function createPromptHandlers(runtime) {
     try {
       await sendPermissionPrompt(projectAlias, props, ctxMeta)
       recordPromptDelivered?.(projectAlias, "permission")
-      await store.flush?.()
+      await flushDurableState("persist permission prompt delivery state")
     } catch (err) {
       prompted[projectAlias].permission.delete(permissionIdentity)
       throw err
@@ -412,7 +444,7 @@ export function createPromptHandlers(runtime) {
       ])
       await sendCurrentQuestionStep(wizard)
       recordPromptDelivered?.(projectAlias, "question")
-      await store.flush?.()
+      await flushDurableState("persist question prompt delivery state")
     } catch (err) {
       prompted[projectAlias].question.delete(questionIdentity)
       throw err

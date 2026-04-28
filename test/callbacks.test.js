@@ -401,6 +401,88 @@ test("createCallbackHandlers switches sessions and refreshes the sessions list",
   ])
 })
 
+test("createCallbackHandlers does not confirm state changes when flush fails", async () => {
+  const switchState = { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } }, sessionIndex: {} }
+  const switchRuntime = makeRuntime({
+    storeState: switchState,
+    store: {
+      get: () => switchState,
+      async flush() {
+        throw new Error("state write failed")
+      },
+    },
+    bindCtxToSession: async (ctxMeta, projectAlias, sessionId) => {
+      switchState.bindings[ctxMeta.ctxKey] = { projectAlias, sessionId }
+    },
+    ocByAlias: {
+      demo: {
+        async getSession(sessionId) {
+          return { id: sessionId }
+        },
+      },
+    },
+  })
+  await assert.rejects(() => createCallbackHandlers(switchRuntime.runtime).handleTelegramCallback(makeCallback("s|demo|ses_next")), (err) => {
+    assert.equal(err.isBoundaryError, true)
+    assert.equal(err.source, "state")
+    assert.equal(err.outcome, "retryable")
+    return true
+  })
+  assert.deepEqual(switchRuntime.callbackAnswers.map((entry) => entry.text), ["Temporarily unavailable"])
+  assert.deepEqual(switchRuntime.sessionListCalls, [])
+  assert.deepEqual(switchState.bindings["100:7"], { projectAlias: "demo", sessionId: "ses_current" })
+
+  const feedState = { feedByContext: { "100:7": "main" } }
+  const feedMutations = []
+  const feedRuntime = makeRuntime({
+    store: {
+      get: () => feedState,
+      setFeedMode(ctxKey, mode) {
+        feedMutations.push({ ctxKey, mode })
+        feedState.feedByContext[ctxKey] = mode
+      },
+      async flush() {
+        throw new Error("state write failed")
+      },
+    },
+  })
+  await assert.rejects(() => createCallbackHandlers(feedRuntime.runtime).handleTelegramCallback(makeCallback("feed|verbose")), (err) => {
+    assert.equal(err.isBoundaryError, true)
+    assert.equal(err.source, "state")
+    assert.equal(err.outcome, "retryable")
+    return true
+  })
+  assert.deepEqual(feedRuntime.callbackAnswers.map((entry) => entry.text), ["Temporarily unavailable"])
+  assert.deepEqual(feedMutations, [{ ctxKey: "100:7", mode: "verbose" }])
+  assert.deepEqual(feedState.feedByContext, { "100:7": "main" })
+
+  const modelState = { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } }, modelPrefsByContext: {} }
+  const modelMutations = []
+  const modelRuntime = makeRuntime({
+    storeState: modelState,
+    store: {
+      get: () => modelState,
+      async flush() {
+        throw new Error("state write failed")
+      },
+    },
+    setThreadModelPreference: async (ctxMeta, _binding, value) => {
+      modelMutations.push({ ctxKey: ctxMeta.ctxKey, value })
+      modelState.modelPrefsByContext[ctxMeta.ctxKey] = value
+      return { ok: true, callbackText: "Model: custom" }
+    },
+  })
+  await assert.rejects(() => createCallbackHandlers(modelRuntime.runtime).handleTelegramCallback(makeCallback("m|apply|openai/gpt-5|xhigh")), (err) => {
+    assert.equal(err.isBoundaryError, true)
+    assert.equal(err.source, "state")
+    assert.equal(err.outcome, "retryable")
+    return true
+  })
+  assert.deepEqual(modelRuntime.callbackAnswers.map((entry) => entry.text), ["Temporarily unavailable"])
+  assert.deepEqual(modelMutations, [{ ctxKey: "100:7", value: { mode: "custom", model: "openai/gpt-5", variant: "xhigh" } }])
+  assert.deepEqual(modelState.modelPrefsByContext, {})
+})
+
 test("createCallbackHandlers rejects unsafe session switch callback ids", async () => {
   const getSessionCalls = []
   const { runtime, callbackAnswers, bindCalls } = makeRuntime({
@@ -807,6 +889,39 @@ test("createCallbackHandlers rebinds and creates replacement sessions for target
   assert.match(sentMessages[1].text, /Created and bound chat 100 \/ topic 7 to demo \/ ses_new\./)
 })
 
+test("createCallbackHandlers does not retry new-session callbacks after binding flush failure", async () => {
+  const state = { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_old" } }, sessionIndex: {} }
+  const createCalls = []
+  const { runtime, callbackAnswers, sentMessages } = makeRuntime({
+    storeState: state,
+    store: {
+      get: () => state,
+      async flush() {
+        throw new Error("state write failed")
+      },
+    },
+    bindCtxToSession: async (ctxMeta, projectAlias, sessionId) => {
+      state.bindings[ctxMeta.ctxKey] = { projectAlias, sessionId }
+    },
+    ocByAlias: {
+      demo: {
+        async createSession() {
+          createCalls.push(true)
+          return { id: "ses_new" }
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("b|new|100:7", { chatType: "private", threadIdOr0: 0 }))
+
+  assert.deepEqual(createCalls, [true])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Action failed"])
+  assert.match(sentMessages.at(-1)?.text, /failed to persist the Telegram binding/)
+  assert.deepEqual(state.bindings["100:7"], { projectAlias: "demo", sessionId: "ses_old" })
+})
+
 test("createCallbackHandlers refuses invalid replacement session ids", async () => {
   const flushCalls = []
   const { runtime, callbackAnswers, bindCalls, sentMessages } = makeRuntime({
@@ -1136,6 +1251,43 @@ test("createCallbackHandlers skips duplicate permission callbacks via idempotenc
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["OK", "Already handled"])
 })
 
+test("createCallbackHandlers rethrows permission reply durability failures", async () => {
+  const idempotencyKeys = new Set()
+  const replyCalls = []
+  const { runtime, callbackAnswers } = makeRuntime({
+    store: {
+      markIdempotencyKey: (key) => {
+        idempotencyKeys.add(key)
+        return true
+      },
+      deletePendingPermission: () => true,
+      async flush() {
+        throw new Error("state write failed")
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async replyPermission(permissionId, payload) {
+          replyCalls.push({ permissionId, payload })
+          return { ok: true }
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await assert.rejects(() => handlers.handleTelegramCallback(makeCallback("p|demo|perm_durable|once")), (err) => {
+    assert.equal(err.isBoundaryError, true)
+    assert.equal(err.source, "state")
+    assert.equal(err.outcome, "retryable")
+    return true
+  })
+
+  assert.deepEqual(replyCalls, [{ permissionId: "perm_durable", payload: { reply: "once" } }])
+  assert.equal(idempotencyKeys.size, 1)
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Temporarily unavailable"])
+})
+
 test("createCallbackHandlers degrades transient permission callback failures without blocking the user", async () => {
   const deletedMessages = []
   const { runtime, callbackAnswers, sentMessages, loggerErrors } = makeRuntime({
@@ -1394,6 +1546,28 @@ test("createCallbackHandlers handles single-choice and multi-choice question ste
     { chatId: 100, messageId: 909 },
     { chatId: 100, messageId: 910 },
   ])
+})
+
+test("createCallbackHandlers does not persist multi-choice toggles when step edit fails", async () => {
+  const wizard = makeWizard({
+    id: "q_multi_edit_fail",
+    questions: [{ header: "Checks", question: "Pick", multiple: true, options: [{ label: "lint" }, { label: "test" }] }],
+    selectedByIndex: { 0: ["test"] },
+  })
+  const { runtime, callbackAnswers, persistedWizards } = makeRuntime({
+    getWizard: () => wizard,
+    ocByAlias: { demo: {} },
+    sendCurrentQuestionStep: async () => {
+      throw new Error("edit failed")
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("q|demo|q_multi_edit_fail|0|t|0", { messageId: 910 }))
+
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Action failed"])
+  assert.deepEqual(persistedWizards, [])
+  assert.deepEqual(wizard.selectedByIndex, { 0: ["test"] })
 })
 
 test("createCallbackHandlers rejects invalid question callback shapes and options", async () => {

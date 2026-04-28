@@ -314,6 +314,17 @@ test("StateStore persists and prunes idempotency ledger entries", async () => {
     createdAt: 10,
   }), true)
   assert.equal(store.hasIdempotencyKey("permission-reply:demo:perm_1:once"), true)
+  assert.equal(store.deleteIdempotencyKey("permission-reply:demo:perm_1:once"), true)
+  assert.equal(store.hasIdempotencyKey("permission-reply:demo:perm_1:once"), false)
+  assert.equal(store.deleteIdempotencyKey("permission-reply:demo:perm_1:once"), false)
+  assert.equal(store.markIdempotencyKey("permission-reply:demo:perm_1:once", {
+    kind: "permission-reply",
+    projectAlias: "demo",
+    ctxKey: "100:7",
+    operation: "replyPermission",
+    action: "once",
+    createdAt: 10,
+  }), true)
   assert.equal(store.pruneIdempotency({ now: 20, maxAgeMs: 5 }), 1)
   assert.equal(store.hasIdempotencyKey("permission-reply:demo:perm_1:once"), false)
 })
@@ -656,6 +667,31 @@ test("StateStore load fails closed on corrupt persisted state", async () => {
   await assert.rejects(() => store.load(), /JSON/)
   assert.equal(store.get().updateOffset, null)
   assert.deepEqual(store.get().bindings, {})
+})
+
+test("StateStore recovers an emergency bak instead of silently resetting missing state", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  const backupPath = `${filePath}.bak.123456.abcdef123456`
+  const saved = {
+    schemaVersion: 5,
+    updateOffset: 777,
+    bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_1" } },
+    sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 0 } },
+    feedByContext: {},
+    modelPrefsByContext: {},
+    pendingPrompts: { permissions: {}, rejectNotes: {}, customAnswers: {}, questionWizards: {} },
+    pendingRuntimeOnlineNotice: null,
+    idempotency: { keys: {} },
+  }
+  await fs.writeFile(backupPath, JSON.stringify(saved, null, 2), "utf8")
+
+  const store = new StateStore({ filePath, logger: makeLogger() })
+  const loaded = await store.load()
+
+  assert.equal(loaded.updateOffset, 777)
+  assert.deepEqual(loaded.bindings, saved.bindings)
+  assert.deepEqual(JSON.parse(await fs.readFile(filePath, "utf8")), saved)
 })
 
 test("StateStore flush rejects write failures", async () => {

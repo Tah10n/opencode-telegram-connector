@@ -214,6 +214,14 @@ export class StateStore {
     return true
   }
 
+  deleteIdempotencyKey(key) {
+    const normalized = normalizeIdempotencyKey(key)
+    if (!normalized || !this.state.idempotency?.keys?.[normalized]) return false
+    delete this.state.idempotency.keys[normalized]
+    this.scheduleSave()
+    return true
+  }
+
   async markIdempotencyKeyAndFlush(key, metadata = {}) {
     const ok = this.markIdempotencyKey(key, metadata)
     if (ok) await this.flush()

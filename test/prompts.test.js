@@ -199,6 +199,77 @@ test("handleQuestionAsked retries after Telegram question step delivery fails", 
   assert.deepEqual(delivered, [["demo", "question"]])
 })
 
+test("sendCurrentQuestionStep surfaces edit failures without recording message id", async () => {
+  const { handlers } = makePromptRuntime({
+    tg: {
+      async editMessageText() {
+        throw new Error("telegram edit down")
+      },
+    },
+  })
+  const wizard = {
+    projectAlias: "demo",
+    request: {
+      id: "q_edit_fail",
+      sessionID: "ses_1",
+      questions: [{ header: "Checks", question: "Pick", multiple: true, options: [{ label: "lint" }] }],
+    },
+    index: 0,
+    selectedByIndex: { 0: ["lint"] },
+    messageIdByIndex: {},
+    ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+  }
+
+  await assert.rejects(() => handlers.sendCurrentQuestionStep(wizard, { editMessageId: 55 }), /telegram edit down/)
+  assert.deepEqual(wizard.messageIdByIndex, {})
+})
+
+test("finishQuestionWizard rethrows durability failures after accepted replies", async () => {
+  const replyCalls = []
+  const marked = []
+  const { handlers } = makePromptRuntime({
+    store: {
+      markIdempotencyKey(key, metadata) {
+        marked.push({ key, metadata })
+        return true
+      },
+      deleteQuestionWizard() {},
+      deleteAwaitingCustomAnswer() {},
+      async flush() {
+        throw new Error("state write failed")
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async replyQuestion(questionId, answers) {
+          replyCalls.push({ questionId, answers })
+          return { ok: true }
+        },
+      },
+    },
+  })
+  const wizard = {
+    projectAlias: "demo",
+    sessionID: "ses_1",
+    request: { id: "q_durable", questions: [{ header: "Reason", question: "Why?" }] },
+    answers: [["because"]],
+    ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+  }
+
+  await assert.rejects(() => handlers.finishQuestionWizard(wizard, {
+    idempotencyEntries: [{ key: "telegram-message:100:7:77", metadata: { kind: "telegram-message", operation: "replyQuestion" } }],
+  }), (err) => {
+    assert.equal(err.isBoundaryError, true)
+    assert.equal(err.source, "state")
+    assert.equal(err.outcome, "retryable")
+    return true
+  })
+
+  assert.deepEqual(replyCalls, [{ questionId: "q_durable", answers: [["because"]] }])
+  assert.equal(marked.length, 2)
+  assert.equal(marked[1].key, "telegram-message:100:7:77")
+})
+
 test("handleQuestionAsked does not baseline-suppress a first SSE prompt after Telegram delivery fails", async () => {
   let fail = true
   const request = {

@@ -1,7 +1,7 @@
 import { normalizeFeedMode } from "../state/store.js"
 import { normalizeModelReference } from "../model-selection.js"
 import { requireSafeOpenCodeId } from "../opencode/ids.js"
-import { classifyBoundaryError, isRetryableBoundaryError, isStaleBoundaryError } from "../boundary-errors.js"
+import { classifyBoundaryError, isRetryableBoundaryError, isStaleBoundaryError, makeBoundaryError } from "../boundary-errors.js"
 import { makeInlineKeyboard } from "../telegram/client.js"
 import {
   permissionNoteIdempotencyPrefix,
@@ -95,9 +95,64 @@ export function createCallbackHandlers(runtime) {
       return store.markIdempotencyKey(key, metadata)
     }
     if (typeof store?.markIdempotencyKeyAndFlush === "function") {
-      return store.markIdempotencyKeyAndFlush(key, metadata)
+      try {
+        return await store.markIdempotencyKeyAndFlush(key, metadata)
+      } catch (err) {
+        throw makeStateDurabilityError(err, "persist callback idempotency")
+      }
     }
     return false
+  }
+
+  function makeStateDurabilityError(err, operation) {
+    return makeBoundaryError({
+      source: "state",
+      operation,
+      kind: "durability",
+      outcome: "retryable",
+      message: `${operation} failed: ${err?.message || String(err)}`,
+      cause: err,
+    })
+  }
+
+  function isStateDurabilityError(err) {
+    return err?.isBoundaryError === true && err.source === "state" && err.kind === "durability"
+  }
+
+  async function flushStoreIfAvailable() {
+    if (typeof store?.flush !== "function") return
+    try {
+      await store.flush()
+    } catch (err) {
+      throw makeStateDurabilityError(err, "persist callback state")
+    }
+  }
+
+  function cloneStoreStateSnapshot() {
+    if (typeof store?.get !== "function") return null
+    const current = store.get()
+    if (!current || typeof current !== "object") return null
+    return JSON.parse(JSON.stringify(current))
+  }
+
+  function restoreStoreStateSnapshot(snapshot) {
+    if (!snapshot || typeof store?.get !== "function") return
+    const current = store.get()
+    if (!current || typeof current !== "object") return
+    for (const key of Object.keys(current)) delete current[key]
+    Object.assign(current, JSON.parse(JSON.stringify(snapshot)))
+  }
+
+  async function commitStateMutation(mutate, { shouldCommit = () => true } = {}) {
+    const snapshot = cloneStoreStateSnapshot()
+    try {
+      const result = await mutate()
+      if (shouldCommit(result)) await flushStoreIfAvailable()
+      return result
+    } catch (err) {
+      restoreStoreStateSnapshot(snapshot)
+      throw err
+    }
   }
 
   function cleanupPermissionState(ctxKey, projectAlias, permissionId, sessionID = "") {
@@ -215,7 +270,7 @@ export function createCallbackHandlers(runtime) {
     if (typeof store?.setPendingRuntimeOnlineNotice !== "function") return
     try {
       store.setPendingRuntimeOnlineNotice({ kind: "restart", chatId: ctxMeta.chatId, createdAt: Date.now() })
-      await store.flush?.()
+      await flushStoreIfAvailable()
     } catch (err) {
       runtime.logger?.error?.("Failed to persist runtime restart notice:", err?.message || String(err))
     }
@@ -342,12 +397,13 @@ export function createCallbackHandlers(runtime) {
         }
         try {
           await oc.getSession(safeTargetSessionId)
-          await bindCtxToSession(ctxMeta, projectAlias, safeTargetSessionId)
         } catch (err) {
           await answerCallbackQuery(callbackQuery.id, "Unavailable")
           await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err)).catch(ignoreError)
           return
         }
+
+        await commitStateMutation(() => bindCtxToSession(ctxMeta, projectAlias, safeTargetSessionId))
 
         await answerCallbackQuery(callbackQuery.id, "Switched")
         await renderSessionsList({ ...ctxMeta, chatId: msg?.chat?.id || ctxMeta.chatId }, {
@@ -444,7 +500,7 @@ export function createCallbackHandlers(runtime) {
             return
           }
           const summary = store.repairBindingIndex?.() || { changed: false }
-          if (summary.changed) await store.flush?.()
+          if (summary.changed) await flushStoreIfAvailable()
           await answerCallbackQuery(callbackQuery.id, summary.changed ? "Repaired" : "Already clean")
           if (typeof handleBindings === "function") await handleBindings(ctxMeta).catch(ignoreError)
           return
@@ -511,8 +567,7 @@ export function createCallbackHandlers(runtime) {
             await sendToThread(ctxMeta, `Binding changed for ${describeTargetCtx(targetCtxKey)}. Open /status or /bindings and confirm again.`).catch(ignoreError)
             return
           }
-          const ok = store.unbind(targetCtxKey)
-          if (ok) await store.flush?.()
+          const ok = await commitStateMutation(() => store.unbind(targetCtxKey), { shouldCommit: (result) => !!result })
           await answerCallbackQuery(callbackQuery.id, ok ? "Unbound" : "Not bound")
           await deleteInteractiveMessage(ctxMeta, msg?.message_id)
           await sendToThread(ctxMeta, ok ? `Changed: binding removed.\nRemoved binding for ${describeTargetCtx(targetCtxKey)}.` : "Binding was already absent.").catch(ignoreError)
@@ -535,11 +590,18 @@ export function createCallbackHandlers(runtime) {
             }
             const safeNextSessionId = requireSafeOpenCodeId(nextSessionId, "session id")
             const targetMeta = { ...targetCtx, ctxKey: targetCtxKey, chatType: ctxMeta.chatType }
-            await bindCtxToSession(targetMeta, projectAlias, safeNextSessionId)
-            await store.flush?.()
+            await commitStateMutation(() => bindCtxToSession(targetMeta, projectAlias, safeNextSessionId))
             await answerCallbackQuery(callbackQuery.id, action === "rebind" ? "Rebound" : "Created")
             await sendToThread(ctxMeta, `${action === "rebind" ? "Rebound" : "Created and bound"} ${describeTargetCtx(targetCtxKey)} to ${projectAlias} / ${safeNextSessionId}.`).catch(ignoreError)
           } catch (err) {
+            if (isStateDurabilityError(err)) {
+              if (action === "new") {
+                await answerCallbackQuery(callbackQuery.id, "Action failed")
+                await sendToThread(ctxMeta, "Created a new opencode session, but failed to persist the Telegram binding. Open /sessions and choose the session again after fixing state storage.").catch(ignoreError)
+                return
+              }
+              throw err
+            }
             await answerCallbackQuery(callbackQuery.id, "Unavailable")
             await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err)).catch(ignoreError)
           }
@@ -566,7 +628,7 @@ export function createCallbackHandlers(runtime) {
           return
         }
         const mode = normalizeFeedMode(rawMode)
-        store.setFeedMode(ctxMeta.ctxKey, mode)
+        await commitStateMutation(() => store.setFeedMode(ctxMeta.ctxKey, mode))
         await answerCallbackQuery(callbackQuery.id, `Feed: ${feedModeLabel(mode)}`)
         await renderFeedSettings(ctxMeta, { editMessageId: msg?.message_id, noticeText: `Changed: this thread feed is now ${feedModeLabel(mode)}.` }).catch(ignoreError)
         return
@@ -612,10 +674,10 @@ export function createCallbackHandlers(runtime) {
           const nextMode = parts[2]
           let setResult = null
           if (nextMode === "inherit") {
-            setResult = await setThreadModelPreference(ctxMeta, binding, null)
+            setResult = await commitStateMutation(() => setThreadModelPreference(ctxMeta, binding, null), { shouldCommit: (result) => result?.ok !== false })
             await answerCallbackQuery(callbackQuery.id, setResult?.callbackText || "Model: inherit")
           } else if (nextMode === "project-default") {
-            setResult = await setThreadModelPreference(ctxMeta, binding, { mode: "project-default" })
+            setResult = await commitStateMutation(() => setThreadModelPreference(ctxMeta, binding, { mode: "project-default" }), { shouldCommit: (result) => result?.ok !== false })
             if (!setResult?.ok) {
               await answerCallbackQuery(callbackQuery.id, setResult?.callbackText || "Unavailable")
               await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(ignoreError)
@@ -667,7 +729,7 @@ export function createCallbackHandlers(runtime) {
             return
           }
           const variant = variantToken === "~" ? "" : variantToken
-          const result = await setThreadModelPreference(ctxMeta, binding, { mode: "custom", model: modelKey, variant })
+          const result = await commitStateMutation(() => setThreadModelPreference(ctxMeta, binding, { mode: "custom", model: modelKey, variant }), { shouldCommit: (mutationResult) => mutationResult?.ok !== false })
           await answerCallbackQuery(callbackQuery.id, result?.callbackText || (variant ? `Model: ${modelKey} ${variant}` : `Model: ${modelKey}`))
           await renderModelSettings(ctxMeta, {
             binding,
@@ -734,7 +796,7 @@ export function createCallbackHandlers(runtime) {
           const replyKey = permissionReplyIdempotencyKey(projectAlias, sessionID, permissionId, action)
           if (hasIdempotencyKey(replyKey) || hasHandledPermission(projectAlias, sessionID, permissionId)) {
             cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, sessionID)
-            await store.flush?.()
+            await flushStoreIfAvailable()
             await answerCallbackQuery(callbackQuery.id, "Already handled")
             await deleteInteractiveMessage(ctxMeta, msg?.message_id)
             return
@@ -751,7 +813,7 @@ export function createCallbackHandlers(runtime) {
                 action,
               })
               cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, sessionID)
-              await store.flush?.()
+              await flushStoreIfAvailable()
               recordCallbackOutcome?.(projectAlias, "stale")
               await answerCallbackQuery(callbackQuery.id, "No longer active")
               await deleteInteractiveMessage(ctxMeta, msg?.message_id)
@@ -774,7 +836,7 @@ export function createCallbackHandlers(runtime) {
           })
           recordPromptAnswered?.(projectAlias, "permission", "ok")
           cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, sessionID)
-          await store.flush?.()
+          await flushStoreIfAvailable()
           await answerCallbackQuery(callbackQuery.id, "OK")
           await deleteInteractiveMessage(ctxMeta, msg?.message_id)
           return
@@ -782,7 +844,7 @@ export function createCallbackHandlers(runtime) {
         if (action === "reject_note") {
           if (hasHandledPermission(projectAlias, sessionID, permissionId)) {
             cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, sessionID)
-            await store.flush?.()
+            await flushStoreIfAvailable()
             await answerCallbackQuery(callbackQuery.id, "Already handled")
             await deleteInteractiveMessage(ctxMeta, msg?.message_id)
             return
@@ -796,7 +858,7 @@ export function createCallbackHandlers(runtime) {
             await answerCallbackQuery(callbackQuery.id, "Unavailable")
             return
           }
-          await store.flush?.()
+          await flushStoreIfAvailable()
           await answerCallbackQuery(callbackQuery.id, "Send note")
           await deleteInteractiveMessage(ctxMeta, msg?.message_id)
           return
@@ -824,7 +886,7 @@ export function createCallbackHandlers(runtime) {
           const rejectKey = questionRejectIdempotencyKey(projectAlias, sessionID, questionId)
           if (hasIdempotencyKey(rejectKey) || hasHandledQuestion(projectAlias, sessionID, questionId)) {
             cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, sessionID)
-            await store.flush?.()
+            await flushStoreIfAvailable()
             await answerCallbackQuery(callbackQuery.id, "Already handled")
             await deleteInteractiveMessage(ctxMeta, msg?.message_id)
             return
@@ -840,7 +902,7 @@ export function createCallbackHandlers(runtime) {
                 operation: "rejectQuestion",
               })
               cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, sessionID)
-              await store.flush?.()
+              await flushStoreIfAvailable()
               recordCallbackOutcome?.(projectAlias, "stale")
               await answerCallbackQuery(callbackQuery.id, "No longer active")
               await deleteInteractiveMessage(ctxMeta, msg?.message_id)
@@ -862,7 +924,7 @@ export function createCallbackHandlers(runtime) {
           })
           recordPromptAnswered?.(projectAlias, "question", "rejected")
           cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, sessionID)
-          await store.flush?.()
+          await flushStoreIfAvailable()
           await answerCallbackQuery(callbackQuery.id, "Rejected")
           await deleteInteractiveMessage(ctxMeta, msg?.message_id)
           return
@@ -871,7 +933,7 @@ export function createCallbackHandlers(runtime) {
         if (!wizard) {
           if (hasHandledQuestion(projectAlias, sessionID, questionId)) {
             cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, sessionID)
-            await store.flush?.()
+            await flushStoreIfAvailable()
             await answerCallbackQuery(callbackQuery.id, "Already handled")
             await deleteInteractiveMessage(ctxMeta, msg?.message_id)
             return
@@ -912,7 +974,7 @@ export function createCallbackHandlers(runtime) {
             await answerCallbackQuery(callbackQuery.id, "Unavailable")
             return
           }
-          await store.flush?.()
+          await flushStoreIfAvailable()
           await answerCallbackQuery(callbackQuery.id, "Send answer")
           await deleteInteractiveMessage(ctxMeta, msg?.message_id)
           return
@@ -1020,6 +1082,11 @@ export function createCallbackHandlers(runtime) {
     } catch (err) {
       runtime.logger?.error?.("Callback handler error:", err?.message || String(err))
       const classification = classifyBoundaryError(err)
+      if (classification.source === "state" && classification.kind === "durability") {
+        recordCallbackOutcome?.(callbackProjectAlias, "retryable")
+        await answerCallbackQuery(callbackQuery.id, "Temporarily unavailable")
+        throw classification.error
+      }
       if (classification.stale) {
         recordCallbackOutcome?.(callbackProjectAlias, "stale")
         await answerCallbackQuery(callbackQuery.id, "No longer active")

@@ -157,6 +157,28 @@ test("readJsonFile returns null for missing files and surfaces parse errors", as
   await assert.rejects(() => readJsonFile(invalidPath), /Expected property name|Unexpected token/)
 })
 
+test("readJsonFile restores an emergency bak file when the canonical state is missing", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  const backupPath = `${filePath}.bak.123456.abcdef123456`
+  await fs.writeFile(backupPath, JSON.stringify({ schemaVersion: 5, updateOffset: 42 }, null, 2), "utf8")
+
+  const loaded = await readJsonFile(filePath)
+
+  assert.deepEqual(loaded, { schemaVersion: 5, updateOffset: 42 })
+  assert.deepEqual(JSON.parse(await fs.readFile(filePath, "utf8")), { schemaVersion: 5, updateOffset: 42 })
+})
+
+test("readJsonFile fails closed when only an invalid emergency bak exists", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  const backupPath = `${filePath}.bak.123456.abcdef123456`
+  await fs.writeFile(backupPath, "{not-json", "utf8")
+
+  await assert.rejects(() => readJsonFile(filePath), /emergency backup.*could not be loaded.*Refusing to start with empty state/)
+  await assert.rejects(() => fs.readFile(filePath, "utf8"), /ENOENT/)
+})
+
 test("createStateFileBackup copies state files and rotates old backups", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
