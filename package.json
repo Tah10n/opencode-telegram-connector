@@ -23,7 +23,6 @@
     "CODE_OF_CONDUCT.md",
     "RELEASING.md",
     ".env.example",
-    "projects.example.json",
     "connector.config.example.mjs"
   ],
   "type": "module",
