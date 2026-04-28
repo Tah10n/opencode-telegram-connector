@@ -78,6 +78,21 @@ test("sessionModelInfoFromMessage extracts model info", () => {
   assert.equal(result?.label, "anthropic/claude-3 high")
 })
 
+test("sessionModelInfoFromMessage supports model payload objects", () => {
+  const result = sessionModelInfoFromMessage({
+    model: {
+      provider: "google",
+      model: "gemini-2.0-flash",
+      variant: "low",
+    },
+  })
+
+  assert.equal(result?.model?.providerID, "google")
+  assert.equal(result?.model?.modelID, "gemini-2.0-flash")
+  assert.equal(result?.variant, "low")
+  assert.equal(result?.label, "google/gemini-2.0-flash low")
+})
+
 test("sessionModelInfoFromMessage returns null for missing model", () => {
   assert.equal(sessionModelInfoFromMessage(null), null)
   assert.equal(sessionModelInfoFromMessage({}), null)
@@ -107,6 +122,17 @@ test("configuredModelInfo reads from agent config when default_agent set", () =>
   assert.equal(result?.variant, "high")
 })
 
+test("configuredModelInfo reads from legacy agents map", () => {
+  const result = configuredModelInfo({
+    default_agent: "primary",
+    agents: { primary: { model: { providerID: "openai", modelID: "gpt-4o-mini" }, variant: "minimal" } },
+  })
+
+  assert.equal(result?.model?.providerID, "openai")
+  assert.equal(result?.model?.modelID, "gpt-4o-mini")
+  assert.equal(result?.variant, "minimal")
+})
+
 test("configuredModelInfo falls back to top-level model", () => {
   const result = configuredModelInfo({ model: "openai/gpt-4" })
   assert.equal(result?.model?.providerID, "openai")
@@ -120,6 +146,7 @@ test("configuredModelInfo returns null for missing model", () => {
 
 test("modelSourceLabel returns readable strings", () => {
   assert.equal(modelSourceLabel("thread-custom"), "Thread custom override")
+  assert.equal(modelSourceLabel("thread-project-default"), "Thread project default override")
   assert.equal(modelSourceLabel("project-default"), "Inherited from project default")
   assert.equal(modelSourceLabel("unknown-source"), "Unknown")
 })

@@ -142,6 +142,13 @@ test("safeErrorText redacts bot tokens and sensitive paths from error stacks", (
   assert.ok(!pathResult.includes("state.json"), "state path must be redacted")
 })
 
+test("safeErrorText falls back to message when stack is unavailable", () => {
+  const token = "1111111111:TESTTOKENABCD"
+  const result = safeErrorText({ message: `failed with /bot${token}` })
+  assert.ok(!result.includes(token), "token must be redacted from message")
+  assert.match(result, /\/bot\*\*\*/)
+})
+
 test("runCli exposes runtime stop and restart shutdown requests", async () => {
   async function runAction(action) {
     const exits = []

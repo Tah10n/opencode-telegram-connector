@@ -3,7 +3,7 @@ import assert from "node:assert/strict"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { buildProjectsOverviewKeyboard, createOverviewHelpers } from "../src/connector/overview.js"
+import { buildProjectsOverviewKeyboard, buildProjectsOverviewText, createOverviewHelpers } from "../src/connector/overview.js"
 
 function swapEnv(t, patch) {
   const previous = new Map()
@@ -44,6 +44,62 @@ test("createOverviewHelpers startServerKeyboard packs callback data", () => {
   const keyboard = helpers.startServerKeyboard("veryLongAliasNameForProject1234567890")
   assert.equal(keyboard.inline_keyboard[0][0].callback_data, "packed:srv|veryLongAliasNameForProject1234567890|start")
   assert.equal(keyboard.inline_keyboard[1][0].callback_data, "packed:srv|close")
+})
+
+test("buildProjectsOverviewText renders empty and populated project summaries", () => {
+  assert.equal(buildProjectsOverviewText({ projects: {} }), "No projects")
+
+  const text = buildProjectsOverviewText({
+    projects: {
+      demo: { baseUrl: "http://127.0.0.1:4312/path" },
+      other: { baseUrl: "http://127.0.0.1:4313" },
+    },
+    bindings: {
+      "100:7": { projectAlias: "demo" },
+      "100:0": { projectAlias: "demo" },
+      "100:9": { projectAlias: "demo" },
+      "200:0": { projectAlias: "other" },
+    },
+    startupSessionByProject: {
+      demo: "demo-session",
+      other: "other-session",
+    },
+    getProjectSseStatus: (alias) => (alias === "demo" ? "connected" : "down"),
+    parseCtxKey: (ctxKey) => {
+      const [chatId, threadIdOr0] = String(ctxKey).split(":")
+      return { chatId: Number(chatId), threadIdOr0: Number(threadIdOr0) }
+    },
+    formatThreadLabel: (threadIdOr0) => (threadIdOr0 === 0 ? "main" : `topic-${threadIdOr0}`),
+    previewLimit: 2,
+  })
+
+  assert.match(text, /Projects:/)
+  assert.match(text, /- demo/)
+  assert.match(text, /URL: http:\/\/127\.0\.0\.1:4312\/path/)
+  assert.match(text, /Startup session: demo-session/)
+  assert.match(text, /SSE: connected/)
+  assert.match(text, /Bindings: 3 \(chat 100\/topic-7, chat 100\/main, \+1 more\)/)
+  assert.match(text, /- other/)
+  assert.match(text, /Bindings: 1 \(chat 200\/main\)/)
+})
+
+test("buildProjectsOverviewText hides binding scopes when requested", () => {
+  const text = buildProjectsOverviewText({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312" } },
+    bindings: {
+      "100:7": { projectAlias: "demo" },
+    },
+    startupSessionByProject: {
+      demo: "demo-session",
+    },
+    getProjectSseStatus: () => "connected",
+    parseCtxKey: () => null,
+    formatThreadLabel: () => "main",
+    showBindingScopes: false,
+    hiddenBindingsLabel: "hidden outside private chat",
+  })
+
+  assert.match(text, /Bindings: hidden outside private chat/)
 })
 
 test("buildProjectsOverviewKeyboard includes safe project actions", () => {
