@@ -1,8 +1,10 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import { spawnSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { createShutdownHandler, isCliEntrypoint, runCli, safeErrorText } from "../src/cli.js"
 
+const indexPath = fileURLToPath(new URL("../index.mjs", import.meta.url))
 const cliPath = fileURLToPath(new URL("../src/cli.js", import.meta.url))
 
 function makeProcessStub() {
@@ -39,6 +41,16 @@ test("isCliEntrypoint recognizes direct and PM2 fork entrypoints", () => {
   assert.equal(isCliEntrypoint({ argv: ["node", cliPath], env: {} }), true)
   assert.equal(isCliEntrypoint({ argv: ["node", "ProcessContainerFork.js"], env: { pm_exec_path: cliPath } }), true)
   assert.equal(isCliEntrypoint({ argv: ["node", "ProcessContainerFork.js"], env: { pm_exec_path: "C:\\other\\app.js" } }), false)
+})
+
+test("index.mjs reuses the CLI entrypoint behavior", () => {
+  const cliRun = spawnSync(process.execPath, [cliPath, "--help"], { encoding: "utf8" })
+  const indexRun = spawnSync(process.execPath, [indexPath, "--help"], { encoding: "utf8" })
+
+  assert.equal(cliRun.status, 0)
+  assert.equal(indexRun.status, 0)
+  assert.equal(indexRun.stdout, cliRun.stdout)
+  assert.equal(indexRun.stderr, cliRun.stderr)
 })
 
 test("runCli wires signal handlers and preserves fatal exit codes", async () => {

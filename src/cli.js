@@ -137,17 +137,28 @@ export async function runCli({
   }
 }
 
-export function isCliEntrypoint({ argv = process.argv, env = process.env } = {}) {
+export function isModuleEntrypoint(importMetaUrl, { argv = process.argv, env = process.env } = {}) {
   const candidates = [argv?.[1], env?.pm_exec_path]
-  return candidates.some((entrypoint) => entrypoint && import.meta.url === pathToFileURL(entrypoint).href)
+  return candidates.some((entrypoint) => entrypoint && importMetaUrl === pathToFileURL(entrypoint).href)
+}
+
+export function isCliEntrypoint(options) {
+  return isModuleEntrypoint(import.meta.url, options)
+}
+
+export function runCliEntrypoint(options = {}) {
+  return runCli(options).catch((err) => {
+    if (!err?.cliLogged) {
+      const reporter = createCliReporter({
+        stderr: options.stderr || console.error,
+        getLogFormat: () => envForProcess(options.processImpl || process).CONNECTOR_LOG_FORMAT,
+      })
+      reporter.error("Connector startup failed:", err)
+    }
+    ;(options.exit || ((code) => process.exit(code)))(1)
+  })
 }
 
 if (isCliEntrypoint()) {
-  runCli().catch((err) => {
-    if (!err?.cliLogged) {
-      const reporter = createCliReporter({ stderr: console.error, getLogFormat: () => process.env.CONNECTOR_LOG_FORMAT })
-      reporter.error("Connector startup failed:", err)
-    }
-    process.exit(1)
-  })
+  void runCliEntrypoint()
 }
