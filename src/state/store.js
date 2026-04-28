@@ -1,6 +1,7 @@
 import path from "node:path"
 import fs from "node:fs/promises"
 import { createStateFileBackup, readJsonFile, writeJsonFileAtomic } from "./fileStore.js"
+import { loadStateWithMigration, migrateStateIfNeeded, preserveStateBeforeRecovery } from "./backup.js"
 import { normalizeModelPreference, storedModelPreference } from "../model-selection.js"
 
 export const STATE_SCHEMA_VERSION = 5
@@ -25,6 +26,30 @@ export class StateSchemaValidationError extends Error {
 export function normalizeFeedMode(value) {
   if (value === "main" || value === "main+changes" || value === "verbose") return value
   return DEFAULT_FEED_MODE
+}
+
+function schemaValidationError(errors, { filePath } = {}) {
+  return new StateSchemaValidationError(errors, { filePath })
+}
+
+function migrationOptionsForLoad(filePath) {
+  return {
+    filePath,
+    schemaVersion: STATE_SCHEMA_VERSION,
+    assertValidCurrentState,
+    createSchemaValidationError: schemaValidationError,
+    normalizeBindings,
+    normalizeSessionIndex,
+    normalizeFeedByContext,
+    normalizeModelPrefsByContext,
+    normalizePendingPrompts,
+    normalizePendingRuntimeOnlineNotice,
+    normalizeIdempotencyLedger,
+    defaultFeedByContext,
+    defaultModelPrefsByContext,
+    defaultPendingPrompts,
+    defaultIdempotencyLedger,
+  }
 }
 
 function defaultFeedByContext() {
@@ -104,46 +129,29 @@ export class StateStore {
       throw err
     }
 
-    let result
-    try {
-      result = migrateStateIfNeeded(loaded, { filePath: this.filePath })
-    } catch (err) {
-      if (err instanceof StateSchemaValidationError) {
-        await this.preserveStateBeforeRecovery(loaded, { reason: "invalid" }).catch((backupErr) => {
-          this.logger?.error?.("Failed to preserve invalid state file:", backupErr?.message || String(backupErr))
-        })
-      }
-      throw err
-    }
+    const state = await loadStateWithMigration({
+      loaded,
+      filePath: this.filePath,
+      logger: this.logger,
+      backupMaxFiles: this.backupMaxFiles,
+      migrateStateIfNeededImpl: (candidate, options = {}) => migrateStateIfNeeded(candidate, { ...migrationOptionsForLoad(this.filePath), ...options }),
+      writeJsonFileAtomicImpl: this._writeJsonFileAtomic,
+      createStateFileBackupImpl: this._createStateFileBackup,
+      schemaVersion: STATE_SCHEMA_VERSION,
+    })
 
-    if (result.migrated) {
-      const backupPath = await this.preserveStateBeforeRecovery(loaded, { reason: "migration" })
-      const snapshot = cloneStateForWrite(result.state)
-      try {
-        await this._writeJsonFileAtomic(this.filePath, snapshot)
-      } catch (err) {
-        this.logger?.error?.(
-          "Failed to persist migrated state; original state file was preserved before migration:",
-          backupPath,
-          err?.message || String(err),
-        )
-        throw err
-      }
-      this.logger?.info?.("State migrated to schema version", STATE_SCHEMA_VERSION, "backup:", backupPath)
-    }
-
-    this.state = result.state
+    this.state = state
     return this.state
   }
 
   async preserveStateBeforeRecovery(loaded, { reason }) {
-    const backupPath = await this._createStateFileBackup(this.filePath, {
+    return preserveStateBeforeRecovery(this.filePath, loaded, {
       reason,
       schemaVersion: loaded?.schemaVersion,
       maxBackups: this.backupMaxFiles,
+      createStateFileBackupImpl: this._createStateFileBackup,
+      logger: this.logger,
     })
-    this.logger?.warn?.(`Preserved ${reason} state file before recovery:`, backupPath)
-    return backupPath
   }
 
   get() {
@@ -545,107 +553,6 @@ async function stateFileExists(filePath) {
     if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return false
     throw err
   }
-}
-
-function migrateStateIfNeeded(loaded, { filePath } = {}) {
-  // New schema.
-  if (loaded && typeof loaded === "object" && loaded.schemaVersion === STATE_SCHEMA_VERSION) {
-    assertValidCurrentState(loaded, { filePath })
-    return {
-      migrated: false,
-      state: {
-        schemaVersion: STATE_SCHEMA_VERSION,
-        updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
-        bindings: normalizeBindings(loaded.bindings),
-        sessionIndex: normalizeSessionIndex(loaded.sessionIndex),
-        feedByContext: normalizeFeedByContext(loaded.feedByContext),
-        modelPrefsByContext: normalizeModelPrefsByContext(loaded.modelPrefsByContext),
-        pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
-        pendingRuntimeOnlineNotice: normalizePendingRuntimeOnlineNotice(loaded.pendingRuntimeOnlineNotice),
-        idempotency: normalizeIdempotencyLedger(loaded.idempotency),
-      },
-    }
-  }
-
-  if (loaded && typeof loaded === "object" && loaded.schemaVersion === 4) {
-    return migratedState({
-      schemaVersion: STATE_SCHEMA_VERSION,
-      updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
-      bindings: normalizeBindings(loaded.bindings),
-      sessionIndex: normalizeSessionIndex(loaded.sessionIndex),
-      feedByContext: normalizeFeedByContext(loaded.feedByContext),
-      modelPrefsByContext: normalizeModelPrefsByContext(loaded.modelPrefsByContext),
-      pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
-      pendingRuntimeOnlineNotice: normalizePendingRuntimeOnlineNotice(loaded.pendingRuntimeOnlineNotice),
-      idempotency: normalizeIdempotencyLedger(loaded.idempotency),
-    }, { filePath })
-  }
-
-  if (loaded && typeof loaded === "object" && loaded.schemaVersion === 3) {
-    return migratedState({
-      schemaVersion: STATE_SCHEMA_VERSION,
-      updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
-      bindings: normalizeBindings(loaded.bindings),
-      sessionIndex: normalizeSessionIndex(loaded.sessionIndex),
-      feedByContext: normalizeFeedByContext(loaded.feedByContext),
-      modelPrefsByContext: defaultModelPrefsByContext(),
-      pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
-      pendingRuntimeOnlineNotice: null,
-      idempotency: defaultIdempotencyLedger(),
-    }, { filePath })
-  }
-
-  if (loaded && typeof loaded === "object" && loaded.schemaVersion === 2) {
-    return migratedState({
-      schemaVersion: STATE_SCHEMA_VERSION,
-      updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
-      bindings: normalizeBindings(loaded.bindings),
-      sessionIndex: normalizeSessionIndex(loaded.sessionIndex),
-      feedByContext: defaultFeedByContext(),
-      modelPrefsByContext: defaultModelPrefsByContext(),
-      pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
-      pendingRuntimeOnlineNotice: null,
-      idempotency: defaultIdempotencyLedger(),
-    }, { filePath })
-  }
-
-  if (loaded && typeof loaded === "object" && loaded.schemaVersion === 1) {
-    return migratedState({
-      schemaVersion: STATE_SCHEMA_VERSION,
-      updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
-      bindings: normalizeBindings(loaded.bindings),
-      sessionIndex: normalizeSessionIndex(loaded.sessionIndex),
-      feedByContext: defaultFeedByContext(),
-      modelPrefsByContext: defaultModelPrefsByContext(),
-      pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
-      pendingRuntimeOnlineNotice: null,
-      idempotency: defaultIdempotencyLedger(),
-    }, { filePath })
-  }
-
-  // Best-effort migration from the old single-session state.
-  // Old format example: { telegram: { updateOffset, chatId }, opencode: { directory } }
-  if (loaded && typeof loaded === "object" && loaded.telegram && typeof loaded.telegram === "object") {
-    return migratedState({
-      schemaVersion: STATE_SCHEMA_VERSION,
-      updateOffset: Number.isInteger(loaded.telegram.updateOffset) ? loaded.telegram.updateOffset : null,
-      bindings: {},
-      sessionIndex: {},
-      feedByContext: defaultFeedByContext(),
-      modelPrefsByContext: defaultModelPrefsByContext(),
-      pendingPrompts: defaultPendingPrompts(),
-      pendingRuntimeOnlineNotice: null,
-      idempotency: defaultIdempotencyLedger(),
-    }, { filePath })
-  }
-
-  const version = loaded && typeof loaded === "object" ? loaded.schemaVersion : undefined
-  throw new StateSchemaValidationError([`state.schemaVersion is unsupported (${version ?? "missing"})`], { filePath })
-}
-
-function migratedState(state, { filePath } = {}) {
-  assertValidCurrentState(state, { filePath })
-  return { migrated: true, state }
 }
 
 function isRecord(value) {

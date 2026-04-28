@@ -25,6 +25,7 @@ import { DEFAULT_FEED_MODE, StateStore, normalizeFeedMode, resolveDefaultStatePa
 import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "./session-list.js"
 import { sanitizeBaseUrlForDisplay } from "./url-utils.js"
 import { normalizeLimits } from "./limits.js"
+import { createParentSessionCache, LruMap, LruSet } from "./util/lru.js"
 
 function parseSseDebugFilter(rawValue) {
   const raw = String(rawValue || "").trim()
@@ -33,49 +34,6 @@ function parseSseDebugFilter(rawValue) {
   return {
     projectAlias: projectAlias ? projectAlias.trim() : "",
     sessionId: sessionId ? sessionId.trim() : "",
-  }
-}
-
-class LruSet {
-  constructor(limit) {
-    this.limit = limit
-    this.map = new Map()
-  }
-  has(k) {
-    return this.map.has(k)
-  }
-  add(k) {
-    if (this.map.has(k)) this.map.delete(k)
-    this.map.set(k, true)
-    while (this.map.size > this.limit) {
-      const oldest = this.map.keys().next().value
-      this.map.delete(oldest)
-    }
-  }
-  delete(k) {
-    return this.map.delete(k)
-  }
-}
-
-class LruMap {
-  constructor(limit) {
-    this.limit = limit
-    this.map = new Map()
-  }
-  get(k) {
-    if (!this.map.has(k)) return undefined
-    const v = this.map.get(k)
-    this.map.delete(k)
-    this.map.set(k, v)
-    return v
-  }
-  set(k, v) {
-    if (this.map.has(k)) this.map.delete(k)
-    this.map.set(k, v)
-    while (this.map.size > this.limit) {
-      const oldest = this.map.keys().next().value
-      this.map.delete(oldest)
-    }
   }
 }
 
@@ -543,7 +501,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const assistantPreviewBySession = new Map() // bound sessionKey -> { messageId, telegramMessageId, lastPreviewHtml, lastPreviewAt }
   const recentTgPromptsBySession = new LruMap(2000) // sessionKey -> LruSet(hash)
   const lastAssistantBySession = new LruMap(2000) // sessionKey -> { messageId, sessionId, text }
-  const parentSessionBySession = new LruMap(5000) // key `${projectAlias}:${sessionId}` -> parent session id or null
+  const parentSessionBySession = createParentSessionCache(5000) // key `${projectAlias}:${sessionId}` -> parent session id or null
   const tuiActiveSessionStateByProject = new Map() // alias -> { currentSessionId, followCtxKey }
   const tuiActiveSessionUnsupportedProjects = new Set() // alias values where /tui/active-session is unavailable
   lifecycle.registerStopHook("assistantDebounce-cleanup", () => {
