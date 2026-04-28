@@ -1,6 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { createMirroringHandlers } from "../src/connector/mirroring.js"
+import { NOISY_SKIP_REASONS } from "../src/connector/noisy-skip-reasons.js"
 import { sessionKey } from "../src/state/store.js"
 
 class FakeLruSet {
@@ -549,7 +550,7 @@ test("handleMessageUpdated suppresses empty assistant previews in verbose mode",
   assert.equal(calls.editMessageText.length, 0)
   assert.equal(runtime.assistantPreviewBySession.has(sessionKey("demo", "ses_1")), false)
   assert.equal(calls.logSseDebug.at(-1)?.[2], "drop=assistant_preview_empty msg=msg_1")
-  assert.deepEqual(noisy, [["demo", "assistant-preview-empty"]])
+  assert.deepEqual(noisy, [["demo", NOISY_SKIP_REASONS.ASSISTANT_PREVIEW_EMPTY]])
 })
 
 test("handleMessageUpdated keeps the preview message when final assistant content cannot be fetched", async (t) => {

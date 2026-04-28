@@ -12,6 +12,7 @@ import {
 } from "../message-display.js"
 import { DEFAULT_FEED_MODE, normalizeFeedMode, sessionKey } from "../state/store.js"
 import { ATTACHMENT_NOTICES, attachmentCaption, sanitizeFilenamePart, scopedAttachmentFilename } from "./attachment-utils.js"
+import { NOISY_SKIP_REASONS } from "./noisy-skip-reasons.js"
 
 export function createMirroringHandlers(runtime) {
   const {
@@ -573,7 +574,7 @@ export function createMirroringHandlers(runtime) {
       const text = extractTextParts(msg)
       if (!text || !text.trim()) {
         logSseDebug(projectAlias, sessionId, `drop=user_empty msg=${info.id}`)
-        recordNoisySkip(projectAlias, "user-empty")
+        recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.USER_EMPTY)
         return
       }
       const mode = config.echoFilterMode ?? "recent"
@@ -589,13 +590,13 @@ export function createMirroringHandlers(runtime) {
       }
       if (isEcho) {
         logSseDebug(projectAlias, sessionId, `drop=user_echo msg=${info.id}`)
-        recordNoisySkip(projectAlias, "user-echo")
+        recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.USER_ECHO)
         return
       }
       if (!shouldMirrorToFeed(routeCtx.ctxKey, "user-mirror")) {
         sets.user.add(info.id)
         logSseDebug(projectAlias, sessionId, `drop=user_feed msg=${info.id} mode=${getFeedMode(routeCtx.ctxKey)}`)
-        recordNoisySkip(projectAlias, "user-feed-filtered")
+        recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.USER_FEED_FILTERED)
         return
       }
       const blocks = [{ type: "text", html: "<b>User</b>" }, ...formatMarkdownToTelegramHtmlBlocks(text)]
@@ -607,7 +608,7 @@ export function createMirroringHandlers(runtime) {
     if (info.role !== "assistant") return
     if (!runtime.mirrorCompaction && (info.mode === "compaction" || info.agent === "compaction")) {
       logSseDebug(projectAlias, sessionId, `drop=compaction msg=${info.id}`)
-      recordNoisySkip(projectAlias, "compaction")
+      recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.COMPACTION)
       return
     }
 
@@ -628,14 +629,14 @@ export function createMirroringHandlers(runtime) {
     if (!completed) {
       if (!shouldMirrorToFeed(routeCtx.ctxKey, "assistant-stream")) {
         logSseDebug(projectAlias, sessionId, `drop=assistant_preview_feed msg=${info.id} mode=${getFeedMode(routeCtx.ctxKey)}`)
-        recordNoisySkip(projectAlias, "assistant-preview-feed-filtered")
+        recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.ASSISTANT_PREVIEW_FEED_FILTERED)
         return
       }
       const previewState = assistantPreviewBySession.get(boundKey)
       const lastPreviewAt = previewState?.messageId === info.id ? previewState.lastPreviewAt || 0 : 0
       if (Date.now() - lastPreviewAt < 200) {
         logSseDebug(projectAlias, sessionId, `drop=assistant_preview_throttled msg=${info.id}`)
-        recordNoisySkip(projectAlias, "assistant-preview-throttled")
+        recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.ASSISTANT_PREVIEW_THROTTLED)
         return
       }
       const msg = await oc.getMessage(sessionId, info.id).catch(() => null)
@@ -646,13 +647,13 @@ export function createMirroringHandlers(runtime) {
       }
       if (!runtime.mirrorCompaction && (msg?.info?.mode === "compaction" || msg?.info?.agent === "compaction")) {
         logSseDebug(projectAlias, sessionId, `drop=assistant_preview_compaction msg=${info.id}`)
-        recordNoisySkip(projectAlias, "assistant-preview-compaction")
+        recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.ASSISTANT_PREVIEW_COMPACTION)
         return
       }
       const text = extractTextParts(msg)
       if (!text || !text.trim()) {
         logSseDebug(projectAlias, sessionId, `drop=assistant_preview_empty msg=${info.id}`)
-        recordNoisySkip(projectAlias, "assistant-preview-empty")
+        recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.ASSISTANT_PREVIEW_EMPTY)
         return
       }
       const previewHtml = buildAssistantStreamPreviewHtml(text)
@@ -718,7 +719,7 @@ export function createMirroringHandlers(runtime) {
         }
         if (!runtime.mirrorCompaction && (msg?.info?.mode === "compaction" || msg?.info?.agent === "compaction")) {
           logSseDebug(projectAlias, sessionId, `drop=compaction_message msg=${info.id}`)
-          recordNoisySkip(projectAlias, "assistant-compaction")
+          recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.ASSISTANT_COMPACTION)
           return
         }
 
@@ -735,7 +736,7 @@ export function createMirroringHandlers(runtime) {
           }
           sets.assistant.add(info.id)
           logSseDebug(projectAlias, sessionId, `drop=assistant_empty msg=${info.id}`)
-          recordNoisySkip(projectAlias, "assistant-empty")
+          recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.ASSISTANT_EMPTY)
           return
         }
 
@@ -761,7 +762,7 @@ export function createMirroringHandlers(runtime) {
         } else if (hasChangedFiles) {
           sets.changes.add(info.id)
           logSseDebug(projectAlias, sessionId, `drop=changed_files_feed msg=${info.id} mode=${getFeedMode(routeCtx.ctxKey)}`)
-          recordNoisySkip(projectAlias, "changed-files-feed-filtered")
+          recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.CHANGED_FILES_FEED_FILTERED)
         }
 
         if (replaceMessageId && !visibleOutputSent) {
