@@ -3,6 +3,22 @@ import assert from "node:assert/strict"
 import { TelegramClient, makeInlineKeyboard, splitTelegramHtml, splitTelegramText } from "../src/telegram/client.js"
 import { classifyBoundaryError, makeBoundaryError } from "../src/boundary-errors.js"
 
+function makeJsonAbortResponse(signal, { ok = true, status = 200, statusText = "OK" } = {}) {
+  return {
+    ok,
+    status,
+    statusText,
+    json: async () =>
+      await new Promise((_, reject) => {
+        if (signal.aborted) {
+          reject(new DOMException("timed out", "AbortError"))
+          return
+        }
+        signal.addEventListener("abort", () => reject(new DOMException("timed out", "AbortError")), { once: true })
+      }),
+  }
+}
+
 test("splitTelegramText keeps short lines and splits oversized lines", () => {
   const chunks = splitTelegramText(`short\n${"x".repeat(6)}`, 5)
   assert.deepEqual(chunks, ["short", "xxxxx", "x"])
@@ -70,6 +86,50 @@ test("TelegramClient call and callMultipart return Telegram results and surface 
     assert.equal(calls[0].init.body, JSON.stringify({ probe: true }))
     assert.equal(typeof calls[0].init.signal.addEventListener, "function")
     assert.equal(calls[1].url, "https://api.example.test/bot/sendDocument")
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("TelegramClient call keeps its timeout active through JSON body reads", { timeout: 1_000 }, async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (_url, init) => makeJsonAbortResponse(init.signal)
+
+  try {
+    const client = new TelegramClient("token", { baseUrl: "https://api.example.test/bot" })
+    await assert.rejects(async () => client.call("getMe", { probe: true }, { timeoutMs: 10 }), (err) => {
+      const classification = classifyBoundaryError(err)
+      assert.equal(err.isBoundaryError, true)
+      assert.equal(err.source, "telegram")
+      assert.equal(err.method, "POST")
+      assert.equal(err.pathname, "/getMe")
+      assert.equal(classification.kind, "timeout")
+      assert.equal(classification.retryable, true)
+      return true
+    })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("TelegramClient callMultipart keeps its timeout active through JSON body reads", { timeout: 1_000 }, async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (_url, init) => makeJsonAbortResponse(init.signal)
+
+  try {
+    const client = new TelegramClient("token", { baseUrl: "https://api.example.test/bot" })
+    const formData = new FormData()
+    formData.set("probe", "1")
+    await assert.rejects(async () => client.callMultipart("sendDocument", formData, { timeoutMs: 10 }), (err) => {
+      const classification = classifyBoundaryError(err)
+      assert.equal(err.isBoundaryError, true)
+      assert.equal(err.source, "telegram")
+      assert.equal(err.method, "POST")
+      assert.equal(err.pathname, "/sendDocument")
+      assert.equal(classification.kind, "timeout")
+      assert.equal(classification.retryable, true)
+      return true
+    })
   } finally {
     globalThis.fetch = originalFetch
   }

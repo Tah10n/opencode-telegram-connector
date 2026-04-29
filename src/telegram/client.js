@@ -34,6 +34,20 @@ function combineSignals(...signals) {
   return ctrl.signal
 }
 
+async function readTelegramApiJsonResponse(res, { requestSignal, timeout, ...context }) {
+  try {
+    return await res.json()
+  } catch (err) {
+    if (err?.name === "AbortError" || requestSignal?.aborted === true || timeout.didTimeout?.() === true) {
+      throw boundaryErrorFromException(err, {
+        ...context,
+        didTimeout: timeout.didTimeout?.() === true,
+      })
+    }
+    return null
+  }
+}
+
 export function splitTelegramText(text, maxLen = 3900) {
   const s = String(text ?? "")
   if (s.length <= maxLen) return [s]
@@ -194,7 +208,14 @@ export class TelegramClient {
   async call(method, params, { timeoutMs, signal } = {}) {
     const url = `${this.baseUrl}/${method}`
     const timeout = makeTimeoutSignal(timeoutMs)
+    const context = {
+      source: "telegram",
+      operation: `POST ${method}`,
+      method: "POST",
+      pathname: `/${method}`,
+    }
     let res
+    let json
     try {
       const requestSignal = combineSignals(signal, timeout.signal)
       res = await fetch(url, {
@@ -203,25 +224,16 @@ export class TelegramClient {
         signal: requestSignal,
         body: params ? JSON.stringify(params) : "{}",
       })
+      json = await readTelegramApiJsonResponse(res, { ...context, requestSignal, timeout })
     } catch (err) {
-      throw boundaryErrorFromException(err, {
-        source: "telegram",
-        operation: `POST ${method}`,
-        method: "POST",
-        pathname: `/${method}`,
-        didTimeout: timeout.didTimeout?.() === true,
-      })
+      throw boundaryErrorFromException(err, { ...context, didTimeout: timeout.didTimeout?.() === true })
     } finally {
       timeout.cancel()
     }
-    const json = await res.json().catch(() => null)
     if (!res.ok || !json || json.ok !== true) {
       const msg = json?.description || res.statusText || "Telegram API error"
       throw boundaryErrorFromHttpResponse({
-        source: "telegram",
-        operation: `POST ${method}`,
-        method: "POST",
-        pathname: `/${method}`,
+        ...context,
         status: res.status,
         statusText: res.statusText,
         bodyText: msg,
@@ -235,7 +247,14 @@ export class TelegramClient {
   async callMultipart(method, formData, { timeoutMs, signal } = {}) {
     const url = `${this.baseUrl}/${method}`
     const timeout = makeTimeoutSignal(timeoutMs)
+    const context = {
+      source: "telegram",
+      operation: `POST ${method}`,
+      method: "POST",
+      pathname: `/${method}`,
+    }
     let res
+    let json
     try {
       const requestSignal = combineSignals(signal, timeout.signal)
       res = await fetch(url, {
@@ -243,25 +262,16 @@ export class TelegramClient {
         body: formData,
         signal: requestSignal,
       })
+      json = await readTelegramApiJsonResponse(res, { ...context, requestSignal, timeout })
     } catch (err) {
-      throw boundaryErrorFromException(err, {
-        source: "telegram",
-        operation: `POST ${method}`,
-        method: "POST",
-        pathname: `/${method}`,
-        didTimeout: timeout.didTimeout?.() === true,
-      })
+      throw boundaryErrorFromException(err, { ...context, didTimeout: timeout.didTimeout?.() === true })
     } finally {
       timeout.cancel()
     }
-    const json = await res.json().catch(() => null)
     if (!res.ok || !json || json.ok !== true) {
       const msg = json?.description || res.statusText || "Telegram API error"
       throw boundaryErrorFromHttpResponse({
-        source: "telegram",
-        operation: `POST ${method}`,
-        method: "POST",
-        pathname: `/${method}`,
+        ...context,
         status: res.status,
         statusText: res.statusText,
         bodyText: msg,

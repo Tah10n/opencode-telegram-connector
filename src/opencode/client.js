@@ -71,6 +71,7 @@ export class OpenCodeClient {
 
   async request(pathname, { method = "GET", query, json, timeoutMs = 30_000, signal } = {}) {
     const url = appendPathToBaseUrl(this.baseUrl, pathname)
+    const operation = `${method} ${url.pathname}`
     if (query) {
       for (const [k, v] of Object.entries(query)) {
         if (v === undefined || v === null) continue
@@ -78,46 +79,46 @@ export class OpenCodeClient {
       }
     }
     const t = makeTimeoutSignal(timeoutMs)
-    let res
+    const requestSignal = combineSignals(signal, t.signal)
     try {
-      const requestSignal = combineSignals(signal, t.signal)
-      res = await fetch(url, {
+      const res = await fetch(url, {
         method,
         headers: this.headers(json ? { "content-type": "application/json" } : undefined),
         signal: requestSignal,
         body: json ? JSON.stringify(json) : undefined,
       })
+
+      if (res.status === 204) return null
+
+      const text = await res.text()
+      if (!res.ok) {
+        throw boundaryErrorFromHttpResponse({
+          source: "opencode",
+          operation,
+          method,
+          pathname: url.pathname,
+          status: res.status,
+          statusText: res.statusText,
+          bodyText: text,
+          message: `${operation} failed: ${res.status} ${text || res.statusText}`,
+        })
+      }
+      if (!text) return null
+      try {
+        return JSON.parse(text)
+      } catch {
+        return text
+      }
     } catch (err) {
       throw boundaryErrorFromException(err, {
         source: "opencode",
-        operation: `${method} ${url.pathname}`,
+        operation,
         method,
         pathname: url.pathname,
         didTimeout: t.didTimeout?.() === true,
       })
     } finally {
       t.cancel()
-    }
-
-    if (res.status === 204) return null
-    const text = await res.text()
-    if (!res.ok) {
-      throw boundaryErrorFromHttpResponse({
-        source: "opencode",
-        operation: `${method} ${url.pathname}`,
-        method,
-        pathname: url.pathname,
-        status: res.status,
-        statusText: res.statusText,
-        bodyText: text,
-        message: `${method} ${url.pathname} failed: ${res.status} ${text || res.statusText}`,
-      })
-    }
-    if (!text) return null
-    try {
-      return JSON.parse(text)
-    } catch {
-      return text
     }
   }
 

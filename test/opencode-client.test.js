@@ -272,3 +272,42 @@ test("OpenCodeClient request keeps timeout behavior when an external abort signa
     globalThis.fetch = originalFetch
   }
 })
+
+test("OpenCodeClient request keeps timeout active while reading the response body", async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (_url, init) => ({
+    ok: true,
+    status: 200,
+    text: async () =>
+      await new Promise((_resolve, reject) => {
+        init.signal.addEventListener(
+          "abort",
+          () => reject(Object.assign(new Error("body read aborted"), { name: "AbortError" })),
+          { once: true },
+        )
+      }),
+  })
+
+  try {
+    const client = new OpenCodeClient({ baseUrl: "https://example.com" })
+    const external = new AbortController()
+    const abortTimer = setTimeout(() => external.abort(), 100)
+
+    try {
+      await assert.rejects(client.request("/slow-body", { timeoutMs: 20, signal: external.signal }), (err) => {
+        const classification = classifyBoundaryError(err)
+        assert.equal(err.isBoundaryError, true)
+        assert.equal(err.source, "opencode")
+        assert.equal(err.method, "GET")
+        assert.equal(err.pathname, "/slow-body")
+        assert.equal(err.kind, "timeout")
+        assert.equal(classification.retryable, true)
+        return true
+      })
+    } finally {
+      clearTimeout(abortTimer)
+    }
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
