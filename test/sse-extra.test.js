@@ -3,6 +3,7 @@ import assert from "node:assert/strict"
 import { ReadableStream } from "node:stream/web"
 import { createRequire, syncBuiltinESMExports } from "node:module"
 import { startOpenCodeSseLoop } from "../src/opencode/sse.js"
+import { makeBoundaryError } from "../src/boundary-errors.js"
 
 const require = createRequire(import.meta.url)
 const timersPromises = require("node:timers/promises")
@@ -122,7 +123,7 @@ test("startOpenCodeSseLoop reports non-OK SSE responses via onError", async (t) 
     ok: false,
     status: 503,
     statusText: "Service Unavailable",
-    text: async () => "busy",
+    text: async () => "busy secret-token",
   }))
 
   let loop
@@ -135,7 +136,8 @@ test("startOpenCodeSseLoop reports non-OK SSE responses via onError", async (t) 
       onError: async ({ projectAlias, err }) => {
         assert.equal(projectAlias, "demo")
         assert.equal(err.isBoundaryError, true)
-        assert.match(err.message, /SSE 503: busy/)
+        assert.match(err.message, /SSE 503: Service Unavailable/)
+        assert.doesNotMatch(err.message, /secret-token|busy/)
         loop.stop()
         clearTimeout(timeout)
         resolve()
@@ -181,6 +183,40 @@ test("startOpenCodeSseLoop skips invalid JSON events and logs handler failures",
   assert.equal(logger.logs.error[0][0], "SSE event handler error")
   assert.equal(logger.logs.error[0][1].projectAlias, "demo")
   assert.equal(logger.logs.error[0][1].error, "handler failed")
+})
+
+test("startOpenCodeSseLoop reports handler failures via onError", async (t) => {
+  usePatchedDelay(t, async () => {})
+  useFetchStub(t, async () => makeSseResponse(['data: {"id":"evt_state","type":"permission.asked"}\n', "\n"]))
+
+  let loop
+  await new Promise((resolve, reject) => {
+    const timeout = originalGlobalSetTimeout(() => reject(new Error("Timed out waiting for handler onError")), 1000)
+    loop = startOpenCodeSseLoop({
+      projectAlias: "demo",
+      ocClient: makeClient(),
+      logger: makeLogger(),
+      onEvent: async () => {
+        throw makeBoundaryError({
+          source: "state",
+          operation: "persist prompt recovery state",
+          kind: "durability",
+          outcome: "retryable",
+          message: "persist prompt recovery state failed",
+        })
+      },
+      onError: async ({ projectAlias, err }) => {
+        assert.equal(projectAlias, "demo")
+        assert.equal(err.isBoundaryError, true)
+        assert.equal(err.source, "state")
+        assert.equal(err.outcome, "retryable")
+        assert.match(err.message, /persist prompt recovery state failed/)
+        loop.stop()
+        clearTimeout(timeout)
+        resolve()
+      },
+    })
+  })
 })
 
 test("startOpenCodeSseLoop aborts oversized SSE events and reports a protocol error", async (t) => {

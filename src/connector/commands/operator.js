@@ -332,6 +332,7 @@ export function createOperatorCommandHandlers(deps) {
       formatThreadLabel,
       previewLimit: 3,
       showBindingScopes: ctxMeta?.chatType === "private",
+      showProjectDetails: ctxMeta?.chatType === "private",
     })]
     if (ctxMeta?.chatType === "private") {
       const entries = Object.entries(store.get().bindings || {}).map(([ctxKey, binding]) => ({ ctxKey, binding }))

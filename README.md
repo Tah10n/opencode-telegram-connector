@@ -351,8 +351,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=connector
-WorkingDirectory=/opt/telegram-connector/project
-ExecStart=/usr/bin/node src/cli.js --env-file /opt/telegram-connector/project/.env
+WorkingDirectory=/opt/telegram-opencode-connector
+ExecStart=/usr/bin/node src/cli.js --env-file /opt/telegram-opencode-connector/.env
 Restart=on-failure
 RestartSec=5
 
@@ -381,21 +381,21 @@ Example user agent at `~/Library/LaunchAgents/dev.opencode.telegram-connector.pl
 <plist version="1.0">
 <dict>
   <key>Label</key><string>dev.opencode.telegram-connector</string>
-  <key>WorkingDirectory</key><string>/Users/YOU/telegram-connector/project</string>
+  <key>WorkingDirectory</key><string>/Users/YOU/telegram-opencode-connector</string>
   <key>ProgramArguments</key>
   <array>
     <string>/usr/local/bin/node</string>
     <string>src/cli.js</string>
     <string>--env-file</string>
-    <string>/Users/YOU/telegram-connector/project/.env</string>
+    <string>/Users/YOU/telegram-opencode-connector/.env</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key>
   <dict>
     <key>SuccessfulExit</key><false/>
   </dict>
-  <key>StandardOutPath</key><string>/Users/YOU/telegram-connector/project/.data/connector.out.log</string>
-  <key>StandardErrorPath</key><string>/Users/YOU/telegram-connector/project/.data/connector.err.log</string>
+  <key>StandardOutPath</key><string>/Users/YOU/telegram-opencode-connector/.data/connector.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/YOU/telegram-opencode-connector/.data/connector.err.log</string>
 </dict>
 </plist>
 ```
@@ -405,7 +405,7 @@ Load and inspect it:
 ```sh
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.opencode.telegram-connector.plist
 launchctl print gui/$(id -u)/dev.opencode.telegram-connector
-tail -f .data/connector.err.log
+tail -f /Users/YOU/telegram-opencode-connector/.data/connector.err.log
 ```
 
 `SuccessfulExit=false` restarts non-zero exits and leaves clean exit code `0` stopped.
@@ -419,10 +419,10 @@ Run these commands from an elevated PowerShell prompt and adjust paths:
 ```powershell
 nssm install telegram-connector
 nssm set telegram-connector Application "C:\Program Files\nodejs\node.exe"
-nssm set telegram-connector AppDirectory "C:\path\to\telegram-connector\project"
-nssm set telegram-connector AppParameters "src\cli.js --env-file C:\path\to\telegram-connector\project\.env"
-nssm set telegram-connector AppStdout "C:\path\to\telegram-connector\project\.data\connector.out.log"
-nssm set telegram-connector AppStderr "C:\path\to\telegram-connector\project\.data\connector.err.log"
+nssm set telegram-connector AppDirectory "C:\path\to\telegram-opencode-connector"
+nssm set telegram-connector AppParameters "src\cli.js --env-file C:\path\to\telegram-opencode-connector\.env"
+nssm set telegram-connector AppStdout "C:\path\to\telegram-opencode-connector\.data\connector.out.log"
+nssm set telegram-connector AppStderr "C:\path\to\telegram-opencode-connector\.data\connector.err.log"
 nssm set telegram-connector AppExit 0 Exit
 nssm set telegram-connector AppExit Default Restart
 nssm set telegram-connector AppRestartDelay 5000

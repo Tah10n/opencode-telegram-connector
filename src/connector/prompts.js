@@ -419,9 +419,9 @@ export function createPromptHandlers(runtime) {
       createdAt: Date.now(),
     })
     try {
+      await flushDurableState("persist permission prompt recovery state")
       await sendPermissionPrompt(projectAlias, props, ctxMeta)
       recordPromptDelivered?.(projectAlias, "permission")
-      await flushDurableState("persist permission prompt delivery state")
     } catch (err) {
       prompted[projectAlias].permission.delete(permissionIdentity)
       throw err
@@ -461,12 +461,12 @@ export function createPromptHandlers(runtime) {
     persistQuestionWizard(wizard)
 
     try {
+      await flushDurableState("persist question prompt recovery state")
       await sendBlocksToThread(ctx, [
         { type: "text", html: `<b>Question request</b>\n<code>${escapeHtml(props.id)}</code>\n\n${escapeHtml(`Project: ${projectAlias}`)}` },
       ])
       await sendCurrentQuestionStep(wizard)
       recordPromptDelivered?.(projectAlias, "question")
-      await flushDurableState("persist question prompt delivery state")
     } catch (err) {
       prompted[projectAlias].question.delete(questionIdentity)
       throw err

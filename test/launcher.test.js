@@ -26,6 +26,8 @@ const os = require("node:os")
 const path = require("node:path")
 const timersPromises = require("node:timers/promises")
 
+const WINDOWS_CMD_METACHARS = ["&", "|", ">", "<", "^", "%", '"']
+
 function swapEnv(t, patch) {
   const previous = new Map()
   for (const key of Object.keys(patch)) previous.set(key, process.env[key])
@@ -459,6 +461,40 @@ test("openAttachWindowWindows allows sensitive base URLs with an override", asyn
   assert.match(calls[0].args[3], /ses_1/)
 })
 
+test("openAttachWindowWindows rejects cmd.exe metacharacters in sessionId", async (t) => {
+  const calls = useSpawnPlans(t, [])
+
+  for (const char of WINDOWS_CMD_METACHARS) {
+    await assert.rejects(
+      openAttachWindowWindows({
+        directory: "C:\\repo",
+        baseUrl: "http://127.0.0.1:4312",
+        sessionId: `ses${char}1`,
+      }),
+      /sessionId contains cmd\.exe metacharacters/,
+    )
+  }
+
+  assert.equal(calls.length, 0)
+})
+
+test("openAttachWindowWindows rejects cmd.exe metacharacters in baseUrl", async (t) => {
+  const calls = useSpawnPlans(t, [])
+
+  for (const char of WINDOWS_CMD_METACHARS) {
+    await assert.rejects(
+      openAttachWindowWindows({
+        directory: "C:\\repo",
+        baseUrl: `http://127.0.0.1:4312/unsafe${char}value`,
+        sessionId: "ses_1",
+      }),
+      /baseUrl contains cmd\.exe metacharacters/,
+    )
+  }
+
+  assert.equal(calls.length, 0)
+})
+
 test("openAttachContinueWindowWindows rejects sensitive base URLs unless explicitly allowed", async () => {
   await assert.rejects(
     openAttachContinueWindowWindows({
@@ -467,6 +503,38 @@ test("openAttachContinueWindowWindows rejects sensitive base URLs unless explici
     }),
     /Refusing to open opencode attach window/,
   )
+})
+
+test("openAttachContinueWindowWindows rejects cmd.exe metacharacters in baseUrl", async (t) => {
+  const calls = useSpawnPlans(t, [])
+
+  for (const char of WINDOWS_CMD_METACHARS) {
+    await assert.rejects(
+      openAttachContinueWindowWindows({
+        directory: "C:\\repo",
+        baseUrl: `http://127.0.0.1:4312/unsafe${char}value`,
+      }),
+      /baseUrl contains cmd\.exe metacharacters/,
+    )
+  }
+
+  assert.equal(calls.length, 0)
+})
+
+test("openAttachContinueWindowWindows rejects cmd.exe metacharacters in directory arg", async (t) => {
+  const calls = useSpawnPlans(t, [])
+
+  for (const char of WINDOWS_CMD_METACHARS) {
+    await assert.rejects(
+      openAttachContinueWindowWindows({
+        directory: `C:\\repo${char}unsafe`,
+        baseUrl: "http://127.0.0.1:4312",
+      }),
+      /directory contains cmd\.exe metacharacters/,
+    )
+  }
+
+  assert.equal(calls.length, 0)
 })
 
 test("openAttachContinueWindowWindows keeps the console open and passes --dir", async (t) => {

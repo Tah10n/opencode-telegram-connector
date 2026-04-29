@@ -189,10 +189,22 @@ export function createCallbackHandlers(runtime) {
     return { projectAlias: parts[1], sessionID: "", permissionId: parts[2], action: parts[3] }
   }
 
+  function isIntegerToken(value) {
+    return typeof value === "string" && value.length > 0 && Number.isInteger(Number(value))
+  }
+
+  function matchesQuestionCallbackRest(rest) {
+    if (rest.length === 1) return rest[0] === "reject"
+    if (rest.length === 2) return isIntegerToken(rest[0]) && (rest[1] === "custom" || rest[1] === "cancel_custom" || rest[1] === "done")
+    if (rest.length === 3) return isIntegerToken(rest[0]) && (rest[1] === "o" || rest[1] === "t") && isIntegerToken(rest[2])
+    return false
+  }
+
   function parseQuestionParts(parts) {
-    const oldShape = parts.length < 4 || parts[3] === "reject" || Number.isInteger(Number(parts[3]))
-    if (oldShape) return { projectAlias: parts[1], sessionID: "", questionId: parts[2], rest: parts.slice(3) }
-    return { projectAlias: parts[1], sessionID: parts[2] || "", questionId: parts[3], rest: parts.slice(4) }
+    const oldShape = { projectAlias: parts[1], sessionID: "", questionId: parts[2], rest: parts.slice(3) }
+    const newShape = { projectAlias: parts[1], sessionID: parts[2] || "", questionId: parts[3], rest: parts.slice(4) }
+    if (matchesQuestionCallbackRest(newShape.rest) && !matchesQuestionCallbackRest(oldShape.rest)) return newShape
+    return oldShape
   }
 
   function hasHandledPermission(projectAlias, sessionID, permissionId) {

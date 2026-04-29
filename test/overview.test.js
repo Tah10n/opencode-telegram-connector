@@ -102,6 +102,30 @@ test("buildProjectsOverviewText hides binding scopes when requested", () => {
   assert.match(text, /Bindings: hidden outside private chat/)
 })
 
+test("buildProjectsOverviewText hides project details when requested", () => {
+  const text = buildProjectsOverviewText({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312" } },
+    bindings: {
+      "100:7": { projectAlias: "demo" },
+    },
+    startupSessionByProject: {
+      demo: "demo-session",
+    },
+    getProjectSseStatus: () => "connected",
+    parseCtxKey: () => null,
+    formatThreadLabel: () => "main",
+    showBindingScopes: false,
+    showProjectDetails: false,
+  })
+
+  assert.match(text, /^Projects:/)
+  assert.match(text, /- demo/)
+  assert.match(text, /SSE: connected/)
+  assert.doesNotMatch(text, /URL:/)
+  assert.doesNotMatch(text, /Startup session:/)
+  assert.doesNotMatch(text, /demo-session/)
+})
+
 test("buildProjectsOverviewKeyboard includes safe project actions", () => {
   const keyboard = buildProjectsOverviewKeyboard({
     projects: { demo: {}, remote: {} },

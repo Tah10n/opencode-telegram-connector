@@ -12,6 +12,7 @@ export function buildProjectsOverviewText({
   formatThreadLabel,
   previewLimit = 3,
   showBindingScopes = true,
+  showProjectDetails = true,
   hiddenBindingsLabel = "hidden outside private chat",
 }) {
   const aliases = Object.keys(projects || {})
@@ -37,8 +38,10 @@ export function buildProjectsOverviewText({
       : hiddenBindingsLabel
 
     lines.push(`- ${alias}`)
-    lines.push(`  URL: ${url || "unknown"}`)
-    lines.push(`  Startup session: ${startupSessionId}`)
+    if (showProjectDetails) {
+      lines.push(`  URL: ${url || "unknown"}`)
+      lines.push(`  Startup session: ${startupSessionId}`)
+    }
     lines.push(`  SSE: ${sseStatus}`)
     lines.push(`  Bindings: ${bindingSummary}`)
   }
@@ -171,6 +174,7 @@ export function createOverviewHelpers({ projects, store, startInProgress, parseC
         startupSessionByProject: input.startupSessionByProject,
         previewLimit: input.previewLimit,
         showBindingScopes: input.showBindingScopes,
+        showProjectDetails: input.showProjectDetails,
         hiddenBindingsLabel: input.hiddenBindingsLabel,
       }),
     buildProjectsOverviewKeyboard: (input = {}) =>

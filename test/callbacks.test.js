@@ -1483,6 +1483,40 @@ test("createCallbackHandlers starts and cancels custom-answer question flows", a
   ])
 })
 
+test("createCallbackHandlers parses session-scoped question callbacks with numeric question ids", async () => {
+  const wizard = makeWizard({ id: "123", questions: [{ header: "Reason", question: "Why?", custom: true, options: [] }] })
+  const deletedMessages = []
+  const getWizardCalls = []
+  const promptCalls = []
+  const { runtime, callbackAnswers, customStateCalls } = makeRuntime({
+    tg: {
+      deleteMessage: async (chatId, messageId) => {
+        deletedMessages.push({ chatId, messageId })
+      },
+    },
+    getWizard: (projectAlias, questionId, sessionID) => {
+      getWizardCalls.push({ projectAlias, questionId, sessionID })
+      return projectAlias === "demo" && questionId === "123" && sessionID === "ses_123" ? wizard : null
+    },
+    ocByAlias: { demo: {} },
+    sendQuestionCustomAnswerPrompt: async (...args) => {
+      promptCalls.push(args)
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("q|demo|ses_123|123|0|custom", { messageId: 909 }))
+
+  assert.deepEqual(getWizardCalls, [{ projectAlias: "demo", questionId: "123", sessionID: "ses_123" }])
+  assert.deepEqual(customStateCalls, [{ ctxKey: "100:7", value: { projectAlias: "demo", requestId: "123", sessionID: "ses_123", qIndex: 0 } }])
+  assert.equal(promptCalls.length, 1)
+  assert.equal(promptCalls[0][1], "demo")
+  assert.equal(promptCalls[0][2], "123")
+  assert.deepEqual(promptCalls[0][5], { sessionID: "ses_123" })
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Send answer"])
+  assert.deepEqual(deletedMessages, [{ chatId: 100, messageId: 909 }])
+})
+
 test("createCallbackHandlers reports prompt bootstrap failures for reject-note and custom-answer flows", async () => {
   const wizard = makeWizard({ questions: [{ header: "Reason", question: "Why?", custom: true, options: [] }] })
   const { runtime, callbackAnswers } = makeRuntime({

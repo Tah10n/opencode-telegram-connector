@@ -216,7 +216,7 @@ export function isDisconnectBoundaryError(err, context = {}) {
 }
 
 export function boundaryErrorFromHttpResponse({ source, message, operation, method, pathname, status, statusText, bodyText, details }) {
-  const suffix = cleanString(bodyText) || cleanString(statusText) || "Request failed"
+  const suffix = cleanString(statusText) || "Request failed"
   return makeBoundaryError({
     source,
     message: cleanString(message) || `${operation || `${method} ${pathname}` || "Request"} failed: ${status} ${suffix}`,

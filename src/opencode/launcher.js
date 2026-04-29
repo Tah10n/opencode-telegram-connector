@@ -9,6 +9,7 @@ import { setTimeout as delay } from "node:timers/promises"
 import { redactCmdlineSecrets, sanitizeBaseUrlForCli } from "../url-utils.js"
 
 const ATTACH_WINDOW_PLATFORMS = new Set(["win32", "linux", "darwin"])
+const WINDOWS_CMD_UNSAFE_ATTACH_ARG_RE = /[\u0000-\u001f\u007f"%&|<>^]/
 
 function normalizeServerLaunchMode(value) {
   return String(value || "background").trim().toLowerCase() === "window" ? "window" : "background"
@@ -403,6 +404,14 @@ function safeAttachBaseUrl(baseUrl) {
   return safe
 }
 
+function requireWindowsCmdSafeAttachArg(value, label) {
+  const text = String(value ?? "")
+  if (WINDOWS_CMD_UNSAFE_ATTACH_ARG_RE.test(text)) {
+    throw new Error(`Refusing to open opencode attach window via cmd.exe because ${label} contains cmd.exe metacharacters`)
+  }
+  return text
+}
+
 function buildPosixShellCommand(argv, { directory } = {}) {
   const steps = []
   if (directory) steps.push(`cd ${shQuote(directory)}`)
@@ -735,7 +744,12 @@ export function startOpenCodeServeDetachedWindows({ directory, port }) {
 
 export async function openAttachWindowWindows({ directory, baseUrl, sessionId }) {
   const safe = safeAttachBaseUrl(baseUrl)
-  const args = ["attach", String(safe.url), "--session", String(sessionId)]
+  const args = [
+    "attach",
+    requireWindowsCmdSafeAttachArg(safe.url, "baseUrl"),
+    "--session",
+    requireWindowsCmdSafeAttachArg(sessionId, "sessionId"),
+  ]
   const ps = [
     "Start-Process -FilePath cmd.exe -ArgumentList @(",
     psQuote("/c"),
@@ -771,9 +785,9 @@ export async function openAttachContinueWindowWindows({ directory, baseUrl }) {
   const safe = safeAttachBaseUrl(baseUrl)
   const args = [
     "attach",
-    String(safe.url),
+    requireWindowsCmdSafeAttachArg(safe.url, "baseUrl"),
     "--continue",
-    ...(directory ? ["--dir", String(directory)] : []),
+    ...(directory ? ["--dir", requireWindowsCmdSafeAttachArg(directory, "directory")] : []),
   ]
   const ps = [
     "Start-Process -WindowStyle Normal -FilePath cmd.exe -ArgumentList @(",

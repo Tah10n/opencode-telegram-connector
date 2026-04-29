@@ -92,6 +92,7 @@ export class OpenCodeClient {
 
       const text = await res.text()
       if (!res.ok) {
+        const statusSummary = [res.status, res.statusText].filter(Boolean).join(" ")
         throw boundaryErrorFromHttpResponse({
           source: "opencode",
           operation,
@@ -100,7 +101,7 @@ export class OpenCodeClient {
           status: res.status,
           statusText: res.statusText,
           bodyText: text,
-          message: `${operation} failed: ${res.status} ${text || res.statusText}`,
+          message: `${operation} failed: ${statusSummary}`,
         })
       }
       if (!text) return null

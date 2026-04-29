@@ -104,7 +104,7 @@ function makeCallbackUpdate(updateId, data, { userId = 42, chatId = 100, chatTyp
   }
 }
 
-function createFakeTelegramClient({ emptyPollDelayMs = 10, sendMessageImpl, sendDocumentImpl, editMessageTextImpl } = {}) {
+function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, sendMessageImpl, sendDocumentImpl, editMessageTextImpl } = {}) {
   let nextMessageId = 1000
   const updates = []
   const sentMessages = []
@@ -133,6 +133,7 @@ function createFakeTelegramClient({ emptyPollDelayMs = 10, sendMessageImpl, send
       return updates.length
     },
     async getMe() {
+      if (getMeImpl) return getMeImpl()
       return { id: 1, username: "test_bot", has_topics_enabled: true }
     },
     async setMyCommands() {
@@ -480,6 +481,30 @@ test("startConnector ignores commands addressed to another bot", async () => {
     assert.match(harness.tg.sentMessages[0].text, /^Telegram connector help:/)
     const state = await readState(harness.stateFile)
     assert.equal(state.updateOffset, 103)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector ignores targeted commands when bot username is unknown", async () => {
+  const harness = await createHarness({
+    tgOptions: {
+      getMeImpl: async () => {
+        throw new Error("getMe unavailable")
+      },
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(111, "/start@OtherBot"))
+    harness.tg.enqueue(makeMessageUpdate(112, "/start"))
+
+    await waitFor(() => harness.tg.pendingUpdates === 0 && harness.tg.sentMessages.length === 1)
+    await harness.connector.stop()
+
+    assert.match(harness.tg.sentMessages[0].text, /^Telegram connector help:/)
+    const state = await readState(harness.stateFile)
+    assert.equal(state.updateOffset, 113)
   } finally {
     await harness.connector.stop()
   }
@@ -1459,6 +1484,9 @@ test("startConnector /projects hides binding scopes in group chats", async () =>
     const text = harness.tg.sentMessages.at(-1)?.text || ""
     assert.match(text, /^Projects:/)
     assert.match(text, /Bindings: hidden outside private chat/)
+    assert.doesNotMatch(text, /URL:/)
+    assert.doesNotMatch(text, /Startup session:/)
+    assert.doesNotMatch(text, /ses_startup/)
     assert.doesNotMatch(text, /chat 100\/main|chat 100\/topic 11/)
     const labels = harness.tg.sentMessages.at(-1)?.replyMarkup?.inline_keyboard.flat().map((button) => button.text) || []
     assert.ok(labels.includes("Close"))
@@ -4625,6 +4653,56 @@ test("startConnector auto-switches the Telegram binding to the active TUI sessio
       "100:7": { projectAlias: "demo", sessionId: "ses_tui_new" },
     })
   } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector does not announce TUI auto-switch when binding flush fails", async () => {
+  const activeSessions = [
+    { id: "ses_parent" },
+    { id: "ses_tui_new" },
+    { id: "ses_tui_new" },
+  ]
+  let failBindingFlush = true
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 845,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_parent" },
+      },
+      sessionIndex: {
+        "demo:ses_parent": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    createStateStoreImpl: (options) => {
+      const store = new StateStore(options)
+      const originalFlush = store.flush.bind(store)
+      store.flush = async () => {
+        if (failBindingFlush) throw new Error("binding write failed")
+        return originalFlush()
+      }
+      return store
+    },
+    ocOptions: {
+      getActiveTuiSessionImpl: async () => (activeSessions.length ? activeSessions.shift() : { id: "ses_tui_new" }),
+    },
+  })
+
+  try {
+    await waitFor(() => harness.ocCalls.getActiveTuiSession.length >= 3)
+    await delay(20)
+
+    assert.equal(harness.tg.sentMessages.some((m) => m.text.includes("TUI switched to session: ses_tui_new")), false)
+
+    failBindingFlush = false
+    await harness.connector.stop()
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.bindings, {
+      "100:7": { projectAlias: "demo", sessionId: "ses_parent" },
+    })
+  } finally {
+    failBindingFlush = false
     await harness.connector.stop()
   }
 })

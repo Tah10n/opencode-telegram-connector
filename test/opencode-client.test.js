@@ -45,12 +45,13 @@ test("OpenCodeClient rejects baseUrl query strings and fragments", () => {
   assert.throws(() => new OpenCodeClient({ baseUrl: "https://example.com/api#frag" }), /must not include query strings or fragments/)
 })
 
-test("OpenCodeClient request handles 204, text responses, and backend errors", async () => {
+test("OpenCodeClient request handles 204, text responses, and redacts backend error bodies from messages", async () => {
   const originalFetch = globalThis.fetch
+  const secret = "apiKey=super-secret"
   const queue = [
     { status: 204, ok: true, text: async () => "" },
     { status: 200, ok: true, text: async () => "plain text" },
-    { status: 500, ok: false, statusText: "Server Error", text: async () => "boom" },
+    { status: 500, ok: false, statusText: "Server Error", text: async () => `boom ${secret}` },
   ]
   globalThis.fetch = async () => queue.shift()
 
@@ -59,7 +60,8 @@ test("OpenCodeClient request handles 204, text responses, and backend errors", a
     assert.equal(await client.request("/noop"), null)
     assert.equal(await client.request("/text"), "plain text")
     await assert.rejects(async () => client.request("/broken"), (err) => {
-      assert.match(err.message, /GET \/broken failed: 500 boom/)
+      assert.equal(err.message, "GET /broken failed: 500 Server Error")
+      assert.equal(err.message.includes(secret), false)
       assert.equal(err.isBoundaryError, true)
       assert.equal(err.source, "opencode")
       assert.equal(err.status, 500)

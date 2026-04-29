@@ -16,6 +16,10 @@ function readIntEnv(name, fallback) {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback
 }
 
+function shouldPropagateHandlerError(err) {
+  return err?.isBoundaryError === true && err.source === "state" && err.kind === "durability"
+}
+
 async function* readLines(readableStream) {
   const reader = readableStream.getReader()
   const decoder = new TextDecoder()
@@ -128,7 +132,7 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
             status: res.status,
             statusText: res.statusText,
             bodyText: text,
-            message: `SSE ${res.status}: ${text || res.statusText}`,
+            message: `SSE ${res.status}: ${res.statusText || "Request failed"}`,
           })
         }
         logger?.info?.("SSE connected", { projectAlias, source: "opencode", operation: "GET /event", method: "GET", pathname: "/event" })
@@ -163,6 +167,7 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
               await onEvent({ projectAlias, evt })
             } catch (err) {
               logger?.error?.("SSE event handler error", { projectAlias, source: "opencode", operation: "handle SSE event", error: err?.message || String(err) })
+              if (shouldPropagateHandlerError(err)) throw err
             }
             continue
           }

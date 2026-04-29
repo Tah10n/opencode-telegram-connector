@@ -83,6 +83,9 @@ function parseCommand(text, { botUsername } = {}) {
   if (normalizedTargetBot && normalizedBotUsername && normalizedTargetBot !== normalizedBotUsername) {
     return { cmd: null, args: rest.join(" ").trim(), argv: rest, targetBot: normalizedTargetBot, isForThisBot: false }
   }
+  if (normalizedTargetBot && !normalizedBotUsername) {
+    return { cmd: null, args: rest.join(" ").trim(), argv: rest, targetBot: normalizedTargetBot, isForThisBot: false }
+  }
   const normalizedCmd = String(commandName || "")
     .toLowerCase()
   return { cmd: normalizedCmd, args: rest.join(" ").trim(), argv: rest, targetBot: normalizedTargetBot, isForThisBot: true }
@@ -1074,7 +1077,15 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       return
     }
 
-    await bindCtxToSession(sourceCtx, projectAlias, activeSessionId)
+    try {
+      await bindCtxToSession(sourceCtx, projectAlias, activeSessionId)
+      await flushCriticalState("persist TUI active session binding")
+    } catch (err) {
+      try {
+        store.setBinding(followCtxKey, followBinding, sourceCtx)
+      } catch {}
+      throw err
+    }
     tuiActiveSessionStateByProject.set(projectAlias, {
       currentSessionId: activeSessionId,
       followCtxKey,

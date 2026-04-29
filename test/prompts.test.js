@@ -165,6 +165,36 @@ test("handlePermissionAsked does not baseline-suppress a first SSE prompt after 
   assert.equal(runtime.prompted.demo.permission.has("ses_1:perm_self_baseline"), true)
 })
 
+test("handlePermissionAsked flushes recovery state before Telegram delivery", async () => {
+  const { calls, runtime, handlers } = makePromptRuntime({
+    store: {
+      async flush() {
+        throw new Error("state write failed")
+      },
+    },
+  })
+
+  await assert.rejects(
+    () => handlers.handlePermissionAsked({
+      projectAlias: "demo",
+      props: { id: "perm_flush_fail", sessionID: "ses_1", permission: "shell", patterns: ["npm test"] },
+      resolveBoundRoute: routeResolver,
+      logSseDebug,
+    }),
+    (err) => {
+      assert.equal(err.isBoundaryError, true)
+      assert.equal(err.source, "state")
+      assert.equal(err.outcome, "retryable")
+      assert.match(err.message, /persist permission prompt recovery state failed/)
+      return true
+    },
+  )
+
+  assert.equal(calls.setPendingPermission.length, 1)
+  assert.equal(calls.sendBlocksToThread.length, 0)
+  assert.equal(runtime.prompted.demo.permission.has("ses_1:perm_flush_fail"), false)
+})
+
 test("handleQuestionAsked retries after Telegram question step delivery fails", async () => {
   let fail = true
   const delivered = []
@@ -334,6 +364,37 @@ test("handleQuestionAsked does not baseline-suppress a first SSE prompt after Te
   await handlers.handleQuestionAsked(input)
   assert.equal(calls.sendMessage.length, 2)
   assert.equal(runtime.prompted.demo.question.has("ses_1:q_self_baseline"), true)
+})
+
+test("handleQuestionAsked flushes recovery state before Telegram delivery", async () => {
+  const request = {
+    id: "q_flush_fail",
+    sessionID: "ses_1",
+    questions: [{ header: "Reason", question: "Why?", options: [{ label: "A" }] }],
+  }
+  const { calls, runtime, handlers } = makePromptRuntime({
+    store: {
+      async flush() {
+        throw new Error("state write failed")
+      },
+    },
+  })
+
+  await assert.rejects(
+    () => handlers.handleQuestionAsked({ projectAlias: "demo", props: request, resolveBoundRoute: routeResolver, logSseDebug }),
+    (err) => {
+      assert.equal(err.isBoundaryError, true)
+      assert.equal(err.source, "state")
+      assert.equal(err.outcome, "retryable")
+      assert.match(err.message, /persist question prompt recovery state failed/)
+      return true
+    },
+  )
+
+  assert.equal(calls.setQuestionWizard.length, 1)
+  assert.equal(calls.sendBlocksToThread.length, 0)
+  assert.equal(calls.sendMessage.length, 0)
+  assert.equal(runtime.prompted.demo.question.has("ses_1:q_flush_fail"), false)
 })
 
 test("restorePendingPromptState leaves permission recovery retryable when Telegram delivery fails", async () => {
