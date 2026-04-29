@@ -553,6 +553,20 @@ test("openAttachContinueWindowWindows closes the console with opencode and passe
   assert.match(calls[0].args[3], /'C:\\repo'/)
 })
 
+test("openAttachContinueWindowWindows preserves Windows directories with spaces", async (t) => {
+  const calls = useSpawnPlans(t, [{ code: 0 }])
+
+  await openAttachContinueWindowWindows({
+    directory: "C:\\Users\\me\\My Project",
+    baseUrl: "http://127.0.0.1:4312",
+  })
+
+  const ps = calls[0].args[3]
+  assert.equal(calls[0].command, "powershell")
+  assert.ok(ps.includes(`'"C:\\Users\\me\\My Project"'`), "quotes the --dir value for cmd.exe")
+  assert.ok(ps.includes(` -WorkingDirectory 'C:\\Users\\me\\My Project'`), "keeps the PowerShell WorkingDirectory value intact")
+})
+
 test("openAttachWindow launches a Linux terminal for attach sessions", async (t) => {
   usePatchedPlatform(t, "linux")
   const calls = useSpawnPlans(t, [{ code: 0 }])

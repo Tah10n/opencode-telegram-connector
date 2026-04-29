@@ -28,7 +28,17 @@ test("classifyBoundaryError marks resource 404s as stale", () => {
     stale: true,
     retryable: false,
     fatal: false,
+    retryAfterMs: null,
   })
+})
+
+test("BoundaryError preserves retry-after metadata", () => {
+  const err = makeBoundaryError({ source: "telegram", status: 429, message: "rate limited", retryAfterMs: 2500 })
+  const classification = classifyBoundaryError(err)
+
+  assert.equal(err.retryAfterMs, 2500)
+  assert.equal(classification.retryable, true)
+  assert.equal(classification.retryAfterMs, 2500)
 })
 
 test("classifyBoundaryError marks path-prefixed resource 404s as stale", () => {

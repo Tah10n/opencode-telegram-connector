@@ -1298,6 +1298,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         recordLoopAbort("backlogDrain", { reason: "connector stop" })
         return
       }
+      let pollRetryAfterMs = null
       const updates = await tg
         .getUpdates({ offset, timeout: 0, limit: 100, allowed_updates: ["message", "callback_query"], signal: abortController.signal })
         .catch((err) => {
@@ -1308,6 +1309,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
             method: "POST",
             pathname: "/getUpdates",
           })
+          pollRetryAfterMs = classification.retryAfterMs
           logLoopIssue("backlogDrain", classification.error, {
             retryable: classification.retryable,
             source: "telegram",
@@ -1323,7 +1325,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         return
       }
       if (!Array.isArray(updates)) {
-        await sleepWithAbort(backoff)
+        await sleepWithAbort(pollRetryAfterMs || backoff)
         backoff = Math.min(30_000, backoff * 2)
         continue
       }
@@ -1343,6 +1345,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     await drainTelegramBacklogIfNeeded()
     let backoff = 1000
     while (!abortController.signal.aborted) {
+      let pollRetryAfterMs = null
       const offset = store.get().updateOffset ?? 0
       const updates = await tg
         .getUpdates({ offset, timeout: 30, limit: 100, allowed_updates: ["message", "callback_query"], signal: abortController.signal })
@@ -1354,6 +1357,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
             method: "POST",
             pathname: "/getUpdates",
           })
+          pollRetryAfterMs = classification.retryAfterMs
           logLoopIssue("telegramPoll", classification.error, {
             retryable: classification.retryable,
             source: "telegram",
@@ -1369,7 +1373,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       }
       if (!Array.isArray(updates)) {
         // Avoid a tight loop on network/API errors.
-        await sleepWithAbort(backoff)
+        await sleepWithAbort(pollRetryAfterMs || backoff)
         backoff = Math.min(30_000, backoff * 2)
         continue
       }
@@ -1381,6 +1385,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       backoff = 1000
       for (const u of updates) {
         let shouldAdvanceOffset = false
+        let retryDelayMs = 1000
         const updateKey = telegramUpdateIdempotencyKey(u?.update_id)
         if (updateKey && store.hasIdempotencyKey?.(updateKey)) {
           store.setUpdateOffset(u.update_id + 1)
@@ -1394,6 +1399,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         } catch (err) {
           const classification = classifyBoundaryError(err)
           if (classification.retryable) {
+            retryDelayMs = classification.retryAfterMs || retryDelayMs
             runtimeObservability.recordUpdateRetry()
             logger.warn("Retryable update handler error", {
               source: "telegram",
@@ -1432,7 +1438,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
           store.setUpdateOffset(u.update_id + 1)
           await flushCriticalState("persist Telegram update checkpoint")
         } else {
-          await sleepWithAbort(1000)
+          await sleepWithAbort(retryDelayMs)
           break
         }
       }

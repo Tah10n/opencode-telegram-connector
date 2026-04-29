@@ -169,7 +169,7 @@ test("TelegramClient classifies rate limits as retryable boundary errors", async
     ok: false,
     status: 429,
     statusText: "Too Many Requests",
-    json: async () => ({ ok: false, description: "rate limited" }),
+    json: async () => ({ ok: false, description: "rate limited", parameters: { retry_after: 3 } }),
   })
 
   try {
@@ -178,7 +178,9 @@ test("TelegramClient classifies rate limits as retryable boundary errors", async
       const classification = classifyBoundaryError(err)
       assert.equal(err.isBoundaryError, true)
       assert.equal(err.status, 429)
+      assert.equal(err.retryAfterMs, 3000)
       assert.equal(classification.retryable, true)
+      assert.equal(classification.retryAfterMs, 3000)
       return true
     })
   } finally {

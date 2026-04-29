@@ -425,6 +425,11 @@ function requireWindowsCmdSafeAttachArg(value, label) {
   return text
 }
 
+function quoteWindowsCmdArgument(value) {
+  const text = String(value ?? "")
+  return /\s/.test(text) ? `"${text}"` : text
+}
+
 function buildPosixShellCommand(argv, { directory } = {}) {
   const steps = []
   if (directory) steps.push(`cd ${shQuote(directory)}`)
@@ -796,11 +801,12 @@ export async function openAttachWindowWindows({ directory, baseUrl, sessionId })
 
 export async function openAttachContinueWindowWindows({ directory, baseUrl }) {
   const safe = safeAttachBaseUrl(baseUrl)
+  const safeDirectory = directory ? requireWindowsCmdSafeAttachArg(directory, "directory") : ""
   const args = [
     "attach",
     requireWindowsCmdSafeAttachArg(safe.url, "baseUrl"),
     "--continue",
-    ...(directory ? ["--dir", requireWindowsCmdSafeAttachArg(directory, "directory")] : []),
+    ...(safeDirectory ? ["--dir", quoteWindowsCmdArgument(safeDirectory)] : []),
   ]
   const ps = [
     "Start-Process -WindowStyle Normal -FilePath cmd.exe -ArgumentList @(",
@@ -812,7 +818,7 @@ export async function openAttachContinueWindowWindows({ directory, baseUrl }) {
     ",",
     args.map((a) => psQuote(a)).join(","),
     ")",
-    directory ? ` -WorkingDirectory ${psQuote(directory)}` : "",
+    safeDirectory ? ` -WorkingDirectory ${psQuote(safeDirectory)}` : "",
     ";",
   ].join("")
 

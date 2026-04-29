@@ -15,7 +15,7 @@ import { DEFAULT_FEED_MODE, normalizeFeedMode, sessionKey } from "../state/store
 import { ATTACHMENT_NOTICES, attachmentCaption, sanitizeFilenamePart, scopedAttachmentFilename } from "./attachment-utils.js"
 import { NOISY_SKIP_REASONS } from "./noisy-skip-reasons.js"
 import { redactSensitiveText } from "../url-utils.js"
-import { isRetryableBoundaryError } from "../boundary-errors.js"
+import { classifyBoundaryError, isRetryableBoundaryError } from "../boundary-errors.js"
 
 export function createMirroringHandlers(runtime) {
   const {
@@ -793,10 +793,10 @@ export function createMirroringHandlers(runtime) {
     }
   }
 
-  async function resolveBoundRouteWithRetry(projectAlias, sessionId, { attempts = ROUTE_LOOKUP_MAX_ATTEMPTS, initialDelayMs = ROUTE_LOOKUP_INITIAL_DELAY_MS, signal } = {}) {
+  async function resolveBoundRouteWithRetry(projectAlias, sessionId, { attempts = ROUTE_LOOKUP_MAX_ATTEMPTS, initialDelayMs = ROUTE_LOOKUP_INITIAL_DELAY_MS, signal, ignoreStopping = false } = {}) {
     let waitMs = initialDelayMs
     for (let attempt = 0; attempt < attempts; attempt += 1) {
-      if (signal?.aborted || isStopping()) return null
+      if (signal?.aborted || (isStopping() && ignoreStopping !== true)) return null
       try {
         return await resolveBoundRoute(projectAlias, sessionId)
       } catch (err) {
@@ -811,6 +811,51 @@ export function createMirroringHandlers(runtime) {
 
   function assistantRetryDelayMs(attempt) {
     return ASSISTANT_FINAL_DELIVERY_RETRY_DELAYS_MS[Math.max(0, Math.min(ASSISTANT_FINAL_DELIVERY_RETRY_DELAYS_MS.length - 1, attempt - 1))]
+  }
+
+  function routeCtxFromRoute(route) {
+    return { chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey: ctxKeyFrom(route.chatId, route.threadIdOr0) }
+  }
+
+  function sameRouteCtx(a, b) {
+    return String(a?.chatId ?? "") === String(b?.chatId ?? "") && String(a?.threadIdOr0 || 0) === String(b?.threadIdOr0 || 0)
+  }
+
+  function previewMatchesRoute(previewState, routeCtx) {
+    const previewRoute = previewState?.routeCtx || previewState?.route
+    if (!previewRoute) return true
+    return sameRouteCtx(previewRoute, routeCtx)
+  }
+
+  function routeProgressKey(routeCtx) {
+    return routeCtx?.ctxKey || `${routeCtx?.chatId ?? ""}:${routeCtx?.threadIdOr0 || 0}`
+  }
+
+  function resetAssistantDeliveryProgressForRoute(deliveryOptions, routeCtx) {
+    const nextRouteKey = routeProgressKey(routeCtx)
+    if (!nextRouteKey) return
+    if (deliveryOptions.assistantDeliveryRouteKey && deliveryOptions.assistantDeliveryRouteKey !== nextRouteKey) {
+      delete deliveryOptions.assistantTextDelivered
+      delete deliveryOptions.assistantTextBlockIndex
+      delete deliveryOptions.assistantLongNoticeDelivered
+    }
+    deliveryOptions.assistantDeliveryRouteKey = nextRouteKey
+  }
+
+  async function resolveFreshAssistantDeliveryRoute(projectAlias, sessionId, messageId, deliveryOptions = {}) {
+    const signal = deliveryOptions.signal || abortSignal
+    const resolved = await resolveBoundRouteWithRetry(projectAlias, sessionId, { signal, ignoreStopping: deliveryOptions.ignoreStopping === true })
+    if (!resolved?.route) {
+      logSseDebug(projectAlias, sessionId, `drop=assistant_no_route msg=${messageId}`)
+      return null
+    }
+    if (resolved.boundSessionId !== sessionId) {
+      logSseDebug(projectAlias, sessionId, `drop=assistant_child_message msg=${messageId} bound=${resolved.boundSessionId}`)
+      return null
+    }
+    const route = resolved.route
+    const routeCtx = routeCtxFromRoute(route)
+    return { route, routeCtx, boundKey: sessionKey(projectAlias, resolved.boundSessionId) }
   }
 
   async function getAssistantMessageWithRetry(oc, sessionId, messageId, { attempts = 3, initialDelayMs = 150, signal, timeoutMs } = {}) {
@@ -1112,6 +1157,7 @@ export function createMirroringHandlers(runtime) {
       }
       state.lastPreviewHtml = previewHtml
       state.lastPreviewAt = Date.now()
+      state.routeCtx = routeCtx
       assistantPreviewBySession.set(boundKey, state)
       logSseDebug(projectAlias, sessionId, `stream=assistant msg=${info.id} thread=${route.threadIdOr0 || 0}`)
       return
@@ -1146,91 +1192,109 @@ export function createMirroringHandlers(runtime) {
         }
         await (async () => {
           if (shouldStopDelivery()) return
-        const previewState = assistantPreviewBySession.get(boundKey)
-        const replaceMessageId = previewState?.messageId === info.id ? previewState.telegramMessageId : undefined
-        const msg = await getAssistantMessageWithRetry(oc, sessionId, info.id, deliveryOptions)
-        if (shouldStopDelivery()) return
-        if (!msg) {
-          if (replaceMessageId) {
+          const msg = await getAssistantMessageWithRetry(oc, sessionId, info.id, deliveryOptions)
+          if (shouldStopDelivery()) return
+
+          let currentRoute = null
+          let currentRouteCtx = null
+          let currentBoundKey = null
+          let replaceMessageId = undefined
+          const refreshDeliveryTarget = async () => {
+            const freshRoute = await resolveFreshAssistantDeliveryRoute(projectAlias, sessionId, info.id, deliveryOptions)
+            if (shouldStopDelivery() || !freshRoute) return false
+            currentRoute = freshRoute.route
+            currentRouteCtx = freshRoute.routeCtx
+            currentBoundKey = freshRoute.boundKey
+            resetAssistantDeliveryProgressForRoute(deliveryOptions, currentRouteCtx)
+            const previewState = assistantPreviewBySession.get(currentBoundKey)
+            replaceMessageId = previewState?.messageId === info.id && previewMatchesRoute(previewState, currentRouteCtx) ? previewState.telegramMessageId : undefined
+            return true
+          }
+
+          if (!msg) {
+            if (!(await refreshDeliveryTarget())) return
+            if (replaceMessageId) {
+              await tg
+                .editMessageText(
+                  currentRoute.chatId,
+                  replaceMessageId,
+                  "Assistant reply finished, but the final content could not be fetched yet. Use /sendlast to retry.",
+                  null,
+                )
+                .catch(() => {})
+            }
+            logSseDebug(projectAlias, sessionId, `drop=assistant_fetch_failed msg=${info.id}`)
+            return
+          }
+          if (!eventStartedAfterLaunch(msg?.info, { allowCompletedAfterStart: true })) {
+            logSseDebug(projectAlias, sessionId, `drop=assistant_message_before_start msg=${info.id}`)
+            return
+          }
+          if (!runtime.mirrorCompaction && (msg?.info?.mode === "compaction" || msg?.info?.agent === "compaction")) {
+            logSseDebug(projectAlias, sessionId, `drop=compaction_message msg=${info.id}`)
+            recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.ASSISTANT_COMPACTION)
+            return
+          }
+
+          const displayText = extractAssistantDisplayText(projectAlias, msg)
+          const text = extractTextParts(msg)
+          const changedFilesSummary = extractChangedFilesSummary(projectAlias, msg)
+          const hasAssistantText = !!text?.trim()
+          const hasChangedFiles = !!changedFilesSummary
+
+          if (!(await refreshDeliveryTarget())) return
+
+          if (!displayText || !displayText.trim()) {
+            if (replaceMessageId) {
+              await tg.editMessageText(currentRoute.chatId, replaceMessageId, "Assistant reply finished with no Telegram-visible content.", null).catch(() => {})
+              assistantPreviewBySession.delete(currentBoundKey)
+            }
+            sets.assistant.add(info.id)
+            logSseDebug(projectAlias, sessionId, `drop=assistant_empty msg=${info.id}`)
+            recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.ASSISTANT_EMPTY)
+            return
+          }
+
+          const current = lastAssistantBySession.get(currentBoundKey)
+          if (current?.messageId === info.id) lastAssistantBySession.set(currentBoundKey, { messageId: info.id, sessionId, text: displayText })
+          const allowChangedFiles = hasChangedFiles && shouldMirrorToFeed(currentRouteCtx.ctxKey, "changed-files")
+          let visibleOutputSent = false
+
+          if (hasAssistantText) {
+            if (deliveryOptions.assistantTextDelivered === true) {
+              visibleOutputSent = true
+            } else {
+              if (shouldStopDelivery()) return
+              const delivered = await deliverAssistantText(currentRouteCtx, projectAlias, sessionId, info.id, text, { replaceMessageId, deliveryOptions })
+              if (delivered) deliveryOptions.assistantTextDelivered = true
+              visibleOutputSent = visibleOutputSent || !!delivered
+            }
+          }
+
+          if (allowChangedFiles) {
+            if (shouldStopDelivery()) return
+            const deliveredChanges = await deliverChangedFilesSummary(currentRouteCtx, projectAlias, sessionId, info.id, msg, {
+              replaceMessageId: !hasAssistantText ? replaceMessageId : undefined,
+            })
+            visibleOutputSent = visibleOutputSent || !!deliveredChanges
+            sets.changes.add(info.id)
+            logSseDebug(projectAlias, sessionId, `send=changed_files msg=${info.id} thread=${currentRoute.threadIdOr0 || 0}`)
+          } else if (hasChangedFiles) {
+            sets.changes.add(info.id)
+            logSseDebug(projectAlias, sessionId, `drop=changed_files_feed msg=${info.id} mode=${getFeedMode(currentRouteCtx.ctxKey)}`)
+            recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.CHANGED_FILES_FEED_FILTERED)
+          }
+
+          if (replaceMessageId && !visibleOutputSent) {
             await tg
-              .editMessageText(
-                route.chatId,
-                replaceMessageId,
-                "Assistant reply finished, but the final content could not be fetched yet. Use /sendlast to retry.",
-                null,
-              )
+              .editMessageText(currentRoute.chatId, replaceMessageId, "Assistant reply finished, but no updates matched the current feed mode.", null)
               .catch(() => {})
           }
-          logSseDebug(projectAlias, sessionId, `drop=assistant_fetch_failed msg=${info.id}`)
-          return
-        }
-        if (!eventStartedAfterLaunch(msg?.info, { allowCompletedAfterStart: true })) {
-          logSseDebug(projectAlias, sessionId, `drop=assistant_message_before_start msg=${info.id}`)
-          return
-        }
-        if (!runtime.mirrorCompaction && (msg?.info?.mode === "compaction" || msg?.info?.agent === "compaction")) {
-          logSseDebug(projectAlias, sessionId, `drop=compaction_message msg=${info.id}`)
-          recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.ASSISTANT_COMPACTION)
-          return
-        }
 
-        const displayText = extractAssistantDisplayText(projectAlias, msg)
-        const text = extractTextParts(msg)
-        const changedFilesSummary = extractChangedFilesSummary(projectAlias, msg)
-        const hasAssistantText = !!text?.trim()
-        const hasChangedFiles = !!changedFilesSummary
-
-        if (!displayText || !displayText.trim()) {
-          if (replaceMessageId) {
-            await tg.editMessageText(route.chatId, replaceMessageId, "Assistant reply finished with no Telegram-visible content.", null).catch(() => {})
-            assistantPreviewBySession.delete(boundKey)
-          }
+          if (replaceMessageId) assistantPreviewBySession.delete(currentBoundKey)
           sets.assistant.add(info.id)
-          logSseDebug(projectAlias, sessionId, `drop=assistant_empty msg=${info.id}`)
-          recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.ASSISTANT_EMPTY)
-          return
-        }
-
-        const current = lastAssistantBySession.get(boundKey)
-        if (current?.messageId === info.id) lastAssistantBySession.set(boundKey, { messageId: info.id, sessionId, text: displayText })
-        const allowChangedFiles = hasChangedFiles && shouldMirrorToFeed(routeCtx.ctxKey, "changed-files")
-        let visibleOutputSent = false
-
-        if (hasAssistantText) {
-          if (deliveryOptions.assistantTextDelivered === true) {
-            visibleOutputSent = true
-          } else {
-            if (shouldStopDelivery()) return
-            const delivered = await deliverAssistantText(routeCtx, projectAlias, sessionId, info.id, text, { replaceMessageId, deliveryOptions })
-            if (delivered) deliveryOptions.assistantTextDelivered = true
-            visibleOutputSent = visibleOutputSent || !!delivered
-          }
-        }
-
-        if (allowChangedFiles) {
-          if (shouldStopDelivery()) return
-          const deliveredChanges = await deliverChangedFilesSummary(routeCtx, projectAlias, sessionId, info.id, msg, {
-            replaceMessageId: !hasAssistantText ? replaceMessageId : undefined,
-          })
-          visibleOutputSent = visibleOutputSent || !!deliveredChanges
-          sets.changes.add(info.id)
-          logSseDebug(projectAlias, sessionId, `send=changed_files msg=${info.id} thread=${route.threadIdOr0 || 0}`)
-        } else if (hasChangedFiles) {
-          sets.changes.add(info.id)
-          logSseDebug(projectAlias, sessionId, `drop=changed_files_feed msg=${info.id} mode=${getFeedMode(routeCtx.ctxKey)}`)
-          recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.CHANGED_FILES_FEED_FILTERED)
-        }
-
-        if (replaceMessageId && !visibleOutputSent) {
-          await tg
-            .editMessageText(route.chatId, replaceMessageId, "Assistant reply finished, but no updates matched the current feed mode.", null)
-            .catch(() => {})
-        }
-
-        if (replaceMessageId) assistantPreviewBySession.delete(boundKey)
-        sets.assistant.add(info.id)
-        if (visibleOutputSent) recordAssistantMirrored?.(projectAlias)
-        logSseDebug(projectAlias, sessionId, `send=assistant msg=${info.id} thread=${route.threadIdOr0 || 0}`)
+          if (visibleOutputSent) recordAssistantMirrored?.(projectAlias)
+          logSseDebug(projectAlias, sessionId, `send=assistant msg=${info.id} thread=${currentRoute.threadIdOr0 || 0}`)
         })()
       } finally {
         deliveryState.inFlight = false
@@ -1244,15 +1308,16 @@ export function createMirroringHandlers(runtime) {
       } catch (err) {
         const attempt = Number.isInteger(deliveryOptions.finalDeliveryAttempt) && deliveryOptions.finalDeliveryAttempt > 0 ? deliveryOptions.finalDeliveryAttempt : 1
         const message = err?.message || String(err)
+        const classification = classifyBoundaryError(err)
         const canRetry =
           deliveryOptions.ignoreStopping !== true &&
           deliveryOptions.signal?.aborted !== true &&
           !isStopping() &&
           attempt < ASSISTANT_FINAL_DELIVERY_MAX_ATTEMPTS &&
-          isRetryableBoundaryError(err)
+          classification.retryable
         if (canRetry) {
           const nextAttempt = attempt + 1
-          const delayMs = assistantRetryDelayMs(attempt)
+          const delayMs = classification.retryAfterMs || assistantRetryDelayMs(attempt)
           logSseDebug(projectAlias, sessionId, `retry=assistant_final_delivery msg=${info.id} attempt=${nextAttempt} delay=${delayMs} ${message}`)
           deliveryOptions.finalDeliveryAttempt = nextAttempt
           const retryOptions = deliveryOptions

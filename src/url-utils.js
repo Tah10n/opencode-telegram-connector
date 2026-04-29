@@ -43,10 +43,33 @@ export function sanitizeBaseUrlForDisplay(baseUrl) {
     }
     if (u.hash) u.hash = ""
     for (const [k] of u.searchParams) u.searchParams.set(k, "***")
+    u.pathname = sanitizePathForDisplay(u.pathname)
     return u.toString()
   } catch {
     return redactCmdlineSecrets(s)
   }
+}
+
+const SENSITIVE_PATH_VALUE_RE = /^(?:token|access[-_.~]?token|password|passwd|secret|api[-_.~]?key|apikey|key|auth|jwt|signature|sig|sso|session|credential|credentials)[-_.~:=].{3,}$/i
+
+function decodePathSegmentForDetection(segment) {
+  try {
+    return decodeURIComponent(segment)
+  } catch {
+    return segment
+  }
+}
+
+function isSensitivePathSegment(segment) {
+  const decoded = decodePathSegmentForDetection(segment)
+  return SENSITIVE_PATH_VALUE_RE.test(decoded) || redactHighEntropyTokens(decoded) !== decoded
+}
+
+function sanitizePathForDisplay(pathname) {
+  return String(pathname || "")
+    .split("/")
+    .map((segment) => (segment && isSensitivePathSegment(segment) ? "***" : segment))
+    .join("/")
 }
 
 function escapeRegExp(value) {
@@ -121,6 +144,20 @@ function redactSensitivePaths(text, sensitivePaths = []) {
   return out
 }
 
+function redactSensitiveUrlPathSegments(text) {
+  return String(text || "").replace(/https?:\/\/[^\s"'<>]+/gi, (raw) => {
+    try {
+      const u = new URL(raw)
+      const sanitizedPath = sanitizePathForDisplay(u.pathname)
+      if (sanitizedPath === u.pathname) return raw
+      u.pathname = sanitizedPath
+      return u.toString()
+    } catch {
+      return raw
+    }
+  })
+}
+
 export function redactCmdlineSecrets(cmdline, options = {}) {
   const s = String(cmdline || "")
   if (!s) return s
@@ -128,6 +165,7 @@ export function redactCmdlineSecrets(cmdline, options = {}) {
   out = out.replace(/\b(https?:\/\/)([^\s:@/]+):([^\s@/]+)@/gi, "$1***:***@")
   out = out.replace(/([?&])([^=&#\s"']+)=([^&\s"']*)/g, "$1$2=***")
   out = out.replace(/#([^\s"']+)/g, "#***")
+  out = redactSensitiveUrlPathSegments(out)
 
   const flags = ["password", "pass", "passwd", "token", "api-key", "apikey", "secret", "key"]
   const flagAlternation = flags.map((f) => f.replaceAll("-", "[-_]?"))
@@ -153,9 +191,16 @@ export function sanitizeBaseUrlForCli(baseUrl) {
     const u = new URL(s)
     const hadUserInfo = !!(u.username || u.password)
     if (u.hash) u.hash = ""
-    const displayUrl = redactCmdlineSecrets(u.toString())
+    const display = new URL(u.toString())
+    display.pathname = sanitizePathForDisplay(display.pathname)
+    const displayUrl = redactCmdlineSecrets(display.toString())
 
-    let seemsSensitive = hadUserInfo || Boolean(u.search)
+    let seemsSensitive =
+      hadUserInfo ||
+      Boolean(u.search) ||
+      String(u.pathname || "")
+        .split("/")
+        .some((segment) => segment && isSensitivePathSegment(segment))
     const sensitiveKeysRe = /(token|access[_-]?token|password|passwd|secret|api[_-]?key|key|auth|jwt|signature|sig|code|sso|session)/i
     for (const k of u.searchParams.keys()) {
       if (sensitiveKeysRe.test(String(k))) {

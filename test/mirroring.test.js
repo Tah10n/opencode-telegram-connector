@@ -1004,6 +1004,127 @@ test("handleMessageUpdated records mirrored final assistant replies", async (t) 
   assert.equal(sets.assistant.has("msg_1"), true)
 })
 
+test("handleMessageUpdated drops final assistant delivery when unbound before debounce fires", async (t) => {
+  const timers = useManualTimeouts(t)
+  let binding = { projectAlias: "demo", sessionId: "ses_1", route: { chatId: 11, threadIdOr0: 22 } }
+  const { calls, runtime, handlers } = createHarness({
+    async resolveBoundRoute(projectAlias, sessionId) {
+      if (binding?.projectAlias !== projectAlias || binding?.sessionId !== sessionId) return null
+      return { route: binding.route, boundSessionId: sessionId }
+    },
+    ocByAlias: {
+      demo: {
+        async getMessage() {
+          return {
+            info: { id: "msg_1", role: "assistant", time: { completed: 1 } },
+            parts: [{ type: "text", text: "Final answer" }],
+          }
+        },
+      },
+    },
+  })
+  runtime.assistantPreviewBySession.set(sessionKey("demo", "ses_1"), {
+    messageId: "msg_1",
+    telegramMessageId: 81,
+    routeCtx: { chatId: 11, threadIdOr0: 22, ctxKey: "11:22" },
+  })
+
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", time: { completed: 1 } } },
+  })
+  binding = null
+  timers.runNext()
+  await flushAsyncWork(20)
+
+  assert.equal(calls.editMessageText.length, 0)
+  assert.equal(calls.sendBlocksToThread.length, 0)
+  const sets = runtime.forwardedBySession.get(sessionKey("demo", "ses_1"))
+  assert.equal(sets.assistant.has("msg_1"), false)
+  assert.ok(calls.logSseDebug.some((entry) => entry[2] === "drop=assistant_no_route msg=msg_1"))
+})
+
+test("handleMessageUpdated drops final assistant delivery when rebound to a different session before debounce fires", async (t) => {
+  const timers = useManualTimeouts(t)
+  let binding = { projectAlias: "demo", sessionId: "ses_1", route: { chatId: 11, threadIdOr0: 22 } }
+  const { calls, runtime, handlers } = createHarness({
+    async resolveBoundRoute(projectAlias, sessionId) {
+      if (binding?.projectAlias !== projectAlias || binding?.sessionId !== sessionId) return null
+      return { route: binding.route, boundSessionId: sessionId }
+    },
+    ocByAlias: {
+      demo: {
+        async getMessage() {
+          return {
+            info: { id: "msg_1", role: "assistant", time: { completed: 1 } },
+            parts: [{ type: "text", text: "Final answer" }],
+          }
+        },
+      },
+    },
+  })
+  runtime.assistantPreviewBySession.set(sessionKey("demo", "ses_1"), {
+    messageId: "msg_1",
+    telegramMessageId: 82,
+    routeCtx: { chatId: 11, threadIdOr0: 22, ctxKey: "11:22" },
+  })
+
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", time: { completed: 1 } } },
+  })
+  binding = { projectAlias: "demo", sessionId: "ses_2", route: { chatId: 33, threadIdOr0: 44 } }
+  timers.runNext()
+  await flushAsyncWork(20)
+
+  assert.equal(calls.editMessageText.length, 0)
+  assert.equal(calls.sendBlocksToThread.length, 0)
+  const sets = runtime.forwardedBySession.get(sessionKey("demo", "ses_1"))
+  assert.equal(sets.assistant.has("msg_1"), false)
+  assert.ok(calls.logSseDebug.some((entry) => entry[2] === "drop=assistant_no_route msg=msg_1"))
+})
+
+test("handleMessageUpdated sends final assistant delivery to current route without editing stale preview", async (t) => {
+  const timers = useManualTimeouts(t)
+  let binding = { projectAlias: "demo", sessionId: "ses_1", route: { chatId: 11, threadIdOr0: 22 } }
+  const { calls, runtime, handlers } = createHarness({
+    async resolveBoundRoute(projectAlias, sessionId) {
+      if (binding?.projectAlias !== projectAlias || binding?.sessionId !== sessionId) return null
+      return { route: binding.route, boundSessionId: sessionId }
+    },
+    ocByAlias: {
+      demo: {
+        async getMessage() {
+          return {
+            info: { id: "msg_1", role: "assistant", time: { completed: 1 } },
+            parts: [{ type: "text", text: "Final answer" }],
+          }
+        },
+      },
+    },
+  })
+  runtime.assistantPreviewBySession.set(sessionKey("demo", "ses_1"), {
+    messageId: "msg_1",
+    telegramMessageId: 83,
+    routeCtx: { chatId: 11, threadIdOr0: 22, ctxKey: "11:22" },
+  })
+
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", time: { completed: 1 } } },
+  })
+  binding = { projectAlias: "demo", sessionId: "ses_1", route: { chatId: 33, threadIdOr0: 44 } }
+  timers.runNext()
+  await flushAsyncWork(20)
+
+  assert.equal(calls.editMessageText.length, 0)
+  assert.equal(calls.sendBlocksToThread.length, 1)
+  assert.equal(calls.sendBlocksToThread[0][0].chatId, 33)
+  assert.equal(calls.sendBlocksToThread[0][0].threadIdOr0, 44)
+  const sets = runtime.forwardedBySession.get(sessionKey("demo", "ses_1"))
+  assert.equal(sets.assistant.has("msg_1"), true)
+})
+
 test("handleMessageUpdated sends changed-files card in main+changes when patch files are inferred from diff", async (t) => {
   useImmediateTimeouts(t)
   const { calls, runtime, handlers } = createHarness({
@@ -1036,7 +1157,7 @@ test("handleMessageUpdated sends changed-files card in main+changes when patch f
     projectAlias: "demo",
     props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", time: { completed: 1 } } },
   })
-  await flushAsyncWork()
+  await flushAsyncWork(16)
 
   assert.equal(calls.sendBlocksToThread.length, 1)
   assert.equal(calls.sendToThread.length, 1)
@@ -1075,7 +1196,7 @@ test("handleMessageUpdated retries retryable route lookups before final delivery
   })
   await flushAsyncWork()
 
-  assert.equal(routeCalls, 2)
+  assert.equal(routeCalls, 3)
   assert.equal(calls.sendBlocksToThread.length, 1)
   const sets = runtime.forwardedBySession.get(sessionKey("demo", "ses_1"))
   assert.equal(sets.assistant.has("msg_1"), true)
@@ -1126,6 +1247,114 @@ test("handleMessageUpdated retries retryable final assistant delivery failures",
   assert.equal(sets.assistant.has("msg_1"), true)
 })
 
+test("handleMessageUpdated honors retry_after for final assistant delivery retries", async (t) => {
+  const timers = useManualTimeouts(t)
+  let sendAttempts = 0
+  const { calls, runtime, handlers } = createHarness({
+    async sendBlocksToThread(...args) {
+      calls.sendBlocksToThread.push(args)
+      sendAttempts += 1
+      if (sendAttempts === 1) {
+        throw makeBoundaryError({
+          source: "telegram",
+          operation: "sendMessage",
+          status: 429,
+          message: "rate limited",
+          retryAfterMs: 42_000,
+        })
+      }
+      return [{ message_id: 905 }]
+    },
+    ocByAlias: {
+      demo: {
+        async getMessage() {
+          return {
+            info: { id: "msg_1", role: "assistant", time: { completed: 1 } },
+            parts: [{ type: "text", text: "Final" }],
+          }
+        },
+      },
+    },
+  })
+
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", time: { completed: 1 } } },
+  })
+  assert.deepEqual(timers.pendingDelays(), [250])
+
+  timers.runNext()
+  await flushAsyncWork(20)
+
+  assert.equal(calls.sendBlocksToThread.length, 1)
+  assert.deepEqual(timers.pendingDelays(), [42_000])
+
+  timers.runNext()
+  await flushAsyncWork(20)
+
+  assert.equal(calls.sendBlocksToThread.length, 2)
+  assert.deepEqual(timers.pendingDelays(), [])
+  const sets = runtime.forwardedBySession.get(sessionKey("demo", "ses_1"))
+  assert.equal(sets.assistant.has("msg_1"), true)
+})
+
+test("handleMessageUpdated resends assistant text when retry route changes", async (t) => {
+  useImmediateTimeouts(t)
+  let currentRoute = { chatId: 11, threadIdOr0: 22 }
+  let changedFilesAttempts = 0
+  const { calls, runtime, handlers } = createHarness({
+    async resolveBoundRoute(_projectAlias, sessionId) {
+      return { route: currentRoute, boundSessionId: sessionId }
+    },
+    async sendToThread(...args) {
+      calls.sendToThread.push(args)
+      changedFilesAttempts += 1
+      if (changedFilesAttempts === 1) {
+        currentRoute = { chatId: 33, threadIdOr0: 44 }
+        throw makeBoundaryError({ source: "telegram", operation: "sendMessage", status: 429, message: "rate limited" })
+      }
+      return { message_id: 904 }
+    },
+    ocByAlias: {
+      demo: {
+        async getMessage() {
+          return {
+            info: { id: "msg_1", role: "assistant", time: { completed: 1 } },
+            parts: [
+              { type: "text", text: "Final answer" },
+              {
+                type: "patch",
+                diff: [
+                  "diff --git a/src/app.js b/src/app.js",
+                  "--- a/src/app.js",
+                  "+++ b/src/app.js",
+                  "@@ -1 +1 @@",
+                  "-old",
+                  "+new",
+                ].join("\n"),
+              },
+            ],
+          }
+        },
+      },
+    },
+  })
+
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", time: { completed: 1 } } },
+  })
+  await flushAsyncWork(24)
+
+  assert.equal(calls.sendBlocksToThread.length, 2)
+  assert.equal(calls.sendBlocksToThread[0][0].chatId, 11)
+  assert.equal(calls.sendBlocksToThread[1][0].chatId, 33)
+  assert.equal(calls.sendToThread.length, 2)
+  assert.equal(calls.sendToThread[1][0].chatId, 33)
+  const sets = runtime.forwardedBySession.get(sessionKey("demo", "ses_1"))
+  assert.equal(sets.assistant.has("msg_1"), true)
+})
+
 test("handleMessageUpdated resumes multi-block assistant delivery without resending completed blocks", async (t) => {
   useImmediateTimeouts(t)
   let sendAttempts = 0
@@ -1158,7 +1387,7 @@ test("handleMessageUpdated resumes multi-block assistant delivery without resend
     projectAlias: "demo",
     props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", time: { completed: 1 } } },
   })
-  await flushAsyncWork(20)
+  await flushAsyncWork(40)
 
   assert.ok(calls.sendMessage.length >= 3)
   assert.equal(calls.sendMessage.filter((args) => args[1] === calls.sendMessage[0][1]).length, 1)
@@ -1301,7 +1530,7 @@ test("handleMessageUpdated logs final assistant delivery failures without markin
     projectAlias: "demo",
     props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", time: { completed: 1 } } },
   })
-  await flushAsyncWork()
+  await flushAsyncWork(16)
 
   assert.equal(failedSendBlocks.length, 1)
   assert.match(loggerErrors[0].join(" "), /Assistant final delivery failed: demo ses_1 msg_1 telegram down/)

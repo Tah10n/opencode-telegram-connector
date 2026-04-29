@@ -19,6 +19,13 @@ function normalizeCode(value) {
   return typeof value === "string" && value.trim() ? value.trim().toUpperCase() : null
 }
 
+function normalizeRetryAfterMs(value) {
+  if (value == null) return null
+  const n = Number(value)
+  if (!Number.isFinite(n) || n <= 0) return null
+  return Math.min(Math.ceil(n), 60 * 60 * 1000)
+}
+
 function parseMethodAndPath(message) {
   const match = cleanString(message).match(/\b(GET|POST|PUT|PATCH|DELETE)\s+([^\s]+)\s+failed:\s+(\d{3})\b/i)
   if (!match) return null
@@ -123,6 +130,7 @@ export class BoundaryError extends Error {
     this.kind = init.kind || "unknown"
     this.outcome = init.outcome || "fatal"
     this.details = init.details || null
+    this.retryAfterMs = normalizeRetryAfterMs(init.retryAfterMs)
   }
 }
 
@@ -176,6 +184,7 @@ export function normalizeBoundaryError(err, context = {}) {
     didTimeout: context.didTimeout === true,
     cause: context.cause || err,
     details: context.details || err?.details || null,
+    retryAfterMs: context.retryAfterMs ?? err?.retryAfterMs ?? null,
     name: err?.name,
   })
 }
@@ -192,6 +201,7 @@ export function classifyBoundaryError(err, context = {}) {
     stale: error.outcome === "stale",
     retryable: error.outcome === "retryable",
     fatal: error.outcome === "fatal",
+    retryAfterMs: error.retryAfterMs,
   }
 }
 
@@ -215,7 +225,7 @@ export function isDisconnectBoundaryError(err, context = {}) {
   return normalizeBoundaryError(err, context).kind === "disconnect"
 }
 
-export function boundaryErrorFromHttpResponse({ source, message, operation, method, pathname, status, statusText, bodyText, details }) {
+export function boundaryErrorFromHttpResponse({ source, message, operation, method, pathname, status, statusText, bodyText, details, retryAfterMs }) {
   const suffix = cleanString(statusText) || "Request failed"
   return makeBoundaryError({
     source,
@@ -225,6 +235,7 @@ export function boundaryErrorFromHttpResponse({ source, message, operation, meth
     pathname,
     status,
     details,
+    retryAfterMs,
   })
 }
 

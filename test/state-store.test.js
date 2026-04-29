@@ -542,6 +542,57 @@ test("StateStore rejects malformed schema version 5 sections with actionable pat
   assert.match(await fs.readFile(path.join(dir, backups[0]), "utf8"), /bad:1/)
 })
 
+test("StateStore rejects unsafe persisted session identities", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  await fs.writeFile(
+    filePath,
+    JSON.stringify(
+      {
+        schemaVersion: 5,
+        updateOffset: 101,
+        bindings: {
+          "100:0": { projectAlias: "demo", sessionId: " ses_1 " },
+          "100:1": { projectAlias: "demo:prod", sessionId: "ses_2" },
+          "100:2": { projectAlias: "demo", sessionId: "bad/id" },
+        },
+        sessionIndex: {
+          "demo:ses_1": { chatId: 100, threadIdOr0: 0 },
+          "demo:prod:ses_2": { chatId: 100, threadIdOr0: 1 },
+        },
+        feedByContext: {},
+        modelPrefsByContext: {},
+        pendingPrompts: {
+          permissions: {
+            unsafe: { projectAlias: "demo", permissionId: "perm_1", sessionID: "bad id", ctx: { chatId: 100, threadIdOr0: 0, ctxKey: "100:0" } },
+          },
+          rejectNotes: {},
+          customAnswers: {},
+          questionWizards: {},
+        },
+        pendingRuntimeOnlineNotice: null,
+        idempotency: { keys: {} },
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  )
+
+  const store = new StateStore({ filePath, logger: makeLogger() })
+
+  await assert.rejects(() => store.load(), (err) => {
+    assert.equal(err.code, "STATE_SCHEMA_INVALID")
+    assert.match(err.message, /state\.bindings\["100:0"\]\.sessionId/)
+    assert.match(err.message, /state\.bindings\["100:1"\]\.projectAlias/)
+    assert.match(err.message, /state\.sessionIndex\["demo:prod:ses_2"\] key/)
+    assert.match(err.message, /state\.pendingPrompts\.permissions\["unsafe"\]\.sessionID/)
+    return true
+  })
+  const backups = (await fs.readdir(dir)).filter((name) => name.startsWith("state.json.backup.") && name.includes(".invalid."))
+  assert.equal(backups.length, 1)
+})
+
 test("StateStore migrates legacy state and flush persists the new schema", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")

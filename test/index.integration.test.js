@@ -3402,7 +3402,7 @@ test("startConnector skips duplicate permission callback replays after ledger pe
       listPermissionsImpl: async () => [{ id: "perm_replay" }],
       listQuestionsImpl: async () => [],
     },
-    initialUpdates: [[makeCallbackUpdate(630, "p|demo|perm_replay|once")]],
+    initialUpdates: [[makeCallbackUpdate(630, "p|demo|ses_1|perm_replay|once")]],
   })
 
   try {
@@ -4016,7 +4016,7 @@ test("startConnector clears stale permission callbacks without blocking later up
         throw new Error("POST /permission/perm_stale/reply failed: 404 not found")
       },
     },
-    initialUpdates: [[makeCallbackUpdate(670, "p|demo|perm_stale|once"), makeMessageUpdate(671, "hello after stale permission")]],
+    initialUpdates: [[makeCallbackUpdate(670, "p|demo|ses_1|perm_stale|once"), makeMessageUpdate(671, "hello after stale permission")]],
   })
 
   try {
@@ -4074,7 +4074,7 @@ test("startConnector transient callback failures do not block later updates", as
         })
       },
     },
-    initialUpdates: [[makeCallbackUpdate(675, "p|demo|perm_retry|once"), makeMessageUpdate(676, "hello after callback failure")]],
+    initialUpdates: [[makeCallbackUpdate(675, "p|demo|ses_1|perm_retry|once"), makeMessageUpdate(676, "hello after callback failure")]],
   })
 
   try {

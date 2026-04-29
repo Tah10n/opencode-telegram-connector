@@ -81,8 +81,8 @@ function makeRuntime(overrides = {}) {
       modelCalls.push({ type: "clear", ctxKey })
       return true
     },
-    deletePendingPermission: (projectAlias, permissionId) => {
-      deletedPermissions.push({ projectAlias, permissionId })
+    deletePendingPermission: (projectAlias, permissionId, sessionID = "") => {
+      deletedPermissions.push({ projectAlias, permissionId, ...(sessionID ? { sessionID } : {}) })
       return true
     },
     ...(storeOverrides || {}),
@@ -1164,6 +1164,7 @@ test("createCallbackHandlers resolves permission callbacks including stale and r
   const deletedMessages = []
   const answered = []
   const { runtime, callbackAnswers, deletedPermissions, rejectStateCalls, rejectedNotes } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
     recordPromptAnswered: (...args) => answered.push(args),
     tg: {
       deleteMessage: async (chatId, messageId) => {
@@ -1190,10 +1191,10 @@ test("createCallbackHandlers resolves permission callbacks including stale and r
   })
   const handlers = createCallbackHandlers(runtime)
 
-  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_ok|once", { messageId: 901 }))
-  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_stale|reject", { messageId: 902 }))
-  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_note|reject_note", { messageId: 903 }))
-  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_note|cancel_note", { messageId: 904 }))
+  await handlers.handleTelegramCallback(makeCallback("p|demo||perm_ok|once", { messageId: 901 }))
+  await handlers.handleTelegramCallback(makeCallback("p|demo||perm_stale|reject", { messageId: 902 }))
+  await handlers.handleTelegramCallback(makeCallback("p|demo||perm_note|reject_note", { messageId: 903 }))
+  await handlers.handleTelegramCallback(makeCallback("p|demo||perm_note|cancel_note", { messageId: 904 }))
 
   assert.deepEqual(deletedPermissions, [
     { projectAlias: "demo", permissionId: "perm_ok" },
@@ -1223,6 +1224,7 @@ test("createCallbackHandlers skips duplicate permission callbacks via idempotenc
   const pendingPermissions = new Set(["demo:perm_dup"])
   const replyCalls = []
   const { runtime, callbackAnswers } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
     store: {
       getPendingPermission: (projectAlias, permissionId) => (pendingPermissions.has(`${projectAlias}:${permissionId}`) ? { projectAlias, permissionId } : null),
       deletePendingPermission: (projectAlias, permissionId) => pendingPermissions.delete(`${projectAlias}:${permissionId}`),
@@ -1244,8 +1246,8 @@ test("createCallbackHandlers skips duplicate permission callbacks via idempotenc
   })
   const handlers = createCallbackHandlers(runtime)
 
-  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_dup|once", { id: "cb_a" }))
-  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_dup|once", { id: "cb_b" }))
+  await handlers.handleTelegramCallback(makeCallback("p|demo||perm_dup|once", { id: "cb_a" }))
+  await handlers.handleTelegramCallback(makeCallback("p|demo||perm_dup|once", { id: "cb_b" }))
 
   assert.deepEqual(replyCalls, [{ permissionId: "perm_dup", payload: { reply: "once" } }])
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["OK", "Already handled"])
@@ -1255,6 +1257,7 @@ test("createCallbackHandlers rethrows permission reply durability failures", asy
   const idempotencyKeys = new Set()
   const replyCalls = []
   const { runtime, callbackAnswers } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
     store: {
       markIdempotencyKey: (key) => {
         idempotencyKeys.add(key)
@@ -1276,7 +1279,7 @@ test("createCallbackHandlers rethrows permission reply durability failures", asy
   })
   const handlers = createCallbackHandlers(runtime)
 
-  await assert.rejects(() => handlers.handleTelegramCallback(makeCallback("p|demo|perm_durable|once")), (err) => {
+  await assert.rejects(() => handlers.handleTelegramCallback(makeCallback("p|demo||perm_durable|once")), (err) => {
     assert.equal(err.isBoundaryError, true)
     assert.equal(err.source, "state")
     assert.equal(err.outcome, "retryable")
@@ -1291,6 +1294,7 @@ test("createCallbackHandlers rethrows permission reply durability failures", asy
 test("createCallbackHandlers degrades transient permission callback failures without blocking the user", async () => {
   const deletedMessages = []
   const { runtime, callbackAnswers, sentMessages, loggerErrors } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
     tg: {
       deleteMessage: async (chatId, messageId) => {
         deletedMessages.push({ chatId, messageId })
@@ -1314,7 +1318,7 @@ test("createCallbackHandlers degrades transient permission callback failures wit
   })
   const handlers = createCallbackHandlers(runtime)
 
-  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_retry|always"))
+  await handlers.handleTelegramCallback(makeCallback("p|demo||perm_retry|always"))
 
   assert.equal(callbackAnswers.at(-1)?.text, "Temporarily unavailable")
   assert.equal(sentMessages.at(-1)?.text, "Action is temporarily unavailable. Please try again.")
@@ -1322,8 +1326,44 @@ test("createCallbackHandlers degrades transient permission callback failures wit
   assert.deepEqual(deletedMessages, [])
 })
 
+test("createCallbackHandlers treats permission callbacks for changed bindings as stale", async () => {
+  const replyCalls = []
+  let flushCount = 0
+  const { runtime, callbackAnswers, deletedPermissions } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_other" } } },
+    store: {
+      getPendingPermission: (projectAlias, permissionId) =>
+        permissionId === "perm_old" ? { projectAlias, permissionId, sessionID: "ses_prompt" } : null,
+      async flush() {
+        flushCount += 1
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async replyPermission(permissionId, payload) {
+          replyCalls.push({ permissionId, payload })
+          return { ok: true }
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("p|demo|ses_prompt|perm_scoped|once"))
+  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_old|once"))
+
+  assert.deepEqual(replyCalls, [])
+  assert.deepEqual(deletedPermissions, [
+    { projectAlias: "demo", permissionId: "perm_scoped", sessionID: "ses_prompt" },
+    { projectAlias: "demo", permissionId: "perm_old", sessionID: "ses_prompt" },
+  ])
+  assert.equal(flushCount, 2)
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["No longer active", "No longer active"])
+})
+
 test("createCallbackHandlers handles permission guard branches and fatal callback failures", async () => {
   const { runtime, callbackAnswers, sentMessages, deletedPermissions, loggerErrors } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
     ocByAlias: {
       demo: {
         async replyPermission() {
@@ -1334,9 +1374,9 @@ test("createCallbackHandlers handles permission guard branches and fatal callbac
   })
   const handlers = createCallbackHandlers(runtime)
 
-  await handlers.handleTelegramCallback(makeCallback("p|missing|perm_1|once"))
-  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_1|weird"))
-  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_1|once"))
+  await handlers.handleTelegramCallback(makeCallback("p|missing||perm_1|once"))
+  await handlers.handleTelegramCallback(makeCallback("p|demo||perm_1|weird"))
+  await handlers.handleTelegramCallback(makeCallback("p|demo||perm_1|once"))
 
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Unknown project", "Invalid", "Action failed"])
   assert.deepEqual(deletedPermissions, [])
@@ -1348,6 +1388,7 @@ test("createCallbackHandlers rejects stale and successful question callbacks", a
   const wizard = makeWizard()
   const deletedMessages = []
   const { runtime, callbackAnswers, clearedQuestionIds, customStateCalls, questionWizards } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
     tg: {
       deleteMessage: async (chatId, messageId) => {
         deletedMessages.push({ chatId, messageId })
@@ -1375,8 +1416,8 @@ test("createCallbackHandlers rejects stale and successful question callbacks", a
   })
   const handlers = createCallbackHandlers(runtime)
 
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_stale|reject", { messageId: 905 }))
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_1|reject", { messageId: 906 }))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_stale|reject", { messageId: 905 }))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_1|reject", { messageId: 906 }))
 
   assert.equal(questionWizards.has("demo:q_1"), false)
   assert.deepEqual(clearedQuestionIds, [
@@ -1396,9 +1437,9 @@ test("createCallbackHandlers rejects stale and successful question callbacks", a
 
 test("createCallbackHandlers cleans scoped question wizards from old-shape reject callbacks", async () => {
   const scopedWizards = [
-    { questionId: "q_success", sessionID: "ses_success" },
-    { questionId: "q_stale", sessionID: "ses_stale" },
-    { questionId: "q_done", sessionID: "ses_done" },
+    { questionId: "q_success", sessionID: "ses_current" },
+    { questionId: "q_stale", sessionID: "ses_current" },
+    { questionId: "q_done", sessionID: "ses_current" },
   ].map(({ questionId, sessionID }) => ({ ...makeWizard({ id: questionId }), sessionID }))
   const questionWizards = new Map()
   for (const wizard of scopedWizards) {
@@ -1408,6 +1449,7 @@ test("createCallbackHandlers cleans scoped question wizards from old-shape rejec
   const rejectCalls = []
   const markedKeys = []
   const { runtime, callbackAnswers, clearedQuestionIds } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
     questionWizards,
     getWizard: (projectAlias, questionId, sessionID = "") => {
       if (sessionID) return questionWizards.get(`${projectAlias}:${sessionID}:${questionId}`) || null
@@ -1416,7 +1458,7 @@ test("createCallbackHandlers cleans scoped question wizards from old-shape rejec
         null
     },
     store: {
-      hasIdempotencyKey: (key) => key.includes("ses_done"),
+      hasIdempotencyKey: (key) => key.includes("q_done"),
       markIdempotencyKey: (key) => {
         markedKeys.push(key)
         return true
@@ -1455,15 +1497,58 @@ test("createCallbackHandlers cleans scoped question wizards from old-shape rejec
     assert.equal(questionWizards.has(`demo:${wizard.id}`), false)
   }
   assert.deepEqual(clearedQuestionIds, [
-    { projectAlias: "demo", questionId: "q_success", sessionID: "ses_success" },
+    { projectAlias: "demo", questionId: "q_success", sessionID: "ses_current" },
     { projectAlias: "demo", questionId: "q_success" },
-    { projectAlias: "demo", questionId: "q_stale", sessionID: "ses_stale" },
+    { projectAlias: "demo", questionId: "q_stale", sessionID: "ses_current" },
     { projectAlias: "demo", questionId: "q_stale" },
-    { projectAlias: "demo", questionId: "q_done", sessionID: "ses_done" },
+    { projectAlias: "demo", questionId: "q_done", sessionID: "ses_current" },
     { projectAlias: "demo", questionId: "q_done" },
   ])
   assert.equal(markedKeys.length, 2)
   assert.ok(markedKeys.every((key) => key.includes("ses_")))
+})
+
+test("createCallbackHandlers treats question callbacks for changed bindings as stale", async () => {
+  const oldWizard = { ...makeWizard({ id: "q_old" }), sessionID: "ses_prompt" }
+  const questionWizards = new Map([["demo:ses_prompt:q_old", oldWizard], ["demo:q_old", oldWizard]])
+  const rejectCalls = []
+  let flushCount = 0
+  const { runtime, callbackAnswers, clearedQuestionIds } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_other" } } },
+    questionWizards,
+    getWizard: (projectAlias, questionId, sessionID = "") => {
+      if (questionId !== "q_old") return null
+      if (sessionID) return questionWizards.get(`${projectAlias}:${sessionID}:${questionId}`) || null
+      return questionWizards.get(`${projectAlias}:${questionId}`) || null
+    },
+    store: {
+      async flush() {
+        flushCount += 1
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async rejectQuestion(questionId) {
+          rejectCalls.push(questionId)
+          return { ok: true }
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("q|demo|ses_prompt|q_scoped|reject"))
+  await handlers.handleTelegramCallback(makeCallback("q|demo|q_old|reject"))
+
+  assert.deepEqual(rejectCalls, [])
+  assert.deepEqual(clearedQuestionIds, [
+    { projectAlias: "demo", questionId: "q_scoped", sessionID: "ses_prompt" },
+    { projectAlias: "demo", questionId: "q_scoped" },
+    { projectAlias: "demo", questionId: "q_old", sessionID: "ses_prompt" },
+    { projectAlias: "demo", questionId: "q_old" },
+  ])
+  assert.equal(flushCount, 2)
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["No longer active", "No longer active"])
 })
 
 test("createCallbackHandlers skips duplicate question reject callbacks via idempotency ledger", async () => {
@@ -1471,6 +1556,7 @@ test("createCallbackHandlers skips duplicate question reject callbacks via idemp
   const idempotencyKeys = new Set()
   const rejectCalls = []
   const { runtime, callbackAnswers } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
     questionWizards: new Map([["demo:q_dup", wizard]]),
     getWizard: () => wizard,
     store: {
@@ -1492,8 +1578,8 @@ test("createCallbackHandlers skips duplicate question reject callbacks via idemp
   })
   const handlers = createCallbackHandlers(runtime)
 
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_dup|reject", { id: "cb_a" }))
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_dup|reject", { id: "cb_b" }))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_dup|reject", { id: "cb_a" }))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_dup|reject", { id: "cb_b" }))
 
   assert.deepEqual(rejectCalls, [{ questionId: "q_dup" }])
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Rejected", "Already handled"])
@@ -1501,6 +1587,7 @@ test("createCallbackHandlers skips duplicate question reject callbacks via idemp
 
 test("createCallbackHandlers clears persisted question state even without an in-memory wizard", async () => {
   const { runtime, callbackAnswers, clearedQuestionIds } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
     getWizard: () => null,
     ocByAlias: {
       demo: {
@@ -1512,7 +1599,7 @@ test("createCallbackHandlers clears persisted question state even without an in-
   })
   const handlers = createCallbackHandlers(runtime)
 
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_missing_mem|reject"))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_missing_mem|reject"))
 
   assert.deepEqual(clearedQuestionIds, [{ projectAlias: "demo", questionId: "q_missing_mem" }])
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Rejected"])
@@ -1522,6 +1609,7 @@ test("createCallbackHandlers starts and cancels custom-answer question flows", a
   const wizard = makeWizard({ questions: [{ header: "Reason", question: "Why?", custom: true, options: [] }] })
   const deletedMessages = []
   const { runtime, callbackAnswers, customPrompts, customStateCalls } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
     tg: {
       deleteMessage: async (chatId, messageId) => {
         deletedMessages.push({ chatId, messageId })
@@ -1532,8 +1620,8 @@ test("createCallbackHandlers starts and cancels custom-answer question flows", a
   })
   const handlers = createCallbackHandlers(runtime)
 
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_1|0|custom", { messageId: 907 }))
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_1|0|cancel_custom", { messageId: 908 }))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_1|0|custom", { messageId: 907 }))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_1|0|cancel_custom", { messageId: 908 }))
 
   assert.deepEqual(customPrompts, [
     {
@@ -1561,6 +1649,7 @@ test("createCallbackHandlers parses session-scoped question callbacks with numer
   const getWizardCalls = []
   const promptCalls = []
   const { runtime, callbackAnswers, customStateCalls } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_123" } } },
     tg: {
       deleteMessage: async (chatId, messageId) => {
         deletedMessages.push({ chatId, messageId })
@@ -1592,6 +1681,7 @@ test("createCallbackHandlers parses session-scoped question callbacks with numer
 test("createCallbackHandlers reports prompt bootstrap failures for reject-note and custom-answer flows", async () => {
   const wizard = makeWizard({ questions: [{ header: "Reason", question: "Why?", custom: true, options: [] }] })
   const { runtime, callbackAnswers } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
     getWizard: () => wizard,
     ocByAlias: { demo: {} },
     sendRejectNotePrompt: async () => {
@@ -1603,8 +1693,8 @@ test("createCallbackHandlers reports prompt bootstrap failures for reject-note a
   })
   const handlers = createCallbackHandlers(runtime)
 
-  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_note|reject_note"))
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_1|0|custom"))
+  await handlers.handleTelegramCallback(makeCallback("p|demo||perm_note|reject_note"))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_1|0|custom"))
 
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Unavailable", "Unavailable"])
 })
@@ -1621,6 +1711,7 @@ test("createCallbackHandlers handles single-choice and multi-choice question ste
   const getWizard = (projectAlias, questionId) => (questionId === "q_single" ? singleWizard : questionId === "q_multi" ? multiWizard : null)
   const deletedMessages = []
   const { runtime, callbackAnswers, persistedWizards, finishCalls, sendQuestionStepCalls } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
     tg: {
       deleteMessage: async (chatId, messageId) => {
         deletedMessages.push({ chatId, messageId })
@@ -1631,9 +1722,9 @@ test("createCallbackHandlers handles single-choice and multi-choice question ste
   })
   const handlers = createCallbackHandlers(runtime)
 
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_single|0|o|0", { messageId: 909 }))
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_multi|0|t|0", { messageId: 910 }))
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_multi|0|done", { messageId: 910 }))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_single|0|o|0", { messageId: 909 }))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_multi|0|t|0", { messageId: 910 }))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_multi|0|done", { messageId: 910 }))
 
   assert.deepEqual(finishCalls, [
     {
@@ -1684,6 +1775,7 @@ test("createCallbackHandlers flushes question wizard progression state before de
     return null
   }
   const { runtime } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
     tg: {
       answerCallbackQuery: async (_callbackQueryId, text) => {
         order.push(`answer:${text ?? ""}`)
@@ -1711,9 +1803,9 @@ test("createCallbackHandlers flushes question wizard progression state before de
   })
   const handlers = createCallbackHandlers(runtime)
 
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_single_next|0|o|0", { messageId: 911 }))
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_multi_toggle|0|t|0", { id: "cb_2", messageId: 912 }))
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_multi_done_next|0|done", { id: "cb_3", messageId: 913 }))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_single_next|0|o|0", { messageId: 911 }))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_multi_toggle|0|t|0", { id: "cb_2", messageId: 912 }))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_multi_done_next|0|done", { id: "cb_3", messageId: 913 }))
 
   assert.deepEqual(order, [
     "send:q_single_next:1:new",
@@ -1736,7 +1828,7 @@ test("createCallbackHandlers flushes question wizard progression state before de
 test("createCallbackHandlers rolls back and rethrows durability failures during question wizard progression flushes", async () => {
   const cases = [
     {
-      callbackData: "q|demo|q_single_flush_fail|0|o|0",
+      callbackData: "q|demo||q_single_flush_fail|0|o|0",
       messageId: 914,
       wizard: makeWizard({
         id: "q_single_flush_fail",
@@ -1751,7 +1843,7 @@ test("createCallbackHandlers rolls back and rethrows durability failures during 
       },
     },
     {
-      callbackData: "q|demo|q_multi_toggle_flush_fail|0|t|0",
+      callbackData: "q|demo||q_multi_toggle_flush_fail|0|t|0",
       messageId: 915,
       wizard: makeWizard({
         id: "q_multi_toggle_flush_fail",
@@ -1765,7 +1857,7 @@ test("createCallbackHandlers rolls back and rethrows durability failures during 
       },
     },
     {
-      callbackData: "q|demo|q_multi_done_flush_fail|0|done",
+      callbackData: "q|demo||q_multi_done_flush_fail|0|done",
       messageId: 916,
       wizard: makeWizard({
         id: "q_multi_done_flush_fail",
@@ -1788,6 +1880,7 @@ test("createCallbackHandlers rolls back and rethrows durability failures during 
     const deletedMessages = []
     const flushCalls = []
     const { runtime, callbackAnswers, persistedWizards, sendQuestionStepCalls } = makeRuntime({
+      storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
       tg: {
         deleteMessage: async (chatId, currentMessageId) => {
           deletedMessages.push({ chatId, messageId: currentMessageId })
@@ -1829,6 +1922,7 @@ test("createCallbackHandlers does not persist multi-choice toggles when step edi
     selectedByIndex: { 0: ["test"] },
   })
   const { runtime, callbackAnswers, persistedWizards } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
     getWizard: () => wizard,
     ocByAlias: { demo: {} },
     sendCurrentQuestionStep: async () => {
@@ -1837,7 +1931,7 @@ test("createCallbackHandlers does not persist multi-choice toggles when step edi
   })
   const handlers = createCallbackHandlers(runtime)
 
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_multi_edit_fail|0|t|0", { messageId: 910 }))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_multi_edit_fail|0|t|0", { messageId: 910 }))
 
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Action failed"])
   assert.deepEqual(persistedWizards, [])
@@ -1851,6 +1945,7 @@ test("createCallbackHandlers rejects invalid question callback shapes and option
     questions: [{ header: "Checks", question: "Pick", multiple: true, options: [{ label: "lint" }, { label: "test" }] }],
   })
   const { runtime, callbackAnswers, persistedWizards, finishCalls, sendQuestionStepCalls } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
     getWizard: (_projectAlias, questionId) => {
       if (questionId === "q_single") return singleWizard
       if (questionId === "q_multi") return multiWizard
@@ -1860,13 +1955,13 @@ test("createCallbackHandlers rejects invalid question callback shapes and option
   })
   const handlers = createCallbackHandlers(runtime)
 
-  await handlers.handleTelegramCallback(makeCallback("q|missing|q_1|reject"))
+  await handlers.handleTelegramCallback(makeCallback("q|missing||q_1|reject"))
   await handlers.handleTelegramCallback(makeCallback("q|demo|q_single"))
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_single|0|t|0"))
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_multi|0|t|99"))
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_single|0|done"))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_single|0|t|0"))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_multi|0|t|99"))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_single|0|done"))
 
-  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Unknown project", "Invalid", "Invalid", "Invalid", "Invalid"])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Unknown project", "No longer active", "Invalid", "Invalid", "Invalid"])
   assert.deepEqual(persistedWizards, [])
   assert.deepEqual(finishCalls, [])
   assert.deepEqual(sendQuestionStepCalls, [])
@@ -1879,6 +1974,7 @@ test("createCallbackHandlers reports retryable completion for multi-choice quest
     selectedByIndex: { 0: ["lint", "test"] },
   })
   const { runtime, callbackAnswers, sentMessages, persistedWizards, finishCalls } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
     getWizard: () => wizard,
     ocByAlias: { demo: {} },
     finishQuestionWizard: async (currentWizard) => {
@@ -1888,7 +1984,7 @@ test("createCallbackHandlers reports retryable completion for multi-choice quest
   })
   const handlers = createCallbackHandlers(runtime)
 
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_multi_retry|0|done"))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_multi_retry|0|done"))
 
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Temporarily unavailable"])
   assert.equal(sentMessages.at(-1)?.text, "Action is temporarily unavailable. Please try again.")
@@ -1957,13 +2053,13 @@ test("createCallbackHandlers answers not-found, out-of-date, and unsupported que
     if (questionId === "q_unsupported") return unsupportedWizard
     return null
   }
-  const { runtime, callbackAnswers } = makeRuntime({ getWizard, ocByAlias: { demo: {} } })
+  const { runtime, callbackAnswers } = makeRuntime({ storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } }, getWizard, ocByAlias: { demo: {} } })
   const handlers = createCallbackHandlers(runtime)
 
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_missing|0|custom"))
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_disabled|0|custom"))
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_mismatch|0|o|0"))
-  await handlers.handleTelegramCallback(makeCallback("q|demo|q_unsupported|0|weird"))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_missing|0|custom"))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_disabled|0|custom"))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_mismatch|0|o|0"))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_unsupported|0|weird"))
 
-  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Not found", "Custom disabled", "Out of date", "Unsupported"])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Not found", "Custom disabled", "Out of date", "No longer active"])
 })

@@ -48,6 +48,7 @@ export function normalizeProjectsConfig(raw, { baseDir, sourceLabel } = {}) {
   const projects = {}
   for (const [alias, cfg] of Object.entries(raw)) {
     if (!alias || typeof alias !== "string") continue
+    if (alias.includes(":")) throw new Error(`Project alias '${alias}' must not contain ':'`)
     if (!isPlainObject(cfg)) throw new Error(`Project '${alias}' must be an object`)
     const directoryRaw = cfg.directory != null ? String(cfg.directory).trim() : ""
     const directory = directoryRaw ? path.resolve(resolvedBaseDir, directoryRaw) : undefined

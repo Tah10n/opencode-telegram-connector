@@ -112,6 +112,17 @@ test("loadProjectsConfig rejects baseUrl userinfo", async () => {
   )
 })
 
+test("loadProjectsConfig rejects project aliases with colons", async () => {
+  await assert.rejects(
+    loadProjectsConfig({
+      projectsJson: JSON.stringify({
+        "demo:prod": { baseUrl: "http://127.0.0.1:4312" },
+      }),
+    }),
+    /Project alias 'demo:prod' must not contain ':'/,
+  )
+})
+
 test("loadProjectsConfig reports a Windows backslash hint for invalid JSON", async () => {
   await assert.rejects(
     loadProjectsConfig({

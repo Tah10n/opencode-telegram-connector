@@ -419,6 +419,7 @@ test("restorePendingPromptState leaves permission recovery retryable when Telegr
   const recovery = createPromptRecovery({
     store: {
       getPendingPrompts: () => pendingPrompts,
+      getBinding: () => ({ projectAlias: "demo", sessionId: "ses_1" }),
       deletePendingPermission() {
         throw new Error("should not delete")
       },
@@ -458,6 +459,101 @@ test("restorePendingPromptState leaves permission recovery retryable when Telegr
   assert.deepEqual(pendingPrompts.permissions["demo:perm_restore"].permissionId, "perm_restore")
 })
 
+test("restorePendingPromptState treats prompts for changed bindings as stale before opencode", async () => {
+  let flushCount = 0
+  let listCalls = 0
+  const clearedQuestions = []
+  const pendingPrompts = {
+    permissions: {
+      "demo:ses_1:perm_changed": {
+        projectAlias: "demo",
+        permissionId: "perm_changed",
+        sessionID: "ses_1",
+        permission: "shell",
+        patterns: [],
+        ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+      },
+    },
+    rejectNotes: {
+      "100:7": { projectAlias: "demo", permissionId: "perm_note", sessionID: "ses_1" },
+    },
+    customAnswers: {
+      "100:7": { projectAlias: "demo", requestId: "q_custom", sessionID: "ses_1", qIndex: 0 },
+    },
+    questionWizards: {
+      "demo:ses_1:q_changed": {
+        projectAlias: "demo",
+        id: "q_changed",
+        sessionID: "ses_1",
+        request: { id: "q_changed", sessionID: "ses_1", questions: [{ header: "Reason", question: "Why?", options: [] }] },
+        index: 0,
+        answers: [[]],
+        selectedByIndex: {},
+        ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+      },
+    },
+  }
+  const recovery = createPromptRecovery({
+    store: {
+      getPendingPrompts: () => pendingPrompts,
+      getBinding: () => ({ projectAlias: "demo", sessionId: "ses_other" }),
+      deletePendingPermission(projectAlias, permissionId, sessionID) {
+        assert.deepEqual({ projectAlias, permissionId, sessionID }, { projectAlias: "demo", permissionId: "perm_changed", sessionID: "ses_1" })
+        delete pendingPrompts.permissions["demo:ses_1:perm_changed"]
+      },
+      async flush() {
+        flushCount += 1
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async listPermissions() {
+          listCalls += 1
+          throw new Error("should not inspect permissions")
+        },
+        async listQuestions() {
+          listCalls += 1
+          throw new Error("should not inspect questions")
+        },
+      },
+    },
+    prompted: { demo: { permission: new FakeLruSet(), question: new FakeLruSet() } },
+    questionWizards: new Map(),
+    wizardKey: (projectAlias, requestId, sessionID = "") => (sessionID ? `${projectAlias}:${sessionID}:${requestId}` : `${projectAlias}:${requestId}`),
+    parseCtxKey: () => ({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }),
+    async sendPermissionPrompt() {},
+    async sendBlocksToThread() {},
+    async sendCurrentQuestionStep() {},
+    async sendRejectNotePrompt() {},
+    async sendQuestionCustomAnswerPrompt() {},
+    clearPersistedQuestionWizard(projectAlias, questionId, sessionID) {
+      clearedQuestions.push({ projectAlias, questionId, sessionID })
+      delete pendingPrompts.questionWizards["demo:ses_1:q_changed"]
+    },
+    setRejectNoteAwaitingState(ctxKey, value) {
+      assert.equal(ctxKey, "100:7")
+      assert.equal(value, null)
+      delete pendingPrompts.rejectNotes[ctxKey]
+    },
+    setAwaitingCustomAnswerState(ctxKey, value) {
+      assert.equal(ctxKey, "100:7")
+      assert.equal(value, null)
+      delete pendingPrompts.customAnswers[ctxKey]
+    },
+    markProjectUp() {},
+  })
+
+  const summary = await recovery.restorePendingPromptState()
+
+  assert.equal(listCalls, 0)
+  assert.equal(flushCount, 4)
+  assert.deepEqual(clearedQuestions, [{ projectAlias: "demo", questionId: "q_changed", sessionID: "ses_1" }])
+  assert.equal(summary.permissions.stale, 1)
+  assert.equal(summary.questionWizards.stale, 1)
+  assert.equal(summary.rejectNotes.stale, 1)
+  assert.equal(summary.customAnswers.stale, 1)
+})
+
 test("restorePendingPromptState treats same prompt ids in other sessions as stale", async () => {
   const deletedPermissions = []
   const deletedQuestions = []
@@ -490,6 +586,7 @@ test("restorePendingPromptState treats same prompt ids in other sessions as stal
   const recovery = createPromptRecovery({
     store: {
       getPendingPrompts: () => pendingPrompts,
+      getBinding: () => ({ projectAlias: "demo", sessionId: "ses_1" }),
       deletePendingPermission(projectAlias, permissionId, sessionID) {
         deletedPermissions.push({ projectAlias, permissionId, sessionID })
         delete pendingPrompts.permissions["demo:ses_1:perm_same"]
@@ -558,7 +655,10 @@ test("restorePendingPromptState does not recover scoped custom answers from anot
   }
 
   const recovery = createPromptRecovery({
-    store: { getPendingPrompts: () => pendingPrompts },
+    store: {
+      getPendingPrompts: () => pendingPrompts,
+      getBinding: () => ({ projectAlias: "demo", sessionId: "ses_1" }),
+    },
     ocByAlias: {
       demo: {
         async listPermissions() {

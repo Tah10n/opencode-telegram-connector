@@ -8,6 +8,16 @@ test("sanitizeBaseUrlForDisplay removes credentials, hash, and query values", ()
   assert.equal(sanitized, "https://example.com/api?token=***&foo=***")
 })
 
+test("sanitizeBaseUrlForDisplay redacts sensitive path segments", () => {
+  const sanitized = sanitizeBaseUrlForDisplay("https://proxy.example.com/token-abc123/opencode")
+  assert.equal(sanitized, "https://proxy.example.com/***/opencode")
+})
+
+test("sanitizeBaseUrlForDisplay preserves ordinary base paths", () => {
+  const sanitized = sanitizeBaseUrlForDisplay("https://proxy.example.com/api")
+  assert.equal(sanitized, "https://proxy.example.com/api")
+})
+
 test("sanitizeBaseUrlForCli flags URLs with query strings as sensitive", () => {
   const result = sanitizeBaseUrlForCli("https://example.com/api?opaque=secret-value#frag")
   assert.equal(result.url, "https://example.com/api?opaque=secret-value")
@@ -23,13 +33,28 @@ test("sanitizeBaseUrlForCli flags URL userinfo as sensitive", () => {
   assert.equal(result.displayUrl, "https://***:***@example.com/api")
 })
 
+test("sanitizeBaseUrlForCli flags sensitive path segments", () => {
+  const result = sanitizeBaseUrlForCli("https://proxy.example.com/token-abc123/opencode")
+  assert.equal(result.url, "https://proxy.example.com/token-abc123/opencode")
+  assert.equal(result.displayUrl, "https://proxy.example.com/***/opencode")
+  assert.equal(result.seemsSensitive, true)
+})
+
+test("sanitizeBaseUrlForCli preserves ordinary base paths", () => {
+  const result = sanitizeBaseUrlForCli("https://proxy.example.com/api")
+  assert.equal(result.url, "https://proxy.example.com/api")
+  assert.equal(result.displayUrl, "https://proxy.example.com/api")
+  assert.equal(result.seemsSensitive, false)
+})
+
 test("redactCmdlineSecrets redacts auth-like command line data", () => {
   const redacted = redactCmdlineSecrets(
-    'opencode attach "https://user:pass@example.com/api?token=abc#frag" --password hunter2 Authorization: Bearer abc',
+    'opencode attach "https://user:pass@example.com/token-abc123/api?token=abc#frag" --password hunter2 Authorization: Bearer abc',
   )
-  assert.match(redacted, /https:\/\/\*\*\*:\*\*\*@example\.com\/api\?token=\*\*\*/)
+  assert.match(redacted, /https:\/\/\*\*\*:\*\*\*@example\.com\/\*\*\*\/api\?token=\*\*\*/)
   assert.match(redacted, /--password=\*\*\*/)
   assert.match(redacted, /Authorization: Bearer \*\*\*/)
+  assert.doesNotMatch(redacted, /token-abc123/)
 })
 
 test("redactSensitiveText redacts bot tokens and sensitive state/config paths", () => {

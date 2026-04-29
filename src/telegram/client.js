@@ -48,6 +48,12 @@ async function readTelegramApiJsonResponse(res, { requestSignal, timeout, ...con
   }
 }
 
+function telegramRetryAfterMs(json) {
+  const seconds = Number(json?.parameters?.retry_after)
+  if (!Number.isFinite(seconds) || seconds <= 0) return null
+  return Math.min(Math.ceil(seconds * 1000), 60 * 60 * 1000)
+}
+
 export function splitTelegramText(text, maxLen = 3900) {
   const s = String(text ?? "")
   if (s.length <= maxLen) return [s]
@@ -278,6 +284,7 @@ export class TelegramClient {
         statusText: res.statusText,
         bodyText: msg,
         details: json,
+        retryAfterMs: telegramRetryAfterMs(json),
         message: `${method} failed: ${msg}`,
       })
     }
@@ -316,6 +323,7 @@ export class TelegramClient {
         statusText: res.statusText,
         bodyText: msg,
         details: json,
+        retryAfterMs: telegramRetryAfterMs(json),
         message: `${method} failed: ${msg}`,
       })
     }

@@ -80,6 +80,16 @@ export function createPromptRecovery(runtime) {
 
   const livePromptSnapshotByProject = new Map()
 
+  function isPromptBindingCurrent(ctxKey, projectAlias, sessionID = "") {
+    const binding = typeof store?.getBinding === "function" ? store.getBinding(ctxKey) : null
+    if (!binding || binding.projectAlias !== projectAlias) return false
+    return !sessionID || binding.sessionId === sessionID
+  }
+
+  async function flushStoreIfAvailable() {
+    if (typeof store?.flush === "function") await store.flush()
+  }
+
   async function getLivePromptSnapshot(projectAlias) {
     if (!projectAlias || !ocByAlias[projectAlias]) {
       return {
@@ -172,6 +182,14 @@ export function createPromptRecovery(runtime) {
     for (const entry of Object.values(pending.permissions || {})) {
       const ctx = entry?.ctx
       if (!entry?.projectAlias || !entry?.permissionId || !ctx?.chatId || !ctx?.ctxKey) continue
+      if (!isPromptBindingCurrent(ctx.ctxKey, entry.projectAlias, entry.sessionID)) {
+        store.deletePendingPermission(entry.projectAlias, entry.permissionId, entry.sessionID)
+        await flushStoreIfAvailable()
+        summary.permissions.stale += 1
+        recordPromptCleanup?.(entry.projectAlias, "stale")
+        record(entry.projectAlias, "stale")
+        continue
+      }
       if (hasHandledPermission(entry.projectAlias, entry.sessionID, entry.permissionId)) {
         store.deletePendingPermission(entry.projectAlias, entry.permissionId, entry.sessionID)
         summary.permissions.stale += 1
@@ -219,6 +237,14 @@ export function createPromptRecovery(runtime) {
     for (const snapshot of Object.values(pending.questionWizards || {})) {
       const ctx = snapshot?.ctx
       if (!snapshot?.projectAlias || !snapshot?.id || !ctx?.chatId || !ctx?.ctxKey) continue
+      if (!isPromptBindingCurrent(ctx.ctxKey, snapshot.projectAlias, snapshot.sessionID)) {
+        clearPersistedQuestionWizard(snapshot.projectAlias, snapshot.id, snapshot.sessionID)
+        await flushStoreIfAvailable()
+        summary.questionWizards.stale += 1
+        recordPromptCleanup?.(snapshot.projectAlias, "stale")
+        record(snapshot.projectAlias, "stale")
+        continue
+      }
       if (hasHandledQuestion(snapshot.projectAlias, snapshot.sessionID, snapshot.id)) {
         clearPersistedQuestionWizard(snapshot.projectAlias, snapshot.id, snapshot.sessionID)
         summary.questionWizards.stale += 1
@@ -274,6 +300,14 @@ export function createPromptRecovery(runtime) {
 
     for (const [ctxKey, value] of Object.entries(pending.rejectNotes || {})) {
       if (!value?.projectAlias || !value?.permissionId) continue
+      if (!isPromptBindingCurrent(ctxKey, value.projectAlias, value.sessionID)) {
+        setRejectNoteAwaitingState(ctxKey, null)
+        await flushStoreIfAvailable()
+        summary.rejectNotes.stale += 1
+        recordPromptCleanup?.(value.projectAlias, "stale")
+        record(value.projectAlias, "stale")
+        continue
+      }
       if (hasHandledPermission(value.projectAlias, value.sessionID, value.permissionId)) {
         setRejectNoteAwaitingState(ctxKey, null)
         summary.rejectNotes.stale += 1
@@ -319,6 +353,14 @@ export function createPromptRecovery(runtime) {
 
     for (const [ctxKey, value] of Object.entries(pending.customAnswers || {})) {
       if (!value?.projectAlias || !value?.requestId || !Number.isInteger(value?.qIndex)) continue
+      if (!isPromptBindingCurrent(ctxKey, value.projectAlias, value.sessionID)) {
+        setAwaitingCustomAnswerState(ctxKey, null)
+        await flushStoreIfAvailable()
+        summary.customAnswers.stale += 1
+        recordPromptCleanup?.(value.projectAlias, "stale")
+        record(value.projectAlias, "stale")
+        continue
+      }
       if (hasHandledQuestion(value.projectAlias, value.sessionID, value.requestId)) {
         setAwaitingCustomAnswerState(ctxKey, null)
         summary.customAnswers.stale += 1

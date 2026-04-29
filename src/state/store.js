@@ -3,6 +3,7 @@ import fs from "node:fs/promises"
 import { createStateFileBackup, readJsonFile, writeJsonFileAtomic } from "./fileStore.js"
 import { loadStateWithMigration, migrateStateIfNeeded, preserveStateBeforeRecovery } from "./backup.js"
 import { normalizeModelPreference, storedModelPreference } from "../model-selection.js"
+import { isSafeOpenCodeId } from "../opencode/ids.js"
 
 export const STATE_SCHEMA_VERSION = 5
 export const DEFAULT_FEED_MODE = "main+changes"
@@ -436,6 +437,9 @@ export class StateStore {
   }
 
   setBinding(ctxKey, binding, ctxMeta) {
+    if (!isSafeProjectAlias(binding?.projectAlias) || !isStoredOpenCodeId(binding?.sessionId)) {
+      throw new Error("Invalid binding: expected safe project alias and opencode session id")
+    }
     let movedFromCtxKey = ""
     let movedFromRoute = null
     const prev = this.state.bindings[ctxKey]
@@ -496,7 +500,7 @@ export class StateStore {
 
     for (const [ctxKey, binding] of Object.entries(this.state.bindings || {}).sort(([a], [b]) => a.localeCompare(b))) {
       const ctx = parseStoredCtxKey(ctxKey)
-      if (!ctx || !binding?.projectAlias || !binding?.sessionId) {
+      if (!ctx || !isSafeProjectAlias(binding?.projectAlias) || !isStoredOpenCodeId(binding?.sessionId)) {
         if (!dryRun) delete this.state.modelPrefsByContext[ctxKey]
         summary.removedBindings.push(ctxKey)
         summary.changed = true
@@ -575,6 +579,51 @@ function isNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0
 }
 
+function isSafeProjectAlias(value) {
+  return isNonEmptyString(value) && !String(value).includes(":")
+}
+
+function isStoredOpenCodeId(value) {
+  return typeof value === "string" && value === value.trim() && isSafeOpenCodeId(value)
+}
+
+function isOptionalStoredOpenCodeId(value) {
+  return value == null || value === "" || isStoredOpenCodeId(value)
+}
+
+function parseStoredSessionKey(key) {
+  if (!isNonEmptyString(key)) return null
+  const parts = String(key).split(":")
+  if (parts.length !== 2) return null
+  const [projectAlias, sessionId] = parts
+  if (!isSafeProjectAlias(projectAlias) || !isStoredOpenCodeId(sessionId)) return null
+  return { projectAlias, sessionId }
+}
+
+function validateProjectAlias(value, statePath, errors) {
+  if (!isSafeProjectAlias(value)) {
+    errors.push(`${statePath} must be a non-empty string without ':'`)
+    return false
+  }
+  return true
+}
+
+function validateStoredOpenCodeId(value, statePath, errors) {
+  if (!isStoredOpenCodeId(value)) {
+    errors.push(`${statePath} must be a non-empty safe opencode id without whitespace, colon, or URL path/query separators`)
+    return false
+  }
+  return true
+}
+
+function validateOptionalStoredOpenCodeId(value, statePath, errors) {
+  if (!isOptionalStoredOpenCodeId(value)) {
+    errors.push(`${statePath} must be a safe opencode id without whitespace, colon, or URL path/query separators when present`)
+    return false
+  }
+  return true
+}
+
 function isOptionalString(value) {
   return value == null || typeof value === "string"
 }
@@ -624,15 +673,15 @@ function validateBindingsSection(value, errors) {
   for (const [ctxKey, binding] of Object.entries(value)) {
     validateCtxKey(ctxKey, `state.bindings${pathKey(ctxKey)}`, errors)
     if (!pushRecordError(errors, binding, `state.bindings${pathKey(ctxKey)}`)) continue
-    if (!isNonEmptyString(binding.projectAlias)) errors.push(`state.bindings${pathKey(ctxKey)}.projectAlias must be a non-empty string`)
-    if (!isNonEmptyString(binding.sessionId)) errors.push(`state.bindings${pathKey(ctxKey)}.sessionId must be a non-empty string`)
+    validateProjectAlias(binding.projectAlias, `state.bindings${pathKey(ctxKey)}.projectAlias`, errors)
+    validateStoredOpenCodeId(binding.sessionId, `state.bindings${pathKey(ctxKey)}.sessionId`, errors)
   }
 }
 
 function validateSessionIndexSection(value, errors) {
   if (!pushRecordError(errors, value, "state.sessionIndex")) return
   for (const [key, route] of Object.entries(value)) {
-    if (!isNonEmptyString(key)) errors.push(`state.sessionIndex${pathKey(key)} key must be non-empty`)
+    if (!parseStoredSessionKey(key)) errors.push(`state.sessionIndex${pathKey(key)} key must be a safe project/session key`)
     if (!pushRecordError(errors, route, `state.sessionIndex${pathKey(key)}`)) continue
     if (!Number.isInteger(route.chatId)) errors.push(`state.sessionIndex${pathKey(key)}.chatId must be an integer`)
     if (!Number.isInteger(route.threadIdOr0) || route.threadIdOr0 < 0) errors.push(`state.sessionIndex${pathKey(key)}.threadIdOr0 must be a non-negative integer`)
@@ -692,9 +741,9 @@ function validatePendingPermissions(value, errors) {
     const statePath = `state.pendingPrompts.permissions${pathKey(key)}`
     if (!isNonEmptyString(key)) errors.push(`${statePath} key must be non-empty`)
     if (!pushRecordError(errors, entry, statePath)) continue
-    if (!isNonEmptyString(entry.projectAlias)) errors.push(`${statePath}.projectAlias must be a non-empty string`)
+    validateProjectAlias(entry.projectAlias, `${statePath}.projectAlias`, errors)
     if (!isNonEmptyString(entry.permissionId)) errors.push(`${statePath}.permissionId must be a non-empty string`)
-    if (!isOptionalString(entry.sessionID)) errors.push(`${statePath}.sessionID must be a string when present`)
+    validateOptionalStoredOpenCodeId(entry.sessionID, `${statePath}.sessionID`, errors)
     if (!isOptionalString(entry.permission)) errors.push(`${statePath}.permission must be a string when present`)
     if (entry.patterns != null && (!Array.isArray(entry.patterns) || entry.patterns.some((pattern) => typeof pattern !== "string"))) {
       errors.push(`${statePath}.patterns must be an array of strings when present`)
@@ -711,9 +760,9 @@ function validateCtxPromptRecordsSection(value, sectionName, idField, errors) {
     const statePath = `${sectionPath}${pathKey(ctxKey)}`
     validateCtxKey(ctxKey, statePath, errors)
     if (!pushRecordError(errors, entry, statePath)) continue
-    if (!isNonEmptyString(entry.projectAlias)) errors.push(`${statePath}.projectAlias must be a non-empty string`)
+    validateProjectAlias(entry.projectAlias, `${statePath}.projectAlias`, errors)
     if (!isNonEmptyString(entry[idField])) errors.push(`${statePath}.${idField} must be a non-empty string`)
-    if (!isOptionalString(entry.sessionID)) errors.push(`${statePath}.sessionID must be a string when present`)
+    validateOptionalStoredOpenCodeId(entry.sessionID, `${statePath}.sessionID`, errors)
     if (sectionName === "customAnswers" && !Number.isInteger(entry.qIndex)) errors.push(`${statePath}.qIndex must be an integer`)
   }
 }
@@ -724,9 +773,9 @@ function validateQuestionWizards(value, errors) {
     const statePath = `state.pendingPrompts.questionWizards${pathKey(key)}`
     if (!isNonEmptyString(key)) errors.push(`${statePath} key must be non-empty`)
     if (!pushRecordError(errors, wizard, statePath)) continue
-    if (!isNonEmptyString(wizard.projectAlias)) errors.push(`${statePath}.projectAlias must be a non-empty string`)
+    validateProjectAlias(wizard.projectAlias, `${statePath}.projectAlias`, errors)
     if (!isNonEmptyString(wizard.id) && !isNonEmptyString(wizard.request?.id)) errors.push(`${statePath}.id or .request.id must be a non-empty string`)
-    if (!isOptionalString(wizard.sessionID)) errors.push(`${statePath}.sessionID must be a string when present`)
+    validateOptionalStoredOpenCodeId(wizard.sessionID, `${statePath}.sessionID`, errors)
     if (!pushRecordError(errors, wizard.request, `${statePath}.request`)) {
       // request shape reported above
     } else {
@@ -799,7 +848,7 @@ function normalizeBindings(value) {
       .filter(([ctxKey, binding]) => {
         if (typeof ctxKey !== "string" || !ctxKey) return false
         if (!binding || typeof binding !== "object") return false
-        return typeof binding.projectAlias === "string" && !!binding.projectAlias && typeof binding.sessionId === "string" && !!binding.sessionId
+        return isSafeProjectAlias(binding.projectAlias) && isStoredOpenCodeId(binding.sessionId)
       })
       .map(([ctxKey, binding]) => [ctxKey, { projectAlias: binding.projectAlias, sessionId: binding.sessionId }]),
   )
@@ -816,7 +865,7 @@ function normalizeSessionIndex(value) {
   return Object.fromEntries(
     Object.entries(value)
       .filter(([key, route]) => {
-        if (typeof key !== "string" || !key) return false
+        if (!parseStoredSessionKey(key)) return false
         if (!route || typeof route !== "object") return false
         return Number.isFinite(route.chatId) && Number.isInteger(route.threadIdOr0)
       })
@@ -844,7 +893,7 @@ function normalizePendingPermissionRecords(value) {
   if (!value || typeof value !== "object") return {}
   return Object.fromEntries(
     Object.values(value)
-      .filter((entry) => entry?.projectAlias && entry?.permissionId)
+      .filter((entry) => isSafeProjectAlias(entry?.projectAlias) && entry?.permissionId && isOptionalStoredOpenCodeId(entry?.sessionID))
       .map((entry) => [
         promptKey(entry.projectAlias, entry.permissionId, entry.sessionID),
         {
@@ -860,7 +909,7 @@ function normalizeCtxPromptRecords(value, idField) {
   if (!value || typeof value !== "object") return {}
   return Object.fromEntries(
     Object.entries(value)
-      .filter(([ctxKey, entry]) => typeof ctxKey === "string" && ctxKey && entry?.projectAlias && entry?.[idField])
+      .filter(([ctxKey, entry]) => typeof ctxKey === "string" && ctxKey && isSafeProjectAlias(entry?.projectAlias) && entry?.[idField] && isOptionalStoredOpenCodeId(entry?.sessionID))
       .map(([ctxKey, entry]) => [ctxKey, { ...entry, sessionID: entry.sessionID || "" }]),
   )
 }
@@ -869,7 +918,7 @@ function normalizeQuestionWizardRecords(value) {
   if (!value || typeof value !== "object") return {}
   return Object.fromEntries(
     Object.values(value)
-      .filter((wizard) => wizard?.projectAlias && (wizard?.id || wizard?.request?.id))
+      .filter((wizard) => isSafeProjectAlias(wizard?.projectAlias) && (wizard?.id || wizard?.request?.id) && isOptionalStoredOpenCodeId(wizard?.sessionID))
       .map((wizard) => {
         const id = wizard.id || wizard.request.id
         return [
