@@ -193,3 +193,35 @@ test("runCli exposes runtime stop and restart shutdown requests", async () => {
   assert.deepEqual(await runAction("stop"), { exits: [0], stopCalls: 1 })
   assert.deepEqual(await runAction("restart"), { exits: [1], stopCalls: 1 })
 })
+
+test("runCli dispatches check mode without starting the connector", async () => {
+  for (const argv of [["check"], ["--check"]]) {
+    const exits = []
+    let startCalls = 0
+    const reports = []
+
+    await runCli({
+      argv,
+      processImpl: makeProcessStub(),
+      stdout: () => {},
+      stderr: () => {},
+      exit: (code) => exits.push(code),
+      buildRuntimeConfigImpl: async () => {
+        throw new Error("check mode should not call buildRuntimeConfig directly")
+      },
+      startConnectorImpl: async () => {
+        startCalls += 1
+        return { stateFile: "state.json", async stop() {} }
+      },
+      runSetupCheckImpl: async ({ args }) => {
+        reports.push(args)
+        return { exitCode: 0 }
+      },
+    })
+
+    assert.equal(startCalls, 0)
+    assert.deepEqual(exits, [0])
+    assert.equal(reports.length, 1)
+    assert.equal(reports[0].check, true)
+  }
+})

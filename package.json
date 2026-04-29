@@ -35,6 +35,7 @@
   "scripts": {
     "start": "node src/cli.js",
     "check": "node scripts/check-syntax.mjs",
+    "setup:check": "node src/cli.js check",
     "lint": "npm run check",
     "test": "node --test",
     "test:platform": "node --test test/launcher.test.js test/overview.test.js test/index.integration.test.js",

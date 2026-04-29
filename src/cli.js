@@ -2,6 +2,7 @@
 import { pathToFileURL } from "node:url"
 import { buildRuntimeConfig, parseCliArgs } from "./config/runtime.js"
 import { startConnector } from "./index.js"
+import { runSetupCheck } from "./setup/check.js"
 import { redactSensitiveText } from "./url-utils.js"
 
 const supervisorGuidance = "Run the connector under a supervisor (systemd, Docker restart policy, pm2, launchd, etc.) so fatal crashes restart automatically."
@@ -73,6 +74,7 @@ export async function runCli({
   exit = (code) => process.exit(code),
   buildRuntimeConfigImpl = buildRuntimeConfig,
   startConnectorImpl = startConnector,
+  runSetupCheckImpl = runSetupCheck,
 } = {}) {
   const stopConnectorRef = { current: async () => {} }
   let cliLogFormat = normalizeCliLogFormat(envForProcess(processImpl).CONNECTOR_LOG_FORMAT)
@@ -99,6 +101,8 @@ export async function runCli({
     stdout(
       [
         "telegram-opencode-connector",
+        "\nModes:",
+        "  check, --check        run guided setup checks without starting connector",
         "\nOptions:",
         "  --env-file <path>",
         "  --config-file <path>",
@@ -108,6 +112,17 @@ export async function runCli({
       ].join("\n"),
     )
     exit(0)
+    return
+  }
+
+  if (args.check) {
+    const report = await runSetupCheckImpl({
+      args,
+      stdout,
+      buildRuntimeConfigImpl,
+      platform: processImpl?.platform || process.platform,
+    })
+    exit(report?.exitCode === 0 ? 0 : 1)
     return
   }
 

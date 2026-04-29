@@ -28,6 +28,7 @@ export function parseCliArgs(argv) {
   }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
+    if (a === "check" || a === "--check") out.check = true
     if (a === "--env-file") out.envFile = takeValue(a, i++)
     else if (a === "--config-file") out.configFile = takeValue(a, i++)
     else if (a === "--projects-file") out.projectsFile = takeValue(a, i++)

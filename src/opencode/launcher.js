@@ -18,7 +18,7 @@ function resolveOpenTuiOnAutoStart(project) {
   return project?.openTuiOnAutoStart !== false
 }
 
-function commandExistsOnPath(command, { platform = process.platform } = {}) {
+export function commandExistsOnPath(command, { platform = process.platform } = {}) {
   const raw = String(command || "").trim()
   if (!raw) return false
 

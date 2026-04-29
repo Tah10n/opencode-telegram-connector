@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-1677ff.svg)](./LICENSE)
 [![Telegram Bot](https://img.shields.io/badge/Telegram-bot-26A5E4?logo=telegram&logoColor=white)](#telegram-commands)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-6f42c1)](#platform-notes)
-[![CI](https://img.shields.io/badge/CI-check%20%2B%20test-2ea44f)](./.github/workflows/ci.yml)
+![CI: check + test](https://img.shields.io/badge/CI-check%20%2B%20test-2ea44f)
 
 Run your opencode sessions from Telegram.
 
@@ -32,8 +32,8 @@ This Node.js connector binds each Telegram chat or forum topic to a specific `{ 
 
 - Node.js **20+**
 - A Telegram bot token
-- Reachable opencode endpoints for your configured projects
-- If you use `autoStart`, the `opencode` CLI must be installed and available on `PATH`
+- Reachable opencode endpoints for remote/manual projects
+- If you use local `autoStart`, the `opencode` CLI must be installed and available on `PATH`
 
 ## Quick start
 
@@ -48,17 +48,26 @@ npm install
 4. Put your secrets in `.env`:
    - `TELEGRAM_BOT_TOKEN`
    - `TELEGRAM_ALLOWED_USER_ID`
-5. Define your projects in `connector.config.mjs`.
+5. Define your projects in `connector.config.mjs`, keep only the entries you plan to use, and update their placeholder paths/URLs before you continue.
+   The bundled examples cover local auto-start, a remote server with Basic Auth loaded from env, and headless/server-only mode.
    Legacy `PROJECTS_FILE` / `PROJECTS_JSON` is still supported if you need the older JSON-based setup.
-6. Start the connector:
+6. Run the guided setup check before starting:
+
+```sh
+npm run setup:check
+```
+
+7. Start the connector:
 
 ```sh
 npm start
 ```
 
-7. In Telegram, send `/start`, then `/bind <projectAlias>`.
+8. In Telegram, send `/start`, then `/bind <projectAlias>`.
 
-Sanity check:
+> Package status: `package.json` remains `"private": true` in this phase. Install and run the connector from a checkout for now; npm packaging and publishing are a later release track.
+
+Optional syntax check:
 
 ```sh
 npm run check
@@ -74,7 +83,7 @@ When you follow the quick start from the connector directory, local runtime file
 
 If you launch the connector from another working directory, pass explicit `--env-file`, `--config-file`, and/or `--state-file` paths, or set `cwd` / `stateFile` in `connector.config.mjs` so relative paths resolve where you expect.
 
-## Minimal config example
+## Starter config example
 
 `connector.config.mjs` is the preferred configuration entrypoint.
 Legacy `PROJECTS_FILE` / `PROJECTS_JSON` setup is still supported if you need it.
@@ -88,37 +97,50 @@ export default {
     allowedUserId: Number(process.env.TELEGRAM_ALLOWED_USER_ID),
   },
 
-  defaultProject: "pocket",
+  defaultProject: "localDesktop",
   logFormat: "text",
 
-  // Optional: mirror user messages typed directly in opencode TUI to Telegram.
-  // mirrorTuiUserMessages: true,
-
-  limits: {
-    userAttachmentConfirmBytes: 32 * 1024,
-    userAttachmentMaxBytes: 256 * 1024,
-    changedFilesLimit: 10,
-    inlineDiffTextMaxChars: 2500,
-    streamPreviewMaxChars: 3500,
-    textAttachmentThreshold: 12_000,
-  },
+  // Uncomment only if you intentionally use Basic Auth over
+  // non-loopback http:// for a project below.
+  // allowInsecureHttp: process.env.OPENCODE_ALLOW_INSECURE_HTTP === "1",
 
   projects: {
-    pocket: {
+    localDesktop: {
+      displayName: "Local desktop project",
       directory: "./project-a",
       port: 4100,
       autoStart: true,
       serverLaunchMode: "background",
       openTuiOnAutoStart: true,
-      openAttachOnNewMode: "same-window",
+      openAttachOnNewMode: "new-window",
     },
 
-    remote: {
-      baseUrl: "http://127.0.0.1:4200",
+    remoteTeam: {
+      displayName: "Remote shared server",
+      baseUrl: "https://opencode.example.com",
+      usernameEnv: "REMOTE_OPENCODE_USERNAME",
+      passwordEnv: "REMOTE_OPENCODE_PASSWORD",
+    },
+
+    serverOnly: {
+      displayName: "Headless local server",
+      directory: "./project-b",
+      port: 4101,
+      autoStart: true,
+      serverLaunchMode: "background",
+      openTuiOnAutoStart: false,
+      openAttachOnNewMode: "same-window",
     },
   },
 }
 ```
+
+- `localDesktop` shows a local auto-start workflow with a TUI/attach window.
+- `remoteTeam` shows an already running remote server with Basic Auth credentials loaded from `.env`.
+- `serverOnly` keeps local auto-start but suppresses UI windows for headless or supervisor-managed deployments.
+- You can mix local and remote projects in one file; keep aliases stable because Telegram bindings are persisted by alias.
+
+If a Basic Auth project uses a non-loopback `http://` URL, set `OPENCODE_ALLOW_INSECURE_HTTP=1` intentionally before `npm run setup:check`; otherwise the connector refuses to start.
 
 ## Telegram commands
 
@@ -229,6 +251,7 @@ Prefer the `limits` object in `connector.config.mjs`; env fallbacks are availabl
 - `autoStart`
 - `serverLaunchMode`: `background` or `window`
 - `openTuiOnAutoStart`
+  - Set this to `false` for headless/server-only deployments where the connector should start or monitor opencode without opening UI windows.
 - `openAttachOnNewMode`: `same-window` or `new-window`
   - `same-window` does not open a new window; it binds Telegram to the new session immediately and requests a switch for the existing attached TUI.
     When the opencode server exposes the TUI active-session API, Telegram can also follow later TUI-driven session switches in the same thread.
@@ -265,7 +288,7 @@ Before writing logs, the connector redacts bot tokens, Basic Auth credentials, U
 
 - **Windows**, **macOS**, and **Linux desktop** environments support local auto-start and optional attach/TUI windows.
 - On Linux, the connector tries `OPENCODE_TERMINAL` first and then common terminal emulators from `PATH`.
-- In headless Linux/macOS environments, connecting to an already running opencode server still works, but opening a new terminal window requires an available GUI/terminal launcher.
+- In headless Linux/macOS environments, local auto-start still works for server-only configs with `openTuiOnAutoStart: false`, but opening a new terminal window still requires an available GUI/terminal launcher.
 - For long-running service examples on each platform, see [Running under a supervisor](#running-under-a-supervisor).
 
 ## Running under a supervisor
@@ -479,6 +502,7 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 ## Useful local commands
 
 ```sh
+npm run setup:check
 npm run check
 npm test
 npm run test:coverage

@@ -316,6 +316,7 @@ test("buildRuntimeConfig falls back to legacy env and projects json when config 
 
 test("parseCliArgs parses supported flags and help aliases", () => {
   const parsed = parseCliArgs([
+    "check",
     "--env-file",
     "./.env.custom",
     "--config-file",
@@ -326,11 +327,13 @@ test("parseCliArgs parses supported flags and help aliases", () => {
     '{"demo":{"baseUrl":"http://127.0.0.1:4312"}}',
     "--state-file",
     "./.data/state.json",
+    "--check",
     "-h",
     "--unknown",
   ])
 
   assert.deepEqual(parsed, {
+    check: true,
     envFile: "./.env.custom",
     configFile: "./config/connector.config.mjs",
     projectsFile: "./projects.json",
@@ -339,6 +342,8 @@ test("parseCliArgs parses supported flags and help aliases", () => {
     help: true,
   })
 
+  assert.deepEqual(parseCliArgs(["check"]), { check: true })
+  assert.deepEqual(parseCliArgs(["--check"]), { check: true })
   assert.deepEqual(parseCliArgs(["--help"]), { help: true })
   assert.deepEqual(parseCliArgs([]), {})
 })

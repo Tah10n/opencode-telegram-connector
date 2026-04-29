@@ -33,9 +33,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ### Added
 - Optional JSON log mode for supervisors and hosted runtimes via `CONNECTOR_LOG_FORMAT=json` or `logFormat: "json"`.
 - Runtime counters for mirrored assistant messages, skipped noisy events, prompt delivery/answers, Telegram send/edit failures, and attachment fallbacks in `/status` and `/runtime`.
-- Public-project split with subtree workflow helpers and boundary checks.
-- Manual preflight and smoke-test helper scripts.
-- Public OSS basics such as license, contributing guide, and CI.
+- Connector project packaging groundwork and release guardrails.
+- Manual preflight and smoke-test guidance.
+- Open-source release basics such as a license, contributing guide, and CI.
 - Cross-platform desktop launcher support for Windows, Linux, and macOS `tui` / attach flows.
 - Added a unified `connector.config.mjs` configuration path with legacy `.env` / `projects.json` fallback.
 - Telegram document prompts for UTF-8 text/code/log files, including size limits and confirmation before large files are sent to opencode.
@@ -48,3 +48,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Start-button auto-start flows and attach-window launch behavior now share one cross-platform launcher path.
 - Added explicit project config knobs for background vs visible server launch and whether auto-start should open a TUI window.
 - Added `openAttachOnNewMode` so `/new` can either open a fresh attach window or stay in manual same-window mode.
+
+### Documentation
+- Quick start now guides users through `npm run setup:check` before `npm start`.
+- README, `.env.example`, `connector.config.example.mjs`, and release docs now show synchronized examples for local auto-start, remote Basic Auth via env, multi-project configs, and headless/server-only operation.
+- Package guidance now explicitly keeps `package.json` private for this phase; npm packaging and publishing remain a later release track.
