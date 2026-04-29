@@ -1548,6 +1548,174 @@ test("createCallbackHandlers handles single-choice and multi-choice question ste
   ])
 })
 
+test("createCallbackHandlers flushes question wizard progression state before deleting or answering", async () => {
+  const order = []
+  let flushCount = 0
+  const singleWizard = makeWizard({
+    id: "q_single_next",
+    questions: [
+      { header: "Pick one", question: "Pick", options: [{ label: "lint" }] },
+      { header: "Reason", question: "Why?", custom: true, options: [] },
+    ],
+  })
+  const toggleWizard = makeWizard({
+    id: "q_multi_toggle",
+    questions: [{ header: "Checks", question: "Pick", multiple: true, options: [{ label: "lint" }, { label: "test" }] }],
+    selectedByIndex: { 0: ["test"] },
+  })
+  const doneWizard = makeWizard({
+    id: "q_multi_done_next",
+    questions: [
+      { header: "Checks", question: "Pick", multiple: true, options: [{ label: "lint" }, { label: "test" }] },
+      { header: "Reason", question: "Why?", custom: true, options: [] },
+    ],
+    selectedByIndex: { 0: ["lint", "test"] },
+  })
+  const getWizard = (_projectAlias, questionId) => {
+    if (questionId === "q_single_next") return singleWizard
+    if (questionId === "q_multi_toggle") return toggleWizard
+    if (questionId === "q_multi_done_next") return doneWizard
+    return null
+  }
+  const { runtime } = makeRuntime({
+    tg: {
+      answerCallbackQuery: async (_callbackQueryId, text) => {
+        order.push(`answer:${text ?? ""}`)
+        return true
+      },
+      deleteMessage: async (_chatId, messageId) => {
+        order.push(`delete:${messageId}`)
+        return true
+      },
+    },
+    store: {
+      flush: async () => {
+        flushCount += 1
+        order.push(`flush:${flushCount}`)
+      },
+    },
+    getWizard,
+    ocByAlias: { demo: {} },
+    persistQuestionWizard: (wizard) => {
+      order.push(`persist:${wizard.id}:${wizard.index}`)
+    },
+    sendCurrentQuestionStep: async (wizard, options) => {
+      order.push(`send:${wizard.id}:${wizard.index}:${options?.editMessageId ?? "new"}`)
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("q|demo|q_single_next|0|o|0", { messageId: 911 }))
+  await handlers.handleTelegramCallback(makeCallback("q|demo|q_multi_toggle|0|t|0", { id: "cb_2", messageId: 912 }))
+  await handlers.handleTelegramCallback(makeCallback("q|demo|q_multi_done_next|0|done", { id: "cb_3", messageId: 913 }))
+
+  assert.deepEqual(order, [
+    "send:q_single_next:1:new",
+    "persist:q_single_next:1",
+    "flush:1",
+    "delete:911",
+    "answer:Selected",
+    "send:q_multi_toggle:0:912",
+    "persist:q_multi_toggle:0",
+    "flush:2",
+    "answer:",
+    "send:q_multi_done_next:1:new",
+    "persist:q_multi_done_next:1",
+    "flush:3",
+    "delete:913",
+    "answer:Done",
+  ])
+})
+
+test("createCallbackHandlers rolls back and rethrows durability failures during question wizard progression flushes", async () => {
+  const cases = [
+    {
+      callbackData: "q|demo|q_single_flush_fail|0|o|0",
+      messageId: 914,
+      wizard: makeWizard({
+        id: "q_single_flush_fail",
+        questions: [
+          { header: "Pick one", question: "Pick", options: [{ label: "lint" }] },
+          { header: "Reason", question: "Why?", custom: true, options: [] },
+        ],
+      }),
+      assertProgress: ({ sendQuestionStepCalls, persistedWizards }) => {
+        assert.equal(sendQuestionStepCalls[0]?.wizard.index, 1)
+        assert.equal(persistedWizards[0]?.index, 1)
+      },
+    },
+    {
+      callbackData: "q|demo|q_multi_toggle_flush_fail|0|t|0",
+      messageId: 915,
+      wizard: makeWizard({
+        id: "q_multi_toggle_flush_fail",
+        questions: [{ header: "Checks", question: "Pick", multiple: true, options: [{ label: "lint" }, { label: "test" }] }],
+        selectedByIndex: { 0: ["test"] },
+      }),
+      assertProgress: ({ sendQuestionStepCalls, persistedWizards }) => {
+        assert.equal(sendQuestionStepCalls[0]?.options.editMessageId, 915)
+        assert.equal(sendQuestionStepCalls[0]?.wizard.selectedByIndex[0].slice().sort().join(","), "lint,test")
+        assert.equal(persistedWizards[0]?.selectedByIndex[0].slice().sort().join(","), "lint,test")
+      },
+    },
+    {
+      callbackData: "q|demo|q_multi_done_flush_fail|0|done",
+      messageId: 916,
+      wizard: makeWizard({
+        id: "q_multi_done_flush_fail",
+        questions: [
+          { header: "Checks", question: "Pick", multiple: true, options: [{ label: "lint" }, { label: "test" }] },
+          { header: "Reason", question: "Why?", custom: true, options: [] },
+        ],
+        selectedByIndex: { 0: ["lint", "test"] },
+      }),
+      assertProgress: ({ sendQuestionStepCalls, persistedWizards }) => {
+        assert.equal(sendQuestionStepCalls[0]?.wizard.index, 1)
+        assert.equal(persistedWizards[0]?.index, 1)
+        assert.equal(persistedWizards[0]?.answers[0].join(","), "lint,test")
+      },
+    },
+  ]
+
+  for (const { callbackData, messageId, wizard, assertProgress } of cases) {
+    const initialWizard = cloneWizardState(wizard)
+    const deletedMessages = []
+    const flushCalls = []
+    const { runtime, callbackAnswers, persistedWizards, sendQuestionStepCalls } = makeRuntime({
+      tg: {
+        deleteMessage: async (chatId, currentMessageId) => {
+          deletedMessages.push({ chatId, messageId: currentMessageId })
+        },
+      },
+      store: {
+        async flush() {
+          flushCalls.push(true)
+          throw new Error("state write failed")
+        },
+      },
+      getWizard: () => wizard,
+      ocByAlias: { demo: {} },
+    })
+    const handlers = createCallbackHandlers(runtime)
+
+    await assert.rejects(() => handlers.handleTelegramCallback(makeCallback(callbackData, { messageId })), (err) => {
+      assert.equal(err.isBoundaryError, true)
+      assert.equal(err.source, "state")
+      assert.equal(err.outcome, "retryable")
+      return true
+    })
+
+    assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Temporarily unavailable"])
+    assert.deepEqual(flushCalls, [true])
+    assert.equal(sendQuestionStepCalls.length, 1)
+    assert.equal(persistedWizards.length, 2)
+    assert.deepEqual(deletedMessages, [])
+    assertProgress({ sendQuestionStepCalls, persistedWizards })
+    assert.deepEqual(persistedWizards[1], initialWizard)
+    assert.deepEqual(cloneWizardState(wizard), initialWizard)
+  }
+})
+
 test("createCallbackHandlers does not persist multi-choice toggles when step edit fails", async () => {
   const wizard = makeWizard({
     id: "q_multi_edit_fail",

@@ -1,6 +1,6 @@
 import { makeInlineKeyboard } from "../../telegram/client.js"
 import { sessionKey } from "../../state/store.js"
-import { classifyBoundaryError } from "../../boundary-errors.js"
+import { classifyBoundaryError, makeBoundaryError } from "../../boundary-errors.js"
 import { userAttachmentLimitsFromConfig } from "../../limits.js"
 import {
   attachmentConfirmationText,
@@ -83,7 +83,30 @@ export function createAttachmentHandlers({
     return !!key && typeof store?.hasIdempotencyKey === "function" && store.hasIdempotencyKey(key)
   }
 
-  async function markIdempotencyEntries(entries, { flush = true } = {}) {
+  async function flushDurableState(operation) {
+    if (typeof store?.flush !== "function") return
+    try {
+      await store.flush()
+    } catch (err) {
+      throw makeBoundaryError({
+        source: "state",
+        operation,
+        kind: "durability",
+        outcome: "retryable",
+        message: `${operation} failed: ${err?.message || String(err)}`,
+        cause: err,
+      })
+    }
+  }
+
+  async function deleteIdempotencyEntry(key, { flush = true } = {}) {
+    if (!key || typeof store?.deleteIdempotencyKey !== "function") return false
+    const deleted = store.deleteIdempotencyKey(key)
+    if (deleted && flush) await flushDurableState("delete idempotency entry")
+    return deleted
+  }
+
+  async function markIdempotencyEntries(entries, { flush = true, rollbackOnFlushFailure = false } = {}) {
     const normalized = entries.filter((entry) => !!entry?.key)
     if (!normalized.length) return false
     if (typeof store?.markIdempotencyKey === "function") {
@@ -91,13 +114,34 @@ export function createAttachmentHandlers({
       for (const entry of normalized) {
         marked = store.markIdempotencyKey(entry.key, entry.metadata || {}) || marked
       }
-      if (marked && flush && typeof store?.flush === "function") await store.flush()
+      if (marked && flush) {
+        try {
+          await flushDurableState("persist idempotency entries")
+        } catch (err) {
+          if (rollbackOnFlushFailure) {
+            await Promise.all(normalized.map((entry) => deleteIdempotencyEntry(entry.key, { flush: false }).catch(() => false)))
+          }
+          throw err
+        }
+      }
       return marked
     }
     if (typeof store?.markIdempotencyKeyAndFlush === "function") {
       let marked = false
       for (const entry of normalized) {
-        marked = (await store.markIdempotencyKeyAndFlush(entry.key, entry.metadata || {})) || marked
+        try {
+          marked = (await store.markIdempotencyKeyAndFlush(entry.key, entry.metadata || {})) || marked
+        } catch (err) {
+          if (rollbackOnFlushFailure) await deleteIdempotencyEntry(entry.key, { flush: false }).catch(() => false)
+          throw makeBoundaryError({
+            source: "state",
+            operation: "persist idempotency entries",
+            kind: "durability",
+            outcome: "retryable",
+            message: `persist idempotency entries failed: ${err?.message || String(err)}`,
+            cause: err,
+          })
+        }
       }
       return marked
     }
@@ -173,7 +217,7 @@ export function createAttachmentHandlers({
 
   async function requestAttachmentConfirmation(ctxMeta, record, markMessageHandled) {
     const token = rememberPendingAttachmentConfirmation(record)
-    await safeInformThread(ctxMeta, attachmentConfirmationText(record.documentInfo, { limits }), attachmentConfirmationKeyboard(token))
+    await sendToThread(ctxMeta, attachmentConfirmationText(record.documentInfo, { limits }), attachmentConfirmationKeyboard(token))
     if (markMessageHandled) {
       await markMessageHandled("attachmentConfirmRequested", {
         projectAlias: record.projectAlias,
@@ -239,11 +283,23 @@ export function createAttachmentHandlers({
       return
     }
 
+    // Match text prompt idempotency: prefer at-most-once delivery over a
+    // duplicate OpenCode prompt if Telegram replays after the external side effect.
+    await markMessageHandled(
+      "promptAsyncAttachment",
+      { projectAlias: binding.projectAlias, sessionId: binding.sessionId },
+      { rollbackOnFlushFailure: true },
+    )
     try {
       await sendAttachmentPromptToOpenCode(ctxMeta, binding, record, loaded)
-      await markMessageHandled("promptAsyncAttachment", { projectAlias: binding.projectAlias, sessionId: binding.sessionId })
       await safeInformThread(ctxMeta, attachmentSentText(loaded.documentInfo, binding), closeOnlyKeyboard())
     } catch (err) {
+      let cleanupErr = null
+      try {
+        await deleteIdempotencyEntry(messageKey)
+      } catch (deleteErr) {
+        cleanupErr = deleteErr
+      }
       const alias = binding.projectAlias
       const withButton = isRetryableProjectError?.(err) && canAutoStartProject?.(alias, { platform })
       if (recordRetryableOpenCodeFailure) {
@@ -254,6 +310,7 @@ export function createAttachmentHandlers({
         })
       }
       await safeInformThread(ctxMeta, formatProjectUnavailable(alias, err), withButton ? startServerKeyboard?.(alias) : closeOnlyKeyboard())
+      if (cleanupErr) throw cleanupErr
       if (isRetryableProjectError?.(err)) throw err
     }
   }
@@ -288,13 +345,13 @@ export function createAttachmentHandlers({
     }
 
     const sendKey = attachmentSendIdempotencyKey(record)
+    if (pendingAttachmentSends.has(sendKey)) {
+      return { callbackText: "Already sending" }
+    }
     if (hasIdempotencyKey(sendKey)) {
       pendingAttachmentConfirmations.delete(token)
       await safeEditMessage(ctxMeta, editMessageId, "Attachment was already sent to OpenCode.", closeOnlyKeyboard())
       return { callbackText: "Already sent" }
-    }
-    if (pendingAttachmentSends.has(sendKey)) {
-      return { callbackText: "Already sending" }
     }
     pendingAttachmentSends.add(sendKey)
 
@@ -324,23 +381,8 @@ export function createAttachmentHandlers({
         return { callbackText: "Unsupported" }
       }
 
-      try {
-        await sendAttachmentPromptToOpenCode(ctxMeta, currentBinding, record, loaded)
-      } catch (err) {
-        const alias = currentBinding.projectAlias
-        const withButton = isRetryableProjectError?.(err) && canAutoStartProject?.(alias, { platform })
-        if (recordRetryableOpenCodeFailure) {
-          recordRetryableOpenCodeFailure(alias, err, {
-            operation: "POST /session/:id/prompt_async",
-            method: "POST",
-            pathname: `/session/${currentBinding.sessionId}/prompt_async`,
-          })
-        }
-        await safeInformThread(ctxMeta, formatProjectUnavailable(alias, err), withButton ? startServerKeyboard?.(alias) : closeOnlyKeyboard())
-        if (isRetryableProjectError?.(err)) return { callbackText: "Temporarily unavailable" }
-        throw err
-      }
-
+      // Confirmed attachments use their own send key because the original
+      // Telegram message was already marked when the confirmation UI was sent.
       await markIdempotencyEntries([
         {
           key: sendKey,
@@ -355,7 +397,31 @@ export function createAttachmentHandlers({
             messageId: record.messageId,
           },
         },
-      ])
+      ], { rollbackOnFlushFailure: true })
+
+      try {
+        await sendAttachmentPromptToOpenCode(ctxMeta, currentBinding, record, loaded)
+      } catch (err) {
+        let cleanupErr = null
+        try {
+          await deleteIdempotencyEntry(sendKey)
+        } catch (deleteErr) {
+          cleanupErr = deleteErr
+        }
+        const alias = currentBinding.projectAlias
+        const withButton = isRetryableProjectError?.(err) && canAutoStartProject?.(alias, { platform })
+        if (recordRetryableOpenCodeFailure) {
+          recordRetryableOpenCodeFailure(alias, err, {
+            operation: "POST /session/:id/prompt_async",
+            method: "POST",
+            pathname: `/session/${currentBinding.sessionId}/prompt_async`,
+          })
+        }
+        await safeInformThread(ctxMeta, formatProjectUnavailable(alias, err), withButton ? startServerKeyboard?.(alias) : closeOnlyKeyboard())
+        if (cleanupErr) throw cleanupErr
+        if (isRetryableProjectError?.(err)) return { callbackText: "Temporarily unavailable" }
+        throw err
+      }
       pendingAttachmentConfirmations.delete(token)
       await safeEditMessage(ctxMeta, editMessageId, attachmentSentText(loaded.documentInfo, currentBinding), closeOnlyKeyboard())
       return { callbackText: "Sent" }

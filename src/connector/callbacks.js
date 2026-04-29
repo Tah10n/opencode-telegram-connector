@@ -128,6 +128,23 @@ export function createCallbackHandlers(runtime) {
     }
   }
 
+  async function persistQuestionWizardDurably(wizard, previousWizard) {
+    persistQuestionWizard(wizard)
+    try {
+      await flushStoreIfAvailable()
+    } catch (err) {
+      if (previousWizard) {
+        try {
+          applyWizardState(wizard, previousWizard)
+          persistQuestionWizard(wizard)
+        } catch (rollbackErr) {
+          runtime.logger?.error?.("Failed to roll back question wizard state:", rollbackErr?.message || String(rollbackErr))
+        }
+      }
+      throw err
+    }
+  }
+
   function cloneStoreStateSnapshot() {
     if (typeof store?.get !== "function") return null
     const current = store.get()
@@ -992,6 +1009,7 @@ export function createCallbackHandlers(runtime) {
             return
           }
           const label = String(q.options[optIndex].label)
+          const previousWizard = cloneWizardState(wizard)
           const nextWizard = cloneWizardState(wizard)
           nextWizard.answers[qIndex] = [label]
           const nextIndex = qIndex + 1
@@ -1013,7 +1031,7 @@ export function createCallbackHandlers(runtime) {
             nextWizard.index = nextIndex
             await runtime.sendCurrentQuestionStep(nextWizard)
             applyWizardState(wizard, nextWizard)
-            persistQuestionWizard(wizard)
+            await persistQuestionWizardDurably(wizard, previousWizard)
             await deleteInteractiveMessage(ctxMeta, msg?.message_id)
           }
           await answerCallbackQuery(callbackQuery.id, "Selected")
@@ -1033,11 +1051,12 @@ export function createCallbackHandlers(runtime) {
           const current = new Set(wizard.selectedByIndex?.[qIndex] || [])
           if (current.has(label)) current.delete(label)
           else current.add(label)
+          const previousWizard = cloneWizardState(wizard)
           const nextWizard = cloneWizardState(wizard)
           nextWizard.selectedByIndex[qIndex] = Array.from(current)
           if (messageId) await runtime.sendCurrentQuestionStep(nextWizard, { editMessageId: messageId })
           applyWizardState(wizard, nextWizard)
-          persistQuestionWizard(wizard)
+          await persistQuestionWizardDurably(wizard, previousWizard)
           await answerCallbackQuery(callbackQuery.id)
           return
         }
@@ -1047,6 +1066,7 @@ export function createCallbackHandlers(runtime) {
             return
           }
           const selected = wizard.selectedByIndex?.[qIndex] || []
+          const previousWizard = cloneWizardState(wizard)
           const nextWizard = cloneWizardState(wizard)
           nextWizard.answers[qIndex] = selected
           const nextIndex = qIndex + 1
@@ -1068,7 +1088,7 @@ export function createCallbackHandlers(runtime) {
             nextWizard.index = nextIndex
             await runtime.sendCurrentQuestionStep(nextWizard)
             applyWizardState(wizard, nextWizard)
-            persistQuestionWizard(wizard)
+            await persistQuestionWizardDurably(wizard, previousWizard)
             await deleteInteractiveMessage(ctxMeta, msg?.message_id)
           }
           await answerCallbackQuery(callbackQuery.id, "Done")

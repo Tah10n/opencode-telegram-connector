@@ -107,6 +107,13 @@ export function createPromptHandlers(runtime) {
     }
   }
 
+  function deleteIdempotencyEntries(entries = []) {
+    if (typeof store?.deleteIdempotencyKey !== "function") return
+    for (const entry of entries) {
+      if (entry?.key) store.deleteIdempotencyKey(entry.key)
+    }
+  }
+
   function makeStateDurabilityError(err, operation) {
     return makeBoundaryError({
       source: "state",
@@ -132,6 +139,24 @@ export function createPromptHandlers(runtime) {
     questionWizards.delete(wizardKey(wizard.projectAlias, wizard.request.id))
     clearPersistedQuestionWizard(wizard.projectAlias, wizard.request.id, wizard.sessionID)
     setAwaitingCustomAnswerState(wizard.ctx.ctxKey, null)
+  }
+
+  async function clearQuestionWizardStateDurably(wizard, operation, { rollbackIdempotencyEntries = [] } = {}) {
+    const key = wizardKey(wizard.projectAlias, wizard.request.id, wizard.sessionID)
+    const ctxKey = wizard.ctx?.ctxKey
+    const hadAwaiting = !!ctxKey && awaitingCustomAnswer.has(ctxKey)
+    const previousAwaiting = hadAwaiting ? awaitingCustomAnswer.get(ctxKey) : null
+
+    clearQuestionWizardState(wizard)
+    try {
+      await flushDurableState(operation)
+    } catch (err) {
+      questionWizards.set(key, wizard)
+      persistQuestionWizard(wizard)
+      if (hadAwaiting) setAwaitingCustomAnswerState(ctxKey, previousAwaiting)
+      deleteIdempotencyEntries(rollbackIdempotencyEntries)
+      throw err
+    }
   }
 
   function setRejectNoteAwaitingState(ctxKey, value) {
@@ -306,8 +331,7 @@ export function createPromptHandlers(runtime) {
     const replyKey = questionReplyIdempotencyKey(wizard.projectAlias, wizard.sessionID, wizard.request.id, wizard.answers)
     if (hasIdempotencyKey(replyKey)) {
       await markIdempotencyEntries(idempotencyEntries)
-      clearQuestionWizardState(wizard)
-      await flushDurableState("persist duplicate question reply state")
+      await clearQuestionWizardStateDurably(wizard, "persist duplicate question reply state", { rollbackIdempotencyEntries: idempotencyEntries })
       return { outcome: "duplicate", duplicate: true }
     }
     try {
@@ -322,8 +346,7 @@ export function createPromptHandlers(runtime) {
           operation: "replyQuestion",
         })
         await markIdempotencyEntries(idempotencyEntries)
-        clearQuestionWizardState(wizard)
-        await flushDurableState("persist stale question reply state")
+        await clearQuestionWizardStateDurably(wizard, "persist stale question reply state", { rollbackIdempotencyEntries: idempotencyEntries })
         await sendToThread(wizard.ctx, "Question is no longer active.").catch(() => {})
         return { outcome: "stale", stale: true }
       }
@@ -341,8 +364,7 @@ export function createPromptHandlers(runtime) {
     })
     await markIdempotencyEntries(idempotencyEntries)
     recordPromptAnswered?.(wizard.projectAlias, "question", "ok")
-    clearQuestionWizardState(wizard)
-    await flushDurableState("persist question reply state")
+    await clearQuestionWizardStateDurably(wizard, "persist question reply state", { rollbackIdempotencyEntries: idempotencyEntries })
     await sendToThread(wizard.ctx, `Answered: ${wizard.request.id}`).catch(() => {})
     return { outcome: "ok", stale: false }
   }

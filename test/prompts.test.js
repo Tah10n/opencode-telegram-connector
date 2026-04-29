@@ -227,14 +227,41 @@ test("sendCurrentQuestionStep surfaces edit failures without recording message i
 test("finishQuestionWizard rethrows durability failures after accepted replies", async () => {
   const replyCalls = []
   const marked = []
+  const deletedIdempotencyKeys = []
+  const questionWizards = new Map()
+  const awaitingCustomAnswer = new Map()
+  const wizard = {
+    projectAlias: "demo",
+    sessionID: "ses_1",
+    request: { id: "q_durable", questions: [{ header: "Reason", question: "Why?" }] },
+    answers: [["because"]],
+    ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+  }
+  const awaitingState = { projectAlias: "demo", requestId: "q_durable", qIndex: 0, sessionID: "ses_1" }
+  questionWizards.set("demo:ses_1:q_durable", wizard)
+  awaitingCustomAnswer.set("100:7", awaitingState)
   const { handlers } = makePromptRuntime({
+    questionWizards,
+    awaitingCustomAnswer,
     store: {
       markIdempotencyKey(key, metadata) {
         marked.push({ key, metadata })
         return true
       },
+      deleteIdempotencyKey(key) {
+        deletedIdempotencyKeys.push(key)
+        return true
+      },
+      setQuestionWizard(key, currentWizard) {
+        questionWizards.set(key, currentWizard)
+      },
       deleteQuestionWizard() {},
-      deleteAwaitingCustomAnswer() {},
+      setAwaitingCustomAnswer(ctxKey, value) {
+        awaitingCustomAnswer.set(ctxKey, value)
+      },
+      deleteAwaitingCustomAnswer(ctxKey) {
+        awaitingCustomAnswer.delete(ctxKey)
+      },
       async flush() {
         throw new Error("state write failed")
       },
@@ -248,13 +275,6 @@ test("finishQuestionWizard rethrows durability failures after accepted replies",
       },
     },
   })
-  const wizard = {
-    projectAlias: "demo",
-    sessionID: "ses_1",
-    request: { id: "q_durable", questions: [{ header: "Reason", question: "Why?" }] },
-    answers: [["because"]],
-    ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
-  }
 
   await assert.rejects(() => handlers.finishQuestionWizard(wizard, {
     idempotencyEntries: [{ key: "telegram-message:100:7:77", metadata: { kind: "telegram-message", operation: "replyQuestion" } }],
@@ -268,6 +288,9 @@ test("finishQuestionWizard rethrows durability failures after accepted replies",
   assert.deepEqual(replyCalls, [{ questionId: "q_durable", answers: [["because"]] }])
   assert.equal(marked.length, 2)
   assert.equal(marked[1].key, "telegram-message:100:7:77")
+  assert.deepEqual(deletedIdempotencyKeys, ["telegram-message:100:7:77"])
+  assert.equal(questionWizards.get("demo:ses_1:q_durable"), wizard)
+  assert.deepEqual(awaitingCustomAnswer.get("100:7"), awaitingState)
 })
 
 test("handleQuestionAsked does not baseline-suppress a first SSE prompt after Telegram delivery fails", async () => {

@@ -402,8 +402,25 @@ export function createCommandHandlers(runtime) {
       }
     }
 
-    async function markMessageHandled(operation, metadata = {}) {
-      return markIdempotencyEntries([messageIdempotencyEntry(operation, metadata)])
+    async function markMessageHandled(operation, metadata = {}, options = {}) {
+      return markIdempotencyEntries([messageIdempotencyEntry(operation, metadata)], options)
+    }
+
+    async function persistCustomAnswerProgressDurably(wizard, previousWizard, previousAwaiting) {
+      persistQuestionWizard(wizard)
+      setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
+      try {
+        await flushDurableState("persist question wizard state")
+      } catch (err) {
+        try {
+          applyWizardState(wizard, previousWizard)
+          persistQuestionWizard(wizard)
+          setAwaitingCustomAnswerState(ctxMeta.ctxKey, previousAwaiting)
+        } catch (rollbackErr) {
+          logger?.error?.("Failed to roll back custom-answer wizard state:", rollbackErr?.message || String(rollbackErr))
+        }
+        throw err
+      }
     }
 
     const awaitingQ = awaitingCustomAnswer.get(ctxMeta.ctxKey)
@@ -434,12 +451,12 @@ export function createCommandHandlers(runtime) {
           return
         }
       } else {
+        const previousWizard = cloneWizardState(wizard)
+        const previousAwaiting = { ...awaitingQ }
         nextWizard.index = nextIndex
         await sendCurrentQuestionStep(nextWizard)
         applyWizardState(wizard, nextWizard)
-        persistQuestionWizard(wizard)
-        setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
-        await flushDurableState("persist question wizard state")
+        await persistCustomAnswerProgressDurably(wizard, previousWizard, previousAwaiting)
         await markMessageHandled("questionNextStep", { projectAlias: awaitingQ.projectAlias, sessionId: wizard.sessionID })
       }
       return
