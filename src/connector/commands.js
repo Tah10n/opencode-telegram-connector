@@ -89,6 +89,8 @@ export function createCommandHandlers(runtime) {
     recordPromptAnswered,
     buildRuntimeStatusLines,
     buildGlobalRuntimeStatusLines,
+    clearAgentActivity,
+    getAgentActivityStatus,
   } = runtime
 
   const userAttachmentLimits = userAttachmentLimitsFromConfig(config?.limits)
@@ -358,6 +360,8 @@ export function createCommandHandlers(runtime) {
     deliverAssistantText,
     extractAssistantDisplayText,
     lastAssistantBySession,
+    clearAgentActivity,
+    getAgentActivityStatus,
     mirrorCompaction: runtime.mirrorCompaction,
     appendEffectiveModelLines,
     resolveEffectiveModelState,

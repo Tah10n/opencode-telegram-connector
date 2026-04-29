@@ -54,6 +54,8 @@ export function createOperatorCommandHandlers(deps) {
     deliverAssistantText,
     extractAssistantDisplayText,
     lastAssistantBySession,
+    clearAgentActivity,
+    getAgentActivityStatus,
     mirrorCompaction,
     appendEffectiveModelLines,
     resolveEffectiveModelState,
@@ -95,6 +97,83 @@ export function createOperatorCommandHandlers(deps) {
     if (health?.status === "stale" && health.reason === "session-missing") return "stale: session missing"
     if (health?.status === "unreachable") return "unreachable"
     return "unknown"
+  }
+
+  function isRunningAssistantMessage(message) {
+    const info = message?.info || message || {}
+    if (info?.role !== "assistant") return false
+    if (!mirrorCompaction && (info?.mode === "compaction" || info?.agent === "compaction")) return false
+    if (info?.error) return false
+    const time = info?.time || message?.time || {}
+    if (normalizeEpochMs(time.completed) != null) return false
+    return normalizeEpochMs(time.updated) != null || normalizeEpochMs(time.created) != null || normalizeEpochMs(time.started) != null
+  }
+
+  function isTerminalAssistantMessage(message) {
+    const info = message?.info || message || {}
+    if (info?.role !== "assistant") return false
+    if (info?.error) return true
+    const time = info?.time || message?.time || {}
+    return normalizeEpochMs(time.completed) != null
+  }
+
+  function messageId(message) {
+    const info = message?.info || message || {}
+    return String(info?.id || "").trim()
+  }
+
+  function localAgentMessageIds(localStatus) {
+    const ids = new Set()
+    for (const id of localStatus?.activeMessageIds || []) {
+      const normalized = String(id || "").trim()
+      if (normalized) ids.add(normalized)
+    }
+    for (const id of localStatus?.activeToolMessageIds || []) {
+      const normalized = String(id || "").trim()
+      if (normalized) ids.add(normalized)
+    }
+    return ids
+  }
+
+  function locallyEndedAgentMessageIds(localStatus) {
+    const ids = new Set()
+    for (const id of localStatus?.endedMessageIds || []) {
+      const normalized = String(id || "").trim()
+      if (normalized) ids.add(normalized)
+    }
+    return ids
+  }
+
+  async function resolveAgentStatus(binding, health) {
+    if (health?.status !== "ok") return `unknown (${bindingHealthLabel(health)})`
+
+    const oc = ocByAlias[binding.projectAlias]
+    const localStatus = getAgentActivityStatus?.(binding.projectAlias, binding.sessionId)
+    const localIsRunning = localStatus?.state === "running"
+    if (typeof oc?.listMessages !== "function") return localIsRunning ? "running" : "unknown (message list unavailable)"
+
+    try {
+      const messages = await oc.listMessages(binding.sessionId, { limit: 20 })
+      if (Array.isArray(messages)) {
+        const locallyEndedIds = locallyEndedAgentMessageIds(localStatus)
+        const runningMessages = messages.filter(isRunningAssistantMessage)
+        if (runningMessages.some((message) => {
+          const id = messageId(message)
+          return !id || !locallyEndedIds.has(id)
+        })) return "running"
+      }
+      if (localIsRunning) {
+        const localIds = localAgentMessageIds(localStatus)
+        if (Array.isArray(messages) && localIds.size > 0) {
+          const remoteById = new Map(messages.map((message) => [messageId(message), message]).filter(([id]) => Boolean(id)))
+          if ([...localIds].every((id) => remoteById.has(id) && isTerminalAssistantMessage(remoteById.get(id)))) return "not running"
+        }
+        return "running"
+      }
+      return "not running"
+    } catch {
+      return localIsRunning ? "running" : "unknown (message list failed)"
+    }
   }
 
   async function resolveBindingHealth(ctxKey, binding) {
@@ -189,6 +268,7 @@ export function createOperatorCommandHandlers(deps) {
     try {
       const aborted = await oc.abortSession(binding.sessionId)
       markProjectUp?.(binding.projectAlias)
+      clearAgentActivity?.(binding.projectAlias, binding.sessionId)
       await sendToThread(
         ctxMeta,
         aborted === false ? `No active run to abort for session: ${binding.sessionId}` : `Abort requested for session: ${binding.sessionId}`,
@@ -210,6 +290,7 @@ export function createOperatorCommandHandlers(deps) {
     const baseUrl = sanitizeBaseUrlForDisplay(projects?.[binding.projectAlias]?.baseUrl) || "unknown"
     const feedMode = feedModeLabel(getFeedMode(ctxMeta.ctxKey))
     const effectiveState = await resolveEffectiveModelState(ctxMeta.ctxKey, binding)
+    const agentStatus = await resolveAgentStatus(binding, health)
     const runtimeLines = buildRuntimeStatusLines?.(binding.projectAlias) || []
     const replyMarkup = health.status === "ok"
       ? boundThreadActionsKeyboard(ctxMeta)
@@ -225,6 +306,7 @@ export function createOperatorCommandHandlers(deps) {
           `Session: ${binding.sessionId}`,
           `Startup session: ${startupSessionId}`,
           `Feed: ${feedMode}`,
+          `Agent: ${agentStatus}`,
           `SSE: ${sseStatus}`,
           `Base URL: ${baseUrl}`,
           `Binding health: ${bindingHealthLabel(health)}`,

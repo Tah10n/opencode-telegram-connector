@@ -1289,9 +1289,47 @@ test("startConnector /status shows startup session, SSE status, and sanitized ba
     assert.match(status, /Session: ses_current/)
     assert.match(status, /Startup session: ses_startup/)
     assert.match(status, /Feed: Main \+ changes/)
+    assert.match(status, /Agent: not running/)
     assert.match(status, /SSE: connected/)
     assert.match(status, /Base URL: http:\/\/example\.test:4312\/path\?token=\*\*\*/) 
     assert.doesNotMatch(status, /secret|user|frag|abc/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector /status shows when the agent is currently running even if message listing lags", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 294,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_current" },
+      },
+      sessionIndex: {
+        "demo:ses_current": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    ocOptions: {
+      listMessagesImpl: async () => [],
+    },
+  })
+
+  try {
+    await harness.emitSse("demo", {
+      type: "message.part.updated",
+      properties: {
+        sessionID: "ses_current",
+        part: { id: "tool_running", messageID: "asst_running", type: "tool", tool: "bash", state: { status: "running", title: "Run checks" } },
+      },
+    })
+    harness.tg.enqueue(makeMessageUpdate(295, "/status"))
+
+    await waitFor(() => harness.tg.sentMessages.some((entry) => /Agent: running/.test(entry.text)))
+
+    const status = harness.tg.sentMessages.at(-1)?.text || ""
+    assert.match(status, /Project: demo/)
+    assert.match(status, /Session: ses_current/)
+    assert.match(status, /Agent: running/)
   } finally {
     await harness.connector.stop()
   }

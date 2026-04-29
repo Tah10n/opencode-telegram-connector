@@ -49,6 +49,11 @@ export function createMirroringHandlers(runtime) {
   const pause = typeof sleep === "function" ? sleep : (ms) => new Promise((resolve) => setTimeout(resolve, ms))
   const isStopping = () => abortSignal?.aborted === true
   const changedFilesExportInFlight = new Set()
+  const agentActivityBySession = new Map()
+  const agentActivityTombstonesBySession = new Map()
+  const AGENT_ACTIVITY_TOMBSTONE_MS = 30 * 60 * 1000
+  const AGENT_ACTIVITY_TOMBSTONE_SWEEP_MS = 60 * 1000
+  let nextAgentActivityTombstoneSweepAt = 0
 
   function ensureForwardedSets(sk) {
     let s = forwardedBySession.get(sk)
@@ -67,6 +72,199 @@ export function createMirroringHandlers(runtime) {
       recentTgPromptsBySession.set(sk, s)
     }
     return s
+  }
+
+  function activeAgentEntry(sk) {
+    let entry = agentActivityBySession.get(sk)
+    if (!entry) {
+      entry = { messages: new Set(), tools: new Map(), updatedAt: 0 }
+      agentActivityBySession.set(sk, entry)
+    }
+    return entry
+  }
+
+  function pruneAgentActivity(sk) {
+    const entry = agentActivityBySession.get(sk)
+    if (entry && entry.messages.size === 0 && entry.tools.size === 0) agentActivityBySession.delete(sk)
+  }
+
+  function activeAgentTombstoneEntry(sk) {
+    maybePruneAgentActivityTombstones()
+    let entry = agentActivityTombstonesBySession.get(sk)
+    if (!entry) {
+      entry = { messages: new Map(), tools: new Map(), clearedAt: 0 }
+      agentActivityTombstonesBySession.set(sk, entry)
+    }
+    return entry
+  }
+
+  function maybePruneAgentActivityTombstones(now = Date.now()) {
+    if (now < nextAgentActivityTombstoneSweepAt) return
+    nextAgentActivityTombstoneSweepAt = now + AGENT_ACTIVITY_TOMBSTONE_SWEEP_MS
+    for (const key of [...agentActivityTombstonesBySession.keys()]) pruneAgentActivityTombstones(key, now)
+  }
+
+  function pruneAgentActivityTombstones(sk, now = Date.now()) {
+    const entry = agentActivityTombstonesBySession.get(sk)
+    if (!entry) return null
+    for (const [messageId, timestamp] of entry.messages.entries()) {
+      if (now - timestamp > AGENT_ACTIVITY_TOMBSTONE_MS) entry.messages.delete(messageId)
+    }
+    for (const [toolKey, timestamp] of entry.tools.entries()) {
+      if (now - timestamp > AGENT_ACTIVITY_TOMBSTONE_MS) entry.tools.delete(toolKey)
+    }
+    if (entry.clearedAt && now - entry.clearedAt > AGENT_ACTIVITY_TOMBSTONE_MS) entry.clearedAt = 0
+    if (entry.messages.size === 0 && entry.tools.size === 0 && !entry.clearedAt) {
+      agentActivityTombstonesBySession.delete(sk)
+      return null
+    }
+    return entry
+  }
+
+  function normalizedActivityTime(value) {
+    const normalized = runtime.normalizeEpochMs?.(value)
+    return typeof normalized === "number" && Number.isFinite(normalized) ? normalized : null
+  }
+
+  function newestActivityEventTime(info) {
+    const time = info?.time || {}
+    const candidates = [time.completed, time.updated, time.created, time.started, info?.completed, info?.updated, info?.created, info?.started, info?.time]
+      .map(normalizedActivityTime)
+      .filter((value) => value != null)
+    return candidates.length ? Math.max(...candidates) : null
+  }
+
+  function tombstoneAgentMessage(sk, messageId, now = Date.now()) {
+    if (!messageId) return
+    activeAgentTombstoneEntry(sk).messages.set(String(messageId), now)
+    pruneAgentActivityTombstones(sk, now)
+  }
+
+  function tombstoneAgentTool(sk, toolKey, now = Date.now()) {
+    if (!toolKey) return
+    activeAgentTombstoneEntry(sk).tools.set(String(toolKey), now)
+    pruneAgentActivityTombstones(sk, now)
+  }
+
+  function agentToolMessageId(toolKey) {
+    return String(toolKey || "").split(":", 1)[0].trim()
+  }
+
+  function shouldSuppressRunningAgentActivity(projectAlias, sessionId, { messageId = "", toolKey = "", eventInfo = null } = {}) {
+    if (!projectAlias || !sessionId) return true
+    const sk = sessionKey(projectAlias, sessionId)
+    maybePruneAgentActivityTombstones()
+    const tombstones = pruneAgentActivityTombstones(sk)
+    if (!tombstones) return false
+    if (messageId && tombstones.messages.has(String(messageId))) return true
+    if (toolKey && tombstones.tools.has(String(toolKey))) return true
+    if (!tombstones.clearedAt) return false
+
+    const eventTime = newestActivityEventTime(eventInfo)
+    if (eventTime != null && eventTime > tombstones.clearedAt) {
+      tombstones.clearedAt = 0
+      pruneAgentActivityTombstones(sk)
+      return false
+    }
+    return true
+  }
+
+  function markAgentMessageActive(projectAlias, sessionId, messageId, active, eventInfo = null) {
+    if (!projectAlias || !sessionId || !messageId) return
+    const sk = sessionKey(projectAlias, sessionId)
+    if (active && shouldSuppressRunningAgentActivity(projectAlias, sessionId, { messageId, eventInfo })) return
+    const entry = active ? activeAgentEntry(sk) : agentActivityBySession.get(sk)
+    if (!entry) {
+      if (!active) tombstoneAgentMessage(sk, messageId)
+      return
+    }
+    if (active) entry.messages.add(String(messageId))
+    else {
+      entry.messages.delete(String(messageId))
+      tombstoneAgentMessage(sk, messageId)
+    }
+    entry.updatedAt = Date.now()
+    pruneAgentActivity(sk)
+  }
+
+  function markAgentToolStatus(projectAlias, sessionId, toolKey, status, text = "", { messageId = "", eventInfo = null } = {}) {
+    if (!projectAlias || !sessionId || !toolKey) return
+    const sk = sessionKey(projectAlias, sessionId)
+    if (status === "running" && shouldSuppressRunningAgentActivity(projectAlias, sessionId, { messageId, toolKey, eventInfo })) return
+    const entry = status === "running" ? activeAgentEntry(sk) : agentActivityBySession.get(sk)
+    if (status === "running") entry.tools.set(String(toolKey), { text: String(text || ""), updatedAt: Date.now() })
+    else {
+      if (entry) entry.tools.delete(String(toolKey))
+      tombstoneAgentTool(sk, toolKey)
+    }
+    if (!entry) return
+    entry.updatedAt = Date.now()
+    pruneAgentActivity(sk)
+  }
+
+  function clearAgentActivity(projectAlias, sessionId) {
+    if (!projectAlias || !sessionId) return
+    const sk = sessionKey(projectAlias, sessionId)
+    const now = Date.now()
+    const entry = agentActivityBySession.get(sk)
+    agentActivityBySession.delete(sk)
+    if (!entry) {
+      maybePruneAgentActivityTombstones(now)
+      return
+    }
+    const tombstones = activeAgentTombstoneEntry(sk)
+    if (entry) {
+      for (const messageId of entry.messages) tombstones.messages.set(String(messageId), now)
+      for (const toolKey of entry.tools.keys()) {
+        tombstones.tools.set(String(toolKey), now)
+        const toolMessageId = agentToolMessageId(toolKey)
+        if (toolMessageId) tombstones.messages.set(toolMessageId, now)
+      }
+    }
+    pruneAgentActivityTombstones(sk, now)
+  }
+
+  function clearAgentMessageActivity(projectAlias, sessionId, messageId) {
+    if (!projectAlias || !sessionId || !messageId) return
+    const sk = sessionKey(projectAlias, sessionId)
+    const now = Date.now()
+    tombstoneAgentMessage(sk, messageId, now)
+    const entry = agentActivityBySession.get(sk)
+    if (!entry) return
+    const messageKey = String(messageId)
+    entry.messages.delete(messageKey)
+    for (const toolKey of entry.tools.keys()) {
+      if (String(toolKey).startsWith(`${messageKey}:`)) {
+        entry.tools.delete(toolKey)
+        tombstoneAgentTool(sk, toolKey, now)
+      }
+    }
+    entry.updatedAt = Date.now()
+    pruneAgentActivity(sk)
+  }
+
+  function getAgentActivityStatus(projectAlias, sessionId) {
+    const sk = sessionKey(projectAlias, sessionId)
+    maybePruneAgentActivityTombstones()
+    const tombstones = pruneAgentActivityTombstones(sk)
+    const tombstoneStatus = tombstones
+      ? {
+        endedMessageIds: [...tombstones.messages.keys()],
+        endedToolMessageIds: [...tombstones.tools.keys()].map(agentToolMessageId).filter(Boolean),
+        ...(tombstones.clearedAt ? { clearedAt: tombstones.clearedAt } : {}),
+      }
+      : {}
+    const entry = agentActivityBySession.get(sk)
+    if (!entry || (entry.messages.size === 0 && entry.tools.size === 0)) return { state: "not-running", ...tombstoneStatus }
+    return {
+      state: "running",
+      activeMessages: entry.messages.size,
+      activeTools: entry.tools.size,
+      activeMessageIds: [...entry.messages],
+      activeToolMessageIds: [...entry.tools.keys()].map(agentToolMessageId).filter(Boolean),
+      updatedAt: entry.updatedAt,
+      ...tombstoneStatus,
+    }
   }
 
   function hashTextForEcho(text) {
@@ -677,6 +875,8 @@ export function createMirroringHandlers(runtime) {
     const routeCtx = { chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey: ctxKeyFrom(route.chatId, route.threadIdOr0) }
     const sets = ensureForwardedSets(sk)
     const forwardKey = agentActionForwardKey(messageId, partId, status)
+    const eventInfo = partEventTimeInfo(part, props)
+    markAgentToolStatus(projectAlias, sessionId, `${messageId}:${partId}`, status, text, { messageId, eventInfo })
     if (sets.actions.has(forwardKey)) {
       logSseDebug(projectAlias, sessionId, `drop=agent_action_already_forwarded part=${partId} status=${status}`)
       return
@@ -773,6 +973,9 @@ export function createMirroringHandlers(runtime) {
     const completed = runtime.normalizeEpochMs(info.time?.completed) != null
     const hasError = !!info.error
     lastAssistantBySession.set(boundKey, { messageId: info.id, sessionId, text: null })
+
+    if (hasError || completed) clearAgentMessageActivity(projectAlias, sessionId, info.id)
+    else markAgentMessageActive(projectAlias, sessionId, info.id, true, info)
 
     if (hasError) {
       const previewState = assistantPreviewBySession.get(boundKey)
@@ -1001,6 +1204,8 @@ export function createMirroringHandlers(runtime) {
     formatAgentActionText,
     handleMessagePartUpdated,
     handleMessageUpdated,
+    clearAgentActivity,
+    getAgentActivityStatus,
     flushPendingAssistantDeliveries,
   }
 }

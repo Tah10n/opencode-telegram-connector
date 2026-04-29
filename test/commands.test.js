@@ -125,7 +125,10 @@ test("createCommandHandlers handleWhere renders operator status fields", async (
     sseByAlias: { demo: "connected" },
     feedByContext: { "100:7": "verbose" },
     ocByAlias: {
-      demo: { async getSession(sessionId) { return { id: sessionId } } },
+      demo: {
+        async getSession(sessionId) { return { id: sessionId } },
+        async listMessages() { return [] },
+      },
     },
   })
   const handlers = createCommandHandlers(runtime)
@@ -137,8 +140,114 @@ test("createCommandHandlers handleWhere renders operator status fields", async (
   assert.match(sent[0].text, /Session: ses_current/)
   assert.match(sent[0].text, /Startup session: ses_startup/)
   assert.match(sent[0].text, /Feed: Verbose/)
+  assert.match(sent[0].text, /Agent: not running/)
   assert.match(sent[0].text, /SSE: connected/)
   assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text), ["Sessions", "New", "Feed", "Model", "Unbind", "Close"])
+})
+
+test("createCommandHandlers handleWhere keeps local running state when message listing lags", async () => {
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    ocByAlias: {
+      demo: {
+        async getSession(sessionId) { return { id: sessionId } },
+        async listMessages() { return [] },
+      },
+    },
+    getAgentActivityStatus: () => ({
+      state: "running",
+      activeMessages: 0,
+      activeTools: 1,
+      activeToolMessageIds: ["asst_running"],
+      updatedAt: 1,
+    }),
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleWhere({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" })
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Agent: running/)
+})
+
+test("createCommandHandlers handleWhere ignores stale remote running messages after local completion", async () => {
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    ocByAlias: {
+      demo: {
+        async getSession(sessionId) { return { id: sessionId } },
+        async listMessages() {
+          return [{ info: { id: "asst_done", role: "assistant", time: { updated: Date.now() } } }]
+        },
+      },
+    },
+    getAgentActivityStatus: () => ({
+      state: "not-running",
+      endedMessageIds: ["asst_done"],
+    }),
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleWhere({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" })
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Agent: not running/)
+})
+
+test("createCommandHandlers handleWhere keeps local running state when remote summary lacks timings", async () => {
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    ocByAlias: {
+      demo: {
+        async getSession(sessionId) { return { id: sessionId } },
+        async listMessages() {
+          return [{ info: { id: "asst_running", role: "assistant" } }]
+        },
+      },
+    },
+    getAgentActivityStatus: () => ({
+      state: "running",
+      activeMessageIds: ["asst_running"],
+    }),
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleWhere({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" })
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Agent: running/)
+})
+
+test("createCommandHandlers handleWhere does not treat completed tools as completed assistant messages", async () => {
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    ocByAlias: {
+      demo: {
+        async getSession(sessionId) { return { id: sessionId } },
+        async listMessages() {
+          return [{ info: { id: "asst_running", role: "assistant", time: { updated: Date.now() } } }]
+        },
+      },
+    },
+    getAgentActivityStatus: () => ({
+      state: "not-running",
+      endedToolMessageIds: ["asst_running"],
+    }),
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleWhere({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" })
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Agent: running/)
 })
 
 test("createCommandHandlers handleWhere reports stale session health with repair actions", async () => {

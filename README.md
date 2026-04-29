@@ -159,7 +159,7 @@ In groups and forum topics, Telegram commands addressed to another bot are ignor
 
 - `/model`, `/model default`, `/model reset`, `/model <provider/model> [variant]` — show or change the model for the current thread.
 - `/feed` — choose mirrored updates for the current thread.
-- `/status` — show the current binding, model, feed mode, SSE status, and base URL.
+- `/status` — show the current binding, model, feed mode, whether the agent is running, SSE status, and base URL.
 - `/runtime` or `/health` — show compact connector runtime counters (**private chat only**): managed tasks, Telegram polling, backlog drain, update retry/skip counts, prompt polling, mirrored/skipped message counts, prompt delivery/answer counts, Telegram send/edit failures, attachment fallbacks, and shutdown state. The message includes **Restart**, **Stop**, and **Close** buttons. Restart and Stop always ask for confirmation first; after a supervised Restart, the bot sends a private-chat notice when the connector is online again.
 - Observability note: `Telegram send/edit failures` count only delivery/edit attempts that affect visible messages (`sendMessage`, `sendDocument`, `editMessageText`, `editMessageReplyMarkup`); polling/control methods such as `getUpdates`, `getMe`, `setMyCommands`, `deleteMessage`, and `answerCallbackQuery` are intentionally excluded.
 - `/abort` — abort the active run in the current thread.

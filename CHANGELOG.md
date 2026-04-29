@@ -31,6 +31,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - State migrations and invalid parsed state files are preserved in bounded `state.json.backup.*` files before recovery attempts.
 
 ### Added
+- `/status` now reports an explicit agent state (`running`, `not running`, or `unknown`) for the bound session.
 - Verbose feed mode now mirrors concise agent action/tool-use updates from opencode tool parts.
 - Optional JSON log mode for supervisors and hosted runtimes via `CONNECTOR_LOG_FORMAT=json` or `logFormat: "json"`.
 - Runtime counters for mirrored assistant messages, skipped noisy events, prompt delivery/answers, Telegram send/edit failures, and attachment fallbacks in `/status` and `/runtime`.

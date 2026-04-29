@@ -42,6 +42,20 @@ function useImmediateTimeouts(t) {
   })
 }
 
+function useFakeNow(t, initialNow = 1_000) {
+  const previousNow = Date.now
+  let now = initialNow
+  Date.now = () => now
+  t.after(() => {
+    Date.now = previousNow
+  })
+  return {
+    set(value) {
+      now = value
+    },
+  }
+}
+
 async function flushAsyncWork(iterations = 8) {
   for (let i = 0; i < iterations; i += 1) await Promise.resolve()
 }
@@ -627,6 +641,132 @@ test("handleMessagePartUpdated deduplicates using properties message ids when to
   assert.equal(calls.sendToThread.length, 2)
   assert.match(calls.sendToThread[0][1], /Running: Run checks/)
   assert.match(calls.sendToThread[1][1], /Running: Run checks/)
+})
+
+test("agent activity tracking keeps overlapping running messages isolated", async (t) => {
+  useImmediateTimeouts(t)
+  const { handlers } = createHarness({ store: { getFeedMode: () => "verbose" } })
+
+  await handlers.handleMessagePartUpdated({
+    projectAlias: "demo",
+    props: {
+      sessionID: "ses_1",
+      part: { id: "tool_1", messageID: "msg_1", type: "tool", tool: "bash", state: { status: "running", title: "First tool" } },
+    },
+  })
+  await handlers.handleMessagePartUpdated({
+    projectAlias: "demo",
+    props: {
+      sessionID: "ses_1",
+      part: { id: "tool_2", messageID: "msg_2", type: "tool", tool: "bash", state: { status: "running", title: "Second tool" } },
+    },
+  })
+
+  assert.equal(handlers.getAgentActivityStatus("demo", "ses_1").state, "running")
+
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", time: { completed: 1 } } },
+  })
+  await flushAsyncWork()
+
+  assert.equal(handlers.getAgentActivityStatus("demo", "ses_1").state, "running")
+})
+
+test("agent activity tracking ignores late running updates after completion", async (t) => {
+  useImmediateTimeouts(t)
+  const { handlers } = createHarness({ store: { getFeedMode: () => "verbose" } })
+
+  await handlers.handleMessagePartUpdated({
+    projectAlias: "demo",
+    props: {
+      sessionID: "ses_1",
+      part: { id: "tool_1", messageID: "msg_1", type: "tool", tool: "bash", state: { status: "running", title: "Run checks" } },
+    },
+  })
+  assert.equal(handlers.getAgentActivityStatus("demo", "ses_1").state, "running")
+
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", time: { completed: 1 } } },
+  })
+  await flushAsyncWork()
+  assert.equal(handlers.getAgentActivityStatus("demo", "ses_1").state, "not-running")
+  assert.deepEqual(handlers.getAgentActivityStatus("demo", "ses_1").endedMessageIds, ["msg_1"])
+
+  await handlers.handleMessagePartUpdated({
+    projectAlias: "demo",
+    props: {
+      sessionID: "ses_1",
+      part: { id: "tool_late", messageID: "msg_1", type: "tool", tool: "bash", state: { status: "running", title: "Late tool" } },
+    },
+  })
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", time: { updated: 2 } } },
+  })
+
+  assert.equal(handlers.getAgentActivityStatus("demo", "ses_1").state, "not-running")
+})
+
+test("agent activity tracking ignores late running updates after abort but allows newer runs without timestamps", async (t) => {
+  const clock = useFakeNow(t, 1_000)
+  const { handlers } = createHarness({ store: { getFeedMode: () => "verbose" } })
+
+  await handlers.handleMessagePartUpdated({
+    projectAlias: "demo",
+    props: {
+      sessionID: "ses_1",
+      time: 900,
+      part: { id: "tool_1", messageID: "msg_1", type: "tool", tool: "bash", state: { status: "running", title: "Run checks" } },
+    },
+  })
+  assert.equal(handlers.getAgentActivityStatus("demo", "ses_1").state, "running")
+
+  handlers.clearAgentActivity("demo", "ses_1")
+  assert.equal(handlers.getAgentActivityStatus("demo", "ses_1").state, "not-running")
+
+  await handlers.handleMessagePartUpdated({
+    projectAlias: "demo",
+    props: {
+      sessionID: "ses_1",
+      time: 900,
+      part: { id: "tool_1", messageID: "msg_1", type: "tool", tool: "bash", state: { status: "running", title: "Late tool" } },
+    },
+  })
+  assert.equal(handlers.getAgentActivityStatus("demo", "ses_1").state, "not-running")
+
+  clock.set(2_000)
+  await handlers.handleMessagePartUpdated({
+    projectAlias: "demo",
+    props: {
+      sessionID: "ses_1",
+      part: { id: "tool_2", messageID: "msg_2", type: "tool", tool: "bash", state: { status: "running", title: "New run" } },
+    },
+  })
+  assert.equal(handlers.getAgentActivityStatus("demo", "ses_1").state, "running")
+})
+
+test("agent activity tombstones expire during later status checks", async (t) => {
+  const clock = useFakeNow(t, 1_000)
+  const { handlers } = createHarness({ store: { getFeedMode: () => "verbose" } })
+
+  await handlers.handleMessagePartUpdated({
+    projectAlias: "demo",
+    props: {
+      sessionID: "ses_1",
+      part: { id: "tool_1", messageID: "msg_1", type: "tool", tool: "bash", state: { status: "running", title: "Run checks" } },
+    },
+  })
+  handlers.clearAgentActivity("demo", "ses_1")
+  assert.deepEqual(handlers.getAgentActivityStatus("demo", "ses_1").endedMessageIds, ["msg_1"])
+  assert.deepEqual(handlers.getAgentActivityStatus("demo", "ses_1").endedToolMessageIds, ["msg_1"])
+
+  clock.set(1_000 + 31 * 60 * 1_000)
+  const status = handlers.getAgentActivityStatus("demo", "ses_1")
+  assert.equal(status.state, "not-running")
+  assert.deepEqual(status.endedMessageIds || [], [])
+  assert.deepEqual(status.endedToolMessageIds || [], [])
 })
 
 test("formatAgentActionText redacts sensitive tool details", () => {
