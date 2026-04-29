@@ -2,6 +2,7 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { makeBoundaryError } from "../src/boundary-errors.js"
 import { createCommandHandlers } from "../src/connector/commands.js"
+import { hashIdempotencyValue, telegramMessageIdempotencyKey } from "../src/connector/idempotency.js"
 import { buildProjectsOverviewText as buildProjectsOverviewTextBase } from "../src/connector/overview.js"
 import { USER_ATTACHMENT_LIMITS } from "../src/connector/incoming-attachments.js"
 
@@ -2019,6 +2020,286 @@ test("createCommandHandlers suppresses parallel confirmed attachment sends", asy
 
   assert.deepEqual(second, { callbackText: "Already sending" })
   assert.equal(promptCalls.length, 1)
+})
+
+test("createCommandHandlers reports expired attachment confirmations", async () => {
+  const editCalls = []
+  const { runtime } = makeRuntime({
+    tg: {
+      async editMessageText(...args) {
+        editCalls.push(args)
+        return true
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  const result = await handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", "missing_token", { editMessageId: 80 })
+
+  assert.deepEqual(result, { callbackText: "Expired" })
+  assert.equal(editCalls.length, 1)
+  assert.equal(editCalls[0][0], 100)
+  assert.equal(editCalls[0][1], 80)
+  assert.match(editCalls[0][2], /confirmation expired/i)
+})
+
+test("createCommandHandlers refuses confirmed attachment when binding changed", async () => {
+  const editCalls = []
+  const promptCalls = []
+  const storeState = { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } }
+  const { runtime, sent } = makeRuntime({
+    storeState,
+    tg: {
+      async downloadFile() {
+        throw new Error("should not download")
+      },
+      async editMessageText(...args) {
+        editCalls.push(args)
+        return true
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async promptAsync(...args) {
+          promptCalls.push(args)
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 17,
+    message_thread_id: 7,
+    document: { file_id: "file_large", file_name: "large.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
+  })
+  const token = sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file").callback_data.split("|")[2]
+  storeState.bindings["100:7"] = { projectAlias: "demo", sessionId: "ses_new" }
+
+  const result = await handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", token, { editMessageId: 81 })
+
+  assert.deepEqual(result, { callbackText: "Binding changed" })
+  assert.equal(promptCalls.length, 0)
+  assert.match(editCalls.at(-1)[2], /binding changed/i)
+})
+
+test("createCommandHandlers treats repeated confirmed attachment sends as already sent", async () => {
+  const editCalls = []
+  const promptCalls = []
+  const seenIdempotencyKeys = []
+  const msg = {
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 18,
+    message_thread_id: 7,
+    document: { file_id: "file_large", file_name: "large.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
+  }
+  const messageKey = telegramMessageIdempotencyKey({ chatId: 100, threadIdOr0: 7 }, msg)
+  const sendKey = `tg-attachment-send:${hashIdempotencyValue(`${messageKey}:demo:ses_current`)}`
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    store: {
+      hasIdempotencyKey(key) {
+        seenIdempotencyKeys.push(key)
+        return key === sendKey
+      },
+    },
+    tg: {
+      async downloadFile() {
+        throw new Error("should not download")
+      },
+      async editMessageText(...args) {
+        editCalls.push(args)
+        return true
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async promptAsync(...args) {
+          promptCalls.push(args)
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage(msg)
+  const token = sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file").callback_data.split("|")[2]
+
+  const result = await handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", token, { editMessageId: 82 })
+
+  assert.deepEqual(result, { callbackText: "Already sent" })
+  assert.deepEqual(seenIdempotencyKeys, [messageKey, sendKey])
+  assert.equal(promptCalls.length, 0)
+  assert.match(editCalls.at(-1)[2], /already sent/i)
+})
+
+test("createCommandHandlers returns retry guidance for confirmed attachment download failures", async () => {
+  const retryableErr = makeBoundaryError({ source: "telegram", method: "POST", pathname: "/getFile", status: 503, message: "getFile unavailable" })
+  const fatalErr = new Error("file path missing")
+  const downloadErrors = [retryableErr, fatalErr]
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    tg: {
+      async getFile() {
+        throw downloadErrors.shift()
+      },
+      async downloadFile() {
+        throw new Error("should not download")
+      },
+      async editMessageText() {
+        return true
+      },
+    },
+    ocByAlias: { demo: { async promptAsync() {} } },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 19,
+    message_thread_id: 7,
+    document: { file_id: "file_large_1", file_name: "one.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
+  })
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 20,
+    message_thread_id: 7,
+    document: { file_id: "file_large_2", file_name: "two.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
+  })
+  const tokens = sent
+    .filter((entry) => /Confirm sending this file/.test(entry.text))
+    .map((entry) => entry.replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file").callback_data.split("|")[2])
+
+  const retryable = await handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", tokens[0], { editMessageId: 83 })
+  const fatal = await handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", tokens[1], { editMessageId: 84 })
+
+  assert.deepEqual(retryable, { callbackText: "Try again" })
+  assert.deepEqual(fatal, { callbackText: "Download failed" })
+  assert.match(sent.at(-2).text, /could not be downloaded/)
+  assert.match(sent.at(-1).text, /could not be downloaded/)
+})
+
+test("createCommandHandlers rejects attachments that Telegram reports over the size limit", async () => {
+  const marks = []
+  const downloadCalls = []
+  const promptCalls = []
+  const { runtime, sent } = makeRuntime({
+    config: { limits: { userAttachmentConfirmBytes: 5, userAttachmentMaxBytes: 5 } },
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    store: {
+      markIdempotencyKey(key, metadata) {
+        marks.push(metadata)
+        return true
+      },
+      async flush() {},
+    },
+    tg: {
+      async getFile() {
+        return { file_path: "files/huge.txt", file_size: 6 }
+      },
+      async downloadFile(...args) {
+        downloadCalls.push(args)
+      },
+    },
+    ocByAlias: { demo: { async promptAsync(...args) { promptCalls.push(args) } } },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 21,
+    message_thread_id: 7,
+    document: { file_id: "file_huge", file_name: "huge.txt", mime_type: "text/plain" },
+  })
+
+  assert.equal(downloadCalls.length, 0)
+  assert.equal(promptCalls.length, 0)
+  assert.match(sent[0].text, /too large/)
+  assert.equal(marks.at(-1).operation, "attachmentTooLarge")
+})
+
+test("createCommandHandlers rejects attachments whose downloaded bytes exceed the limit", async () => {
+  const marks = []
+  const promptCalls = []
+  const { runtime, sent } = makeRuntime({
+    config: { limits: { userAttachmentConfirmBytes: 5, userAttachmentMaxBytes: 5 } },
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    store: {
+      markIdempotencyKey(key, metadata) {
+        marks.push(metadata)
+        return true
+      },
+      async flush() {},
+    },
+    tg: {
+      async getFile() {
+        return { file_path: "files/grows.txt", file_size: 1 }
+      },
+      async downloadFile(filePath, options) {
+        assert.equal(filePath, "files/grows.txt")
+        assert.equal(options.maxBytes, 5)
+        return new Uint8Array(6)
+      },
+    },
+    ocByAlias: { demo: { async promptAsync(...args) { promptCalls.push(args) } } },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 22,
+    message_thread_id: 7,
+    document: { file_id: "file_grows", file_name: "grows.txt", mime_type: "text/plain", file_size: 1 },
+  })
+
+  assert.equal(promptCalls.length, 0)
+  assert.match(sent[0].text, /too large/)
+  assert.equal(marks.at(-1).operation, "attachmentTooLarge")
+})
+
+test("createCommandHandlers rejects binary attachment contents", async () => {
+  const marks = []
+  const promptCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    store: {
+      markIdempotencyKey(key, metadata) {
+        marks.push(metadata)
+        return true
+      },
+      async flush() {},
+    },
+    tg: {
+      async getFile() {
+        return { file_path: "files/binary.txt", file_size: 2 }
+      },
+      async downloadFile() {
+        return new Uint8Array([65, 0])
+      },
+    },
+    ocByAlias: { demo: { async promptAsync(...args) { promptCalls.push(args) } } },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 23,
+    message_thread_id: 7,
+    document: { file_id: "file_binary", file_name: "binary.txt", mime_type: "text/plain", file_size: 2 },
+  })
+
+  assert.equal(promptCalls.length, 0)
+  assert.match(sent[0].text, /not supported/)
+  assert.match(sent[0].text, /binary, not UTF-8 text/)
+  assert.equal(marks.at(-1).operation, "unsupportedAttachmentText")
 })
 
 test("createCommandHandlers rejects unsupported media messages", async () => {

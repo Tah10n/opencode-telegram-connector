@@ -1,6 +1,30 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { createConnectorLogger } from "../src/runtime/logger.js"
+import { collectLoggerRedactionOptions, createConnectorLogger } from "../src/runtime/logger.js"
+
+test("collectLoggerRedactionOptions returns empty options for missing config", () => {
+  assert.deepEqual(collectLoggerRedactionOptions(), { knownSecrets: [], sensitivePaths: [] })
+  assert.deepEqual(collectLoggerRedactionOptions(null), { knownSecrets: [], sensitivePaths: [] })
+})
+
+test("collectLoggerRedactionOptions collects configured secrets and sensitive paths", () => {
+  assert.deepEqual(
+    collectLoggerRedactionOptions({
+      telegram: { botToken: "123456789:replace_me" },
+      stateFile: "C:\\tmp\\connector\\.data\\state.json",
+      projects: {
+        demo: { password: "basic-auth-secret" },
+        emptyPassword: { password: "" },
+        missingPassword: {},
+        disabled: null,
+      },
+    }),
+    {
+      knownSecrets: ["123456789:replace_me", "basic-auth-secret"],
+      sensitivePaths: [{ path: "C:\\tmp\\connector\\.data\\state.json", label: "state-file" }],
+    },
+  )
+})
 
 test("createConnectorLogger emits redacted structured JSON logs", () => {
   const stdout = []
@@ -55,6 +79,63 @@ test("createConnectorLogger keeps legacy text logs redacted", () => {
   assert.doesNotMatch(stdout[0], /123456789:replace_me|C:\\work/)
 })
 
+test("createConnectorLogger treats trailing non-plain objects as legacy message args", () => {
+  class LegacyDetails {
+    constructor() {
+      this.safe = "ok"
+      this.secret = "supersecret"
+    }
+  }
+
+  const output = []
+  const logger = createConnectorLogger({
+    format: "json",
+    knownSecrets: ["supersecret"],
+    stdout: (line) => output.push(line),
+    now: () => "2026-04-25T00:00:00.000Z",
+  })
+
+  logger.info("Legacy", new LegacyDetails())
+
+  const entry = JSON.parse(output[0])
+  assert.equal(entry.msg, 'Legacy {"safe":"ok","secret":"***"}')
+  assert.equal(Object.prototype.hasOwnProperty.call(entry, "safe"), false)
+  assert.equal(Object.prototype.hasOwnProperty.call(entry, "secret"), false)
+  assert.doesNotMatch(output[0], /supersecret/)
+})
+
+test("createConnectorLogger serializes text fields and skips empty values", () => {
+  const output = []
+  const logger = createConnectorLogger({
+    format: "text",
+    stdout: (line) => output.push(line),
+    now: () => "2026-04-25T00:00:00.000Z",
+  })
+
+  logger.info("Fields", {
+    empty: "",
+    none: null,
+    zero: 0,
+    disabled: false,
+    nested: { ok: true },
+  })
+
+  assert.equal(output[0], '2026-04-25T00:00:00.000Z INFO Fields zero=0 disabled=false nested={"ok":true}')
+})
+
+test("createConnectorLogger handles empty messages and falls back to text format", () => {
+  const output = []
+  const logger = createConnectorLogger({
+    format: "yaml",
+    stdout: (line) => output.push(line),
+    now: () => "2026-04-25T00:00:00.000Z",
+  })
+
+  logger.debug()
+
+  assert.equal(output[0], "2026-04-25T00:00:00.000Z DEBUG")
+})
+
 test("createConnectorLogger preserves field names while redacting only values", () => {
   const output = []
   const logger = createConnectorLogger({
@@ -97,4 +178,66 @@ test("createConnectorLogger marks omitted error stacks", () => {
   assert.equal(entry.error.message, "boom")
   assert.equal(entry.error.stack_redacted, true)
   assert.equal(Object.prototype.hasOwnProperty.call(entry.error, "stack"), false)
+})
+
+test("createConnectorLogger recursively sanitizes circular values, bigint, and boundary errors", () => {
+  const output = []
+  const logger = createConnectorLogger({
+    format: "json",
+    knownSecrets: ["123456789:replace_me", "basic-auth-secret"],
+    sensitivePaths: [{ path: "C:\\tmp\\connector\\.data\\state.json", label: "state-file" }],
+    stderr: (line) => output.push(line),
+    now: () => "2026-04-25T00:00:00.000Z",
+  })
+  const circular = {
+    name: "root",
+    botToken: "123456789:replace_me",
+  }
+  circular.self = circular
+  circular.children = [
+    {
+      parent: circular,
+      stateFile: "C:\\tmp\\connector\\.data\\state.json",
+    },
+  ]
+  const boundaryError = {
+    isBoundaryError: true,
+    name: "BoundaryError",
+    message: "failed with basic-auth-secret at C:\\tmp\\connector\\.data\\state.json",
+    code: "E_basic-auth-secret",
+    status: 429,
+    kind: "retryable",
+    outcome: "blocked",
+    source: "123456789:replace_me",
+    operation: "sendMessage",
+    pathname: "C:\\tmp\\connector\\.data\\state.json",
+    stack: "BoundaryError: failed\n    at C:\\tmp\\connector\\.data\\state.json:1:1",
+  }
+
+  logger.warn("Recursive", {
+    circular,
+    count: 42n,
+    values: ["basic-auth-secret", 7n, { boundaryError }],
+  })
+
+  const entry = JSON.parse(output[0])
+  assert.equal(entry.circular.botToken, "***")
+  assert.equal(entry.circular.self, "[Circular]")
+  assert.equal(entry.circular.children[0].parent, "[Circular]")
+  assert.equal(entry.circular.children[0].stateFile, "<state-file>")
+  assert.equal(entry.count, "42")
+  assert.deepEqual(entry.values.slice(0, 2), ["***", "7"])
+  assert.deepEqual(entry.values[2].boundaryError, {
+    name: "BoundaryError",
+    message: "failed with *** at <state-file>",
+    code: "E_***",
+    status: 429,
+    kind: "retryable",
+    outcome: "blocked",
+    source: "***",
+    operation: "sendMessage",
+    pathname: "<state-file>",
+    stack_redacted: true,
+  })
+  assert.doesNotMatch(output[0], /123456789:replace_me|basic-auth-secret|C:\\tmp/)
 })

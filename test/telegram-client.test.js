@@ -254,6 +254,73 @@ test("TelegramClient downloadFile rejects oversized downloads", async () => {
   }
 })
 
+test("TelegramClient downloadFile reads streaming bodies and cancels over-limit streams", async () => {
+  const originalFetch = globalThis.fetch
+  const enc = new TextEncoder()
+  const cancellations = []
+  let fetchCount = 0
+
+  globalThis.fetch = async () => {
+    fetchCount += 1
+    const chunks = fetchCount === 1 ? [enc.encode("he"), enc.encode("llo")] : [enc.encode("abc"), enc.encode("def")]
+    let index = 0
+    return {
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      headers: { get: () => null },
+      body: {
+        getReader() {
+          return {
+            async read() {
+              if (index >= chunks.length) return { done: true }
+              return { done: false, value: chunks[index++] }
+            },
+            async cancel() {
+              cancellations.push(fetchCount)
+            },
+          }
+        },
+      },
+    }
+  }
+
+  try {
+    const client = new TelegramClient("token", { fileBaseUrl: "https://files.example.test/file/bottoken" })
+    assert.equal(new TextDecoder().decode(await client.downloadFile("stream.txt", { maxBytes: 10 })), "hello")
+    await assert.rejects(async () => client.downloadFile("stream.txt", { maxBytes: 5 }), (err) => {
+      assert.equal(err.isBoundaryError, true)
+      assert.match(err.message, /exceeds limit: 6 bytes/)
+      return true
+    })
+    assert.deepEqual(cancellations, [2])
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("TelegramClient downloadFile rejects over-limit arrayBuffer bodies without content-length", async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    headers: { get: () => null },
+    arrayBuffer: async () => new Uint8Array([1, 2, 3, 4]).buffer,
+  })
+
+  try {
+    const client = new TelegramClient("token", { fileBaseUrl: "https://files.example.test/file/bottoken" })
+    await assert.rejects(async () => client.downloadFile("big.txt", { maxBytes: 3 }), (err) => {
+      assert.equal(err.isBoundaryError, true)
+      assert.match(err.message, /exceeds limit: 4 bytes/)
+      return true
+    })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
 test("TelegramClient downloadFile rejects unsafe file paths", async () => {
   const client = new TelegramClient("token", { fileBaseUrl: "https://files.example.test/file/bottoken" })
 
@@ -305,6 +372,51 @@ test("TelegramClient callMultipart returns Telegram results on success", async (
     const formData = new FormData()
     formData.set("probe", "1")
     assert.deepEqual(await client.callMultipart("sendDocument", formData, { timeoutMs: 5 }), { uploaded: true })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("TelegramClient call and callMultipart surface unparsable API responses as Telegram failures", async () => {
+  const originalFetch = globalThis.fetch
+  let callCount = 0
+  globalThis.fetch = async () => {
+    callCount += 1
+    const currentCall = callCount
+    return {
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => {
+        if (currentCall === 1) return null
+        throw new SyntaxError("unexpected token")
+      },
+    }
+  }
+
+  try {
+    const client = new TelegramClient("token", { baseUrl: "https://api.example.test/bot" })
+    await assert.rejects(async () => client.call("getMe", null, { timeoutMs: 5 }), (err) => {
+      assert.equal(err.isBoundaryError, true)
+      assert.equal(err.source, "telegram")
+      assert.equal(err.pathname, "/getMe")
+      assert.equal(err.status, 200)
+      assert.equal(err.details, null)
+      assert.match(err.message, /getMe failed: OK/)
+      return true
+    })
+
+    const formData = new FormData()
+    formData.set("probe", "1")
+    await assert.rejects(async () => client.callMultipart("sendDocument", formData, { timeoutMs: 5 }), (err) => {
+      assert.equal(err.isBoundaryError, true)
+      assert.equal(err.source, "telegram")
+      assert.equal(err.pathname, "/sendDocument")
+      assert.equal(err.status, 200)
+      assert.equal(err.details, null)
+      assert.match(err.message, /sendDocument failed: OK/)
+      return true
+    })
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -519,6 +631,58 @@ test("TelegramClient reports send and edit delivery failures to observer", async
   assert.equal(failures[0].params.message_thread_id, 7)
   assert.equal(failures[1].method, "editMessageText")
   assert.equal(failures[1].params.message_id, 200)
+})
+
+test("TelegramClient keeps original send and edit failures when observer throws", async () => {
+  const warnings = []
+  const client = new TelegramClient("token", {
+    onApiFailure: () => {
+      throw new Error("observer down")
+    },
+    logger: { warn: (...args) => warnings.push(args) },
+  })
+
+  client.call = async (method, params) => {
+    throw makeBoundaryError({
+      source: "telegram",
+      operation: `POST ${method}`,
+      method: "POST",
+      pathname: `/${method}`,
+      status: 502,
+      message: `${method} original failure`,
+      details: { params },
+    })
+  }
+
+  await assert.rejects(() => client.sendMessage(100, "hello", null), /sendMessage original failure/)
+  await assert.rejects(() => client.editMessageText(100, 200, "hello", null), /editMessageText original failure/)
+
+  assert.equal(warnings.length, 2)
+  assert.equal(warnings[0][0], "onApiFailure callback threw")
+  assert.deepEqual(warnings[0][1], { error: "observer down" })
+  assert.equal(warnings[1][0], "onApiFailure callback threw")
+})
+
+test("TelegramClient only applies remembered topic context when absent", () => {
+  const client = new TelegramClient("token")
+  const absent = { chat_id: 100, message_id: 200 }
+
+  assert.equal(client.paramsWithRememberedMessageContext(absent), absent)
+
+  client.rememberMessageContext({ message_id: 200 }, { chat_id: 100, message_thread_id: 7 })
+
+  assert.deepEqual(client.paramsWithRememberedMessageContext({ chat_id: 100, message_id: 200 }), {
+    chat_id: 100,
+    message_id: 200,
+    message_thread_id: 7,
+  })
+
+  const explicit = { chat_id: 100, message_id: 200, message_thread_id: 9 }
+  assert.equal(client.paramsWithRememberedMessageContext(explicit), explicit)
+
+  const unthreaded = { chat_id: 101, message_id: 201 }
+  client.rememberMessageContext({ message_id: 201 }, { chat_id: 101 })
+  assert.equal(client.paramsWithRememberedMessageContext(unthreaded), unthreaded)
 })
 
 test("TelegramClient reports edit failures with remembered topic context", async () => {
