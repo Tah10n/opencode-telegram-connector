@@ -51,6 +51,38 @@ async function readTelegramApiJsonResponse(res, { requestSignal, timeout, ...con
 export function splitTelegramText(text, maxLen = 3900) {
   const s = String(text ?? "")
   if (s.length <= maxLen) return [s]
+
+  const nextWholeCharacterIndex = (value, index) => {
+    const first = value.charCodeAt(index)
+    if (Number.isNaN(first)) return index + 1
+    if (first >= 0xd800 && first <= 0xdbff && index + 1 < value.length) {
+      const second = value.charCodeAt(index + 1)
+      if (second >= 0xdc00 && second <= 0xdfff) return index + 2
+    }
+    return index + 1
+  }
+
+  const splitOversizedChunk = (value) => {
+    const pieces = []
+    let current = ""
+    for (let i = 0; i < value.length;) {
+      const next = nextWholeCharacterIndex(value, i)
+      const token = value.slice(i, next)
+      if (current && current.length + token.length > maxLen) {
+        pieces.push(current)
+        current = ""
+      }
+      if (!current && token.length > maxLen) {
+        pieces.push(token)
+      } else {
+        current += token
+      }
+      i = next
+    }
+    if (current) pieces.push(current)
+    return pieces
+  }
+
   const lines = s.split("\n")
   const chunks = []
   let current = ""
@@ -65,7 +97,7 @@ export function splitTelegramText(text, maxLen = 3900) {
       current = ""
     }
     if (line.length > maxLen) {
-      for (let i = 0; i < line.length; i += maxLen) chunks.push(line.slice(i, i + maxLen))
+      for (const piece of splitOversizedChunk(line)) chunks.push(piece)
     } else {
       current = line
     }
@@ -108,6 +140,14 @@ export function splitTelegramHtml(text, maxLen = 3900) {
     if (ch === "&") {
       const end = s.indexOf(";", index + 1)
       if (end !== -1 && end - index <= 16) return { token: s.slice(index, end + 1), next: end + 1 }
+    }
+
+    const first = s.charCodeAt(index)
+    if (first >= 0xd800 && first <= 0xdbff && index + 1 < s.length) {
+      const second = s.charCodeAt(index + 1)
+      if (second >= 0xdc00 && second <= 0xdfff) {
+        return { token: s.slice(index, index + 2), next: index + 2 }
+      }
     }
     return { token: ch, next: index + 1 }
   }

@@ -48,6 +48,14 @@ export function createSessionCommandHandlers(deps) {
     return "Invalid session id. Use a session id without spaces or URL path/query characters, or provide a supported OpenCode share link."
   }
 
+  function createSessionOptions(projectAlias, extra = {}) {
+    const directory = projects?.[projectAlias]?.directory
+    return {
+      ...extra,
+      ...(directory ? { directory } : {}),
+    }
+  }
+
   async function resolveValidStartupSession(alias, oc) {
     let startupSid = startupSessionByProject[alias] || (await resolveStartupSession(alias))
     if (startupSid && !normalizeSafeSessionId(startupSid)) {
@@ -138,8 +146,8 @@ export function createSessionCommandHandlers(deps) {
       markProjectUp?.(projectAlias)
       const text = `${formatSessionsListText(projectAlias, sessions, { startupSessionId: startupSid })}\n\nViewing only. Bind the target chat/thread to switch sessions with buttons.`
         .replace("Tap a button below to switch:\n\n", "")
-        .replace("Use /new to create one or /use <sessionId> to switch.", "Bind the target chat/thread to this project before creating or switching sessions from Telegram.")
-        .replace("Use /use <sessionId> to switch.", "Use /bind <projectAlias> in the target chat/thread, then /use <sessionId> to switch.")
+        .replace("Use /new to create one or /use <sessionId|shareLink> to switch.", "Bind the target chat/thread to this project before creating or switching sessions from Telegram.")
+        .replace("Use /use <sessionId|shareLink> to switch.", "Use /bind <projectAlias> in the target chat/thread, then /use <sessionId|shareLink> to switch.")
       const replyMarkup = closeKeyboard("srv|close")
       if (editMessageId) {
         await tg.editMessageText(ctxMeta.chatId, editMessageId, text, replyMarkup)
@@ -174,7 +182,7 @@ export function createSessionCommandHandlers(deps) {
         const bindResult = await bindCtxToSession(ctxMeta, alias, startupSid)
         await sendToThread(ctxMeta, appendMoveConflict([`Bound to project '${alias}' (startup session): ${startupSid}`], bindResult).join("\n"))
       } else {
-        const created = await oc.createSession({})
+        const created = await oc.createSession(createSessionOptions(alias))
         const createdId = requireSessionIdFromBackend(created?.id, "created session id")
         logger.info(`[${alias}] created session for bind:`, createdId)
         startupSessionByProject[alias] = createdId
@@ -196,7 +204,7 @@ export function createSessionCommandHandlers(deps) {
     try {
       const p = projects[binding.projectAlias]
       const attachOnNewMode = String(p?.openAttachOnNewMode || "same-window")
-      const created = await oc.createSession({ title: title || undefined })
+      const created = await oc.createSession(createSessionOptions(binding.projectAlias, title ? { title } : {}))
       const createdId = requireSessionIdFromBackend(created?.id, "created session id")
       logger.info(`[${binding.projectAlias}] /new created session:`, createdId)
 

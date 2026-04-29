@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url"
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 const includeRoots = ["src", "test"]
-const includeFiles = ["index.mjs"]
+const includeFiles = ["connector.config.example.mjs", "index.mjs"]
 const extensions = new Set([".js", ".mjs"])
 
 async function collectFiles(dirPath) {

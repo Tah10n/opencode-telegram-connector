@@ -7,6 +7,7 @@ export async function ensureStartupSession({
   startupSessionInProgress,
   ocByAlias,
   logger,
+  directory,
   waitForStart = true,
   forceRefresh = false,
   abortSignal,
@@ -39,14 +40,14 @@ export async function ensureStartupSession({
     const oc = ocByAlias[alias]
     if (!oc) return null
 
-    const list = await oc.listSessions({ limit: 1, signal: abortSignal })
+    const list = await oc.listSessions({ directory, limit: 1, signal: abortSignal })
     const latest = Array.isArray(list) && list[0] ? list[0] : null
     const latestId = normalizeOpenCodeId(latest?.id)
     if (latestId && isSafeOpenCodeId(latestId)) {
       startupSessionByProject[alias] = latestId
     } else {
       if (latest?.id) logger?.warn?.(`[${alias}] ignored invalid latest session id`)
-      const created = await oc.createSession({ signal: abortSignal })
+      const created = await oc.createSession({ directory, signal: abortSignal })
       const createdId = normalizeOpenCodeId(created?.id)
       if (createdId && isSafeOpenCodeId(createdId)) {
         logger?.info?.(`[${alias}] created startup session:`, createdId)

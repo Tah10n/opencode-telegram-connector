@@ -997,9 +997,7 @@ export async function ensureOpenCodeRunning({ projectAlias, project, ocClient, l
     await maybeOpenAttachUi()
     return { started: true, pid, stop }
   } catch (err) {
-    if (err?.name === "AbortError") {
-      await Promise.resolve(stop?.()).catch(() => {})
-    }
+    await Promise.resolve(stop?.()).catch(() => {})
     throw err
   }
 }

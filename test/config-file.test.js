@@ -97,6 +97,41 @@ test("buildRuntimeConfig loads connector.config.mjs and resolves relative paths"
   })
 })
 
+test("buildRuntimeConfig resolves config relative paths from connector cwd", async (t) => {
+  const dir = await makeTempDir()
+  const workspace = path.join(dir, "workspace")
+  await fs.mkdir(workspace, { recursive: true })
+  swapEnv(t, {
+    TELEGRAM_BOT_TOKEN: undefined,
+    TELEGRAM_ALLOWED_USER_ID: undefined,
+    PROJECTS_FILE: undefined,
+    PROJECTS_JSON: undefined,
+    STATE_FILE: undefined,
+  })
+  await fs.writeFile(
+    path.join(dir, "connector.config.mjs"),
+    `export default {
+      cwd: "./workspace",
+      telegram: { botToken: "cfg-token", allowedUserId: 42 },
+      stateFile: "./state/custom.json",
+      projects: {
+        demo: {
+          directory: "./repo",
+          port: 4312,
+          autoStart: true
+        }
+      }
+    }`,
+    "utf8",
+  )
+
+  const { config } = await buildRuntimeConfig({ cwd: dir })
+
+  assert.equal(config.cwd, workspace)
+  assert.equal(config.stateFile, path.join(workspace, "state", "custom.json"))
+  assert.equal(config.projects.demo.directory, path.join(workspace, "repo"))
+})
+
 test("buildRuntimeConfig loads .env before evaluating connector.config.mjs", async (t) => {
   const dir = await makeTempDir()
   swapEnv(t, {
@@ -202,6 +237,29 @@ test("buildRuntimeConfig rejects invalid Telegram workflow limits", async (t) =>
   )
 
   await assert.rejects(() => buildRuntimeConfig({ cwd: dir }), /userAttachmentConfirmBytes cannot exceed userAttachmentMaxBytes/)
+})
+
+test("buildRuntimeConfig rejects invalid echo filter mode", async (t) => {
+  const dir = await makeTempDir()
+  swapEnv(t, {
+    TELEGRAM_BOT_TOKEN: undefined,
+    TELEGRAM_ALLOWED_USER_ID: undefined,
+    ECHO_FILTER_MODE: undefined,
+    PROJECTS_JSON: undefined,
+  })
+  await fs.writeFile(
+    path.join(dir, ".env"),
+    [
+      "TELEGRAM_BOT_TOKEN=env-token",
+      "TELEGRAM_ALLOWED_USER_ID=77",
+      "ECHO_FILTER_MODE=recent|prefix",
+      '{"PROJECTS_JSON":"unused"}',
+    ].slice(0, 3).join("\n"),
+    "utf8",
+  )
+  process.env.PROJECTS_JSON = JSON.stringify({ demo: { baseUrl: "http://127.0.0.1:4312" } })
+
+  await assert.rejects(() => buildRuntimeConfig({ cwd: dir }), /Invalid echoFilterMode \/ ECHO_FILTER_MODE/)
 })
 
 test("buildRuntimeConfig lets connector.config.mjs override legacy env and projects json", async (t) => {
@@ -386,10 +444,10 @@ test("buildRuntimeConfig resolves explicit CLI env, config, projects, and state 
   const { config, envFile, configFile, loadedConfigFile } = await buildRuntimeConfig({
     cwd: dir,
     args: {
-      envFile: path.relative(process.cwd(), path.join(nestedDir, "custom.env")),
-      configFile: path.relative(process.cwd(), path.join(nestedDir, "connector.config.mjs")),
-      projectsFile: path.relative(process.cwd(), path.join(nestedDir, "projects.json")),
-      stateFile: path.relative(process.cwd(), path.join(nestedDir, "state.json")),
+      envFile: path.join("nested", "custom.env"),
+      configFile: path.join("nested", "connector.config.mjs"),
+      projectsFile: path.join("nested", "projects.json"),
+      stateFile: path.join("nested", "state.json"),
     },
   })
 
@@ -401,4 +459,16 @@ test("buildRuntimeConfig resolves explicit CLI env, config, projects, and state 
   assert.equal(config.stateFile, path.resolve(dir, "nested", "state.json"))
   assert.deepEqual(Object.keys(config.projects), ["filedemo"])
   assert.equal(config.projects.filedemo.directory, path.resolve(dir, "nested", "repo"))
+})
+
+test("buildRuntimeConfig fails fast for missing explicit env or config files", async (t) => {
+  const dir = await makeTempDir()
+  swapEnv(t, {
+    TELEGRAM_BOT_TOKEN: "env-token",
+    TELEGRAM_ALLOWED_USER_ID: "77",
+    PROJECTS_JSON: JSON.stringify({ demo: { baseUrl: "http://127.0.0.1:4312" } }),
+  })
+
+  await assert.rejects(() => buildRuntimeConfig({ cwd: dir, args: { envFile: "missing.env" } }), /ENOENT/)
+  await assert.rejects(() => buildRuntimeConfig({ cwd: dir, args: { configFile: "missing.config.mjs" } }), /ENOENT/)
 })

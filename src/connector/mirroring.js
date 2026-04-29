@@ -486,12 +486,31 @@ export function createMirroringHandlers(runtime) {
     return escaped
   }
 
-  async function getAssistantMessageWithRetry(oc, sessionId, messageId, { attempts = 3, initialDelayMs = 150 } = {}) {
+  async function pauseWithSignal(ms, signal) {
+    if (signal?.aborted) return
+    if (!signal) {
+      await pause(ms)
+      return
+    }
+    let onAbort = null
+    const abortPromise = new Promise((resolve) => {
+      onAbort = () => resolve()
+      signal.addEventListener?.("abort", onAbort, { once: true })
+    })
+    try {
+      await Promise.race([pause(ms), abortPromise])
+    } finally {
+      if (onAbort) signal.removeEventListener?.("abort", onAbort)
+    }
+  }
+
+  async function getAssistantMessageWithRetry(oc, sessionId, messageId, { attempts = 3, initialDelayMs = 150, signal, timeoutMs } = {}) {
     let waitMs = initialDelayMs
     for (let attempt = 0; attempt < attempts; attempt++) {
-      const msg = await oc.getMessage(sessionId, messageId).catch(() => null)
+      if (signal?.aborted) return null
+      const msg = await oc.getMessage(sessionId, messageId, { signal, timeoutMs }).catch(() => null)
       if (msg) return msg
-      if (attempt + 1 < attempts) await pause(waitMs)
+      if (attempt + 1 < attempts) await pauseWithSignal(waitMs, signal)
       waitMs = Math.min(1000, waitMs * 2)
     }
     return null
@@ -687,20 +706,21 @@ export function createMirroringHandlers(runtime) {
 
     const debounceKey = `${sk}:${info.id}`
     const existing = assistantDebounce.get(debounceKey)
-    if (existing) clearTimeout(existing)
-    const t = setTimeout(() => {
+    if (existing) clearTimeout(existing?.timer || existing)
+    const runDelivery = async (deliveryOptions = {}) => {
+      const shouldStopDelivery = () => (isStopping() && deliveryOptions.ignoreStopping !== true) || deliveryOptions.signal?.aborted === true
       assistantDebounce.delete(debounceKey)
-      if (isStopping()) return
+      if (shouldStopDelivery()) return
       if (sets.assistant.has(info.id)) {
         logSseDebug(projectAlias, sessionId, `drop=assistant_already_forwarded msg=${info.id}`)
         return
       }
-      void (async () => {
-        if (isStopping()) return
+      await (async () => {
+        if (shouldStopDelivery()) return
         const previewState = assistantPreviewBySession.get(boundKey)
         const replaceMessageId = previewState?.messageId === info.id ? previewState.telegramMessageId : undefined
-        const msg = await getAssistantMessageWithRetry(oc, sessionId, info.id)
-        if (isStopping()) return
+        const msg = await getAssistantMessageWithRetry(oc, sessionId, info.id, deliveryOptions)
+        if (shouldStopDelivery()) return
         if (!msg) {
           if (replaceMessageId) {
             await tg
@@ -748,13 +768,13 @@ export function createMirroringHandlers(runtime) {
         let visibleOutputSent = false
 
         if (hasAssistantText) {
-          if (isStopping()) return
+          if (shouldStopDelivery()) return
           const delivered = await deliverAssistantText(routeCtx, projectAlias, sessionId, info.id, text, { replaceMessageId })
           visibleOutputSent = visibleOutputSent || !!delivered
         }
 
         if (allowChangedFiles) {
-          if (isStopping()) return
+          if (shouldStopDelivery()) return
           const deliveredChanges = await deliverChangedFilesSummary(routeCtx, projectAlias, sessionId, info.id, msg, {
             replaceMessageId: !hasAssistantText ? replaceMessageId : undefined,
           })
@@ -777,13 +797,48 @@ export function createMirroringHandlers(runtime) {
         sets.assistant.add(info.id)
         if (visibleOutputSent) recordAssistantMirrored?.(projectAlias)
         logSseDebug(projectAlias, sessionId, `send=assistant msg=${info.id} thread=${route.threadIdOr0 || 0}`)
-      })().catch((err) => {
-        const message = err?.message || String(err)
-        runtime.logger?.error?.("Assistant final delivery failed:", projectAlias, sessionId, info.id, message)
-        logSseDebug(projectAlias, sessionId, `error=assistant_final_delivery msg=${info.id} ${message}`)
-      })
+      })()
+    }
+    const run = async (deliveryOptions = {}) => runDelivery(deliveryOptions).catch((err) => {
+      const message = err?.message || String(err)
+      runtime.logger?.error?.("Assistant final delivery failed:", projectAlias, sessionId, info.id, message)
+      logSseDebug(projectAlias, sessionId, `error=assistant_final_delivery msg=${info.id} ${message}`)
+    })
+    const t = setTimeout(() => {
+      void run()
     }, 250)
-    assistantDebounce.set(debounceKey, t)
+    assistantDebounce.set(debounceKey, { timer: t, run })
+  }
+
+  async function flushPendingAssistantDeliveries({ timeoutMs = 5000 } = {}) {
+    const pending = [...assistantDebounce.values()]
+    assistantDebounce.clear()
+    const ctrl = new AbortController()
+    const deadlineMs = Math.max(1, timeoutMs)
+    const startedAt = Date.now()
+    const timeout = setTimeout(() => ctrl.abort(), deadlineMs)
+    for (const entry of pending) {
+      if (ctrl.signal.aborted) break
+      clearTimeout(entry?.timer || entry)
+      if (typeof entry?.run === "function") {
+        const remainingMs = Math.max(1, deadlineMs - (Date.now() - startedAt))
+        let entryTimeout = null
+        try {
+          await Promise.race([
+            entry.run({ attempts: 1, initialDelayMs: 0, signal: ctrl.signal, timeoutMs: Math.max(1, Math.min(1000, remainingMs)), ignoreStopping: true }),
+            new Promise((resolve) => {
+              entryTimeout = setTimeout(() => {
+                ctrl.abort()
+                resolve()
+              }, remainingMs)
+            }),
+          ])
+        } finally {
+          if (entryTimeout) clearTimeout(entryTimeout)
+        }
+      }
+    }
+    clearTimeout(timeout)
   }
 
   return {
@@ -807,5 +862,6 @@ export function createMirroringHandlers(runtime) {
     buildAssistantStreamPreviewHtml,
     deliverAssistantText,
     handleMessageUpdated,
+    flushPendingAssistantDeliveries,
   }
 }

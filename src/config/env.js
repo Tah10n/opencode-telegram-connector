@@ -23,7 +23,7 @@ export function parseDotEnv(text) {
   return out
 }
 
-export async function loadEnvFromFile(envFilePath) {
+export async function loadEnvFromFile(envFilePath, { required = false } = {}) {
   if (!envFilePath) return
   try {
     const content = await fs.readFile(envFilePath, "utf8")
@@ -32,7 +32,7 @@ export async function loadEnvFromFile(envFilePath) {
       if (process.env[k] == null || process.env[k] === "") process.env[k] = v
     }
   } catch (err) {
-    if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return
+    if (err && typeof err === "object" && "code" in err && err.code === "ENOENT" && !required) return
     throw err
   }
 }

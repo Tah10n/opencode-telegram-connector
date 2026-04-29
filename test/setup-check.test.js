@@ -379,10 +379,12 @@ test("runSetupCheck fails on shipped Telegram placeholders", async () => {
   assert.equal(report.findings.find((finding) => finding.item === "Telegram config")?.status, "fail")
 })
 
-test("package scripts keep syntax check and add setup check", async () => {
+test("package scripts keep syntax check, cover starter config, and add setup check", async () => {
   const pkg = JSON.parse(await fs.readFile(new URL("../package.json", import.meta.url), "utf8"))
+  const syntaxCheckScript = await fs.readFile(new URL("../scripts/check-syntax.mjs", import.meta.url), "utf8")
 
   assert.equal(pkg.private, true)
   assert.equal(pkg.scripts.check, "node scripts/check-syntax.mjs")
+  assert.match(syntaxCheckScript, /connector\.config\.example\.mjs/)
   assert.equal(pkg.scripts["setup:check"], "node src/cli.js check")
 })

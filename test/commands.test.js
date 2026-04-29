@@ -260,7 +260,7 @@ test("createCommandHandlers renderProjectSessions is view-only when private chat
   assert.equal(sent.length, 1)
   assert.match(sent[0].text, /Viewing only/)
   assert.match(sent[0].text, /Bind the target chat\/thread to this project/)
-  assert.doesNotMatch(sent[0].text, /\/use <sessionId> to switch/)
+  assert.doesNotMatch(sent[0].text, /\/use <sessionId\|shareLink> to switch/)
   assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text), ["Close"])
 })
 

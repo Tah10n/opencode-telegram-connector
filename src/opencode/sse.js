@@ -218,7 +218,7 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
           if (now - lastHealthCheckAt >= HEALTH_CHECK_MIN_INTERVAL_MS) {
             lastHealthCheckAt = now
             try {
-              await ocClient.health()
+              await ocClient.health({ signal: abortSignal })
             } catch {
               try {
                 await onError?.({ projectAlias, err: normalized })

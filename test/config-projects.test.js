@@ -101,6 +101,17 @@ test("loadProjectsConfig rejects baseUrl query strings and fragments", async () 
   )
 })
 
+test("loadProjectsConfig rejects baseUrl userinfo", async () => {
+  await assert.rejects(
+    loadProjectsConfig({
+      projectsJson: JSON.stringify({
+        demo: { baseUrl: "http://user:pass@example.com:4312" },
+      }),
+    }),
+    /invalid baseUrl.*must not include username or password/,
+  )
+})
+
 test("loadProjectsConfig reports a Windows backslash hint for invalid JSON", async () => {
   await assert.rejects(
     loadProjectsConfig({

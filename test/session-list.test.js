@@ -25,7 +25,7 @@ test("formatSessionsListText shows current and startup markers", () => {
   assert.match(text, /Tap a button below to switch:/)
   assert.match(text, /- ses_current \[current\] — Current session/)
   assert.match(text, /- ses_startup \[startup\] — Startup session/)
-  assert.match(text, /Use \/use <sessionId> to switch\./)
+  assert.match(text, /Use \/use <sessionId\|shareLink> to switch\./)
 })
 
 test("formatSessionsListText handles empty session lists", () => {
@@ -33,7 +33,7 @@ test("formatSessionsListText handles empty session lists", () => {
 
   assert.match(text, /Current: ses_bound/)
   assert.match(text, /No sessions found\./)
-  assert.match(text, /Use \/new to create one or \/use <sessionId> to switch\./)
+  assert.match(text, /Use \/new to create one or \/use <sessionId\|shareLink> to switch\./)
 })
 
 test("formatSessionsListText limits long lists and ignores invalid entries", () => {

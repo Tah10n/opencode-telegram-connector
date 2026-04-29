@@ -4,6 +4,7 @@ export function normalizeEndpointBaseUrl(baseUrl, { label = "baseUrl" } = {}) {
   const s = String(baseUrl || "").trim()
   if (!s) return s
   const u = new URL(s)
+  if (u.username || u.password) throw new Error(`${label} must not include username or password`)
   if (u.search || u.hash) throw new Error(`${label} must not include query strings or fragments`)
   u.search = ""
   u.hash = ""

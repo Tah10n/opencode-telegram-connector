@@ -18,17 +18,24 @@ function parseConfigBool(name, value) {
   throw new Error(`Config field '${name}' must be a boolean`)
 }
 
+function normalizeEchoFilterMode(value, { fieldName = "echoFilterMode" } = {}) {
+  const mode = String(value ?? "").trim()
+  if (!mode) return undefined
+  if (mode !== "recent" && mode !== "prefix") throw new Error(`Config field '${fieldName}' must be 'recent' or 'prefix'`)
+  return mode
+}
+
 function normalizePathValue(filePath, baseDir) {
   if (filePath == null || filePath === "") return undefined
   return path.resolve(baseDir, String(filePath))
 }
 
-export async function loadConnectorConfigFile(configFilePath) {
+export async function loadConnectorConfigFile(configFilePath, { required = false } = {}) {
   if (!configFilePath) return null
   try {
     await fs.access(configFilePath)
   } catch (err) {
-    if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return null
+    if (err && typeof err === "object" && "code" in err && err.code === "ENOENT" && !required) return null
     throw err
   }
   try {
@@ -47,10 +54,11 @@ export function normalizeConnectorConfig(raw, { configFilePath } = {}) {
 
   const out = { cwd: baseDir }
   if (raw.cwd != null && raw.cwd !== "") out.cwd = path.resolve(baseDir, String(raw.cwd))
-  if (raw.stateFile != null && raw.stateFile !== "") out.stateFile = normalizePathValue(raw.stateFile, baseDir)
+  const runtimeBaseDir = out.cwd
+  if (raw.stateFile != null && raw.stateFile !== "") out.stateFile = normalizePathValue(raw.stateFile, runtimeBaseDir)
   if (raw.defaultProject != null && raw.defaultProject !== "") out.defaultProject = String(raw.defaultProject)
   if (raw.tgPrefix != null) out.tgPrefix = String(raw.tgPrefix)
-  if (raw.echoFilterMode != null && raw.echoFilterMode !== "") out.echoFilterMode = String(raw.echoFilterMode)
+  if (raw.echoFilterMode != null && raw.echoFilterMode !== "") out.echoFilterMode = normalizeEchoFilterMode(raw.echoFilterMode)
   if (raw.mirrorTuiUserMessages != null) out.mirrorTuiUserMessages = parseConfigBool("mirrorTuiUserMessages", raw.mirrorTuiUserMessages)
   if (raw.logFormat != null && raw.logFormat !== "") out.logFormat = String(raw.logFormat)
   if (raw.allowInsecureHttp != null) out.allowInsecureHttp = parseConfigBool("allowInsecureHttp", raw.allowInsecureHttp)
@@ -73,7 +81,7 @@ export function normalizeConnectorConfig(raw, { configFilePath } = {}) {
 
   if (raw.projects != null) {
     out.projects = normalizeProjectsConfig(raw.projects, {
-      baseDir,
+      baseDir: runtimeBaseDir,
       sourceLabel: `config file (${configFilePath || "inline"})`,
     })
   }

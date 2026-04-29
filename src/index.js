@@ -7,7 +7,7 @@ import { createMirroringHandlers } from "./connector/mirroring.js"
 import { createOverviewHelpers } from "./connector/overview.js"
 import { createPromptHandlers } from "./connector/prompts.js"
 import { createPromptRecovery } from "./connector/prompt-recovery.js"
-import { classifyBoundaryError, normalizeBoundaryError } from "./boundary-errors.js"
+import { classifyBoundaryError, makeBoundaryError, normalizeBoundaryError } from "./boundary-errors.js"
 import { TelegramClient, makeInlineKeyboard } from "./telegram/client.js"
 import { formatMarkdownToTelegramHtmlBlocks, escapeHtml } from "./telegram/formatter.js"
 import { ctxKeyFrom, threadIdOr0FromMessage } from "./telegram/routing.js"
@@ -144,6 +144,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const sleep = deps?.delay || delay
   const wizardTtlMs = Number.isFinite(deps?.wizardTtlMs) ? Math.max(0, Number(deps.wizardTtlMs)) : 2 * 60 * 60 * 1000
   const wizardGcIntervalMs = Number.isFinite(deps?.wizardGcIntervalMs) ? Math.max(1, Number(deps.wizardGcIntervalMs)) : 10 * 60 * 1000
+  const assistantDrainTimeoutMs = Number.isFinite(deps?.assistantDrainTimeoutMs) ? Math.max(1, Number(deps.assistantDrainTimeoutMs)) : 5000
   const openCodeWatchdog = normalizeOpenCodeWatchdogOptions(deps?.opencodeWatchdog ?? config?.opencodeWatchdog ?? {})
   const startedAt = Date.now()
   const sseDebugFilter = parseSseDebugFilter(process.env.DEBUG_SSE_ROUTING)
@@ -162,6 +163,22 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const store = createStateStore({ filePath: stateFile, logger })
   await store.load()
   const recoverPendingPromptsOnStartup = Number.isInteger(store.get().updateOffset)
+
+  async function flushCriticalState(operation) {
+    if (typeof store?.flush !== "function") return
+    try {
+      await store.flush()
+    } catch (err) {
+      throw makeBoundaryError({
+        source: "state",
+        operation,
+        kind: "durability",
+        outcome: "fatal",
+        message: `${operation} failed: ${err?.message || String(err)}`,
+        cause: err,
+      })
+    }
+  }
 
   // Log only aggregate persisted-state info; bindings themselves are sensitive.
   try {
@@ -356,6 +373,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         startupSessionInProgress,
         ocByAlias,
         logger,
+        directory: projects?.[alias]?.directory,
         abortSignal: abortController.signal,
         ...(options || {}),
       })
@@ -497,17 +515,18 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const TEXT_ATTACHMENT_THRESHOLD = limits.textAttachmentThreshold
   // Bound the amount of per-session state we keep.
   const forwardedBySession = new LruMap(2000) // sessionKey -> {user:LruSet, assistant:LruSet, changes:LruSet}
-  const assistantDebounce = new Map() // `${projectAlias}:${sessionId}:${msgId}` -> timeout
+  const assistantDebounce = new Map() // `${projectAlias}:${sessionId}:${msgId}` -> { timer, run }
   const assistantPreviewBySession = new Map() // bound sessionKey -> { messageId, telegramMessageId, lastPreviewHtml, lastPreviewAt }
   const recentTgPromptsBySession = new LruMap(2000) // sessionKey -> LruSet(hash)
   const lastAssistantBySession = new LruMap(2000) // sessionKey -> { messageId, sessionId, text }
   const parentSessionBySession = createParentSessionCache(5000) // key `${projectAlias}:${sessionId}` -> parent session id or null
   const tuiActiveSessionStateByProject = new Map() // alias -> { currentSessionId, followCtxKey }
   const tuiActiveSessionUnsupportedProjects = new Set() // alias values where /tui/active-session is unavailable
-  lifecycle.registerStopHook("assistantDebounce-cleanup", () => {
-    for (const timer of assistantDebounce.values()) clearTimeout(timer)
+  let flushPendingAssistantDeliveries = async () => {
+    for (const entry of assistantDebounce.values()) clearTimeout(entry?.timer || entry)
     assistantDebounce.clear()
-  })
+  }
+  lifecycle.registerStopHook("assistantDebounce-cleanup", () => flushPendingAssistantDeliveries())
 
   const promptBaseline = {}
   const prompted = {}
@@ -796,7 +815,9 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     extractAssistantDisplayText,
     deliverAssistantText,
     handleMessageUpdated,
+    flushPendingAssistantDeliveries: drainPendingAssistantDeliveries,
   } = mirroringHandlers
+  flushPendingAssistantDeliveries = drainPendingAssistantDeliveries
 
   function ctxMetaFromMessage(msg) {
     const chatId = msg?.chat?.id
@@ -1252,6 +1273,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       await sleepWithAbort(200)
     }
     store.setUpdateOffset(offset)
+    await flushCriticalState("persist Telegram backlog offset")
     logger.info("Telegram backlog drained. Starting from offset:", offset)
   }
 
@@ -1300,6 +1322,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         const updateKey = telegramUpdateIdempotencyKey(u?.update_id)
         if (updateKey && store.hasIdempotencyKey?.(updateKey)) {
           store.setUpdateOffset(u.update_id + 1)
+          await flushCriticalState("persist replayed Telegram update offset")
           continue
         }
         try {
@@ -1345,6 +1368,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
             operation: u.message ? "message" : u.callback_query ? "callback" : "unknown",
           })
           store.setUpdateOffset(u.update_id + 1)
+          await flushCriticalState("persist Telegram update checkpoint")
         } else {
           await sleepWithAbort(1000)
           break
@@ -1571,6 +1595,9 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     stopPromise = (async () => {
       logger.info("Stopping connector. Managed tasks:", lifecycle.snapshot().map((entry) => `${entry.kind}:${entry.name}`).join(", ") || "none")
       abortController.abort()
+      await flushPendingAssistantDeliveries({ timeoutMs: assistantDrainTimeoutMs }).catch((err) => {
+        logger.error("Failed to drain pending assistant deliveries during shutdown:", err?.message || String(err))
+      })
       runtimeObservability.recordLoopSuccess("shutdown")
       await lifecycle.stopAll()
       await Promise.allSettled([telegramLoopPromise, promptPollPromise, tuiActiveSessionSyncPromise])

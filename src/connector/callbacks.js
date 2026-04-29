@@ -379,7 +379,7 @@ export function createCallbackHandlers(runtime) {
             return
           }
           await answerCallbackQuery(callbackQuery.id, "Creating…")
-          await handleNewCommand(ctxMeta, "").catch(async (err) => {
+          await handleNewCommand(ctxMeta, "").then(() => flushStoreIfAvailable()).catch(async (err) => {
             runtime.logger?.error?.("Failed to create session from callback:", err?.message || String(err))
             await sendToThread(ctxMeta, "Action failed. Please try /new.").catch(ignoreError)
           })
@@ -472,7 +472,7 @@ export function createCallbackHandlers(runtime) {
             return
           }
           await answerCallbackQuery(callbackQuery.id, "Binding…")
-          await handleBindCommand(ctxMeta, [projectAlias]).catch(async (err) => {
+          await handleBindCommand(ctxMeta, [projectAlias]).then(() => flushStoreIfAvailable()).catch(async (err) => {
             runtime.logger?.error?.("Failed to bind project from callback:", err?.message || String(err))
             await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err)).catch(ignoreError)
           })
@@ -600,7 +600,7 @@ export function createCallbackHandlers(runtime) {
           try {
             const nextSessionId = action === "rebind"
               ? await getStartupSession(projectAlias, { waitForStart: false, forceRefresh: true })
-              : (await oc.createSession({}))?.id
+              : (await oc.createSession(projects?.[projectAlias]?.directory ? { directory: projects[projectAlias].directory } : {}))?.id
             if (!nextSessionId) {
               await answerCallbackQuery(callbackQuery.id, "Unavailable")
               return
@@ -882,6 +882,7 @@ export function createCallbackHandlers(runtime) {
         }
         if (action === "cancel_note") {
           setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
+          await flushStoreIfAvailable()
           await answerCallbackQuery(callbackQuery.id, "Cancelled")
           await deleteInteractiveMessage(ctxMeta, msg?.message_id)
           return
@@ -998,6 +999,7 @@ export function createCallbackHandlers(runtime) {
         }
         if (action === "cancel_custom") {
           setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
+          await flushStoreIfAvailable()
           await answerCallbackQuery(callbackQuery.id, "Cancelled")
           await deleteInteractiveMessage(ctxMeta, msg?.message_id)
           return

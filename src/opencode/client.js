@@ -142,8 +142,11 @@ export class OpenCodeClient {
     return this.request(`/session/${encodeOpenCodePathSegment(sessionId, "session id")}`)
   }
 
-  createSession({ title, signal } = {}) {
-    return this.request("/session", { method: "POST", json: title ? { title } : {}, ...(signal ? { signal } : {}) })
+  createSession({ title, directory, signal } = {}) {
+    const json = {}
+    if (title) json.title = title
+    if (directory) json.directory = directory
+    return this.request("/session", { method: "POST", json, ...(signal ? { signal } : {}) })
   }
 
   abortSession(sessionId) {
@@ -166,9 +169,11 @@ export class OpenCodeClient {
     })
   }
 
-  getMessage(sessionId, messageId) {
+  getMessage(sessionId, messageId, { signal, timeoutMs } = {}) {
+    const options = { ...(signal ? { signal } : {}), ...(timeoutMs ? { timeoutMs } : {}) }
     return this.request(
       `/session/${encodeOpenCodePathSegment(sessionId, "session id")}/message/${encodeOpenCodePathSegment(messageId, "message id")}`,
+      Object.keys(options).length ? options : undefined,
     )
   }
 

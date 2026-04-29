@@ -651,7 +651,7 @@ test("handleMessageUpdated keeps the preview message when final assistant conten
     projectAlias: "demo",
     props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", time: { completed: 1 } } },
   })
-  await flushAsyncWork()
+  await flushAsyncWork(16)
 
   assert.equal(fetchCalls, 3)
   assert.equal(calls.editMessageText.length, 1)

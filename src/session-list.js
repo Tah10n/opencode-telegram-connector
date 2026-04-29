@@ -68,7 +68,7 @@ export function formatSessionsListText(
 
   if (normalized.length === 0) {
     lines.push("No sessions found.")
-    lines.push("Use /new to create one or /use <sessionId> to switch.")
+    lines.push("Use /new to create one or /use <sessionId|shareLink> to switch.")
     return lines.join("\n")
   }
 
@@ -87,6 +87,6 @@ export function formatSessionsListText(
     lines.push(`…and ${normalized.length - limit} more.`)
   }
   lines.push("")
-  lines.push("Use /use <sessionId> to switch.")
+  lines.push("Use /use <sessionId|shareLink> to switch.")
   return lines.join("\n")
 }

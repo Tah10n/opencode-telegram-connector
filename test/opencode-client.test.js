@@ -130,6 +130,7 @@ test("OpenCodeClient convenience methods call the expected endpoints", async () 
   await client.listSessions({ directory: "C:/repo", limit: 5 })
   await client.getSession("ses_1")
   await client.createSession({ title: "demo" })
+  await client.createSession({ title: "scoped", directory: "C:/repo" })
   await client.selectTuiSession("ses_1")
   await client.getActiveTuiSession()
   await client.abortSession("ses_1")
@@ -149,6 +150,7 @@ test("OpenCodeClient convenience methods call the expected endpoints", async () 
     { pathname: "/session", options: { query: { directory: "C:/repo", limit: 5 } } },
     { pathname: "/session/ses_1", options: undefined },
     { pathname: "/session", options: { method: "POST", json: { title: "demo" } } },
+    { pathname: "/session", options: { method: "POST", json: { title: "scoped", directory: "C:/repo" } } },
     { pathname: "/tui/select-session", options: { method: "POST", json: { sessionID: "ses_1" }, timeoutMs: 5000 } },
     { pathname: "/tui/active-session", options: { timeoutMs: 5000 } },
     { pathname: "/session/ses_1/abort", options: { method: "POST" } },

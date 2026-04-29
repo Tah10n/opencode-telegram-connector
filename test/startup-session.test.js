@@ -69,6 +69,42 @@ test("ensureStartupSession creates a session when none exist", async () => {
   assert.equal(createCalls, 1)
 })
 
+test("ensureStartupSession scopes listing and creation by directory", async () => {
+  const startInProgress = new Map()
+  const startupSessionByProject = {}
+  const startupSessionInProgress = new Map()
+  const calls = { list: [], create: [] }
+  const ocByAlias = {
+    demo: {
+      async listSessions(input = {}) {
+        calls.list.push(input)
+        return []
+      },
+      async createSession(input = {}) {
+        calls.create.push(input)
+        return { id: "sess-created" }
+      },
+    },
+  }
+
+  const sid = await ensureStartupSession({
+    alias: "demo",
+    directory: "C:/repo/demo",
+    startInProgress,
+    startupSessionByProject,
+    startupSessionInProgress,
+    ocByAlias,
+    logger: makeLogger(),
+  })
+
+  assert.equal(sid, "sess-created")
+  assert.equal(calls.list.length, 1)
+  assert.equal(calls.list[0].directory, "C:/repo/demo")
+  assert.equal(calls.list[0].limit, 1)
+  assert.equal(calls.create.length, 1)
+  assert.equal(calls.create[0].directory, "C:/repo/demo")
+})
+
 test("ensureStartupSession does not cache invalid session ids", async () => {
   const startInProgress = new Map()
   const startupSessionByProject = {}

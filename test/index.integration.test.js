@@ -275,9 +275,9 @@ function createFakeOpenCodeClient({
       calls.promptAsync.push(options === undefined ? { sessionId, text } : { sessionId, text, options })
       return promptAsyncImpl ? promptAsyncImpl(sessionId, text, options) : { ok: true }
     },
-    async getMessage(sessionId, messageId) {
+    async getMessage(sessionId, messageId, input = {}) {
       calls.getMessage.push({ sessionId, messageId })
-      return getMessageImpl ? getMessageImpl(sessionId, messageId) : (messagesById[messageId] ?? null)
+      return getMessageImpl ? getMessageImpl(sessionId, messageId, input) : (messagesById[messageId] ?? null)
     },
     async listMessages(sessionId, input = {}) {
       calls.listMessages.push({ sessionId, input })
@@ -329,6 +329,7 @@ async function createHarness({
   delayImpl = shortDelay,
   wizardTtlMs,
   wizardGcIntervalMs,
+  assistantDrainTimeoutMs,
   opencodeWatchdog,
   createStateStoreImpl,
   configPatch,
@@ -403,6 +404,7 @@ async function createHarness({
       ...(platform ? { platform } : {}),
       ...(wizardTtlMs != null ? { wizardTtlMs } : {}),
       ...(wizardGcIntervalMs != null ? { wizardGcIntervalMs } : {}),
+      ...(assistantDrainTimeoutMs != null ? { assistantDrainTimeoutMs } : {}),
       ...(opencodeWatchdog ? { opencodeWatchdog } : {}),
       delay: delayImpl,
     },
@@ -3119,6 +3121,38 @@ test("startConnector replays remaining updates after a mid-batch Telegram handle
   }
 })
 
+test("startConnector treats Telegram checkpoint flush failures as fatal", async () => {
+  const fatalErrors = []
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 500,
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+      sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+    },
+    createStateStoreImpl: (options) => {
+      const store = new StateStore(options)
+      store.flush = async () => {
+        throw new Error("disk full")
+      }
+      return store
+    },
+    onFatalErrorImpl: (err) => fatalErrors.push(err),
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(501, "blocked", { userId: 999 }))
+
+    await waitFor(() => fatalErrors.length === 1)
+
+    assert.match(fatalErrors[0].message, /persist Telegram update checkpoint failed: disk full/)
+    assert.deepEqual(harness.ocCalls.promptAsync, [])
+    const state = await readState(harness.stateFile)
+    assert.equal(state.updateOffset, 500)
+  } finally {
+    await harness.connector.stop().catch(() => {})
+  }
+})
+
 test("startConnector skips non-retryable updates without wedging later updates", async () => {
   let sendAttempts = 0
   const harness = await createHarness({
@@ -3714,7 +3748,7 @@ test("startConnector finalizes assistant replies independently when sessions reu
   }
 })
 
-test("startConnector stop cancels pending assistant finalization timers", async () => {
+test("startConnector stop drains pending assistant finalization timers", async () => {
   const completedAt = new Date(Date.now() + 60_000).toISOString()
   const harness = await createHarness({
     statePatch: {
@@ -3729,7 +3763,7 @@ test("startConnector stop cancels pending assistant finalization timers", async 
     messagesById: {
       msg_stop: {
         info: { id: "msg_stop", role: "assistant", time: { created: completedAt, completed: completedAt } },
-        parts: [{ type: "text", text: "Should not be delivered after stop" }],
+        parts: [{ type: "text", text: "Delivered while stopping" }],
       },
     },
   })
@@ -3743,9 +3777,46 @@ test("startConnector stop cancels pending assistant finalization timers", async 
     await harness.connector.stop()
     await delay(350)
 
-    assert.equal(harness.tg.sentHtmlBlocks.length, 0)
+    assert.equal(harness.tg.sentHtmlBlocks.length, 1)
+    assert.equal(harness.tg.sentHtmlBlocks[0].blocks[0]?.html, "Delivered while stopping")
     assert.equal(harness.tg.sentMessages.length, 0)
     assert.equal(harness.tg.sentDocuments.length, 0)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector bounds pending assistant drain during shutdown", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 662,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    ocOptions: {
+      getMessageImpl: (_sessionId, _messageId, { signal } = {}) => new Promise((_resolve, reject) => {
+        signal?.addEventListener?.("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })), { once: true })
+      }),
+    },
+    assistantDrainTimeoutMs: 5,
+  })
+
+  try {
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_1", info: { id: "msg_hung", role: "assistant", time: { completed: completedAt } } },
+    })
+
+    const startedAt = Date.now()
+    await harness.connector.stop()
+
+    assert.ok(Date.now() - startedAt < 500)
+    assert.equal(harness.tg.sentHtmlBlocks.length, 0)
   } finally {
     await harness.connector.stop()
   }

@@ -2,6 +2,20 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { escapeHtml, formatInlineMarkdownToHtml, formatMarkdownToTelegramHtmlBlocks } from "../src/telegram/formatter.js"
 
+function assertNoDanglingSurrogates(text) {
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i)
+    if (code >= 0xd800 && code <= 0xdbff) {
+      assert.ok(i + 1 < text.length, "high surrogate must have a following code unit")
+      const next = text.charCodeAt(i + 1)
+      assert.ok(next >= 0xdc00 && next <= 0xdfff, "high surrogate must be followed by low surrogate")
+      i += 1
+      continue
+    }
+    assert.ok(code < 0xdc00 || code > 0xdfff, "low surrogate must follow a high surrogate")
+  }
+}
+
 test("escapeHtml escapes special Telegram HTML characters", () => {
   assert.equal(escapeHtml('<a "b" & c>'), "&lt;a &quot;b&quot; &amp; c&gt;")
 })
@@ -77,6 +91,17 @@ test("formatMarkdownToTelegramHtmlBlocks does not split escaped entities", () =>
   for (const block of blocks) {
     assert.ok(block.html.length <= 3900)
     assert.doesNotMatch(block.html, /&(?:a|am|amp|l|lt)$/)
+  }
+})
+
+test("formatMarkdownToTelegramHtmlBlocks keeps long emoji lines on surrogate-pair boundaries", () => {
+  const emoji = "😀"
+  const blocks = formatMarkdownToTelegramHtmlBlocks(emoji.repeat(1100))
+
+  assert.deepEqual(blocks, [{ type: "text", html: `${emoji.repeat(1000)}\n${emoji.repeat(100)}` }])
+  for (const block of blocks) {
+    assert.ok(block.html.length <= 3900)
+    assertNoDanglingSurrogates(block.html)
   }
 })
 

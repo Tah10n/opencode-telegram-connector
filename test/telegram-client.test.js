@@ -19,6 +19,20 @@ function makeJsonAbortResponse(signal, { ok = true, status = 200, statusText = "
   }
 }
 
+function assertNoDanglingSurrogates(text) {
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i)
+    if (code >= 0xd800 && code <= 0xdbff) {
+      assert.ok(i + 1 < text.length, "high surrogate must have a following code unit")
+      const next = text.charCodeAt(i + 1)
+      assert.ok(next >= 0xdc00 && next <= 0xdfff, "high surrogate must be followed by low surrogate")
+      i += 1
+      continue
+    }
+    assert.ok(code < 0xdc00 || code > 0xdfff, "low surrogate must follow a high surrogate")
+  }
+}
+
 test("splitTelegramText keeps short lines and splits oversized lines", () => {
   const chunks = splitTelegramText(`short\n${"x".repeat(6)}`, 5)
   assert.deepEqual(chunks, ["short", "xxxxx", "x"])
@@ -27,6 +41,17 @@ test("splitTelegramText keeps short lines and splits oversized lines", () => {
 test("splitTelegramText carries a short next line into a fresh chunk", () => {
   const chunks = splitTelegramText("aa\nbbb", 3)
   assert.deepEqual(chunks, ["aa", "bbb"])
+})
+
+test("splitTelegramText does not split surrogate pairs in oversized emoji lines", () => {
+  const text = `${"😀".repeat(6)}\n${"x".repeat(3)}`
+  const chunks = splitTelegramText(text, 5)
+
+  assert.deepEqual(chunks, ["😀😀", "😀😀", "😀😀", "xxx"])
+  for (const chunk of chunks) {
+    assert.ok(chunk.length <= 5)
+    assertNoDanglingSurrogates(chunk)
+  }
 })
 
 test("splitTelegramHtml avoids splitting tags and entities", () => {
@@ -41,15 +66,18 @@ test("splitTelegramHtml avoids splitting tags and entities", () => {
   }
 })
 
-test("splitTelegramHtml keeps chunks well-formed across open tags", () => {
-  const chunks = splitTelegramHtml(`<b>${"a".repeat(20)}</b>`, 12)
+test("splitTelegramHtml keeps chunks well-formed across open tags without splitting emoji", () => {
+  const text = `<b>${"😀".repeat(10)}</b>`
+  const chunks = splitTelegramHtml(text, 11)
 
   assert.ok(chunks.length > 1)
   for (const chunk of chunks) {
-    assert.ok(chunk.length <= 12)
+    assert.ok(chunk.length <= 11)
     assert.match(chunk, /^<b>/)
     assert.match(chunk, /<\/b>$/)
+    assertNoDanglingSurrogates(chunk)
   }
+  assert.equal(chunks.map((chunk) => chunk.replace(/<\/?b>/g, "")).join(""), "😀".repeat(10))
 })
 
 test("TelegramClient call and callMultipart return Telegram results and surface API errors", async () => {

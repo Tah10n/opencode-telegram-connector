@@ -128,12 +128,12 @@ test("startOpenCodeSseLoop reports disconnects only after a failed health check"
     return makeSseResponse([])
   })
 
-  let healthCalls = 0
+  const healthCalls = []
   const ocClient = {
     baseUrl: "http://127.0.0.1:4312",
     headers: () => ({}),
-    health: async () => {
-      healthCalls += 1
+    health: async (input = {}) => {
+      healthCalls.push(input)
       throw new Error("server down")
     },
   }
@@ -161,7 +161,8 @@ test("startOpenCodeSseLoop reports disconnects only after a failed health check"
   })
 
   assert.equal(fetchCalls, 1)
-  assert.equal(healthCalls, 1)
+  assert.equal(healthCalls.length, 1)
+  assert.equal(healthCalls[0].signal, abortController.signal)
 })
 
 test("startOpenCodeSseLoop times out a hung initial SSE fetch", async (t) => {
