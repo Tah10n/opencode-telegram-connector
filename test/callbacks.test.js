@@ -153,8 +153,8 @@ function makeRuntime(overrides = {}) {
       rejectedNotes.push({ ctxMeta, projectAlias, permissionId })
     },
     getWizard: runtimeOverrides.getWizard || (() => null),
-    clearPersistedQuestionWizard: (projectAlias, questionId) => {
-      clearedQuestionIds.push({ projectAlias, questionId })
+    clearPersistedQuestionWizard: (projectAlias, questionId, sessionID = "") => {
+      clearedQuestionIds.push({ projectAlias, questionId, ...(sessionID ? { sessionID } : {}) })
     },
     setAwaitingCustomAnswerState: (ctxKey, value) => {
       customStateCalls.push({ ctxKey, value })
@@ -1392,6 +1392,78 @@ test("createCallbackHandlers rejects stale and successful question callbacks", a
     { chatId: 100, messageId: 905 },
     { chatId: 100, messageId: 906 },
   ])
+})
+
+test("createCallbackHandlers cleans scoped question wizards from old-shape reject callbacks", async () => {
+  const scopedWizards = [
+    { questionId: "q_success", sessionID: "ses_success" },
+    { questionId: "q_stale", sessionID: "ses_stale" },
+    { questionId: "q_done", sessionID: "ses_done" },
+  ].map(({ questionId, sessionID }) => ({ ...makeWizard({ id: questionId }), sessionID }))
+  const questionWizards = new Map()
+  for (const wizard of scopedWizards) {
+    questionWizards.set(`demo:${wizard.sessionID}:${wizard.id}`, wizard)
+    questionWizards.set(`demo:${wizard.id}`, wizard)
+  }
+  const rejectCalls = []
+  const markedKeys = []
+  const { runtime, callbackAnswers, clearedQuestionIds } = makeRuntime({
+    questionWizards,
+    getWizard: (projectAlias, questionId, sessionID = "") => {
+      if (sessionID) return questionWizards.get(`${projectAlias}:${sessionID}:${questionId}`) || null
+      return questionWizards.get(`${projectAlias}:${questionId}`) ||
+        [...questionWizards.values()].find((wizard) => wizard?.projectAlias === projectAlias && (wizard?.id || wizard?.request?.id) === questionId) ||
+        null
+    },
+    store: {
+      hasIdempotencyKey: (key) => key.includes("ses_done"),
+      markIdempotencyKey: (key) => {
+        markedKeys.push(key)
+        return true
+      },
+      flush: async () => {},
+    },
+    ocByAlias: {
+      demo: {
+        async rejectQuestion(questionId) {
+          rejectCalls.push(questionId)
+          if (questionId === "q_stale") {
+            throw makeBoundaryError({
+              source: "opencode",
+              operation: `POST /question/${questionId}/reject`,
+              method: "POST",
+              pathname: `/question/${questionId}/reject`,
+              status: 404,
+              message: "missing",
+            })
+          }
+          return { ok: true }
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("q|demo|q_success|reject"))
+  await handlers.handleTelegramCallback(makeCallback("q|demo|q_stale|reject"))
+  await handlers.handleTelegramCallback(makeCallback("q|demo|q_done|reject"))
+
+  assert.deepEqual(rejectCalls, ["q_success", "q_stale"])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Rejected", "No longer active", "Already handled"])
+  for (const wizard of scopedWizards) {
+    assert.equal(questionWizards.has(`demo:${wizard.sessionID}:${wizard.id}`), false)
+    assert.equal(questionWizards.has(`demo:${wizard.id}`), false)
+  }
+  assert.deepEqual(clearedQuestionIds, [
+    { projectAlias: "demo", questionId: "q_success", sessionID: "ses_success" },
+    { projectAlias: "demo", questionId: "q_success" },
+    { projectAlias: "demo", questionId: "q_stale", sessionID: "ses_stale" },
+    { projectAlias: "demo", questionId: "q_stale" },
+    { projectAlias: "demo", questionId: "q_done", sessionID: "ses_done" },
+    { projectAlias: "demo", questionId: "q_done" },
+  ])
+  assert.equal(markedKeys.length, 2)
+  assert.ok(markedKeys.every((key) => key.includes("ses_")))
 })
 
 test("createCallbackHandlers skips duplicate question reject callbacks via idempotency ledger", async () => {

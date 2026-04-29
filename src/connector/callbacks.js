@@ -178,9 +178,10 @@ export function createCallbackHandlers(runtime) {
   }
 
   function cleanupQuestionState(ctxKey, projectAlias, questionId, sessionID = "") {
-    runtime.questionWizards.delete(sessionID ? `${projectAlias}:${sessionID}:${questionId}` : `${projectAlias}:${questionId}`)
+    if (sessionID) runtime.questionWizards.delete(`${projectAlias}:${sessionID}:${questionId}`)
     runtime.questionWizards.delete(`${projectAlias}:${questionId}`)
-    clearPersistedQuestionWizard(projectAlias, questionId, sessionID)
+    if (sessionID) clearPersistedQuestionWizard(projectAlias, questionId, sessionID)
+    clearPersistedQuestionWizard(projectAlias, questionId, "")
     setAwaitingCustomAnswerState(ctxKey, null)
   }
 
@@ -912,10 +913,11 @@ export function createCallbackHandlers(runtime) {
         }
 
         const wizard = getWizard(projectAlias, questionId, sessionID)
+        const effectiveSessionID = sessionID || wizard?.sessionID || ""
         if (rest.length === 1 && rest[0] === "reject") {
-          const rejectKey = questionRejectIdempotencyKey(projectAlias, sessionID, questionId)
-          if (hasIdempotencyKey(rejectKey) || hasHandledQuestion(projectAlias, sessionID, questionId)) {
-            cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, sessionID)
+          const rejectKey = questionRejectIdempotencyKey(projectAlias, effectiveSessionID, questionId)
+          if (hasIdempotencyKey(rejectKey) || hasHandledQuestion(projectAlias, effectiveSessionID, questionId)) {
+            cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, effectiveSessionID)
             await flushStoreIfAvailable()
             await answerCallbackQuery(callbackQuery.id, "Already handled")
             await deleteInteractiveMessage(ctxMeta, msg?.message_id)
@@ -931,7 +933,7 @@ export function createCallbackHandlers(runtime) {
                 ctxKey: ctxMeta.ctxKey,
                 operation: "rejectQuestion",
               })
-              cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, sessionID)
+              cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, effectiveSessionID)
               await flushStoreIfAvailable()
               recordCallbackOutcome?.(projectAlias, "stale")
               await answerCallbackQuery(callbackQuery.id, "No longer active")
@@ -953,7 +955,7 @@ export function createCallbackHandlers(runtime) {
             operation: "rejectQuestion",
           })
           recordPromptAnswered?.(projectAlias, "question", "rejected")
-          cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, sessionID)
+          cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, effectiveSessionID)
           await flushStoreIfAvailable()
           await answerCallbackQuery(callbackQuery.id, "Rejected")
           await deleteInteractiveMessage(ctxMeta, msg?.message_id)
@@ -961,8 +963,8 @@ export function createCallbackHandlers(runtime) {
         }
 
         if (!wizard) {
-          if (hasHandledQuestion(projectAlias, sessionID, questionId)) {
-            cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, sessionID)
+          if (hasHandledQuestion(projectAlias, effectiveSessionID, questionId)) {
+            cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, effectiveSessionID)
             await flushStoreIfAvailable()
             await answerCallbackQuery(callbackQuery.id, "Already handled")
             await deleteInteractiveMessage(ctxMeta, msg?.message_id)
@@ -995,9 +997,9 @@ export function createCallbackHandlers(runtime) {
             await answerCallbackQuery(callbackQuery.id, "Custom disabled")
             return
           }
-          setAwaitingCustomAnswerState(ctxMeta.ctxKey, { projectAlias, requestId: questionId, ...(sessionID ? { sessionID } : {}), qIndex })
+          setAwaitingCustomAnswerState(ctxMeta.ctxKey, { projectAlias, requestId: questionId, ...(effectiveSessionID ? { sessionID: effectiveSessionID } : {}), qIndex })
           try {
-            await sendQuestionCustomAnswerPrompt(ctxMeta, projectAlias, questionId, qIndex, q.header || "question", { sessionID })
+            await sendQuestionCustomAnswerPrompt(ctxMeta, projectAlias, questionId, qIndex, q.header || "question", { sessionID: effectiveSessionID })
           } catch (err) {
             setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
             runtime.logger?.error?.("Failed to start custom-answer flow:", err?.message || String(err))
