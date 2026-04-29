@@ -2836,6 +2836,7 @@ test("startConnector watchdog does not kill UI or serve after shutdown abort", a
 test("startConnector watchdog restarts an autoStart project after repeated prompt poll failures", async () => {
   const startCalls = []
   const portStopCalls = []
+  const uiStopCalls = []
   let pollHealthy = false
   let permissionCalls = 0
   let questionCalls = 0
@@ -2889,6 +2890,10 @@ test("startConnector watchdog restarts an autoStart project after repeated promp
       portStopCalls.push({ projectAlias, port })
       return { stopped: true, count: 1, pids: [1234] }
     },
+    stopOpenCodeUiOnPortImpl: async ({ projectAlias, port }) => {
+      uiStopCalls.push({ projectAlias, port })
+      return { stopped: true, count: 1, pids: [5678] }
+    },
     ensureStartupSessionImpl: async ({ alias, startupSessionByProject }) => {
       startupSessionByProject[alias] = "ses_startup"
       return "ses_startup"
@@ -2897,6 +2902,7 @@ test("startConnector watchdog restarts an autoStart project after repeated promp
 
   try {
     await waitFor(() => startCalls.length === 2)
+    assert.deepEqual(uiStopCalls, [{ projectAlias: "demo", port: 4312 }])
     assert.deepEqual(portStopCalls, [{ projectAlias: "demo", port: 4312 }])
   } finally {
     await harness.connector.stop()

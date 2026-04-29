@@ -537,7 +537,7 @@ test("openAttachContinueWindowWindows rejects cmd.exe metacharacters in director
   assert.equal(calls.length, 0)
 })
 
-test("openAttachContinueWindowWindows keeps the console open and passes --dir", async (t) => {
+test("openAttachContinueWindowWindows closes the console with opencode and passes --dir", async (t) => {
   const calls = useSpawnPlans(t, [{ code: 0 }])
 
   await openAttachContinueWindowWindows({
@@ -547,7 +547,7 @@ test("openAttachContinueWindowWindows keeps the console open and passes --dir", 
 
   assert.equal(calls[0].command, "powershell")
   assert.match(calls[0].args[3], /Start-Process -WindowStyle Normal/)
-  assert.match(calls[0].args[3], /'\/k'/)
+  assert.match(calls[0].args[3], /'\/c'/)
   assert.match(calls[0].args[3], /--continue/)
   assert.match(calls[0].args[3], /--dir/)
   assert.match(calls[0].args[3], /'C:\\repo'/)
@@ -592,6 +592,27 @@ test("killProcessWindows shells out to taskkill and ignores launcher errors", as
 
   assert.equal(calls[0].command, "taskkill")
   assert.deepEqual(calls[0].args, ["/PID", "123", "/T", "/F"])
+})
+
+test("stopOpenCodeUiOnPort stops legacy Windows TUI commands only", async (t) => {
+  const calls = useSpawnPlans(t, [
+    {
+      stdout: JSON.stringify([
+        { ProcessId: 111, Name: "cmd.exe", CommandLine: "cmd.exe /c opencode . --port 4312 --continue" },
+        { ProcessId: 222, Name: "cmd.exe", CommandLine: "cmd.exe /c opencode serve --port 4312" },
+        { ProcessId: 333, Name: "cmd.exe", CommandLine: "cmd.exe /c opencode run --port 4312" },
+        { ProcessId: 444, Name: "cmd.exe", CommandLine: "cmd.exe /c opencode . --port 4313 --continue" },
+      ]),
+    },
+    {},
+  ])
+
+  const result = await stopOpenCodeUiOnPort({ port: 4312, projectAlias: "demo", logger: makeLogger(), platform: "win32" })
+
+  assert.deepEqual(result, { stopped: true, count: 1, pids: [111] })
+  assert.equal(calls[0].command, "powershell")
+  assert.equal(calls[1].command, "taskkill")
+  assert.deepEqual(calls[1].args, ["/PID", "111", "/T", "/F"])
 })
 
 test("startOpenCodeServeDetached spawns a detached server process and unreferences it", (t) => {

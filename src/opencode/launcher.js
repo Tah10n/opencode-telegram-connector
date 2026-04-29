@@ -184,7 +184,7 @@ function isOpenCodeServeCommandLine(cmdline) {
   return serveIdx !== -1 && serveIdx > openIdx
 }
 
-function isOpenCodeAttachCommandLine(cmdline) {
+function isOpenCodeUiCommandLine(cmdline) {
   const tokens = tokenizeCmdline(cmdline).map((t) => t.toLowerCase())
   if (!tokens.length) return false
 
@@ -195,7 +195,20 @@ function isOpenCodeAttachCommandLine(cmdline) {
   if (openIdx === -1) return false
 
   const attachIdx = tokens.indexOf("attach")
-  return attachIdx !== -1 && attachIdx > openIdx
+  if (attachIdx !== -1 && attachIdx > openIdx) return true
+
+  // Older Windows TUI launches used `opencode . --port <port> --continue`.
+  // Treat that shape as UI too, but avoid matching server/non-interactive commands.
+  const serveIdx = tokens.indexOf("serve")
+  if (serveIdx !== -1 && serveIdx > openIdx) return false
+  const runIdx = tokens.indexOf("run")
+  if (runIdx !== -1 && runIdx > openIdx) return false
+
+  const dotIdx = tokens.findIndex((t, idx) => idx > openIdx && (t === "." || t === "./"))
+  if (dotIdx === -1) return false
+  const continueIdx = tokens.indexOf("--continue")
+  if (continueIdx === -1 || continueIdx < dotIdx) return false
+  return tokens.some((t, idx) => idx > openIdx && (t === "--port" || t.startsWith("--port=")))
 }
 
 function isTrueEnv(name) {
@@ -232,7 +245,7 @@ async function isAnyOpenCodeUiRunningWindows({ port } = {}) {
   for (const p of procs) {
     const cmd = String(p?.CommandLine || "")
     if (!cmd) continue
-    if (!isOpenCodeAttachCommandLine(cmd)) continue
+    if (!isOpenCodeUiCommandLine(cmd)) continue
     if (!wantPort) return true
     const ports = extractPortsFromCommandLine(cmd)
     if (ports.has(wantPort)) return true
@@ -247,7 +260,7 @@ async function findOpenCodeUiProcessesWindows({ port } = {}) {
   for (const p of procs) {
     const cmd = String(p?.CommandLine || "")
     if (!cmd) continue
-    if (!isOpenCodeAttachCommandLine(cmd)) continue
+    if (!isOpenCodeUiCommandLine(cmd)) continue
     if (!wantPort) {
       matches.push({ pid: p?.ProcessId ?? null, cmd })
       continue
@@ -791,8 +804,9 @@ export async function openAttachContinueWindowWindows({ directory, baseUrl }) {
   ]
   const ps = [
     "Start-Process -WindowStyle Normal -FilePath cmd.exe -ArgumentList @(",
-    // Use /k to keep the window open if opencode exits with an error.
-    psQuote("/k"),
+    // Use /c so an auto-opened TUI window exits with opencode instead of
+    // lingering at a shell prompt after watchdog cleanup/restart.
+    psQuote("/c"),
     ",",
     psQuote("opencode"),
     ",",

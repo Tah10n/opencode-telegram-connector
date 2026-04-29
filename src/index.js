@@ -272,6 +272,81 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     return !!(project?.autoStart && project?.directory && project?.port)
   }
 
+  async function stopTrackedAutoStartHandle(projectAlias, reason) {
+    const previousHandle = autoStartHandleByProject.get(projectAlias)
+    autoStartHandleByProject.delete(projectAlias)
+    if (!previousHandle?.stop) return null
+    try {
+      await Promise.resolve(previousHandle.stop())
+      return { stopped: true }
+    } catch (err) {
+      logger.warn(`[${projectAlias}] ${reason || "cleanup"} failed to stop managed opencode handle: ${err?.message || String(err)}`)
+      return { stopped: false, reason: "stop-failed" }
+    }
+  }
+
+  function logArtifactCleanupResult(projectAlias, artifact, result) {
+    if (!result) return
+    const details = [`stopped=${result.stopped === true}`, `count=${Number(result.count || 0)}`]
+    if (result.reason) details.push(`reason=${result.reason}`)
+    if (Array.isArray(result.pids) && result.pids.length) details.push(`pids=${result.pids.join(",")}`)
+    const message = `[${projectAlias}] opencode ${artifact} cleanup: ${details.join(" ")}`
+    if (result.stopped) logger.warn(message)
+    else logger.info(message)
+  }
+
+  async function cleanupProjectOpenCodeArtifacts(projectAlias, { reason, stopTrackedHandle = false, stopUi = false, stopServe = false } = {}) {
+    const project = projects?.[projectAlias]
+    const summary = { projectAlias, port: project?.port ?? null, handle: null, ui: null, serve: null }
+    if (!project) return summary
+
+    logger.info(`[${projectAlias}] cleaning opencode runtime artifacts: ${reason || "cleanup"}`)
+
+    if (stopTrackedHandle) {
+      summary.handle = await stopTrackedAutoStartHandle(projectAlias, reason)
+    }
+
+    if (abortController.signal.aborted) return summary
+    if (stopUi) {
+      try {
+        summary.ui = await Promise.resolve(
+          stopOpenCodeUiOnPortFn({
+            projectAlias,
+            project,
+            port: project?.port,
+            logger,
+            platform,
+          }),
+        )
+        logArtifactCleanupResult(projectAlias, "UI", summary.ui)
+      } catch (err) {
+        summary.ui = { stopped: false, count: 0, reason: "stop-failed" }
+        logger.warn(`[${projectAlias}] failed to stop opencode UI on port ${project?.port}: ${err?.message || String(err)}`)
+      }
+    }
+
+    if (abortController.signal.aborted) return summary
+    if (stopServe) {
+      try {
+        summary.serve = await Promise.resolve(
+          stopOpenCodeServeOnPortFn({
+            projectAlias,
+            project,
+            port: project?.port,
+            logger,
+            platform,
+          }),
+        )
+        logArtifactCleanupResult(projectAlias, "serve", summary.serve)
+      } catch (err) {
+        summary.serve = { stopped: false, count: 0, reason: "stop-failed" }
+        logger.warn(`[${projectAlias}] failed to stop opencode serve on port ${project?.port}: ${err?.message || String(err)}`)
+      }
+    }
+
+    return summary
+  }
+
   function scheduleProjectWatchdogRestart(projectAlias, reason) {
     if (!shouldWatchProjectHealth(projectAlias) || abortController.signal.aborted) return
     if (startInProgress.has(projectAlias) || watchdogRestartInProgress.has(projectAlias)) return
@@ -289,40 +364,11 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
 
     const task = (async () => {
       logger.warn(`[${projectAlias}] watchdog restarting opencode after repeated retryable failures: ${reason || "unhealthy"}`)
-      const previousHandle = autoStartHandleByProject.get(projectAlias)
-      autoStartHandleByProject.delete(projectAlias)
-      if (previousHandle?.stop) {
-        await Promise.resolve(previousHandle.stop()).catch((err) => {
-          logger.warn(`[${projectAlias}] watchdog failed to stop managed opencode handle: ${err?.message || String(err)}`)
-        })
-      }
-
-      const project = projects?.[projectAlias]
-      if (abortController.signal.aborted) return null
-      if (project?.openTuiOnAutoStart !== false) {
-        await Promise.resolve(
-          stopOpenCodeUiOnPortFn({
-            projectAlias,
-            project,
-            port: project?.port,
-            logger,
-            platform,
-          }),
-        ).catch((err) => {
-          logger.warn(`[${projectAlias}] watchdog failed to stop opencode UI on port ${project?.port}: ${err?.message || String(err)}`)
-        })
-      }
-      if (abortController.signal.aborted) return null
-      await Promise.resolve(
-        stopOpenCodeServeOnPortFn({
-          projectAlias,
-          project,
-          port: project?.port,
-          logger,
-          platform,
-        }),
-      ).catch((err) => {
-        logger.warn(`[${projectAlias}] watchdog failed to stop opencode serve on port ${project?.port}: ${err?.message || String(err)}`)
+      await cleanupProjectOpenCodeArtifacts(projectAlias, {
+        reason: "watchdog restart",
+        stopTrackedHandle: true,
+        stopUi: true,
+        stopServe: true,
       })
 
       if (abortController.signal.aborted) return null
@@ -423,8 +469,8 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
           abortSignal: abortController.signal,
         })
         if (handle?.stop) {
-          autoStartHandleByProject.set(alias, handle)
-          trackManagedHandle(`autoStart-handle:${alias}`, handle, { kind: "task", metadata: { projectAlias: alias } })
+          const managedHandle = trackManagedHandle(`autoStart-handle:${alias}`, handle, { kind: "task", metadata: { projectAlias: alias } })
+          autoStartHandleByProject.set(alias, managedHandle)
         }
         resetProjectHealthFailures(alias)
         runtimeObservability.recordLoopSuccess("autoStart", { projectAlias: alias })
@@ -628,8 +674,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   }
 
   function trackManagedHandle(name, handle, { kind = "task", metadata } = {}) {
-    lifecycle.registerHandle(name, handle, { kind, metadata })
-    return handle
+    return lifecycle.registerHandle(name, handle, { kind, metadata })
   }
 
   function recordLoopError(loopName, err, { projectAlias, source = projectAlias ? "opencode" : "runtime", operation, method, pathname } = {}) {
