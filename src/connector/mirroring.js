@@ -15,6 +15,7 @@ import { DEFAULT_FEED_MODE, normalizeFeedMode, sessionKey } from "../state/store
 import { ATTACHMENT_NOTICES, attachmentCaption, sanitizeFilenamePart, scopedAttachmentFilename } from "./attachment-utils.js"
 import { NOISY_SKIP_REASONS } from "./noisy-skip-reasons.js"
 import { redactSensitiveText } from "../url-utils.js"
+import { isRetryableBoundaryError } from "../boundary-errors.js"
 
 export function createMirroringHandlers(runtime) {
   const {
@@ -51,8 +52,13 @@ export function createMirroringHandlers(runtime) {
   const changedFilesExportInFlight = new Set()
   const agentActivityBySession = new Map()
   const agentActivityTombstonesBySession = new Map()
+  const assistantDeliveryStateByKey = new Map()
   const AGENT_ACTIVITY_TOMBSTONE_MS = 30 * 60 * 1000
   const AGENT_ACTIVITY_TOMBSTONE_SWEEP_MS = 60 * 1000
+  const ROUTE_LOOKUP_MAX_ATTEMPTS = 3
+  const ROUTE_LOOKUP_INITIAL_DELAY_MS = 150
+  const ASSISTANT_FINAL_DELIVERY_MAX_ATTEMPTS = 4
+  const ASSISTANT_FINAL_DELIVERY_RETRY_DELAYS_MS = [500, 1500, 5000]
   let nextAgentActivityTombstoneSweepAt = 0
 
   function ensureForwardedSets(sk) {
@@ -787,6 +793,26 @@ export function createMirroringHandlers(runtime) {
     }
   }
 
+  async function resolveBoundRouteWithRetry(projectAlias, sessionId, { attempts = ROUTE_LOOKUP_MAX_ATTEMPTS, initialDelayMs = ROUTE_LOOKUP_INITIAL_DELAY_MS, signal } = {}) {
+    let waitMs = initialDelayMs
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (signal?.aborted || isStopping()) return null
+      try {
+        return await resolveBoundRoute(projectAlias, sessionId)
+      } catch (err) {
+        if (!isRetryableBoundaryError(err) || attempt + 1 >= attempts) throw err
+        logSseDebug(projectAlias, sessionId, `retry=route_lookup attempt=${attempt + 2} error=${err?.message || String(err)}`)
+        await pauseWithSignal(waitMs, signal)
+        waitMs = Math.min(1000, waitMs * 2)
+      }
+    }
+    return null
+  }
+
+  function assistantRetryDelayMs(attempt) {
+    return ASSISTANT_FINAL_DELIVERY_RETRY_DELAYS_MS[Math.max(0, Math.min(ASSISTANT_FINAL_DELIVERY_RETRY_DELAYS_MS.length - 1, attempt - 1))]
+  }
+
   async function getAssistantMessageWithRetry(oc, sessionId, messageId, { attempts = 3, initialDelayMs = 150, signal, timeoutMs } = {}) {
     let waitMs = initialDelayMs
     for (let attempt = 0; attempt < attempts; attempt++) {
@@ -799,15 +825,45 @@ export function createMirroringHandlers(runtime) {
     return null
   }
 
-  async function deliverAssistantText(ctxMeta, projectAlias, sessionId, messageId, text, { replaceMessageId } = {}) {
+  async function sendAssistantBlocksWithProgress(ctxMeta, blocks, replyMarkup, deliveryOptions) {
+    let nextBlockIndex = Number.isInteger(deliveryOptions.assistantTextBlockIndex) && deliveryOptions.assistantTextBlockIndex > 0
+      ? deliveryOptions.assistantTextBlockIndex
+      : 0
+    let sentAny = nextBlockIndex > 0
+    let currentReplyMarkup = nextBlockIndex === 0 ? replyMarkup : null
+
+    for (let index = nextBlockIndex; index < blocks.length; index += 1) {
+      const block = blocks[index]
+      if (!block || block.type !== "text") {
+        deliveryOptions.assistantTextBlockIndex = index + 1
+        continue
+      }
+      await tg.sendMessage(ctxMeta.chatId, block.html, currentReplyMarkup, {
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        message_thread_id: ctxMeta.threadIdOr0 || undefined,
+      })
+      currentReplyMarkup = null
+      deliveryOptions.assistantTextBlockIndex = index + 1
+      nextBlockIndex = index + 1
+      sentAny = true
+    }
+
+    return sentAny ? { mode: nextBlockIndex > 0 ? "sent" : "skipped" } : null
+  }
+
+  async function deliverAssistantText(ctxMeta, projectAlias, sessionId, messageId, text, { replaceMessageId, deliveryOptions = {} } = {}) {
     if (!text || !text.trim()) return null
     if (shouldSendAssistantAsAttachment(text)) {
       const notice = ATTACHMENT_NOTICES.assistantTooLong
-      if (replaceMessageId) {
-        const edited = await tg.editMessageText(ctxMeta.chatId, replaceMessageId, notice, null).catch(() => null)
-        if (!edited) await sendToThread(ctxMeta, notice)
-      } else {
-        await sendToThread(ctxMeta, notice)
+      if (deliveryOptions.assistantLongNoticeDelivered !== true) {
+        if (replaceMessageId) {
+          const edited = await tg.editMessageText(ctxMeta.chatId, replaceMessageId, notice, null).catch(() => null)
+          if (!edited) await sendToThread(ctxMeta, notice)
+        } else {
+          await sendToThread(ctxMeta, notice)
+        }
+        deliveryOptions.assistantLongNoticeDelivered = true
       }
       await tg.sendDocument(
         ctxMeta.chatId,
@@ -822,6 +878,23 @@ export function createMirroringHandlers(runtime) {
 
     const blocks = formatMarkdownToTelegramHtmlBlocks(text)
     if (!blocks.length) return null
+    if (blocks.length > 1) {
+      if (replaceMessageId && blocks[0]?.type === "text" && !deliveryOptions.assistantTextBlockIndex) {
+        const edited = await tg
+          .editMessageText(ctxMeta.chatId, replaceMessageId, blocks[0].html, null, {
+            parse_mode: "HTML",
+            disable_web_page_preview: true,
+          })
+          .catch(() => null)
+        if (edited) {
+          deliveryOptions.assistantTextBlockIndex = 1
+          await sendAssistantBlocksWithProgress(ctxMeta, blocks, null, deliveryOptions)
+          return { mode: "edited" }
+        }
+      }
+      const delivered = await sendAssistantBlocksWithProgress(ctxMeta, blocks, null, deliveryOptions)
+      return delivered ? { mode: replaceMessageId ? "resent" : "sent" } : null
+    }
     if (replaceMessageId && blocks[0]?.type === "text") {
       const edited = await tg
         .editMessageText(ctxMeta.chatId, replaceMessageId, blocks[0].html, null, {
@@ -857,7 +930,7 @@ export function createMirroringHandlers(runtime) {
     if (!text) return
 
     const sk = sessionKey(projectAlias, sessionId)
-    const resolved = await resolveBoundRoute(projectAlias, sessionId)
+    const resolved = await resolveBoundRouteWithRetry(projectAlias, sessionId, { signal: abortSignal })
     if (!resolved?.route) {
       logSseDebug(projectAlias, sessionId, "drop=agent_action_no_route")
       return
@@ -901,7 +974,7 @@ export function createMirroringHandlers(runtime) {
     if (!sessionId || !info?.id || !info?.role) return
     logSseDebug(projectAlias, sessionId, `event type=message.updated role=${info.role} msg=${info.id}`)
     const sk = sessionKey(projectAlias, sessionId)
-    const resolved = await resolveBoundRoute(projectAlias, sessionId)
+    const resolved = await resolveBoundRouteWithRetry(projectAlias, sessionId, { signal: abortSignal })
     if (!resolved?.route) {
       logSseDebug(projectAlias, sessionId, "drop=no_route")
       return
@@ -1045,18 +1118,34 @@ export function createMirroringHandlers(runtime) {
     }
 
     const debounceKey = `${sk}:${info.id}`
+    let deliveryState = assistantDeliveryStateByKey.get(debounceKey)
+    if (!deliveryState) {
+      deliveryState = { deliveryOptions: {}, inFlight: false }
+      assistantDeliveryStateByKey.set(debounceKey, deliveryState)
+    }
     const existing = assistantDebounce.get(debounceKey)
+    if (existing?.kind === "retry") {
+      logSseDebug(projectAlias, sessionId, `drop=assistant_retry_pending msg=${info.id}`)
+      return
+    }
+    if (deliveryState.inFlight) {
+      logSseDebug(projectAlias, sessionId, `drop=assistant_delivery_in_flight msg=${info.id}`)
+      return
+    }
     if (existing) clearTimeout(existing?.timer || existing)
+    const initialDeliveryOptions = existing?.deliveryOptions && typeof existing.deliveryOptions === "object" ? existing.deliveryOptions : deliveryState.deliveryOptions
     const runDelivery = async (deliveryOptions = {}) => {
+      deliveryState.inFlight = true
       const shouldStopDelivery = () => (isStopping() && deliveryOptions.ignoreStopping !== true) || deliveryOptions.signal?.aborted === true
-      assistantDebounce.delete(debounceKey)
-      if (shouldStopDelivery()) return
-      if (sets.assistant.has(info.id)) {
-        logSseDebug(projectAlias, sessionId, `drop=assistant_already_forwarded msg=${info.id}`)
-        return
-      }
-      await (async () => {
+      try {
+        assistantDebounce.delete(debounceKey)
         if (shouldStopDelivery()) return
+        if (sets.assistant.has(info.id)) {
+          logSseDebug(projectAlias, sessionId, `drop=assistant_already_forwarded msg=${info.id}`)
+          return
+        }
+        await (async () => {
+          if (shouldStopDelivery()) return
         const previewState = assistantPreviewBySession.get(boundKey)
         const replaceMessageId = previewState?.messageId === info.id ? previewState.telegramMessageId : undefined
         const msg = await getAssistantMessageWithRetry(oc, sessionId, info.id, deliveryOptions)
@@ -1108,9 +1197,14 @@ export function createMirroringHandlers(runtime) {
         let visibleOutputSent = false
 
         if (hasAssistantText) {
-          if (shouldStopDelivery()) return
-          const delivered = await deliverAssistantText(routeCtx, projectAlias, sessionId, info.id, text, { replaceMessageId })
-          visibleOutputSent = visibleOutputSent || !!delivered
+          if (deliveryOptions.assistantTextDelivered === true) {
+            visibleOutputSent = true
+          } else {
+            if (shouldStopDelivery()) return
+            const delivered = await deliverAssistantText(routeCtx, projectAlias, sessionId, info.id, text, { replaceMessageId, deliveryOptions })
+            if (delivered) deliveryOptions.assistantTextDelivered = true
+            visibleOutputSent = visibleOutputSent || !!delivered
+          }
         }
 
         if (allowChangedFiles) {
@@ -1137,17 +1231,58 @@ export function createMirroringHandlers(runtime) {
         sets.assistant.add(info.id)
         if (visibleOutputSent) recordAssistantMirrored?.(projectAlias)
         logSseDebug(projectAlias, sessionId, `send=assistant msg=${info.id} thread=${route.threadIdOr0 || 0}`)
-      })()
+        })()
+      } finally {
+        deliveryState.inFlight = false
+      }
     }
-    const run = async (deliveryOptions = {}) => runDelivery(deliveryOptions).catch((err) => {
-      const message = err?.message || String(err)
-      runtime.logger?.error?.("Assistant final delivery failed:", projectAlias, sessionId, info.id, message)
-      logSseDebug(projectAlias, sessionId, `error=assistant_final_delivery msg=${info.id} ${message}`)
-    })
+    const run = async (deliveryOptions = {}) => {
+      try {
+        deliveryState.deliveryOptions = deliveryOptions
+        await runDelivery(deliveryOptions)
+        assistantDeliveryStateByKey.delete(debounceKey)
+      } catch (err) {
+        const attempt = Number.isInteger(deliveryOptions.finalDeliveryAttempt) && deliveryOptions.finalDeliveryAttempt > 0 ? deliveryOptions.finalDeliveryAttempt : 1
+        const message = err?.message || String(err)
+        const canRetry =
+          deliveryOptions.ignoreStopping !== true &&
+          deliveryOptions.signal?.aborted !== true &&
+          !isStopping() &&
+          attempt < ASSISTANT_FINAL_DELIVERY_MAX_ATTEMPTS &&
+          isRetryableBoundaryError(err)
+        if (canRetry) {
+          const nextAttempt = attempt + 1
+          const delayMs = assistantRetryDelayMs(attempt)
+          logSseDebug(projectAlias, sessionId, `retry=assistant_final_delivery msg=${info.id} attempt=${nextAttempt} delay=${delayMs} ${message}`)
+          deliveryOptions.finalDeliveryAttempt = nextAttempt
+          const retryOptions = deliveryOptions
+          deliveryState.deliveryOptions = retryOptions
+          const retryTimer = setTimeout(() => {
+            void run(retryOptions)
+          }, delayMs)
+          retryTimer.unref?.()
+          assistantDebounce.set(debounceKey, {
+            timer: retryTimer,
+            run: (overrideOptions = {}) => run({ ...retryOptions, ...overrideOptions }),
+            deliveryOptions: retryOptions,
+            kind: "retry",
+          })
+          return
+        }
+        assistantDeliveryStateByKey.delete(debounceKey)
+        runtime.logger?.error?.("Assistant final delivery failed:", projectAlias, sessionId, info.id, message)
+        logSseDebug(projectAlias, sessionId, `error=assistant_final_delivery msg=${info.id} ${message}`)
+      }
+    }
     const t = setTimeout(() => {
-      void run()
+      void run(initialDeliveryOptions)
     }, 250)
-    assistantDebounce.set(debounceKey, { timer: t, run })
+    assistantDebounce.set(debounceKey, {
+      timer: t,
+      run: (overrideOptions = {}) => run({ ...initialDeliveryOptions, ...overrideOptions }),
+      deliveryOptions: initialDeliveryOptions,
+      kind: "debounce",
+    })
   }
 
   async function flushPendingAssistantDeliveries({ timeoutMs = 5000 } = {}) {

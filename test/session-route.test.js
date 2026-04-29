@@ -1,6 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { resolveSessionRoute } from "../src/session-route.js"
+import { makeBoundaryError } from "../src/boundary-errors.js"
 
 test("resolveSessionRoute returns direct binding when session is bound", async () => {
   const sessionIndex = {
@@ -79,23 +80,26 @@ test("resolveSessionRoute caches parent lookups", async () => {
   assert.equal(second.boundSessionId, "ses_parent")
 })
 
-test("resolveSessionRoute does not cache transient lookup failures", async () => {
+test("resolveSessionRoute propagates and does not cache retryable lookup failures", async () => {
   const sessionIndex = {
     "demo:ses_parent": { chatId: 10, threadIdOr0: 20 },
   }
   let callCount = 0
   const parentBySessionKey = new Map()
 
-  const first = await resolveSessionRoute({
-    projectAlias: "demo",
-    sessionId: "ses_child",
-    sessionIndex,
-    getSession: async () => {
-      callCount += 1
-      throw new Error("temporary failure")
-    },
-    parentBySessionKey,
-  })
+  await assert.rejects(
+    resolveSessionRoute({
+      projectAlias: "demo",
+      sessionId: "ses_child",
+      sessionIndex,
+      getSession: async () => {
+        callCount += 1
+        throw makeBoundaryError({ source: "opencode", operation: "GET /session/ses_child", status: 503, message: "temporary failure" })
+      },
+      parentBySessionKey,
+    }),
+    /temporary failure/,
+  )
   const second = await resolveSessionRoute({
     projectAlias: "demo",
     sessionId: "ses_child",
@@ -107,7 +111,6 @@ test("resolveSessionRoute does not cache transient lookup failures", async () =>
     parentBySessionKey,
   })
 
-  assert.equal(first, null)
   assert.equal(callCount, 2)
   assert.equal(second?.boundSessionId, "ses_parent")
 })

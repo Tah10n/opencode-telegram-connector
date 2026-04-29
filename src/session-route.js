@@ -1,4 +1,5 @@
 import { sessionKey } from "./state/store.js"
+import { isRetryableBoundaryError } from "./boundary-errors.js"
 
 const NO_PARENT = ""
 
@@ -20,7 +21,17 @@ export async function resolveSessionRoute({ projectAlias, sessionId, sessionInde
 
     let parentSessionId = parentBySessionKey.get(currentKey)
     if (parentSessionId === undefined) {
-      const session = await getSession(currentSessionId).catch(() => null)
+      let session = null
+      try {
+        session = await getSession(currentSessionId)
+      } catch (err) {
+        if (isRetryableBoundaryError(err, { source: "opencode", operation: "getSession" })) {
+          debug?.(`route lookup retryable session=${currentSessionId} error=${err?.message || String(err)}`)
+          throw err
+        }
+        debug?.(`route miss session=${currentSessionId} reason=session_lookup_failed`)
+        return null
+      }
       if (!session) {
         debug?.(`route miss session=${currentSessionId} reason=session_lookup_failed`)
         return null
