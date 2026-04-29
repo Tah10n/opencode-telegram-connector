@@ -540,6 +540,115 @@ test("handleMessageUpdated drops assistant events when there is no bound route",
   assert.equal(calls.logSseDebug.at(-1)?.[2], "drop=no_route")
 })
 
+test("handleMessagePartUpdated mirrors tool actions only in verbose feed", async () => {
+  const noisy = []
+  const { calls, runtime, handlers } = createHarness({
+    store: { getFeedMode: () => "verbose" },
+    recordNoisyEventSkipped: (...args) => noisy.push(args),
+  })
+  const runningPart = {
+    id: "part_1",
+    callID: "call_1",
+    sessionID: "ses_1",
+    messageID: "msg_1",
+    type: "tool",
+    tool: "read_file",
+    state: { status: "running", title: "Read project file", time: { start: Date.now() } },
+  }
+
+  await handlers.handleMessagePartUpdated({ projectAlias: "demo", props: { part: runningPart } })
+  await handlers.handleMessagePartUpdated({ projectAlias: "demo", props: { part: runningPart } })
+
+  assert.equal(calls.sendToThread.length, 1)
+  assert.equal(calls.sendToThread[0][0].chatId, 11)
+  assert.equal(calls.sendToThread[0][0].threadIdOr0, 22)
+  assert.match(calls.sendToThread[0][1], /^🛠 Agent action\nRunning: Read project file\nTool: read_file$/)
+  assert.deepEqual(calls.sendToThread[0][3], { disable_web_page_preview: true })
+
+  await handlers.handleMessagePartUpdated({
+    projectAlias: "demo",
+    props: {
+      sessionID: "ses_1",
+      part: {
+        ...runningPart,
+        state: { status: "completed", title: "Read project file", time: { start: Date.now(), end: Date.now() } },
+      },
+    },
+  })
+
+  assert.equal(calls.sendToThread.length, 2)
+  assert.match(calls.sendToThread[1][1], /^✅ Agent action\nDone: Read project file\nTool: read_file$/)
+  assert.deepEqual(noisy, [])
+  const sets = runtime.forwardedBySession.get(sessionKey("demo", "ses_1"))
+  assert.equal(sets.actions.map.size, 2)
+})
+
+test("handleMessagePartUpdated suppresses tool actions outside verbose feed", async () => {
+  const noisy = []
+  const { calls, runtime, handlers } = createHarness({
+    store: { getFeedMode: () => "main+changes" },
+    recordNoisyEventSkipped: (...args) => noisy.push(args),
+  })
+
+  await handlers.handleMessagePartUpdated({
+    projectAlias: "demo",
+    props: {
+      sessionID: "ses_1",
+      part: {
+        id: "part_1",
+        messageID: "msg_1",
+        type: "tool",
+        tool: "bash",
+        state: { status: "running", title: "Run tests" },
+      },
+    },
+  })
+
+  assert.equal(calls.sendToThread.length, 0)
+  assert.deepEqual(noisy, [["demo", NOISY_SKIP_REASONS.AGENT_ACTION_FEED_FILTERED]])
+  const sets = runtime.forwardedBySession.get(sessionKey("demo", "ses_1"))
+  assert.equal(sets.actions.map.size, 1)
+})
+
+test("handleMessagePartUpdated deduplicates using properties message ids when tool part ids are missing", async () => {
+  const { calls, handlers } = createHarness({
+    store: { getFeedMode: () => "verbose" },
+  })
+  const part = {
+    type: "tool",
+    tool: "bash",
+    state: { status: "running", title: "Run checks" },
+  }
+
+  await handlers.handleMessagePartUpdated({ projectAlias: "demo", props: { sessionID: "ses_1", messageID: "msg_1", time: 100, part } })
+  await handlers.handleMessagePartUpdated({ projectAlias: "demo", props: { sessionID: "ses_1", messageID: "msg_1", time: 200, part } })
+  await handlers.handleMessagePartUpdated({ projectAlias: "demo", props: { sessionID: "ses_1", messageID: "msg_2", time: 300, part } })
+
+  assert.equal(calls.sendToThread.length, 2)
+  assert.match(calls.sendToThread[0][1], /Running: Run checks/)
+  assert.match(calls.sendToThread[1][1], /Running: Run checks/)
+})
+
+test("formatAgentActionText redacts sensitive tool details", () => {
+  const { handlers } = createHarness()
+
+  const text = handlers.formatAgentActionText({
+    id: "part_1",
+    messageID: "msg_1",
+    type: "tool",
+    tool: "fetch",
+    state: {
+      status: "error",
+      title: "GET https://user:pass@example.test/path?token=abc#frag",
+      error: "Authorization: Bearer supersecret token=123456789:replace_me",
+    },
+  })
+
+  assert.match(text, /^⚠️ Agent action\nFailed:/)
+  assert.match(text, /https:\/\/\*\*\*:\*\*\*@example\.test\/path\?token=\*\*\*/)
+  assert.doesNotMatch(text, /user:pass|token=abc|Bearer supersecret|replace_me/)
+})
+
 test("handleMessageUpdated clears an existing assistant preview when the reply fails", async () => {
   const { calls, runtime, handlers } = createHarness()
   runtime.assistantPreviewBySession.set(sessionKey("demo", "ses_1"), {

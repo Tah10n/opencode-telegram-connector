@@ -179,7 +179,7 @@ When opencode asks for a permission decision or a question answer, the connector
 
 - `Main` — final assistant replies only.
 - `Main + changes` — final assistant replies and changed-file cards.
-- `Verbose` — final replies, streaming previews, and changed-file cards.
+- `Verbose` — final replies, streaming previews, agent action/tool-use updates, and changed-file cards.
 
 User messages typed directly in opencode TUI are mirrored separately from `/feed`; enable `mirrorTuiUserMessages: true` or `MIRROR_TUI_USER_MESSAGES=1` to duplicate them into the bound Telegram thread.
 

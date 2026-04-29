@@ -862,6 +862,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     renderChangedFilesView,
     extractAssistantDisplayText,
     deliverAssistantText,
+    handleMessagePartUpdated,
     handleMessageUpdated,
     flushPendingAssistantDeliveries: drainPendingAssistantDeliveries,
   } = mirroringHandlers
@@ -1260,6 +1261,11 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
 
     if (type === "message.updated") {
       await handleMessageUpdated({ projectAlias, props })
+      return false
+    }
+
+    if (type === "message.part.updated") {
+      await handleMessagePartUpdated({ projectAlias, props })
       return false
     }
 

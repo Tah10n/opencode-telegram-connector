@@ -14,6 +14,7 @@ import {
 import { DEFAULT_FEED_MODE, normalizeFeedMode, sessionKey } from "../state/store.js"
 import { ATTACHMENT_NOTICES, attachmentCaption, sanitizeFilenamePart, scopedAttachmentFilename } from "./attachment-utils.js"
 import { NOISY_SKIP_REASONS } from "./noisy-skip-reasons.js"
+import { redactSensitiveText } from "../url-utils.js"
 
 export function createMirroringHandlers(runtime) {
   const {
@@ -52,9 +53,10 @@ export function createMirroringHandlers(runtime) {
   function ensureForwardedSets(sk) {
     let s = forwardedBySession.get(sk)
     if (!s) {
-      s = { user: new LruSet(8000), assistant: new LruSet(8000), changes: new LruSet(8000) }
+      s = { user: new LruSet(8000), assistant: new LruSet(8000), changes: new LruSet(8000), actions: new LruSet(8000) }
       forwardedBySession.set(sk, s)
     }
+    if (!s.actions) s.actions = new LruSet(8000)
     return s
   }
 
@@ -128,7 +130,7 @@ export function createMirroringHandlers(runtime) {
     if (kind === "internal") return false
     if (mode === "main") return kind === "assistant-final"
     if (mode === "main+changes") return kind === "assistant-final" || kind === "changed-files"
-    return kind === "assistant-final" || kind === "assistant-stream" || kind === "changed-files"
+    return kind === "assistant-final" || kind === "assistant-stream" || kind === "changed-files" || kind === "agent-action"
   }
 
   function renderFeedSettingsText(ctxKey) {
@@ -138,7 +140,7 @@ export function createMirroringHandlers(runtime) {
       "",
       "Main — final assistant replies only.",
       "Main + changes — final assistant replies and changed files.",
-      "Verbose — final replies, streaming previews, and changed files.",
+      "Verbose — final replies, streaming previews, agent actions, and changed files.",
       "TUI user-message mirroring is controlled by the runtime mirrorTuiUserMessages setting.",
       "",
       "Internal compaction output stays hidden in all modes.",
@@ -223,6 +225,89 @@ export function createMirroringHandlers(runtime) {
     const files = extractPatchFiles(msg)
     if (!files.length) return ""
     return formatChangedFilesText(files, { baseDir: projects?.[projectAlias]?.directory, limit: CHANGED_FILES_LIMIT })
+  }
+
+  function normalizeAgentActionStatus(status) {
+    const normalized = String(status || "").trim().toLowerCase()
+    if (normalized === "running" || normalized === "completed" || normalized === "error") return normalized
+    return ""
+  }
+
+  function compactAgentActionText(value, { fallback = "", max = 180 } = {}) {
+    let text = redactSensitiveText(String(value ?? ""))
+      .replace(/\b(token|password|passwd|secret|api[_-]?key|authorization)\s*[:=]\s*\S+/gi, "$1=***")
+      .replace(/\s+/g, " ")
+      .trim()
+    if (!text) text = fallback
+    if (!text) return ""
+    if (text.length > max) text = `${text.slice(0, Math.max(0, max - 1))}…`
+    return text
+  }
+
+  function formatToolName(tool) {
+    const raw = String(tool || "").trim()
+    if (!raw) return "tool"
+    return raw.replace(/[_-]+/g, " ")
+  }
+
+  function agentActionStatusLabel(status) {
+    if (status === "running") return "Running"
+    if (status === "completed") return "Done"
+    return "Failed"
+  }
+
+  function agentActionIcon(status) {
+    if (status === "running") return "🛠"
+    if (status === "completed") return "✅"
+    return "⚠️"
+  }
+
+  function formatAgentActionText(part) {
+    if (part?.type !== "tool") return ""
+    const status = normalizeAgentActionStatus(part?.state?.status)
+    if (!status) return ""
+
+    const toolName = compactAgentActionText(part.tool, { fallback: "tool", max: 80 })
+    const title = compactAgentActionText(part?.state?.title || part?.metadata?.title || part?.state?.metadata?.title, {
+      fallback: formatToolName(toolName),
+      max: 180,
+    })
+    const lines = [`${agentActionIcon(status)} Agent action`, `${agentActionStatusLabel(status)}: ${title}`]
+    if (toolName && toolName.toLowerCase() !== title.toLowerCase()) lines.push(`Tool: ${toolName}`)
+    if (status === "error") {
+      const errorText = compactAgentActionText(part?.state?.error, { max: 240 })
+      if (errorText) lines.push(`Error: ${errorText}`)
+    }
+    return lines.join("\n")
+  }
+
+  function stableHash(value) {
+    let text = ""
+    try {
+      text = JSON.stringify(value ?? null)
+    } catch {
+      text = String(value ?? "")
+    }
+    return crypto.createHash("sha1").update(text, "utf8").digest("hex").slice(0, 12)
+  }
+
+  function fallbackAgentActionPartId(part, props) {
+    const state = part?.state || {}
+    const stateTime = state.time || {}
+    const identity = [part?.tool || "tool", stateTime.start ?? "", state.raw ?? "", state.input ?? null]
+    if (!stateTime.start && !state.raw && state.input == null) identity.push(state.title ?? part?.metadata?.title ?? state.metadata?.title ?? part?.time ?? "")
+    return `tool:${stableHash(identity)}`
+  }
+
+  function agentActionForwardKey(messageId, partId, status) {
+    return `${messageId}:${partId}:${status}`
+  }
+
+  function partEventTimeInfo(part, props) {
+    const stateTime = part?.state?.time || {}
+    const created = stateTime.start ?? props?.time ?? part?.time
+    const completed = stateTime.end ?? (part?.state?.status === "completed" || part?.state?.status === "error" ? props?.time : undefined)
+    return { time: { created, updated: props?.time, completed } }
   }
 
   async function loadChangedFilesDiffData(oc, sessionId, msg) {
@@ -557,6 +642,58 @@ export function createMirroringHandlers(runtime) {
     return { mode: "sent" }
   }
 
+  async function handleMessagePartUpdated({ projectAlias, props }) {
+    if (isStopping()) return
+    const part = props?.part
+    if (part?.type !== "tool") return
+
+    const sessionId = props?.sessionID || part.sessionID || part.sessionId
+    const messageId = String(part.messageID || part.messageId || props?.messageID || props?.messageId || "")
+    const partId = String(part.id || part.callID || part.callId || fallbackAgentActionPartId(part, props))
+    const status = normalizeAgentActionStatus(part?.state?.status)
+    if (!sessionId || !partId || !status) return
+
+    logSseDebug(projectAlias, sessionId, `event type=message.part.updated part=tool status=${status} msg=${messageId || "unknown"} part=${partId}`)
+
+    const text = formatAgentActionText(part)
+    if (!text) return
+
+    const sk = sessionKey(projectAlias, sessionId)
+    const resolved = await resolveBoundRoute(projectAlias, sessionId)
+    if (!resolved?.route) {
+      logSseDebug(projectAlias, sessionId, "drop=agent_action_no_route")
+      return
+    }
+    if (!eventStartedAfterLaunch(partEventTimeInfo(part, props), { allowCompletedAfterStart: true })) {
+      logSseDebug(projectAlias, sessionId, `drop=agent_action_before_start part=${partId}`)
+      return
+    }
+    if (resolved.boundSessionId !== sessionId) {
+      logSseDebug(projectAlias, sessionId, `drop=agent_action_child bound=${resolved.boundSessionId}`)
+      return
+    }
+
+    const route = resolved.route
+    const routeCtx = { chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey: ctxKeyFrom(route.chatId, route.threadIdOr0) }
+    const sets = ensureForwardedSets(sk)
+    const forwardKey = agentActionForwardKey(messageId, partId, status)
+    if (sets.actions.has(forwardKey)) {
+      logSseDebug(projectAlias, sessionId, `drop=agent_action_already_forwarded part=${partId} status=${status}`)
+      return
+    }
+
+    if (!shouldMirrorToFeed(routeCtx.ctxKey, "agent-action")) {
+      sets.actions.add(forwardKey)
+      logSseDebug(projectAlias, sessionId, `drop=agent_action_feed part=${partId} mode=${getFeedMode(routeCtx.ctxKey)}`)
+      recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.AGENT_ACTION_FEED_FILTERED)
+      return
+    }
+
+    await sendToThread(routeCtx, text, null, { disable_web_page_preview: true })
+    sets.actions.add(forwardKey)
+    logSseDebug(projectAlias, sessionId, `send=agent_action part=${partId} status=${status} thread=${route.threadIdOr0 || 0}`)
+  }
+
   async function handleMessageUpdated({ projectAlias, props }) {
     if (isStopping()) return
     const sessionId = props.sessionID
@@ -861,6 +998,8 @@ export function createMirroringHandlers(runtime) {
     assistantAttachmentName,
     buildAssistantStreamPreviewHtml,
     deliverAssistantText,
+    formatAgentActionText,
+    handleMessagePartUpdated,
     handleMessageUpdated,
     flushPendingAssistantDeliveries,
   }

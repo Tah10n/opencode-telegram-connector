@@ -10,4 +10,5 @@ export const NOISY_SKIP_REASONS = Object.freeze({
   ASSISTANT_COMPACTION: "assistant-compaction",
   ASSISTANT_EMPTY: "assistant-empty",
   CHANGED_FILES_FEED_FILTERED: "changed-files-feed-filtered",
+  AGENT_ACTION_FEED_FILTERED: "agent-action-feed-filtered",
 })
