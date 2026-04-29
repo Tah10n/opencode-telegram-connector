@@ -35,8 +35,22 @@ export async function resolveModelProviderCatalog(oc, ...fallbackEntries) {
     return created
   }
 
-  function addModel(providerId, providerName, modelValue, modelName = "") {
-    const model = normalizeModelReference(modelValue)
+  function normalizeProviderModelReference(providerId, modelValue, modelIdHint = "") {
+    const normalized = normalizeModelReference(modelValue)
+    if (normalized) return normalized
+
+    const normalizedProviderId = trimString(providerId)
+    if (!normalizedProviderId) return null
+
+    const modelId =
+      typeof modelValue === "string"
+        ? trimString(modelValue)
+        : trimString(modelValue?.modelID || modelValue?.modelId || modelValue?.model || modelValue?.id || modelIdHint)
+    return modelId ? { providerID: normalizedProviderId, modelID: modelId } : null
+  }
+
+  function addModel(providerId, providerName, modelValue, modelName = "", { providerContext = false, modelIdHint = "" } = {}) {
+    const model = providerContext ? normalizeProviderModelReference(providerId, modelValue, modelIdHint) : normalizeModelReference(modelValue)
     if (!model) return
     const provider = ensureProvider(model.providerID || providerId, providerName)
     if (!provider) return
@@ -59,7 +73,9 @@ export async function resolveModelProviderCatalog(oc, ...fallbackEntries) {
       const models = providerEntry?.models
       if (Array.isArray(models)) {
         for (const modelEntry of models) {
-          addModel(providerId, providerName, modelEntry, modelEntry?.name || modelEntry?.id || modelEntry?.modelID || modelEntry?.modelId)
+          addModel(providerId, providerName, modelEntry, modelEntry?.name || modelEntry?.id || modelEntry?.modelID || modelEntry?.modelId, {
+            providerContext: true,
+          })
         }
         continue
       }
@@ -72,7 +88,7 @@ export async function resolveModelProviderCatalog(oc, ...fallbackEntries) {
               providerID: providerId,
               modelID: trimString(modelEntry?.id || modelEntry?.modelID || modelEntry?.modelId || modelId),
             })
-          addModel(providerId, providerName, normalizedModel, modelEntry?.name || modelId)
+          addModel(providerId, providerName, normalizedModel, modelEntry?.name || modelId, { providerContext: true, modelIdHint: modelId })
         }
       }
     }

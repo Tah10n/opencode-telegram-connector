@@ -30,6 +30,7 @@ test("normalizeModelReference parses object form", () => {
   assert.deepEqual(normalizeModelReference({ providerId: "openai", modelId: "gpt-4" }), { providerID: "openai", modelID: "gpt-4" })
   assert.deepEqual(normalizeModelReference({ provider: "google", model: "gemini" }), { providerID: "google", modelID: "gemini" })
   assert.equal(normalizeModelReference({ providerID: "", modelID: "x" }), null)
+  assert.equal(normalizeModelReference({ id: "gpt-5", name: "GPT-5" }), null)
 })
 
 test("modelKeyOf returns provider/model string", () => {

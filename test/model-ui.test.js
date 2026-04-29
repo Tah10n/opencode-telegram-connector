@@ -61,3 +61,24 @@ test("resolveModelProviderCatalog merges provider config with fallback models", 
   assert.deepEqual(catalog.map((provider) => provider.id), ["anthropic", "openai"])
   assert.deepEqual(catalog.find((provider) => provider.id === "openai")?.models.map((model) => model.key), ["openai/gpt-5"])
 })
+
+test("resolveModelProviderCatalog accepts bare provider model entries", async () => {
+  const catalog = await resolveModelProviderCatalog({
+    getConfigProviders: async () => ({
+      providers: [
+        {
+          id: "openai",
+          name: "OpenAI",
+          models: ["gpt-5", { id: "o3", name: "O3" }],
+        },
+      ],
+    }),
+  })
+
+  const openai = catalog.find((provider) => provider.id === "openai")
+  assert.deepEqual(openai?.models.map((model) => model.model), [
+    { providerID: "openai", modelID: "gpt-5" },
+    { providerID: "openai", modelID: "o3" },
+  ])
+  assert.deepEqual(openai?.models.map((model) => model.name), ["gpt-5", "O3"])
+})
