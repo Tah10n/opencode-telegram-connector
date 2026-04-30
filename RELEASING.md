@@ -16,7 +16,7 @@ Use this checklist before a release.
 
 ## Verification
 
-Run:
+From this package directory, run:
 
 ```sh
 npm run setup:check
