@@ -262,7 +262,7 @@ test("createOverviewHelpers offers a Start button for Linux TUI auto-start proje
   assert.equal(sent[0].replyMarkup.inline_keyboard[0][0].callback_data, "srv|demo|start")
 })
 
-test("createOverviewHelpers hides the Start button for Linux TUI auto-start projects without GUI launcher support", async (t) => {
+test("createOverviewHelpers offers the Start button for Linux background auto-start projects without GUI launcher support", async (t) => {
   swapEnv(t, { DISPLAY: undefined, WAYLAND_DISPLAY: undefined, PATH: "", OPENCODE_TERMINAL: undefined })
 
   const sent = []
@@ -294,10 +294,11 @@ test("createOverviewHelpers hides the Start button for Linux TUI auto-start proj
   await helpers.notifyProjectUnavailable("demo", new Error("fetch failed"), { platform: "linux" })
 
   assert.equal(sent.length, 1)
-  assert.equal(sent[0].replyMarkup, null)
+  assert.ok(sent[0].replyMarkup)
+  assert.equal(sent[0].replyMarkup.inline_keyboard[0][0].callback_data, "srv|demo|start")
 })
 
-test("createOverviewHelpers hides the Start button for macOS SSH sessions", async (t) => {
+test("createOverviewHelpers offers the Start button for macOS SSH background auto-start projects", async (t) => {
   const fakeBin = makeFakeLauncherDir(t, "osascript")
   swapEnv(t, { PATH: fakeBin, SSH_CONNECTION: "ci-session", SSH_TTY: "/dev/ttys001" })
 
@@ -328,6 +329,43 @@ test("createOverviewHelpers hides the Start button for macOS SSH sessions", asyn
   })
 
   await helpers.notifyProjectUnavailable("demo", new Error("fetch failed"), { platform: "darwin" })
+
+  assert.equal(sent.length, 1)
+  assert.ok(sent[0].replyMarkup)
+  assert.equal(sent[0].replyMarkup.inline_keyboard[0][0].callback_data, "srv|demo|start")
+})
+
+test("createOverviewHelpers hides the Start button for window-mode projects without GUI launcher support", async (t) => {
+  swapEnv(t, { DISPLAY: undefined, WAYLAND_DISPLAY: undefined, PATH: "", OPENCODE_TERMINAL: undefined })
+
+  const sent = []
+  const helpers = createOverviewHelpers({
+    projects: {
+      demo: {
+        baseUrl: "http://127.0.0.1:4312",
+        autoStart: true,
+        serverLaunchMode: "window",
+        directory: "/demo",
+        port: 4312,
+        openTuiOnAutoStart: true,
+      },
+    },
+    store: {
+      get: () => ({
+        bindings: {
+          "100:7": { projectAlias: "demo", sessionId: "ses_demo_1" },
+        },
+      }),
+    },
+    startInProgress: new Map(),
+    parseCtxKey: (ctxKey) => ({ chatId: 100, threadIdOr0: 7, ctxKey }),
+    sendToThread: async (ctx, text, replyMarkup) => {
+      sent.push({ ctx, text, replyMarkup })
+    },
+    cb: { pack: (value) => value },
+  })
+
+  await helpers.notifyProjectUnavailable("demo", new Error("fetch failed"), { platform: "linux" })
 
   assert.equal(sent.length, 1)
   assert.equal(sent[0].replyMarkup, null)
