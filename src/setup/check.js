@@ -111,9 +111,6 @@ function autoStartReason(support) {
   if (support.canLaunchServerWindow !== true) {
     return `serverLaunchMode '${support.serverLaunchMode}' is not supported on this platform`
   }
-  if (support.openTuiOnAutoStart === true && support.canOpenAttachWindow !== true) {
-    return "openTuiOnAutoStart requires an attach window on this platform"
-  }
   return "manual start may still be required on this platform"
 }
 
@@ -139,6 +136,9 @@ function describeAutoStart({ project, support, directoryStatus, commandAvailable
     details.push(`directory ${project.directory}${suffix}`)
   }
   if (project.port) details.push(`port ${project.port}`)
+  if (support.openTuiOnAutoStart === true) {
+    details.push(support.canAutoOpenTui === true ? "TUI auto-open supported" : "TUI auto-open unavailable")
+  }
 
   const summary = support.canAutoStart === true ? "supported" : autoStartReason(support)
   return `${summary}${details.length ? `; ${details.join(", ")}` : ""}`
