@@ -1730,9 +1730,9 @@ test("startConnector applies feed modes per thread for assistant, user, and chan
     assert.ok(htmlByThread.some((entry) => entry.threadId === 7 && entry.first === "Main answer"))
     assert.ok(htmlByThread.some((entry) => entry.threadId === 9 && entry.first === "Changes answer"))
     assert.ok(harness.tg.editedMessages.some((entry) => entry.kind === "text" && entry.messageId && entry.text === "Verbose answer"))
-    assert.ok(!htmlByThread.some((entry) => entry.threadId === 7 && entry.first === "<b>User</b>"))
-    assert.ok(!htmlByThread.some((entry) => entry.threadId === 9 && entry.first === "<b>User</b>"))
-    assert.ok(!htmlByThread.some((entry) => entry.threadId === 11 && entry.first === "<b>User</b>"))
+    assert.ok(!htmlByThread.some((entry) => entry.threadId === 7 && entry.first?.startsWith("<i>User:</i>")))
+    assert.ok(!htmlByThread.some((entry) => entry.threadId === 9 && entry.first?.startsWith("<i>User:</i>")))
+    assert.ok(!htmlByThread.some((entry) => entry.threadId === 11 && entry.first?.startsWith("<i>User:</i>")))
 
     assert.ok(textByThread.some((entry) => entry.threadId === 9 && /Changed files:/.test(entry.text)))
     assert.ok(textByThread.some((entry) => entry.threadId === 11 && entry.text === "Streaming verbose reply"))
@@ -1767,9 +1767,9 @@ test("startConnector mirrors TUI user messages when runtime setting is enabled",
   try {
     await harness.emitSse("demo", { type: "message.updated", properties: { sessionID: "ses_main", info: { id: "user_main", role: "user", time: { completed: completedAt } } } })
 
-    await waitFor(() => harness.tg.sentHtmlBlocks.some((entry) => entry.options.message_thread_id === 7 && entry.blocks[0]?.html === "<b>User</b>"))
-    const mirrored = harness.tg.sentHtmlBlocks.find((entry) => entry.options.message_thread_id === 7 && entry.blocks[0]?.html === "<b>User</b>")
-    assert.ok(mirrored.blocks.some((block) => /typed in tui/.test(block.html)))
+    await waitFor(() => harness.tg.sentHtmlBlocks.some((entry) => entry.options.message_thread_id === 7 && entry.blocks[0]?.html === "<i>User:</i>\ntyped in tui"))
+    const mirrored = harness.tg.sentHtmlBlocks.find((entry) => entry.options.message_thread_id === 7 && entry.blocks[0]?.html === "<i>User:</i>\ntyped in tui")
+    assert.equal(mirrored.blocks.length, 1)
   } finally {
     await harness.connector.stop()
   }

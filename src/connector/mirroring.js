@@ -1075,7 +1075,10 @@ export function createMirroringHandlers(runtime) {
         recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.USER_MIRROR_DISABLED)
         return
       }
-      const blocks = [{ type: "text", html: "<b>User</b>" }, ...formatMarkdownToTelegramHtmlBlocks(text)]
+      const blocks = formatMarkdownToTelegramHtmlBlocks(text)
+      if (blocks.length > 0) {
+        blocks[0] = { ...blocks[0], html: `<i>User:</i>\n${blocks[0].html}` }
+      }
       await tg.sendHtmlBlocks(route.chatId, blocks, null, { message_thread_id: route.threadIdOr0 || undefined })
       sets.user.add(info.id)
       logSseDebug(projectAlias, sessionId, `send=user msg=${info.id} thread=${route.threadIdOr0 || 0}`)
