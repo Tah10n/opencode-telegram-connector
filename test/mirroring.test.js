@@ -244,7 +244,8 @@ test("handleMessageUpdated mirrors TUI user messages independently of feed mode"
 
   assert.equal(calls.sendHtmlBlocks.length, 1)
   assert.equal(calls.sendHtmlBlocks[0][0], 11)
-  assert.equal(calls.sendHtmlBlocks[0][1][0].html, "<b>User</b>")
+  assert.equal(calls.sendHtmlBlocks[0][1].length, 1)
+  assert.equal(calls.sendHtmlBlocks[0][1][0].html, "<i>User:</i>\ntyped in tui")
   assert.equal(calls.sendHtmlBlocks[0][3].message_thread_id, 22)
 })
 
