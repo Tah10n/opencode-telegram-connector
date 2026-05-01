@@ -329,13 +329,13 @@ test("getLaunchSupport reports cross-platform TUI and attach support", (t) => {
     },
   )
 
-  assert.equal(
-    getLaunchSupport({
-      project: { autoStart: true, openTuiOnAutoStart: true, directory: "/repo", port: 4312 },
-      platform: "freebsd",
-    }).canAutoStart,
-    false,
-  )
+  const backgroundOnOtherPlatform = getLaunchSupport({
+    project: { autoStart: true, openTuiOnAutoStart: true, directory: "/repo", port: 4312 },
+    platform: "freebsd",
+  })
+  assert.equal(backgroundOnOtherPlatform.canAutoStart, true)
+  assert.equal(backgroundOnOtherPlatform.canOpenAttachWindow, false)
+  assert.equal(backgroundOnOtherPlatform.canAutoOpenTui, false)
 
   const configured = getLaunchSupport({
     project: {
@@ -351,7 +351,7 @@ test("getLaunchSupport reports cross-platform TUI and attach support", (t) => {
   assert.equal(configured.openTuiOnAutoStart, false)
 })
 
-test("getLaunchSupport disables Linux TUI/window auto-start without GUI launcher support", (t) => {
+test("getLaunchSupport allows Linux background auto-start without GUI launcher support", (t) => {
   swapEnv(t, { DISPLAY: undefined, WAYLAND_DISPLAY: undefined, PATH: "", OPENCODE_TERMINAL: undefined })
 
   const tui = getLaunchSupport({
@@ -359,7 +359,8 @@ test("getLaunchSupport disables Linux TUI/window auto-start without GUI launcher
     platform: "linux",
   })
   assert.equal(tui.canOpenAttachWindow, false)
-  assert.equal(tui.canAutoStart, false)
+  assert.equal(tui.canAutoOpenTui, false)
+  assert.equal(tui.canAutoStart, true)
 
   const backgroundOnly = getLaunchSupport({
     project: { autoStart: true, openTuiOnAutoStart: false, serverLaunchMode: "background", directory: "/repo", port: 4312 },
@@ -382,7 +383,7 @@ test("getLaunchSupport honors OPENCODE_TERMINAL on Linux when the preferred laun
   assert.equal(support.canAutoStart, true)
 })
 
-test("getLaunchSupport disables macOS attach auto-start in SSH sessions", (t) => {
+test("getLaunchSupport allows macOS background auto-start in SSH sessions without attach auto-open", (t) => {
   const fakeBin = makeFakeLauncherDir(t, "osascript")
   swapEnv(t, { PATH: fakeBin, SSH_CONNECTION: "ci-session", SSH_TTY: "/dev/ttys001" })
 
@@ -392,7 +393,8 @@ test("getLaunchSupport disables macOS attach auto-start in SSH sessions", (t) =>
   })
 
   assert.equal(support.canOpenAttachWindow, false)
-  assert.equal(support.canAutoStart, false)
+  assert.equal(support.canAutoOpenTui, false)
+  assert.equal(support.canAutoStart, true)
 })
 
 test("startOpenCodeServeInNewWindowWindows normalizes style and enables debug flags", async (t) => {
@@ -736,6 +738,7 @@ test("ensureOpenCodeRunning skips auto-open after start when the baseUrl is sens
 
   const result = await ensureOpenCodeRunning({
     projectAlias: "demo",
+    platform: "win32",
     project: {
       autoStart: true,
       openTuiOnAutoStart: true,
@@ -787,6 +790,7 @@ test("ensureOpenCodeRunning waits for a running TUI to bring the server back", a
 
   const result = await ensureOpenCodeRunning({
     projectAlias: "demo",
+    platform: "win32",
     project: {
       autoStart: true,
       openTuiOnAutoStart: true,
@@ -874,10 +878,10 @@ test("ensureOpenCodeRunning starts background serve mode on Windows and returns 
 
   const result = await ensureOpenCodeRunning({
     projectAlias: "demo",
+    platform: "win32",
     project: {
       autoStart: true,
       serverLaunchMode: "background",
-      openTuiOnAutoStart: false,
       openTuiOnAutoStart: false,
       directory: "C:\\repo",
       port: 4312,
@@ -998,8 +1002,9 @@ test("ensureOpenCodeRunning starts detached serve plus TUI attach on Linux", asy
   assert.deepEqual(killCalls, [[777, "SIGTERM"]])
 })
 
-test("ensureOpenCodeRunning starts detached serve mode on non-Windows platforms", async (t) => {
+test("ensureOpenCodeRunning starts detached serve mode on non-Windows platforms without attach support", async (t) => {
   usePatchedPlatform(t, "linux")
+  swapEnv(t, { DISPLAY: undefined, WAYLAND_DISPLAY: undefined, PATH: "", OPENCODE_TERMINAL: undefined })
   const calls = useSpawnPlans(t, [{ pid: 777, close: false }])
   const killCalls = []
   usePatchedProcessKill(t, (...args) => {
@@ -1019,7 +1024,7 @@ test("ensureOpenCodeRunning starts detached serve mode on non-Windows platforms"
     projectAlias: "demo",
     project: {
       autoStart: true,
-      openTuiOnAutoStart: false,
+      openTuiOnAutoStart: true,
       directory: "/repo",
       port: 4312,
     },
@@ -1032,6 +1037,7 @@ test("ensureOpenCodeRunning starts detached serve mode on non-Windows platforms"
   assert.equal(calls[0].command, "opencode")
   assert.equal(calls[0].options.detached, true)
   assert.equal(calls[0].child.unrefCalled, true)
+  assert.equal(calls.length, 1)
 
   await result.stop()
   assert.deepEqual(killCalls, [[777, "SIGTERM"]])

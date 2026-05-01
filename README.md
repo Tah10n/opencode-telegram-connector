@@ -288,7 +288,7 @@ Before writing logs, the connector redacts bot tokens, Basic Auth credentials, U
 
 - **Windows**, **macOS**, and **Linux desktop** environments support local auto-start and optional attach/TUI windows.
 - On Linux, the connector tries `OPENCODE_TERMINAL` first and then common terminal emulators from `PATH`.
-- In headless Linux/macOS environments, local auto-start still works for server-only configs with `openTuiOnAutoStart: false`, but opening a new terminal window still requires an available GUI/terminal launcher.
+- In headless Linux/macOS environments, local background auto-start can still start the opencode server; `openTuiOnAutoStart` is best-effort and only opens a terminal window when a GUI/terminal launcher is available.
 - For long-running service examples on each platform, see [Running under a supervisor](#running-under-a-supervisor).
 
 ## Running under a supervisor

@@ -75,7 +75,7 @@ export function getLaunchSupport({ project, platform = process.platform } = {}) 
   const autoStartConfigured = project?.autoStart === true && !!project?.directory && !!project?.port
   const canOpenAttachWindow = canOpenAttachWindowOnPlatform(platform)
   const canLaunchServerWindow = serverLaunchMode === "background" || canOpenAttachWindow
-  const canAutoStart = autoStartConfigured && canLaunchServerWindow && (!openTuiOnAutoStart || canOpenAttachWindow)
+  const canAutoStart = autoStartConfigured && canLaunchServerWindow
   return {
     serverLaunchMode,
     openTuiOnAutoStart,
