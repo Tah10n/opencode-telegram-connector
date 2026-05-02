@@ -2233,6 +2233,62 @@ test("startConnector retries reject-note input after a transient permission repl
   }
 })
 
+test("startConnector does not submit recovered child reject-note while route check is retryable", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 364,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_other" },
+      },
+      sessionIndex: {
+        "demo:ses_other": { chatId: 100, threadIdOr0: 7 },
+      },
+      pendingPrompts: {
+        permissions: {
+          "demo:ses_child:perm_child_note": {
+            projectAlias: "demo",
+            permissionId: "perm_child_note",
+            sessionID: "ses_child",
+            permission: "shell",
+            patterns: ["npm test"],
+            ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+            createdAt: Date.now(),
+          },
+        },
+        rejectNotes: {
+          "100:7": { projectAlias: "demo", permissionId: "perm_child_note", sessionID: "ses_child" },
+        },
+        customAnswers: {},
+        questionWizards: {},
+      },
+    },
+    ocOptions: {
+      getSessionImpl: async () => {
+        throw makeBoundaryError({
+          source: "opencode",
+          operation: "GET /session/ses_child",
+          method: "GET",
+          pathname: "/session/ses_child",
+          status: 503,
+          outcome: "retryable",
+          message: "session lookup unavailable",
+        })
+      },
+    },
+    initialUpdates: [[makeMessageUpdate(365, "because it is unsafe")]],
+  })
+
+  try {
+    await waitFor(() => harness.tg.sentMessages.some((entry) => /Permission reply is temporarily unavailable/.test(entry.text)))
+    await delay(30)
+
+    assert.deepEqual(harness.ocCalls.replyPermission, [])
+    assert.deepEqual(harness.ocCalls.promptAsync, [])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
 test("startConnector restores pending question custom-answer flows after restart", async () => {
   const request = {
     id: "q_restore",
@@ -2643,6 +2699,142 @@ test("startConnector delivers permission prompts and handles allow callbacks", a
     assert.deepEqual(harness.ocCalls.replyPermission, [{ permissionId: "perm_1", payload: { reply: "once" } }])
     assert.deepEqual(harness.tg.callbackAnswers, [{ callbackQueryId: "cb_301", text: "OK" }])
     assert.deepEqual(harness.tg.deletedMessages, [{ chatId: 100, messageId: promptMessageId }])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector retries child-session permission prompts after parent becomes visible", async () => {
+  const permission = { id: "perm_child_late_parent", sessionID: "ses_child", permission: "shell", patterns: ["npm test"] }
+  let parentVisible = false
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 305,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_root" },
+      },
+      sessionIndex: {
+        "demo:ses_root": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    ocOptions: {
+      getSessionImpl: async (sessionId) => {
+        if (sessionId === "ses_child") return { id: sessionId, parentID: parentVisible ? "ses_root" : null }
+        return { id: sessionId, parentID: null }
+      },
+      listPermissionsImpl: async () => [],
+    },
+  })
+
+  try {
+    await harness.emitSse("demo", { type: "permission.asked", properties: permission })
+    await delay(30)
+    assert.equal(harness.tg.sentHtmlBlocks.filter((entry) => entry.blocks.some((block) => /perm_child_late_parent/.test(block.html))).length, 0)
+
+    parentVisible = true
+    await harness.emitSse("demo", { type: "permission.asked", properties: permission })
+
+    await waitFor(() => harness.tg.sentHtmlBlocks.some((entry) => entry.blocks.some((block) => /perm_child_late_parent/.test(block.html))))
+    const state = await readState(harness.stateFile)
+    assert.ok(state.pendingPrompts.permissions["demo:ses_child:perm_child_late_parent"])
+    assert.deepEqual(harness.ocCalls.getSession, ["ses_child", "ses_child"])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector delivers permission prompts from nested child sessions", async () => {
+  const permissions = [
+    { id: "perm_subagent", sessionID: "ses_subagent", permission: "shell", patterns: ["npm test"] },
+    { id: "perm_subsubagent", sessionID: "ses_subsubagent", permission: "shell", patterns: ["npm run check"] },
+  ]
+  const parents = new Map([
+    ["ses_subagent", "ses_root"],
+    ["ses_subsubagent", "ses_subagent"],
+  ])
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 306,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_root" },
+      },
+      sessionIndex: {
+        "demo:ses_root": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    ocOptions: {
+      getSessionImpl: async (sessionId) => ({ id: sessionId, parentID: parents.get(sessionId) || null }),
+      listPermissionsImpl: async () => [],
+    },
+  })
+
+  try {
+    for (const permission of permissions) {
+      await harness.emitSse("demo", { type: "permission.asked", properties: permission })
+    }
+
+    await waitFor(() => permissions.every((permission) => harness.tg.sentHtmlBlocks.some((entry) => entry.blocks.some((block) => new RegExp(permission.id).test(block.html)))))
+    const state = await readState(harness.stateFile)
+    for (const permission of permissions) {
+      assert.ok(state.pendingPrompts.permissions[`demo:${permission.sessionID}:${permission.id}`])
+    }
+
+    for (let index = 0; index < permissions.length; index += 1) {
+      const permission = permissions[index]
+      const prompt = harness.tg.sentHtmlBlocks.find((entry) => entry.blocks.some((block) => new RegExp(permission.id).test(block.html)))
+      harness.tg.enqueue(makeCallbackUpdate(307 + index, `p|demo|${permission.sessionID}|${permission.id}|once`, { messageId: prompt.result.message_id }))
+    }
+
+    await waitFor(() => harness.ocCalls.replyPermission.length === permissions.length)
+    assert.deepEqual(harness.ocCalls.replyPermission, permissions.map((permission) => ({ permissionId: permission.id, payload: { reply: "once" } })))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector restores child-session permission prompts through ancestor bindings", async () => {
+  const permission = { id: "perm_restore_subsubagent", sessionID: "ses_subsubagent", permission: "shell", patterns: ["npm test"] }
+  const parents = new Map([
+    ["ses_subagent", "ses_root"],
+    ["ses_subsubagent", "ses_subagent"],
+  ])
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 309,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_root" },
+      },
+      sessionIndex: {
+        "demo:ses_root": { chatId: 100, threadIdOr0: 7 },
+      },
+      pendingPrompts: {
+        permissions: {
+          "demo:ses_subsubagent:perm_restore_subsubagent": {
+            projectAlias: "demo",
+            permissionId: permission.id,
+            sessionID: permission.sessionID,
+            permission: permission.permission,
+            patterns: permission.patterns,
+            ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+            createdAt: Date.now(),
+          },
+        },
+        rejectNotes: {},
+        customAnswers: {},
+        questionWizards: {},
+      },
+    },
+    ocOptions: {
+      getSessionImpl: async (sessionId) => ({ id: sessionId, parentID: parents.get(sessionId) || null }),
+      listPermissionsImpl: async () => [permission],
+      listQuestionsImpl: async () => [],
+    },
+  })
+
+  try {
+    await waitFor(() => harness.tg.sentHtmlBlocks.some((entry) => entry.blocks.some((block) => /perm_restore_subsubagent/.test(block.html))))
+    const state = await readState(harness.stateFile)
+    assert.ok(state.pendingPrompts.permissions["demo:ses_subsubagent:perm_restore_subsubagent"])
   } finally {
     await harness.connector.stop()
   }

@@ -80,6 +80,66 @@ test("resolveSessionRoute caches parent lookups", async () => {
   assert.equal(second.boundSessionId, "ses_parent")
 })
 
+test("resolveSessionRoute does not cache missing parent lookups", async () => {
+  const sessionIndex = {
+    "demo:ses_parent": { chatId: 10, threadIdOr0: 20 },
+  }
+  let getSessionCalls = 0
+  const parentBySessionKey = new Map()
+
+  const first = await resolveSessionRoute({
+    projectAlias: "demo",
+    sessionId: "ses_child",
+    sessionIndex,
+    getSession: async () => {
+      getSessionCalls += 1
+      return { parentID: null }
+    },
+    parentBySessionKey,
+  })
+
+  const second = await resolveSessionRoute({
+    projectAlias: "demo",
+    sessionId: "ses_child",
+    sessionIndex,
+    getSession: async () => {
+      getSessionCalls += 1
+      return { parentID: "ses_parent" }
+    },
+    parentBySessionKey,
+  })
+
+  assert.equal(first, null)
+  assert.equal(getSessionCalls, 2)
+  assert.deepEqual(second, {
+    route: { chatId: 10, threadIdOr0: 20 },
+    boundSessionId: "ses_parent",
+  })
+})
+
+test("resolveSessionRoute inherits route through multiple ancestors", async () => {
+  const sessionIndex = {
+    "demo:ses_root": { chatId: 10, threadIdOr0: 20 },
+  }
+  const parents = new Map([
+    ["ses_child", "ses_parent"],
+    ["ses_parent", "ses_root"],
+  ])
+
+  const result = await resolveSessionRoute({
+    projectAlias: "demo",
+    sessionId: "ses_child",
+    sessionIndex,
+    getSession: async (sessionId) => ({ parentID: parents.get(sessionId) || null }),
+    parentBySessionKey: new Map(),
+  })
+
+  assert.deepEqual(result, {
+    route: { chatId: 10, threadIdOr0: 20 },
+    boundSessionId: "ses_root",
+  })
+})
+
 test("resolveSessionRoute propagates and does not cache retryable lookup failures", async () => {
   const sessionIndex = {
     "demo:ses_parent": { chatId: 10, threadIdOr0: 20 },

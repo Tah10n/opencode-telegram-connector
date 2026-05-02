@@ -1,8 +1,6 @@
 import { sessionKey } from "./state/store.js"
 import { isRetryableBoundaryError } from "./boundary-errors.js"
 
-const NO_PARENT = ""
-
 export async function resolveSessionRoute({ projectAlias, sessionId, sessionIndex, getSession, parentBySessionKey, maxDepth = 8, debug } = {}) {
   if (!projectAlias || !sessionId) return null
 
@@ -36,8 +34,8 @@ export async function resolveSessionRoute({ projectAlias, sessionId, sessionInde
         debug?.(`route miss session=${currentSessionId} reason=session_lookup_failed`)
         return null
       }
-      parentSessionId = typeof session.parentID === "string" && session.parentID.trim() ? session.parentID.trim() : NO_PARENT
-      parentBySessionKey.set(currentKey, parentSessionId)
+      parentSessionId = typeof session.parentID === "string" && session.parentID.trim() ? session.parentID.trim() : ""
+      if (parentSessionId) parentBySessionKey.set(currentKey, parentSessionId)
       debug?.(`parent fetched session=${currentSessionId} parent=${parentSessionId || "(none)"}`)
     } else {
       debug?.(`parent cached session=${currentSessionId} parent=${parentSessionId || "(none)"}`)
