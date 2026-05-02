@@ -172,6 +172,32 @@ test("createCommandHandlers handleWhere keeps local running state when message l
   assert.match(sent[0].text, /Agent: running/)
 })
 
+test("createCommandHandlers handleWhere reports stale active turns", async () => {
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    config: { activeTurnStaleMs: 20 * 60 * 1000 },
+    ocByAlias: {
+      demo: {
+        async getSession(sessionId) { return { id: sessionId } },
+        async listMessages() {
+          return [{
+            info: { id: "msg_stuck", role: "assistant", time: { created: Date.now() - 31 * 60 * 1000 } },
+            parts: [{ type: "tool", state: { status: "running", time: { started: Date.now() - 30 * 60 * 1000 } } }],
+          }]
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleWhere({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" })
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Agent: stale \(30m without progress; message msg_stuck; use \/abort or \/new\)/)
+})
+
 test("createCommandHandlers handleWhere ignores stale remote running messages after local completion", async () => {
   const { runtime, sent } = makeRuntime({
     storeState: {
@@ -1457,6 +1483,50 @@ test("createCommandHandlers handleTelegramMessage forwards the custom model over
   ])
 })
 
+test("createCommandHandlers handleTelegramMessage blocks prompts behind stale active turns", async () => {
+  const promptCalls = []
+  let recentPromptAdded = false
+  const marked = []
+  const { runtime, sent } = makeRuntime({
+    config: { tgPrefix: "[TG] ", activeTurnStaleMs: 20 * 60 * 1000 },
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    store: {
+      markIdempotencyKey(key, metadata) {
+        marked.push({ key, metadata })
+        return true
+      },
+      async flush() {},
+    },
+    ensureRecentPromptSet: () => ({ add() { recentPromptAdded = true } }),
+    ocByAlias: {
+      demo: {
+        async listMessages() {
+          return [{ info: { id: "msg_stuck", role: "assistant", time: { updated: Date.now() - 25 * 60 * 1000 } } }]
+        },
+        async promptAsync(sessionId, text) {
+          promptCalls.push({ sessionId, text })
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 330,
+    message_thread_id: 7,
+    text: "do the next thing",
+  })
+
+  assert.deepEqual(promptCalls, [])
+  assert.equal(recentPromptAdded, false)
+  assert.equal(marked.length, 1)
+  assert.equal(marked[0].metadata.operation, "staleActiveTurn")
+  assert.match(sent[0].text, /Agent appears stuck/)
+  assert.match(sent[0].text, /did not send this prompt/)
+})
+
 test("createCommandHandlers handleTelegramMessage rethrows retryable promptAsync failures", async () => {
   const promptCalls = []
   const err = makeBoundaryError({
@@ -1738,6 +1808,51 @@ test("createCommandHandlers handleTelegramMessage forwards small text documents 
   assert.match(promptCalls[0].text, /console\.log\(1\)/)
   assert.deepEqual(events.slice(0, 3), ["mark:promptAsyncAttachment", "flush", "prompt"])
   assert.match(sent.at(-1).text, /Attachment sent to demo\/ses_current: app\.js/)
+})
+
+test("createCommandHandlers blocks direct attachment prompts behind stale active turns", async () => {
+  const events = []
+  const { runtime, sent } = makeRuntime({
+    config: { activeTurnStaleMs: 20 * 60 * 1000 },
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    store: {
+      markIdempotencyKey(_key, metadata) {
+        events.push(`mark:${metadata.operation}`)
+        return true
+      },
+      async flush() {
+        events.push("flush")
+      },
+    },
+    tg: {
+      async getFile() {
+        events.push("download")
+        return { file_path: "files/app.js", file_size: 16 }
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async listMessages() {
+          return [{ info: { id: "msg_stuck", role: "assistant", time: { updated: Date.now() - 25 * 60 * 1000 } } }]
+        },
+        async promptAsync() {
+          events.push("prompt")
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 11,
+    message_thread_id: 7,
+    document: { file_id: "file_1", file_name: "app.js", mime_type: "text/javascript", file_size: 16 },
+  })
+
+  assert.deepEqual(events, ["mark:staleActiveTurnAttachment", "flush"])
+  assert.match(sent[0].text, /Agent appears stuck/)
 })
 
 test("createCommandHandlers rolls back small attachment idempotency when OpenCode send fails", async () => {
