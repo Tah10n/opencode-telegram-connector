@@ -86,6 +86,7 @@ export function createCommandHandlers(runtime) {
     sendCurrentQuestionStep,
     setRejectNoteAwaitingState,
     setAwaitingCustomAnswerState,
+    resolveBoundRoute,
     recordPromptAnswered,
     buildRuntimeStatusLines,
     buildGlobalRuntimeStatusLines,
@@ -94,6 +95,27 @@ export function createCommandHandlers(runtime) {
   } = runtime
 
   const userAttachmentLimits = userAttachmentLimitsFromConfig(config?.limits)
+
+  function routeCtxKey(route) {
+    if (route?.chatId == null) return ""
+    return `${route.chatId}:${route.threadIdOr0 || 0}`
+  }
+
+  async function promptContinuationBindingStatus(ctxKey, projectAlias, sessionID = "") {
+    try {
+      const binding = typeof store?.getBinding === "function" ? store.getBinding(ctxKey) : null
+      if (!binding) return typeof resolveBoundRoute === "function" ? "stale" : "current"
+      if (binding.projectAlias !== projectAlias) return "stale"
+      if (!sessionID || binding.sessionId === sessionID) return "current"
+      if (typeof resolveBoundRoute !== "function") return "stale"
+      const resolved = await resolveBoundRoute(projectAlias, sessionID)
+      return binding.sessionId === resolved?.boundSessionId && routeCtxKey(resolved?.route) === ctxKey ? "current" : "stale"
+    } catch (err) {
+      const classification = classifyBoundaryError(err)
+      if (classification.retryable) return "retryable"
+      throw err
+    }
+  }
 
   const {
     resolveSessionModelInfo,
@@ -429,6 +451,17 @@ export function createCommandHandlers(runtime) {
 
     const awaitingQ = awaitingCustomAnswer.get(ctxMeta.ctxKey)
     if (awaitingQ) {
+      const bindingStatus = await promptContinuationBindingStatus(ctxMeta.ctxKey, awaitingQ.projectAlias, awaitingQ.sessionID)
+      if (bindingStatus === "retryable") {
+        await sendToThread(ctxMeta, "Question answer is temporarily unavailable. Send the answer again or /cancel.").catch(() => {})
+        return
+      }
+      if (bindingStatus !== "current") {
+        setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
+        await sendToThread(ctxMeta, "Question is no longer active.").catch(() => {})
+        await markMessageHandled("customAnswerStale", { projectAlias: awaitingQ.projectAlias })
+        return
+      }
       if (!hasText) {
         await sendToThread(ctxMeta, "This question expects a text answer. Send text or /cancel.", closeOnlyKeyboard())
         await markMessageHandled("questionNonText", { projectAlias: awaitingQ.projectAlias })
@@ -468,6 +501,18 @@ export function createCommandHandlers(runtime) {
 
     const awaiting = rejectNoteAwaiting.get(ctxMeta.ctxKey)
     if (awaiting) {
+      const bindingStatus = await promptContinuationBindingStatus(ctxMeta.ctxKey, awaiting.projectAlias, awaiting.sessionID)
+      if (bindingStatus === "retryable") {
+        await sendToThread(ctxMeta, "Permission reply is temporarily unavailable. Send the note again or /cancel.").catch(() => {})
+        return
+      }
+      if (bindingStatus !== "current") {
+        store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId, awaiting.sessionID)
+        setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
+        await sendToThread(ctxMeta, "Permission request is no longer active.").catch(() => {})
+        await markMessageHandled("permissionNoteStale", { projectAlias: awaiting.projectAlias })
+        return
+      }
       if (!hasText) {
         await sendToThread(ctxMeta, "This permission flow expects a text rejection note. Send text or /cancel.", closeOnlyKeyboard())
         await markMessageHandled("permissionNoteNonText", { projectAlias: awaiting.projectAlias })

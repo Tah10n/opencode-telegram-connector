@@ -61,6 +61,7 @@ export function createCallbackHandlers(runtime) {
     platform,
     recordCallbackOutcome,
     recordPromptAnswered,
+    resolveBoundRoute,
     requestRuntimeShutdown,
     scheduleRuntimeShutdown,
   } = runtime
@@ -208,14 +209,22 @@ export function createCallbackHandlers(runtime) {
     return oldShape
   }
 
-  function isPromptBindingCurrent(ctxKey, projectAlias, callbackSessionID = "", { isOldShape = false, stateSessionID = "" } = {}) {
+  function routeCtxKey(route) {
+    if (route?.chatId == null) return ""
+    return `${route.chatId}:${route.threadIdOr0 || 0}`
+  }
+
+  async function isPromptBindingCurrent(ctxKey, projectAlias, callbackSessionID = "", { isOldShape = false, stateSessionID = "" } = {}) {
     if (typeof store?.getBinding !== "function") return true
     const binding = store.getBinding(ctxKey)
     if (!binding) return false
     if (binding.projectAlias !== projectAlias) return false
     const expectedSessionID = callbackSessionID || stateSessionID || ""
     if (isOldShape && !expectedSessionID) return false
-    return !expectedSessionID || binding.sessionId === expectedSessionID
+    if (!expectedSessionID || binding.sessionId === expectedSessionID) return true
+    if (typeof resolveBoundRoute !== "function") return false
+    const resolved = await resolveBoundRoute(projectAlias, expectedSessionID)
+    return binding.sessionId === resolved?.boundSessionId && routeCtxKey(resolved?.route) === ctxKey
   }
 
   async function answerStalePromptCallback(callbackQuery, ctxMeta, messageId, projectAlias) {
@@ -842,7 +851,7 @@ export function createCallbackHandlers(runtime) {
         if (action === "once" || action === "always" || action === "reject") {
           const pendingPermission = store.getPendingPermission?.(projectAlias, permissionId, sessionID) || null
           const effectiveSessionID = sessionID || pendingPermission?.sessionID || ""
-          if (!isPromptBindingCurrent(ctxMeta.ctxKey, projectAlias, sessionID, { isOldShape, stateSessionID: pendingPermission?.sessionID || "" })) {
+          if (!(await isPromptBindingCurrent(ctxMeta.ctxKey, projectAlias, sessionID, { isOldShape, stateSessionID: pendingPermission?.sessionID || "" }))) {
             cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, effectiveSessionID)
             await answerStalePromptCallback(callbackQuery, ctxMeta, msg?.message_id, projectAlias)
             return
@@ -898,7 +907,7 @@ export function createCallbackHandlers(runtime) {
         if (action === "reject_note") {
           const pendingPermission = store.getPendingPermission?.(projectAlias, permissionId, sessionID) || null
           const effectiveSessionID = sessionID || pendingPermission?.sessionID || ""
-          if (!isPromptBindingCurrent(ctxMeta.ctxKey, projectAlias, sessionID, { isOldShape, stateSessionID: pendingPermission?.sessionID || "" })) {
+          if (!(await isPromptBindingCurrent(ctxMeta.ctxKey, projectAlias, sessionID, { isOldShape, stateSessionID: pendingPermission?.sessionID || "" }))) {
             cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, effectiveSessionID)
             await answerStalePromptCallback(callbackQuery, ctxMeta, msg?.message_id, projectAlias)
             return
@@ -927,7 +936,7 @@ export function createCallbackHandlers(runtime) {
         if (action === "cancel_note") {
           const pendingPermission = store.getPendingPermission?.(projectAlias, permissionId, sessionID) || null
           const effectiveSessionID = sessionID || pendingPermission?.sessionID || ""
-          if (!isPromptBindingCurrent(ctxMeta.ctxKey, projectAlias, sessionID, { isOldShape, stateSessionID: pendingPermission?.sessionID || "" })) {
+          if (!(await isPromptBindingCurrent(ctxMeta.ctxKey, projectAlias, sessionID, { isOldShape, stateSessionID: pendingPermission?.sessionID || "" }))) {
             cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, effectiveSessionID)
             await answerStalePromptCallback(callbackQuery, ctxMeta, msg?.message_id, projectAlias)
             return
@@ -952,7 +961,7 @@ export function createCallbackHandlers(runtime) {
 
         const wizard = getWizard(projectAlias, questionId, sessionID)
         const effectiveSessionID = sessionID || wizard?.sessionID || ""
-        if (!isPromptBindingCurrent(ctxMeta.ctxKey, projectAlias, sessionID, { isOldShape, stateSessionID: wizard?.sessionID || "" })) {
+        if (!(await isPromptBindingCurrent(ctxMeta.ctxKey, projectAlias, sessionID, { isOldShape, stateSessionID: wizard?.sessionID || "" }))) {
           cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, effectiveSessionID)
           await answerStalePromptCallback(callbackQuery, ctxMeta, msg?.message_id, projectAlias)
           return

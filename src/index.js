@@ -664,6 +664,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     markProjectUp,
     recordPromptRecovery: runtimeObservability.recordPromptRecovery,
     recordPromptCleanup: runtimeObservability.recordPromptCleanup,
+    resolveBoundRoute,
   })
 
   let fatalRuntimeErrorReported = false
@@ -1214,6 +1215,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     rejectNoteAwaiting,
     awaitingCustomAnswer,
     bindAliasAwaiting,
+    resolveBoundRoute,
     recordPromptAnswered: runtimeObservability.recordPromptAnswered,
     isAllowedUser,
     ctxMetaFromMessage,
@@ -1240,6 +1242,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     formatThreadLabel,
     isAllowedUser,
     bindCtxToSession,
+    resolveBoundRoute,
     sendToThread,
     ensureProjectStarted,
     validateProject,

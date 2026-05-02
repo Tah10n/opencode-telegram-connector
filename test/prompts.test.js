@@ -2,6 +2,7 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { createPromptHandlers } from "../src/connector/prompts.js"
 import { createPromptRecovery } from "../src/connector/prompt-recovery.js"
+import { makeBoundaryError } from "../src/boundary-errors.js"
 
 class FakeLruSet {
   constructor() {
@@ -457,6 +458,81 @@ test("restorePendingPromptState leaves permission recovery retryable when Telegr
   assert.equal(summary.permissions.retryable, 1)
   assert.equal(prompted.demo.permission.has("perm_restore"), false)
   assert.deepEqual(pendingPrompts.permissions["demo:perm_restore"].permissionId, "perm_restore")
+})
+
+test("restorePendingPromptState keeps child permission recovery retryable when parent route lookup fails", async () => {
+  const prompted = {
+    demo: { permission: new FakeLruSet(), question: new FakeLruSet() },
+  }
+  const restored = []
+  const pendingPrompts = {
+    permissions: {
+      "demo:ses_child:perm_child_retry": {
+        projectAlias: "demo",
+        permissionId: "perm_child_retry",
+        sessionID: "ses_child",
+        permission: "shell",
+        patterns: ["npm test"],
+        ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+      },
+      "demo:ses_root:perm_root_restore": {
+        projectAlias: "demo",
+        permissionId: "perm_root_restore",
+        sessionID: "ses_root",
+        permission: "shell",
+        patterns: ["npm run check"],
+        ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+      },
+    },
+    rejectNotes: {},
+    customAnswers: {},
+    questionWizards: {},
+  }
+  const recovery = createPromptRecovery({
+    store: {
+      getPendingPrompts: () => pendingPrompts,
+      getBinding: () => ({ projectAlias: "demo", sessionId: "ses_root" }),
+      deletePendingPermission() {
+        throw new Error("should not delete")
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async listPermissions() {
+          return [{ id: "perm_root_restore", sessionID: "ses_root" }]
+        },
+        async listQuestions() {
+          return []
+        },
+      },
+    },
+    prompted,
+    questionWizards: new Map(),
+    wizardKey: (projectAlias, requestId, sessionID = "") => (sessionID ? `${projectAlias}:${sessionID}:${requestId}` : `${projectAlias}:${requestId}`),
+    parseCtxKey: () => null,
+    async sendPermissionPrompt(projectAlias, props) {
+      restored.push({ projectAlias, permissionId: props.id, sessionID: props.sessionID })
+    },
+    async sendBlocksToThread() {},
+    async sendCurrentQuestionStep() {},
+    async sendRejectNotePrompt() {},
+    async sendQuestionCustomAnswerPrompt() {},
+    clearPersistedQuestionWizard() {},
+    setRejectNoteAwaitingState() {},
+    setAwaitingCustomAnswerState() {},
+    markProjectUp() {},
+    async resolveBoundRoute(projectAlias, sessionID) {
+      assert.deepEqual({ projectAlias, sessionID }, { projectAlias: "demo", sessionID: "ses_child" })
+      throw makeBoundaryError({ source: "opencode", operation: "GET /session/ses_child", status: 503, outcome: "retryable", message: "session lookup unavailable" })
+    },
+  })
+
+  const summary = await recovery.restorePendingPromptState()
+
+  assert.equal(summary.permissions.retryable, 1)
+  assert.equal(summary.permissions.restored, 1)
+  assert.ok(pendingPrompts.permissions["demo:ses_child:perm_child_retry"])
+  assert.deepEqual(restored, [{ projectAlias: "demo", permissionId: "perm_root_restore", sessionID: "ses_root" }])
 })
 
 test("restorePendingPromptState treats prompts for changed bindings as stale before opencode", async () => {
