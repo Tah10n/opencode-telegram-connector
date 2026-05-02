@@ -76,14 +76,33 @@ export function createPromptRecovery(runtime) {
     markProjectUp,
     recordPromptRecovery,
     recordPromptCleanup,
+    resolveBoundRoute,
   } = runtime
 
   const livePromptSnapshotByProject = new Map()
 
-  function isPromptBindingCurrent(ctxKey, projectAlias, sessionID = "") {
+  function routeCtxKey(route) {
+    if (route?.chatId == null) return ""
+    return `${route.chatId}:${route.threadIdOr0 || 0}`
+  }
+
+  async function isPromptBindingCurrent(ctxKey, projectAlias, sessionID = "") {
     const binding = typeof store?.getBinding === "function" ? store.getBinding(ctxKey) : null
     if (!binding || binding.projectAlias !== projectAlias) return false
-    return !sessionID || binding.sessionId === sessionID
+    if (!sessionID || binding.sessionId === sessionID) return true
+    if (typeof resolveBoundRoute !== "function") return false
+    const resolved = await resolveBoundRoute(projectAlias, sessionID)
+    return binding.sessionId === resolved?.boundSessionId && routeCtxKey(resolved?.route) === ctxKey
+  }
+
+  async function promptBindingStatus(ctxKey, projectAlias, sessionID = "") {
+    try {
+      return (await isPromptBindingCurrent(ctxKey, projectAlias, sessionID)) ? "current" : "stale"
+    } catch (err) {
+      const classification = classifyBoundaryError(err)
+      if (classification.retryable) return "retryable"
+      throw err
+    }
   }
 
   async function flushStoreIfAvailable() {
@@ -182,7 +201,13 @@ export function createPromptRecovery(runtime) {
     for (const entry of Object.values(pending.permissions || {})) {
       const ctx = entry?.ctx
       if (!entry?.projectAlias || !entry?.permissionId || !ctx?.chatId || !ctx?.ctxKey) continue
-      if (!isPromptBindingCurrent(ctx.ctxKey, entry.projectAlias, entry.sessionID)) {
+      const bindingStatus = await promptBindingStatus(ctx.ctxKey, entry.projectAlias, entry.sessionID)
+      if (bindingStatus === "retryable") {
+        summary.permissions.retryable += 1
+        record(entry.projectAlias, "retryable")
+        continue
+      }
+      if (bindingStatus !== "current") {
         store.deletePendingPermission(entry.projectAlias, entry.permissionId, entry.sessionID)
         await flushStoreIfAvailable()
         summary.permissions.stale += 1
@@ -237,7 +262,14 @@ export function createPromptRecovery(runtime) {
     for (const snapshot of Object.values(pending.questionWizards || {})) {
       const ctx = snapshot?.ctx
       if (!snapshot?.projectAlias || !snapshot?.id || !ctx?.chatId || !ctx?.ctxKey) continue
-      if (!isPromptBindingCurrent(ctx.ctxKey, snapshot.projectAlias, snapshot.sessionID)) {
+      const bindingStatus = await promptBindingStatus(ctx.ctxKey, snapshot.projectAlias, snapshot.sessionID)
+      if (bindingStatus === "retryable") {
+        questionWizards.set(wizardKey(snapshot.projectAlias, snapshot.id, snapshot.sessionID), buildWizardFromSnapshot({ ...snapshot, ctx }))
+        summary.questionWizards.retryable += 1
+        record(snapshot.projectAlias, "retryable")
+        continue
+      }
+      if (bindingStatus !== "current") {
         clearPersistedQuestionWizard(snapshot.projectAlias, snapshot.id, snapshot.sessionID)
         await flushStoreIfAvailable()
         summary.questionWizards.stale += 1
@@ -300,7 +332,14 @@ export function createPromptRecovery(runtime) {
 
     for (const [ctxKey, value] of Object.entries(pending.rejectNotes || {})) {
       if (!value?.projectAlias || !value?.permissionId) continue
-      if (!isPromptBindingCurrent(ctxKey, value.projectAlias, value.sessionID)) {
+      const bindingStatus = await promptBindingStatus(ctxKey, value.projectAlias, value.sessionID)
+      if (bindingStatus === "retryable") {
+        setRejectNoteAwaitingState(ctxKey, value)
+        summary.rejectNotes.retryable += 1
+        record(value.projectAlias, "retryable")
+        continue
+      }
+      if (bindingStatus !== "current") {
         setRejectNoteAwaitingState(ctxKey, null)
         await flushStoreIfAvailable()
         summary.rejectNotes.stale += 1
@@ -353,7 +392,14 @@ export function createPromptRecovery(runtime) {
 
     for (const [ctxKey, value] of Object.entries(pending.customAnswers || {})) {
       if (!value?.projectAlias || !value?.requestId || !Number.isInteger(value?.qIndex)) continue
-      if (!isPromptBindingCurrent(ctxKey, value.projectAlias, value.sessionID)) {
+      const bindingStatus = await promptBindingStatus(ctxKey, value.projectAlias, value.sessionID)
+      if (bindingStatus === "retryable") {
+        setAwaitingCustomAnswerState(ctxKey, value)
+        summary.customAnswers.retryable += 1
+        record(value.projectAlias, "retryable")
+        continue
+      }
+      if (bindingStatus !== "current") {
         setAwaitingCustomAnswerState(ctxKey, null)
         await flushStoreIfAvailable()
         summary.customAnswers.stale += 1
