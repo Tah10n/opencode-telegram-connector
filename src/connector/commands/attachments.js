@@ -42,6 +42,7 @@ export function createAttachmentHandlers({
   formatProjectUnavailable,
   ensureRecentPromptSet,
   hashTextForEcho,
+  staleActiveTurnGuard,
 }) {
   const packCallback = callbackPacker(cb)
   const limits = userAttachmentLimits || userAttachmentLimitsFromConfig(config?.limits)
@@ -253,6 +254,11 @@ export function createAttachmentHandlers({
       return
     }
 
+    if (await staleActiveTurnGuard?.(ctxMeta, binding)) {
+      await markMessageHandled("staleActiveTurnAttachment", { projectAlias: binding.projectAlias, sessionId: binding.sessionId })
+      return
+    }
+
     let loaded
     try {
       loaded = await loadTelegramAttachment(record)
@@ -342,6 +348,10 @@ export function createAttachmentHandlers({
         closeOnlyKeyboard(),
       )
       return { callbackText: "Binding changed" }
+    }
+
+    if (await staleActiveTurnGuard?.(ctxMeta, currentBinding)) {
+      return { callbackText: "Agent busy" }
     }
 
     const sendKey = attachmentSendIdempotencyKey(record)

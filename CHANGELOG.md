@@ -8,6 +8,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ## [Unreleased]
 
 ### Fixed
+- New Telegram prompts now detect stale running assistant turns before sending to opencode and warn the thread instead of silently queueing behind a hung agent.
+- Assistant and tool failures now surface a redacted `Agent stopped due to error` notice in the bound Telegram thread instead of silently disappearing when no streaming preview exists.
+- Tool-error stop notices are delayed and verified against the assistant message so recovered tool failures do not create false stop alerts.
+- Child-session permission and question prompts now route through parent session bindings.
+- Mirrored opencode TUI user messages are combined consistently instead of arriving as fragmented updates.
 - Handled opencode permission and question prompt messages are now removed after the user presses a final inline button, while multi-select prompts stay visible until **Done**.
 - Windows auto-start now closes stale matching `opencode attach` UI windows before reopening them when a TUI fails to recover the server or the watchdog restarts a hung project.
 - `/new` with `openAttachOnNewMode: "same-window"` now binds Telegram to the created session immediately while best-effort switching the attached TUI.

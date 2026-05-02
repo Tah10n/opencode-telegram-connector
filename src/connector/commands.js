@@ -9,6 +9,7 @@ import { createOperatorCommandHandlers } from "./commands/operator.js"
 import { createSessionCommandHandlers } from "./commands/sessions.js"
 import { formatModelUiChoices, resolveModelProviderCatalog } from "./model-ui.js"
 import { unsupportedMediaKind, unsupportedMediaText } from "./incoming-attachments.js"
+import { formatStaleActiveTurnNotice, resolveActiveTurnStaleMs, resolveActiveTurnStatus } from "./active-turns.js"
 
 function helpText({ scopeLabel = "this thread", defaultProject = "", isBound = false } = {}) {
   const next = isBound
@@ -95,6 +96,28 @@ export function createCommandHandlers(runtime) {
   } = runtime
 
   const userAttachmentLimits = userAttachmentLimitsFromConfig(config?.limits)
+  const activeTurnStaleMs = resolveActiveTurnStaleMs(config?.activeTurnStaleMs)
+
+  function routeCtxKey(route) {
+    if (route?.chatId == null) return ""
+    return `${route.chatId}:${route.threadIdOr0 || 0}`
+  }
+
+  async function promptContinuationBindingStatus(ctxKey, projectAlias, sessionID = "") {
+    try {
+      const binding = typeof store?.getBinding === "function" ? store.getBinding(ctxKey) : null
+      if (!binding) return typeof resolveBoundRoute === "function" ? "stale" : "current"
+      if (binding.projectAlias !== projectAlias) return "stale"
+      if (!sessionID || binding.sessionId === sessionID) return "current"
+      if (typeof resolveBoundRoute !== "function") return "stale"
+      const resolved = await resolveBoundRoute(projectAlias, sessionID)
+      return binding.sessionId === resolved?.boundSessionId && routeCtxKey(resolved?.route) === ctxKey ? "current" : "stale"
+    } catch (err) {
+      const classification = classifyBoundaryError(err)
+      if (classification.retryable) return "retryable"
+      throw err
+    }
+  }
 
   function routeCtxKey(route) {
     if (route?.chatId == null) return ""
@@ -166,6 +189,7 @@ export function createCommandHandlers(runtime) {
     startServerKeyboard,
     ensureRecentPromptSet,
     hashTextForEcho,
+    staleActiveTurnGuard: maybeBlockStaleActiveTurn,
   })
 
   async function resolveStartupSession(alias, { forceRefresh = false } = {}) {
@@ -229,6 +253,28 @@ export function createCommandHandlers(runtime) {
 
   function closeOnlyKeyboard() {
     return makeInlineKeyboard([[{ text: "Close", callback_data: runtime.cb.pack("s|close") }]])
+  }
+
+  async function maybeBlockStaleActiveTurn(ctxMeta, binding) {
+    const oc = ocByAlias[binding?.projectAlias]
+    if (!oc?.listMessages || !binding?.sessionId) return false
+    let status
+    try {
+      status = await resolveActiveTurnStatus({
+        oc,
+        projectAlias: binding.projectAlias,
+        sessionId: binding.sessionId,
+        getAgentActivityStatus: runtime.getAgentActivityStatus,
+        mirrorCompaction: runtime.mirrorCompaction,
+        staleMs: activeTurnStaleMs,
+      })
+    } catch (err) {
+      logger?.warn?.("Stale active-turn check failed:", binding.projectAlias, binding.sessionId, err?.message || String(err))
+      return false
+    }
+    if (status?.state !== "stale") return false
+    await sendToThread(ctxMeta, formatStaleActiveTurnNotice(status, binding), closeOnlyKeyboard())
+    return true
   }
 
   function hasIdempotencyKey(key) {
@@ -384,6 +430,7 @@ export function createCommandHandlers(runtime) {
     lastAssistantBySession,
     clearAgentActivity,
     getAgentActivityStatus,
+    activeTurnStaleMs,
     mirrorCompaction: runtime.mirrorCompaction,
     appendEffectiveModelLines,
     resolveEffectiveModelState,
@@ -749,6 +796,10 @@ export function createCommandHandlers(runtime) {
     if (!hasText) return
 
     const oc = ocByAlias[binding.projectAlias]
+    if (await maybeBlockStaleActiveTurn(ctxMeta, binding)) {
+      await markMessageHandled("staleActiveTurn", { projectAlias: binding.projectAlias, sessionId: binding.sessionId })
+      return
+    }
     const prefix = config.tgPrefix ?? "[TG] "
     const promptText = `${prefix}${text}`
     const sk = sessionKey(binding.projectAlias, binding.sessionId)
