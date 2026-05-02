@@ -53,21 +53,26 @@ export function createMirroringHandlers(runtime) {
   const agentActivityBySession = new Map()
   const agentActivityTombstonesBySession = new Map()
   const assistantDeliveryStateByKey = new Map()
+  const agentStopErrorDeliveryClaims = new Set()
   const AGENT_ACTIVITY_TOMBSTONE_MS = 30 * 60 * 1000
   const AGENT_ACTIVITY_TOMBSTONE_SWEEP_MS = 60 * 1000
   const ROUTE_LOOKUP_MAX_ATTEMPTS = 3
   const ROUTE_LOOKUP_INITIAL_DELAY_MS = 150
   const ASSISTANT_FINAL_DELIVERY_MAX_ATTEMPTS = 4
   const ASSISTANT_FINAL_DELIVERY_RETRY_DELAYS_MS = [500, 1500, 5000]
+  const AGENT_STOP_ERROR_FALLBACK_GRACE_MS = 5000
   let nextAgentActivityTombstoneSweepAt = 0
 
   function ensureForwardedSets(sk) {
     let s = forwardedBySession.get(sk)
     if (!s) {
-      s = { user: new LruSet(8000), assistant: new LruSet(8000), changes: new LruSet(8000), actions: new LruSet(8000) }
+      const agentStopErrors = new LruSet(8000)
+      s = { user: new LruSet(8000), assistant: new LruSet(8000), assistantErrors: agentStopErrors, agentStopErrors, changes: new LruSet(8000), actions: new LruSet(8000) }
       forwardedBySession.set(sk, s)
     }
     if (!s.actions) s.actions = new LruSet(8000)
+    if (!s.agentStopErrors) s.agentStopErrors = s.assistantErrors || new LruSet(8000)
+    s.assistantErrors = s.agentStopErrors
     return s
   }
 
@@ -276,6 +281,49 @@ export function createMirroringHandlers(runtime) {
   function hashTextForEcho(text) {
     const t = String(text ?? "")
     return crypto.createHash("sha1").update(t, "utf8").digest("hex") + ":" + String(t.length)
+  }
+
+  function agentStopErrorDedupeKey({ messageId = "", partId = "", details = "" } = {}) {
+    const msg = String(messageId || "").trim()
+    if (msg) return msg
+    const part = String(partId || "").trim()
+    if (part) return `part:${part}:${hashTextForEcho(details || "agent-stop-error")}`
+    return `error:${hashTextForEcho(details || "agent-stop-error")}`
+  }
+
+  function agentStopErrorDebounceKey(projectAlias, sessionId, dedupeKey) {
+    return `agent-stop-error:${sessionKey(projectAlias, sessionId)}:${dedupeKey}`
+  }
+
+  function isAgentStopErrorDebounce(entry) {
+    return String(entry?.kind || "").startsWith("agent-stop-error")
+  }
+
+  function redactAgentStopErrorText(value) {
+    return redactSensitiveText(String(value || ""))
+      .replace(/(^|[^A-Za-z0-9_-])([A-Za-z0-9_-]*(?:token|password|passwd|secret|api[_-]?key|authorization)[A-Za-z0-9_-]*)\s*[:=]\s*[^,;\n\r]+/gi, "$1$2=***")
+      .trim()
+  }
+
+  function formatAgentStopErrorNotice({ reason = "Agent stopped due to error.", details = "" } = {}) {
+    const lines = ["⚠️ Agent stopped due to error."]
+    const reasonText = redactAgentStopErrorText(reason)
+    if (reasonText) lines.push("", reasonText)
+    let detailsText = redactAgentStopErrorText(details)
+    if (detailsText.length > 2000) detailsText = `${detailsText.slice(0, 1999)}…`
+    if (detailsText) lines.push("", detailsText)
+    return lines.join("\n")
+  }
+
+  function cancelPendingAgentStopError(projectAlias, sessionId, messageId) {
+    const msg = String(messageId || "").trim()
+    if (!projectAlias || !sessionId || !msg) return false
+    const key = agentStopErrorDebounceKey(projectAlias, sessionId, agentStopErrorDedupeKey({ messageId: msg }))
+    const entry = assistantDebounce.get(key)
+    if (!isAgentStopErrorDebounce(entry)) return false
+    clearTimeout(entry?.timer || entry)
+    assistantDebounce.delete(key)
+    return true
   }
 
   function changedFilesExportIdempotencyKey(projectAlias, sessionId, messageId, action, actionArg = "") {
@@ -844,18 +892,237 @@ export function createMirroringHandlers(runtime) {
 
   async function resolveFreshAssistantDeliveryRoute(projectAlias, sessionId, messageId, deliveryOptions = {}) {
     const signal = deliveryOptions.signal || abortSignal
+    const allowParentRoute = deliveryOptions.allowParentRoute === true
     const resolved = await resolveBoundRouteWithRetry(projectAlias, sessionId, { signal, ignoreStopping: deliveryOptions.ignoreStopping === true })
     if (!resolved?.route) {
       logSseDebug(projectAlias, sessionId, `drop=assistant_no_route msg=${messageId}`)
       return null
     }
-    if (resolved.boundSessionId !== sessionId) {
+    if (resolved.boundSessionId !== sessionId && !allowParentRoute) {
       logSseDebug(projectAlias, sessionId, `drop=assistant_child_message msg=${messageId} bound=${resolved.boundSessionId}`)
       return null
     }
     const route = resolved.route
     const routeCtx = routeCtxFromRoute(route)
     return { route, routeCtx, boundKey: sessionKey(projectAlias, resolved.boundSessionId) }
+  }
+
+  async function deliverAgentStopErrorNotice({
+    projectAlias,
+    sessionId,
+    messageId = "",
+    dedupeKey,
+    text,
+    route,
+    routeCtx,
+    boundKey,
+    previewState,
+    allowParentRoute = false,
+    verifyMessageError = false,
+    deliveryOptions = {},
+  } = {}) {
+    if (!projectAlias || !sessionId || !dedupeKey || !text) return false
+    const sk = sessionKey(projectAlias, sessionId)
+    const sets = ensureForwardedSets(sk)
+    if (sets.agentStopErrors.has(dedupeKey)) {
+      logSseDebug(projectAlias, sessionId, `drop=agent_stop_error_already_forwarded key=${dedupeKey}`)
+      return true
+    }
+
+    const deliveryKey = agentStopErrorDebounceKey(projectAlias, sessionId, dedupeKey)
+    assistantDebounce.delete(deliveryKey)
+    if ((isStopping() && deliveryOptions.ignoreStopping !== true) || deliveryOptions.signal?.aborted === true) return false
+    let deliveryClaimed = false
+
+    const claimDelivery = () => {
+      if (sets.agentStopErrors.has(dedupeKey)) {
+        logSseDebug(projectAlias, sessionId, `drop=agent_stop_error_already_forwarded key=${dedupeKey}`)
+        return false
+      }
+      if (deliveryClaimed) return true
+      if (agentStopErrorDeliveryClaims.has(deliveryKey)) {
+        logSseDebug(projectAlias, sessionId, `drop=agent_stop_error_in_flight key=${dedupeKey}`)
+        return false
+      }
+      agentStopErrorDeliveryClaims.add(deliveryKey)
+      deliveryClaimed = true
+      return true
+    }
+    const releaseDeliveryClaim = () => {
+      if (!deliveryClaimed) return
+      agentStopErrorDeliveryClaims.delete(deliveryKey)
+      deliveryClaimed = false
+    }
+
+    let noticeText = text
+    if (verifyMessageError) {
+      if (!messageId) return false
+      let msg = null
+      try {
+        msg = await ocByAlias[projectAlias]?.getMessage?.(sessionId, messageId, { signal: deliveryOptions.signal || abortSignal, timeoutMs: deliveryOptions.timeoutMs })
+      } catch (err) {
+        const attempt = Number.isInteger(deliveryOptions.agentStopErrorVerifyAttempt) && deliveryOptions.agentStopErrorVerifyAttempt > 0 ? deliveryOptions.agentStopErrorVerifyAttempt : 1
+        const classification = classifyBoundaryError(err)
+        const canRetry = deliveryOptions.ignoreStopping !== true && deliveryOptions.signal?.aborted !== true && !isStopping() && attempt < ASSISTANT_FINAL_DELIVERY_MAX_ATTEMPTS && classification.retryable
+        if (canRetry) {
+          const nextAttempt = attempt + 1
+          const delayMs = classification.retryAfterMs || assistantRetryDelayMs(attempt)
+          logSseDebug(projectAlias, sessionId, `retry=agent_stop_error_verify key=${dedupeKey} attempt=${nextAttempt} delay=${delayMs} ${err?.message || String(err)}`)
+          const retryOptions = { ...deliveryOptions, agentStopErrorVerifyAttempt: nextAttempt }
+          const retryTimer = setTimeout(() => {
+            void deliverAgentStopErrorNotice({ projectAlias, sessionId, messageId, dedupeKey, text, allowParentRoute, verifyMessageError, deliveryOptions: retryOptions })
+          }, delayMs)
+          retryTimer.unref?.()
+          assistantDebounce.set(deliveryKey, {
+            timer: retryTimer,
+            run: (overrideOptions = {}) => deliverAgentStopErrorNotice({ projectAlias, sessionId, messageId, dedupeKey, text, allowParentRoute, verifyMessageError, deliveryOptions: { ...retryOptions, ...overrideOptions } }),
+            deliveryOptions: retryOptions,
+            kind: "agent-stop-error-verify",
+          })
+        } else {
+          logSseDebug(projectAlias, sessionId, `drop=agent_stop_error_verify_failed key=${dedupeKey} ${err?.message || String(err)}`)
+        }
+        return false
+      }
+      const confirmedError = msg?.info?.error
+      if (!confirmedError) {
+        if (runtime.normalizeEpochMs(msg?.info?.time?.completed) != null) logSseDebug(projectAlias, sessionId, `drop=agent_stop_error_completed key=${dedupeKey}`)
+        else logSseDebug(projectAlias, sessionId, `drop=agent_stop_error_unconfirmed key=${dedupeKey}`)
+        return false
+      }
+      noticeText = formatAgentStopErrorNotice({ reason: "Assistant reply failed.", details: confirmedError })
+    }
+
+    const clearPreviewForMessage = (targetBoundKey = boundKey) => {
+      if (!targetBoundKey || !messageId) return
+      const currentPreview = assistantPreviewBySession.get(targetBoundKey)
+      if (currentPreview?.messageId === messageId) assistantPreviewBySession.delete(targetBoundKey)
+    }
+    const markDelivered = (deliveredRouteCtx = routeCtx, deliveredBoundKey = boundKey) => {
+      clearPreviewForMessage(deliveredBoundKey)
+      sets.agentStopErrors.add(dedupeKey)
+      releaseDeliveryClaim()
+      logSseDebug(projectAlias, sessionId, `send=agent_stop_error key=${dedupeKey} thread=${deliveredRouteCtx?.threadIdOr0 || 0}`)
+    }
+
+    const previewForMessage = previewState?.messageId === messageId ? previewState : null
+    let previewEditFailed = false
+    if (previewForMessage?.telegramMessageId && route && routeCtx && previewMatchesRoute(previewForMessage, routeCtx)) {
+      if (!claimDelivery()) return false
+      const edited = await tg.editMessageText(route.chatId, previewForMessage.telegramMessageId, noticeText, null).then(() => true, () => false)
+      if (edited) {
+        markDelivered(routeCtx, boundKey)
+        return true
+      }
+      previewEditFailed = true
+    }
+
+    try {
+      const routeDeliveryOptions = allowParentRoute ? { ...deliveryOptions, allowParentRoute: true } : deliveryOptions
+      const freshTarget = await resolveFreshAssistantDeliveryRoute(projectAlias, sessionId, messageId || dedupeKey, routeDeliveryOptions)
+      if (!freshTarget) return false
+      const freshPreviewState = messageId ? assistantPreviewBySession.get(freshTarget.boundKey) : null
+      if (!previewEditFailed && freshPreviewState?.messageId === messageId && freshPreviewState.telegramMessageId && previewMatchesRoute(freshPreviewState, freshTarget.routeCtx)) {
+        if (!claimDelivery()) return false
+        const edited = await tg.editMessageText(freshTarget.route.chatId, freshPreviewState.telegramMessageId, noticeText, null).then(() => true, () => false)
+        if (edited) {
+          markDelivered(freshTarget.routeCtx, freshTarget.boundKey)
+          return true
+        }
+      }
+      if (!claimDelivery()) return false
+      await sendToThread(freshTarget.routeCtx, noticeText)
+      markDelivered(freshTarget.routeCtx, freshTarget.boundKey)
+      return true
+    } catch (err) {
+      releaseDeliveryClaim()
+      const attempt = Number.isInteger(deliveryOptions.agentStopErrorDeliveryAttempt) && deliveryOptions.agentStopErrorDeliveryAttempt > 0 ? deliveryOptions.agentStopErrorDeliveryAttempt : 1
+      const message = err?.message || String(err)
+      const classification = classifyBoundaryError(err)
+      const canRetry =
+        deliveryOptions.ignoreStopping !== true &&
+        deliveryOptions.signal?.aborted !== true &&
+        !isStopping() &&
+        attempt < ASSISTANT_FINAL_DELIVERY_MAX_ATTEMPTS &&
+        classification.retryable
+      if (canRetry) {
+        const nextAttempt = attempt + 1
+        const delayMs = classification.retryAfterMs || assistantRetryDelayMs(attempt)
+        logSseDebug(projectAlias, sessionId, `retry=agent_stop_error_delivery key=${dedupeKey} attempt=${nextAttempt} delay=${delayMs} ${message}`)
+        const retryOptions = { ...deliveryOptions, agentStopErrorDeliveryAttempt: nextAttempt }
+        const retryTimer = setTimeout(() => {
+          void deliverAgentStopErrorNotice({
+            projectAlias,
+            sessionId,
+            messageId,
+            dedupeKey,
+            text: noticeText,
+            boundKey,
+            previewState,
+            allowParentRoute,
+            deliveryOptions: retryOptions,
+          })
+        }, delayMs)
+        retryTimer.unref?.()
+        assistantDebounce.set(deliveryKey, {
+          timer: retryTimer,
+          run: (overrideOptions = {}) =>
+            deliverAgentStopErrorNotice({
+              projectAlias,
+              sessionId,
+              messageId,
+              dedupeKey,
+              text: noticeText,
+              boundKey,
+              previewState,
+              allowParentRoute,
+              deliveryOptions: { ...retryOptions, ...overrideOptions },
+            }),
+          deliveryOptions: retryOptions,
+          kind: "agent-stop-error-retry",
+        })
+        return false
+      }
+      runtime.logger?.error?.("Agent stop error notification failed:", projectAlias, sessionId, dedupeKey, message)
+      logSseDebug(projectAlias, sessionId, `error=agent_stop_error_delivery key=${dedupeKey} ${message}`)
+      return false
+    } finally {
+      releaseDeliveryClaim()
+    }
+  }
+
+  function scheduleAgentStopErrorFallback({ projectAlias, sessionId, messageId = "", partId = "", text, dedupeKey, allowParentRoute = false, verifyMessageError = false } = {}) {
+    if (!projectAlias || !sessionId || !text) return false
+    if (verifyMessageError && !messageId) return false
+    const key = dedupeKey || agentStopErrorDedupeKey({ messageId, partId, details: text })
+    const sk = sessionKey(projectAlias, sessionId)
+    const sets = ensureForwardedSets(sk)
+    if (sets.agentStopErrors.has(key)) return false
+    const deliveryKey = agentStopErrorDebounceKey(projectAlias, sessionId, key)
+    if (isAgentStopErrorDebounce(assistantDebounce.get(deliveryKey))) return false
+    const run = (deliveryOptions = {}) =>
+      deliverAgentStopErrorNotice({
+        projectAlias,
+        sessionId,
+        messageId,
+        dedupeKey: key,
+        text,
+        allowParentRoute,
+        verifyMessageError,
+        deliveryOptions,
+      })
+    const timer = setTimeout(() => {
+      void run()
+    }, AGENT_STOP_ERROR_FALLBACK_GRACE_MS)
+    timer.unref?.()
+    assistantDebounce.set(deliveryKey, {
+      timer,
+      run: (overrideOptions = {}) => run(overrideOptions),
+      deliveryOptions: {},
+      kind: "agent-stop-error-fallback",
+    })
+    logSseDebug(projectAlias, sessionId, `schedule=agent_stop_error key=${key} delay=${AGENT_STOP_ERROR_FALLBACK_GRACE_MS}`)
+    return true
   }
 
   async function getAssistantMessageWithRetry(oc, sessionId, messageId, { attempts = 3, initialDelayMs = 150, signal, timeoutMs } = {}) {
@@ -984,17 +1251,28 @@ export function createMirroringHandlers(runtime) {
       logSseDebug(projectAlias, sessionId, `drop=agent_action_before_start part=${partId}`)
       return
     }
-    if (resolved.boundSessionId !== sessionId) {
-      logSseDebug(projectAlias, sessionId, `drop=agent_action_child bound=${resolved.boundSessionId}`)
-      return
-    }
-
+    const isChildAction = resolved.boundSessionId !== sessionId
     const route = resolved.route
     const routeCtx = { chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey: ctxKeyFrom(route.chatId, route.threadIdOr0) }
     const sets = ensureForwardedSets(sk)
     const forwardKey = agentActionForwardKey(messageId, partId, status)
     const eventInfo = partEventTimeInfo(part, props)
     markAgentToolStatus(projectAlias, sessionId, `${messageId}:${partId}`, status, text, { messageId, eventInfo })
+    if (status === "error") {
+      scheduleAgentStopErrorFallback({
+        projectAlias,
+        sessionId,
+        messageId,
+        partId,
+        text: formatAgentStopErrorNotice({ reason: "Agent action failed; no successful completion was seen yet.", details: text }),
+        allowParentRoute: isChildAction,
+        verifyMessageError: true,
+      })
+    }
+    if (isChildAction) {
+      logSseDebug(projectAlias, sessionId, `drop=agent_action_child bound=${resolved.boundSessionId}`)
+      return
+    }
     if (sets.actions.has(forwardKey)) {
       logSseDebug(projectAlias, sessionId, `drop=agent_action_already_forwarded part=${partId} status=${status}`)
       return
@@ -1033,7 +1311,8 @@ export function createMirroringHandlers(runtime) {
       logSseDebug(projectAlias, sessionId, "drop=before_connector_start")
       return
     }
-    if (resolved.boundSessionId !== sessionId) {
+    const isChildMessage = resolved.boundSessionId !== sessionId
+    if (isChildMessage && !(info.role === "assistant" && info.error)) {
       logSseDebug(projectAlias, sessionId, `drop=child_message bound=${resolved.boundSessionId}`)
       return
     }
@@ -1099,14 +1378,24 @@ export function createMirroringHandlers(runtime) {
     else markAgentMessageActive(projectAlias, sessionId, info.id, true, info)
 
     if (hasError) {
+      cancelPendingAgentStopError(projectAlias, sessionId, info.id)
       const previewState = assistantPreviewBySession.get(boundKey)
-      if (previewState?.messageId === info.id && previewState.telegramMessageId) {
-        await tg.editMessageText(route.chatId, previewState.telegramMessageId, `Assistant reply failed.\n\n${String(info.error)}`, null).catch(() => {})
-        assistantPreviewBySession.delete(boundKey)
-      }
-      logSseDebug(projectAlias, sessionId, `drop=assistant_error msg=${info.id}`)
+      await deliverAgentStopErrorNotice({
+        projectAlias,
+        sessionId,
+        messageId: info.id,
+        dedupeKey: agentStopErrorDedupeKey({ messageId: info.id }),
+        text: formatAgentStopErrorNotice({ reason: "Assistant reply failed.", details: info.error }),
+        route,
+        routeCtx,
+        boundKey,
+        previewState,
+        allowParentRoute: isChildMessage,
+      })
       return
     }
+
+    if (completed) cancelPendingAgentStopError(projectAlias, sessionId, info.id)
 
     if (!completed) {
       if (!shouldMirrorToFeed(routeCtx.ctxKey, "assistant-stream")) {

@@ -2,6 +2,7 @@ import { makeInlineKeyboard } from "../../telegram/client.js"
 import { sessionKey } from "../../state/store.js"
 import { sanitizeBaseUrlForDisplay } from "../../url-utils.js"
 import { isStaleBoundaryError } from "../../boundary-errors.js"
+import { formatActiveTurnStatus, resolveActiveTurnStatus } from "../active-turns.js"
 
 function normalizeEpochMs(value) {
   if (typeof value === "number" && Number.isFinite(value)) return value < 1e12 ? value * 1000 : value
@@ -56,6 +57,7 @@ export function createOperatorCommandHandlers(deps) {
     lastAssistantBySession,
     clearAgentActivity,
     getAgentActivityStatus,
+    activeTurnStaleMs,
     mirrorCompaction,
     appendEffectiveModelLines,
     resolveEffectiveModelState,
@@ -99,80 +101,23 @@ export function createOperatorCommandHandlers(deps) {
     return "unknown"
   }
 
-  function isRunningAssistantMessage(message) {
-    const info = message?.info || message || {}
-    if (info?.role !== "assistant") return false
-    if (!mirrorCompaction && (info?.mode === "compaction" || info?.agent === "compaction")) return false
-    if (info?.error) return false
-    const time = info?.time || message?.time || {}
-    if (normalizeEpochMs(time.completed) != null) return false
-    return normalizeEpochMs(time.updated) != null || normalizeEpochMs(time.created) != null || normalizeEpochMs(time.started) != null
-  }
-
-  function isTerminalAssistantMessage(message) {
-    const info = message?.info || message || {}
-    if (info?.role !== "assistant") return false
-    if (info?.error) return true
-    const time = info?.time || message?.time || {}
-    return normalizeEpochMs(time.completed) != null
-  }
-
-  function messageId(message) {
-    const info = message?.info || message || {}
-    return String(info?.id || "").trim()
-  }
-
-  function localAgentMessageIds(localStatus) {
-    const ids = new Set()
-    for (const id of localStatus?.activeMessageIds || []) {
-      const normalized = String(id || "").trim()
-      if (normalized) ids.add(normalized)
-    }
-    for (const id of localStatus?.activeToolMessageIds || []) {
-      const normalized = String(id || "").trim()
-      if (normalized) ids.add(normalized)
-    }
-    return ids
-  }
-
-  function locallyEndedAgentMessageIds(localStatus) {
-    const ids = new Set()
-    for (const id of localStatus?.endedMessageIds || []) {
-      const normalized = String(id || "").trim()
-      if (normalized) ids.add(normalized)
-    }
-    return ids
-  }
-
   async function resolveAgentStatus(binding, health) {
     if (health?.status !== "ok") return `unknown (${bindingHealthLabel(health)})`
 
     const oc = ocByAlias[binding.projectAlias]
-    const localStatus = getAgentActivityStatus?.(binding.projectAlias, binding.sessionId)
-    const localIsRunning = localStatus?.state === "running"
-    if (typeof oc?.listMessages !== "function") return localIsRunning ? "running" : "unknown (message list unavailable)"
-
     try {
-      const messages = await oc.listMessages(binding.sessionId, { limit: 20 })
-      if (Array.isArray(messages)) {
-        const locallyEndedIds = locallyEndedAgentMessageIds(localStatus)
-        const runningMessages = messages.filter(isRunningAssistantMessage)
-        if (runningMessages.some((message) => {
-          const id = messageId(message)
-          return !id || !locallyEndedIds.has(id)
-        })) return "running"
-      }
-      if (localIsRunning) {
-        const localIds = localAgentMessageIds(localStatus)
-        if (Array.isArray(messages) && localIds.size > 0) {
-          const remoteById = new Map(messages.map((message) => [messageId(message), message]).filter(([id]) => Boolean(id)))
-          if ([...localIds].every((id) => remoteById.has(id) && isTerminalAssistantMessage(remoteById.get(id)))) return "not running"
-        }
-        return "running"
-      }
-      return "not running"
+      const status = await resolveActiveTurnStatus({
+        oc,
+        projectAlias: binding.projectAlias,
+        sessionId: binding.sessionId,
+        getAgentActivityStatus,
+        mirrorCompaction,
+        staleMs: activeTurnStaleMs,
+      })
+      return formatActiveTurnStatus(status)
     } catch {
-      return localIsRunning ? "running" : "unknown (message list failed)"
+      const localStatus = getAgentActivityStatus?.(binding.projectAlias, binding.sessionId)
+      return localStatus?.state === "running" ? "running" : "unknown (message list failed)"
     }
   }
 

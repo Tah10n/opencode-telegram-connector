@@ -183,6 +183,10 @@ When opencode asks for a permission decision or a question answer, the connector
 
 User messages typed directly in opencode TUI are mirrored separately from `/feed`; enable `mirrorTuiUserMessages: true` or `MIRROR_TUI_USER_MESSAGES=1` to duplicate them into the bound Telegram thread.
 
+Agent-stop error notices are delivered separately from `/feed`: if an assistant reply fails, the bound thread gets a redacted `Agent stopped due to error` warning. If only a tool error arrives first, the connector waits briefly and verifies the assistant message before sending the warning so recovered tool failures do not create false stop notices.
+
+If a session still has a running assistant turn with no recent progress, new Telegram prompts are not sent into that stale queue. The thread receives a warning with `/abort` and `/new` recovery options instead.
+
 ## File, code, and log workflow
 
 ### Incoming Telegram files
@@ -214,6 +218,8 @@ Long assistant replies are still delivered as `.txt` attachments instead of over
 - send the changed-file summary as `.txt`
 - send the full diff as `.patch`
 - open per-file diff choices and send a selected file diff as `.patch` when file-level diffs are available
+
+If the final assistant message cannot be fetched yet and a Telegram preview/placeholder exists, the connector updates it with a retry hint (`/sendlast`). If a completed reply has no output allowed by the current feed mode, the connector updates the existing Telegram placeholder with that explanation.
 
 ## Configuration overview
 

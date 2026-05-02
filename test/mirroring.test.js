@@ -661,6 +661,190 @@ test("handleMessagePartUpdated suppresses tool actions outside verbose feed", as
   assert.equal(sets.actions.map.size, 1)
 })
 
+test("handleMessagePartUpdated sends agent stop notice for tool errors outside verbose feed", async (t) => {
+  const timers = useManualTimeouts(t)
+  const { calls, runtime, handlers } = createHarness({
+    store: { getFeedMode: () => "main+changes" },
+    ocByAlias: {
+      demo: {
+        async getMessage() {
+          return { info: { id: "msg_1", role: "assistant", error: "boom token=123456789:replace_me; DB_PASSWORD=hunter2; OPENAI_API_KEY=sk-test; Authorization: Bearer supersecret" } }
+        },
+      },
+    },
+  })
+
+  await handlers.handleMessagePartUpdated({
+    projectAlias: "demo",
+    props: {
+      sessionID: "ses_1",
+      part: {
+        id: "part_1",
+        messageID: "msg_1",
+        type: "tool",
+        tool: "bash",
+        state: {
+          status: "error",
+          title: "Run tests token=abc123",
+          error: "Authorization: Bearer replace_me",
+        },
+      },
+    },
+  })
+
+  assert.equal(calls.sendToThread.length, 0)
+  assert.deepEqual(timers.pendingDelays(), [5000])
+
+  timers.runNext()
+  await flushAsyncWork(20)
+
+  assert.equal(calls.sendToThread.length, 1)
+  assert.deepEqual(calls.sendToThread[0][0], { chatId: 11, threadIdOr0: 22, ctxKey: "11:22" })
+  assert.match(calls.sendToThread[0][1], /Agent stopped due to error/)
+  assert.match(calls.sendToThread[0][1], /Assistant reply failed/)
+  assert.match(calls.sendToThread[0][1], /boom/)
+  assert.doesNotMatch(calls.sendToThread[0][1], /123456789|replace_me|hunter2|sk-test|supersecret/)
+  const sets = runtime.forwardedBySession.get(sessionKey("demo", "ses_1"))
+  assert.equal(sets.agentStopErrors.has("msg_1"), true)
+})
+
+test("handleMessagePartUpdated does not flush unconfirmed tool errors as stop notices", async (t) => {
+  const timers = useManualTimeouts(t)
+  const { calls, handlers } = createHarness({
+    store: { getFeedMode: () => "main+changes" },
+  })
+
+  await handlers.handleMessagePartUpdated({
+    projectAlias: "demo",
+    props: {
+      sessionID: "ses_1",
+      part: { id: "part_1", messageID: "msg_1", type: "tool", tool: "bash", state: { status: "error", title: "Run tests" } },
+    },
+  })
+  assert.deepEqual(timers.pendingDelays(), [5000])
+
+  await handlers.flushPendingAssistantDeliveries()
+
+  assert.equal(calls.sendToThread.length, 0)
+  assert.equal(timers.runNext(), false)
+  assert.ok(calls.logSseDebug.some((entry) => entry[2] === "drop=agent_stop_error_unconfirmed key=msg_1"))
+})
+
+test("handleMessageUpdated cancels pending tool-error stop notice on successful completion", async (t) => {
+  const timers = useManualTimeouts(t)
+  const { calls, handlers } = createHarness({
+    store: { getFeedMode: () => "main+changes" },
+    ocByAlias: {
+      demo: {
+        async getMessage() {
+          return {
+            info: { id: "msg_1", role: "assistant", time: { completed: 1 } },
+            parts: [{ type: "text", text: "Recovered" }],
+          }
+        },
+      },
+    },
+  })
+
+  await handlers.handleMessagePartUpdated({
+    projectAlias: "demo",
+    props: {
+      sessionID: "ses_1",
+      part: { id: "part_1", messageID: "msg_1", type: "tool", tool: "bash", state: { status: "error", title: "Run tests" } },
+    },
+  })
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", time: { completed: 1 } } },
+  })
+
+  assert.deepEqual(timers.pendingDelays(), [250])
+  timers.runNext()
+  await flushAsyncWork(20)
+
+  assert.equal(calls.sendToThread.length, 0)
+  assert.equal(calls.sendBlocksToThread.length, 1)
+  assert.doesNotMatch(calls.sendBlocksToThread[0][1]?.[0]?.html || "", /Agent stopped due to error/)
+})
+
+test("handleMessageUpdated replaces pending tool-error stop notice with assistant error", async (t) => {
+  const timers = useManualTimeouts(t)
+  const { calls, runtime, handlers } = createHarness({
+    store: { getFeedMode: () => "main+changes" },
+  })
+
+  await handlers.handleMessagePartUpdated({
+    projectAlias: "demo",
+    props: {
+      sessionID: "ses_1",
+      part: { id: "part_1", messageID: "msg_1", type: "tool", tool: "bash", state: { status: "error", title: "Run tests" } },
+    },
+  })
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", error: "boom" } },
+  })
+
+  assert.equal(calls.sendToThread.length, 1)
+  assert.match(calls.sendToThread[0][1], /Assistant reply failed/)
+  assert.equal(runtime.forwardedBySession.get(sessionKey("demo", "ses_1")).agentStopErrors.has("msg_1"), true)
+  assert.equal(timers.runNext(), false)
+})
+
+test("handleMessagePartUpdated routes child-session tool stop notices through the parent binding", async (t) => {
+  const timers = useManualTimeouts(t)
+  const { calls, runtime, handlers } = createHarness({
+    store: { getFeedMode: () => "main+changes" },
+    async resolveBoundRoute(_projectAlias, sessionId) {
+      if (sessionId === "ses_child") return { route: { chatId: 11, threadIdOr0: 22 }, boundSessionId: "ses_parent" }
+      return null
+    },
+    ocByAlias: {
+      demo: {
+        async getMessage(sessionId) {
+          assert.equal(sessionId, "ses_child")
+          return { info: { id: "msg_1", role: "assistant", error: "child boom" } }
+        },
+      },
+    },
+  })
+
+  await handlers.handleMessagePartUpdated({
+    projectAlias: "demo",
+    props: {
+      sessionID: "ses_child",
+      part: { id: "part_1", messageID: "msg_1", type: "tool", tool: "bash", state: { status: "error", title: "Run tests" } },
+    },
+  })
+  timers.runNext()
+  await flushAsyncWork(20)
+
+  assert.equal(calls.sendToThread.length, 1)
+  assert.deepEqual(calls.sendToThread[0][0], { chatId: 11, threadIdOr0: 22, ctxKey: "11:22" })
+  assert.match(calls.sendToThread[0][1], /child boom/)
+  assert.equal(runtime.forwardedBySession.get(sessionKey("demo", "ses_child")).agentStopErrors.has("msg_1"), true)
+  assert.ok(calls.logSseDebug.some((entry) => entry[2] === "drop=agent_action_child bound=ses_parent"))
+})
+
+test("handleMessageUpdated routes child-session assistant errors through the parent binding", async () => {
+  const { calls, runtime, handlers } = createHarness({
+    async resolveBoundRoute(_projectAlias, sessionId) {
+      if (sessionId === "ses_child") return { route: { chatId: 11, threadIdOr0: 22 }, boundSessionId: "ses_parent" }
+      return null
+    },
+  })
+
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: { sessionID: "ses_child", info: { id: "msg_1", role: "assistant", error: "child boom" } },
+  })
+
+  assert.equal(calls.sendToThread.length, 1)
+  assert.deepEqual(calls.sendToThread[0][0], { chatId: 11, threadIdOr0: 22, ctxKey: "11:22" })
+  assert.match(calls.sendToThread[0][1], /child boom/)
+  assert.equal(runtime.forwardedBySession.get(sessionKey("demo", "ses_child")).agentStopErrors.has("msg_1"), true)
+})
+
 test("handleMessagePartUpdated deduplicates using properties message ids when tool part ids are missing", async () => {
   const { calls, handlers } = createHarness({
     store: { getFeedMode: () => "verbose" },
@@ -842,7 +1026,113 @@ test("handleMessageUpdated clears an existing assistant preview when the reply f
   assert.equal(calls.editMessageText[0][1], 77)
   assert.match(calls.editMessageText[0][2], /Assistant reply failed\./)
   assert.match(calls.editMessageText[0][2], /boom/)
+  assert.equal(calls.sendToThread.length, 0)
   assert.equal(runtime.assistantPreviewBySession.has(sessionKey("demo", "ses_1")), false)
+})
+
+test("handleMessageUpdated sends assistant error notification when no preview exists", async () => {
+  const { calls, handlers } = createHarness()
+
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", error: "boom" } },
+  })
+
+  assert.equal(calls.editMessageText.length, 0)
+  assert.equal(calls.sendToThread.length, 1)
+  assert.deepEqual(calls.sendToThread[0][0], { chatId: 11, threadIdOr0: 22, ctxKey: "11:22" })
+  assert.match(calls.sendToThread[0][1], /Assistant reply failed\./)
+  assert.match(calls.sendToThread[0][1], /boom/)
+})
+
+test("handleMessageUpdated deduplicates repeated assistant error notifications", async () => {
+  const { calls, handlers } = createHarness()
+  const update = {
+    projectAlias: "demo",
+    props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", error: "boom" } },
+  }
+
+  await handlers.handleMessageUpdated(update)
+  await handlers.handleMessageUpdated(update)
+
+  assert.equal(calls.sendToThread.length, 1)
+  assert.ok(calls.logSseDebug.some((entry) => entry[2] === "drop=agent_stop_error_already_forwarded key=msg_1"))
+})
+
+test("handleMessageUpdated falls back to a new assistant error notification when preview edit fails", async () => {
+  const { calls, runtime, handlers } = createHarness({
+    tg: {
+      async editMessageText(...args) {
+        calls.editMessageText.push(args)
+        throw new Error("message not found")
+      },
+    },
+  })
+  runtime.assistantPreviewBySession.set(sessionKey("demo", "ses_1"), {
+    messageId: "msg_1",
+    telegramMessageId: 77,
+  })
+
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", error: "boom" } },
+  })
+
+  assert.equal(calls.editMessageText.length, 1)
+  assert.equal(calls.sendToThread.length, 1)
+  assert.match(calls.sendToThread[0][1], /Assistant reply failed\./)
+  assert.equal(runtime.assistantPreviewBySession.has(sessionKey("demo", "ses_1")), false)
+})
+
+test("handleMessageUpdated sends a new assistant error notification when preview route changed", async () => {
+  const { calls, runtime, handlers } = createHarness()
+  runtime.assistantPreviewBySession.set(sessionKey("demo", "ses_1"), {
+    messageId: "msg_1",
+    telegramMessageId: 77,
+    routeCtx: { chatId: 99, threadIdOr0: 0, ctxKey: "99:0" },
+  })
+
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", error: "boom" } },
+  })
+
+  assert.equal(calls.editMessageText.length, 0)
+  assert.equal(calls.sendToThread.length, 1)
+  assert.deepEqual(calls.sendToThread[0][0], { chatId: 11, threadIdOr0: 22, ctxKey: "11:22" })
+  assert.equal(runtime.assistantPreviewBySession.has(sessionKey("demo", "ses_1")), false)
+})
+
+test("handleMessageUpdated retries assistant error notification after transient send failure", async (t) => {
+  const timers = useManualTimeouts(t)
+  let sendAttempts = 0
+  const { calls, runtime, handlers } = createHarness({
+    async sendToThread(...args) {
+      calls.sendToThread.push(args)
+      sendAttempts += 1
+      if (sendAttempts === 1) {
+        throw makeBoundaryError({ source: "telegram", operation: "sendMessage", status: 429, message: "rate limited" })
+      }
+      return { message_id: 904 }
+    },
+  })
+
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", error: "boom" } },
+  })
+
+  const sets = runtime.forwardedBySession.get(sessionKey("demo", "ses_1"))
+  assert.equal(calls.sendToThread.length, 1)
+  assert.equal(sets.assistantErrors.has("msg_1"), false)
+  assert.deepEqual(timers.pendingDelays(), [500])
+
+  timers.runNext()
+  await flushAsyncWork(20)
+
+  assert.equal(calls.sendToThread.length, 2)
+  assert.equal(sets.assistantErrors.has("msg_1"), true)
+  assert.ok(calls.logSseDebug.some((entry) => /retry=agent_stop_error_delivery key=msg_1/.test(entry[2])))
 })
 
 test("handleMessageUpdated edits an existing assistant preview in verbose mode", async () => {
