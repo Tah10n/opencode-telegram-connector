@@ -119,27 +119,6 @@ export function createCommandHandlers(runtime) {
     }
   }
 
-  function routeCtxKey(route) {
-    if (route?.chatId == null) return ""
-    return `${route.chatId}:${route.threadIdOr0 || 0}`
-  }
-
-  async function promptContinuationBindingStatus(ctxKey, projectAlias, sessionID = "") {
-    try {
-      const binding = typeof store?.getBinding === "function" ? store.getBinding(ctxKey) : null
-      if (!binding) return typeof resolveBoundRoute === "function" ? "stale" : "current"
-      if (binding.projectAlias !== projectAlias) return "stale"
-      if (!sessionID || binding.sessionId === sessionID) return "current"
-      if (typeof resolveBoundRoute !== "function") return "stale"
-      const resolved = await resolveBoundRoute(projectAlias, sessionID)
-      return binding.sessionId === resolved?.boundSessionId && routeCtxKey(resolved?.route) === ctxKey ? "current" : "stale"
-    } catch (err) {
-      const classification = classifyBoundaryError(err)
-      if (classification.retryable) return "retryable"
-      throw err
-    }
-  }
-
   const {
     resolveSessionModelInfo,
     resolveConfiguredModelInfo,
