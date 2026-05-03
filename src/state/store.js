@@ -296,11 +296,13 @@ export class StateStore {
     if (this._saveTimer) return
     this._saveTimer = setTimeout(() => {
       this._saveTimer = null
-      void this.flush().catch(() => {})
+      void this.flush({ logErrors: false }).catch((err) => {
+        this.logger?.error?.("Failed to write state:", err?.message || String(err))
+      })
     }, delayMs)
   }
 
-  async flush() {
+  async flush({ logErrors = true } = {}) {
     if (this._saveTimer) {
       clearTimeout(this._saveTimer)
       this._saveTimer = null
@@ -311,7 +313,7 @@ export class StateStore {
     try {
       await write
     } catch (err) {
-      this.logger?.error?.("Failed to write state:", err?.message || String(err))
+      if (logErrors) this.logger?.error?.("Failed to write state:", err?.message || String(err))
       throw err
     }
   }
