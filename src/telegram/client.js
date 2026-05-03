@@ -183,6 +183,17 @@ export function splitTelegramHtml(text, maxLen = 3900) {
   return chunks
 }
 
+function hasNonWhitespaceTelegramText(text, parseMode) {
+  const value = String(text ?? "")
+  const visibleText =
+    parseMode === "HTML"
+      ? value.replace(/<[^>]*>/g, "").replace(/&(?:nbsp|#160|#x[a-f0-9]+);/gi, (entity) => {
+          return /^&(?:nbsp|#160|#x0*0*a0);$/i.test(entity) ? " " : entity
+        })
+      : value
+  return visibleText.trim().length > 0
+}
+
 function isMessageNotModifiedError(err) {
   const description = [err?.message, err?.details?.description]
     .filter((value) => typeof value === "string" && value)
@@ -481,7 +492,10 @@ export class TelegramClient {
   }
 
   async sendMessage(chatId, text, replyMarkup, options = {}) {
-    const chunks = options.parse_mode === "HTML" ? splitTelegramHtml(text) : splitTelegramText(text)
+    const parseMode = options.parse_mode
+    const chunks = (parseMode === "HTML" ? splitTelegramHtml(text) : splitTelegramText(text)).filter((chunk) =>
+      hasNonWhitespaceTelegramText(chunk, parseMode),
+    )
     let last = null
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i]
@@ -513,6 +527,7 @@ export class TelegramClient {
     let last = null
     for (const b of blocks || []) {
       if (!b || b.type !== "text") continue
+      if (!hasNonWhitespaceTelegramText(b.html, "HTML")) continue
       last = await this.sendMessage(chatId, b.html, replyMarkup, {
         ...options,
         parse_mode: "HTML",

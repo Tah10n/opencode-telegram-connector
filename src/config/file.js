@@ -18,6 +18,32 @@ function parseConfigBool(name, value) {
   throw new Error(`Config field '${name}' must be a boolean`)
 }
 
+function parseConfigInteger(name, value, { min = 1 } = {}) {
+  const n = typeof value === "number"
+    ? value
+    : typeof value === "string" && value.trim() !== ""
+      ? Number(value.trim())
+      : NaN
+  const expected = min > 0 ? "a positive integer" : "a non-negative integer"
+  if (!Number.isInteger(n) || n < min) throw new Error(`Config field '${name}' must be ${expected}`)
+  return n
+}
+
+function normalizeOpenCodeWatchdog(value) {
+  if (!isPlainObject(value)) throw new Error("Config field 'opencodeWatchdog' must be an object")
+  const out = {}
+  if (value.failureThreshold != null && value.failureThreshold !== "") {
+    out.failureThreshold = parseConfigInteger("opencodeWatchdog.failureThreshold", value.failureThreshold)
+  }
+  if (value.windowMs != null && value.windowMs !== "") {
+    out.windowMs = parseConfigInteger("opencodeWatchdog.windowMs", value.windowMs)
+  }
+  if (value.cooldownMs != null && value.cooldownMs !== "") {
+    out.cooldownMs = parseConfigInteger("opencodeWatchdog.cooldownMs", value.cooldownMs, { min: 0 })
+  }
+  return out
+}
+
 function normalizeEchoFilterMode(value, { fieldName = "echoFilterMode" } = {}) {
   const mode = String(value ?? "").trim()
   if (!mode) return undefined
@@ -62,6 +88,10 @@ export function normalizeConnectorConfig(raw, { configFilePath } = {}) {
   if (raw.mirrorTuiUserMessages != null) out.mirrorTuiUserMessages = parseConfigBool("mirrorTuiUserMessages", raw.mirrorTuiUserMessages)
   if (raw.logFormat != null && raw.logFormat !== "") out.logFormat = String(raw.logFormat)
   if (raw.allowInsecureHttp != null) out.allowInsecureHttp = parseConfigBool("allowInsecureHttp", raw.allowInsecureHttp)
+  if (raw.activeTurnStaleMs != null && raw.activeTurnStaleMs !== "") {
+    out.activeTurnStaleMs = parseConfigInteger("activeTurnStaleMs", raw.activeTurnStaleMs)
+  }
+  if (raw.opencodeWatchdog != null) out.opencodeWatchdog = normalizeOpenCodeWatchdog(raw.opencodeWatchdog)
   if (raw.limits != null) {
     if (!isPlainObject(raw.limits)) throw new Error("Config field 'limits' must be an object")
     out.limits = { ...raw.limits }

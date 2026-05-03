@@ -14,6 +14,13 @@ function makeProcessStub() {
     on(event, handler) {
       handlers.push({ event, handler })
     },
+    off(event, handler) {
+      const index = handlers.findIndex((entry) => entry.event === event && entry.handler === handler)
+      if (index >= 0) handlers.splice(index, 1)
+    },
+    removeListener(event, handler) {
+      this.off(event, handler)
+    },
   }
 }
 
@@ -81,6 +88,60 @@ test("runCli wires signal handlers and preserves fatal exit codes", async () => 
   assert.match(errors.join("\n"), /Unhandled promise rejection:/)
   assert.match(errors.join("\n"), /Fatal runtime failure \(unhandledRejection\)/)
   assert.match(errors.join("\n"), /fatal stop failed/)
+})
+
+test("runCli can clean up process handlers between repeated embedded runs", async () => {
+  const processStub = makeProcessStub()
+
+  for (let i = 0; i < 3; i += 1) {
+    const result = await runCli({
+      argv: [],
+      processImpl: processStub,
+      stdout: () => {},
+      stderr: () => {},
+      exit: () => {},
+      buildRuntimeConfigImpl: async () => ({ config: { stateFile: "state.json" } }),
+      startConnectorImpl: async () => ({
+        stateFile: "state.json",
+        async stop() {},
+      }),
+    })
+
+    assert.equal(processStub.handlers.length, 4)
+    result.cleanupProcessHandlers()
+    assert.equal(processStub.handlers.length, 0)
+  }
+})
+
+test("runCli cleans process handlers after parse and setup-check failures", async () => {
+  const invalidArgsProcess = makeProcessStub()
+  await assert.rejects(
+    () => runCli({
+      argv: ["--env-file"],
+      processImpl: invalidArgsProcess,
+      stdout: () => {},
+      stderr: () => {},
+      exit: () => {},
+    }),
+    /Missing value for --env-file/,
+  )
+  assert.equal(invalidArgsProcess.handlers.length, 0)
+
+  const checkProcess = makeProcessStub()
+  await assert.rejects(
+    () => runCli({
+      argv: ["check"],
+      processImpl: checkProcess,
+      stdout: () => {},
+      stderr: () => {},
+      exit: () => {},
+      runSetupCheckImpl: async () => {
+        throw new Error("setup check failed")
+      },
+    }),
+    /setup check failed/,
+  )
+  assert.equal(checkProcess.handlers.length, 0)
 })
 
 test("runCli emits JSON fatal logs in JSON log mode", async () => {

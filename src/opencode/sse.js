@@ -27,24 +27,29 @@ async function* readLines(readableStream) {
   // Some SSE lines (single `data:` line with a large JSON payload) can be very large.
   // Keep this bounded, but high enough for long assistant/tool outputs.
   const MAX_BUF_BYTES = readIntEnv("OPENCODE_SSE_MAX_LINE_BYTES", 8 * 1024 * 1024)
+  const assertLineWithinLimit = (line) => {
+    if (Buffer.byteLength(line, "utf8") > MAX_BUF_BYTES) {
+      throw new Error(`SSE line buffer exceeded limit (${Math.round(MAX_BUF_BYTES / 1024 / 1024)}MB)`)
+    }
+  }
   while (true) {
     const { value, done } = await reader.read()
     if (done) break
     buf += decoder.decode(value, { stream: true })
-    if (Buffer.byteLength(buf, "utf8") > MAX_BUF_BYTES) {
-      throw new Error(`SSE line buffer exceeded limit (${Math.round(MAX_BUF_BYTES / 1024 / 1024)}MB)`)
-    }
     while (true) {
       const idx = buf.indexOf("\n")
       if (idx === -1) break
       let line = buf.slice(0, idx)
       buf = buf.slice(idx + 1)
       if (line.endsWith("\r")) line = line.slice(0, -1)
+      assertLineWithinLimit(line)
       yield line
     }
+    assertLineWithinLimit(buf)
   }
   // Flush the decoder in case the final chunk ends mid-codepoint.
   buf += decoder.decode()
+  assertLineWithinLimit(buf)
   if (buf) yield buf
 }
 

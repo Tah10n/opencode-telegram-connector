@@ -754,6 +754,44 @@ test("StateStore flush rejects write failures", async () => {
   await assert.rejects(() => store.flush())
 })
 
+test("StateStore scheduled save logs write failures", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  const writeErr = new Error("scheduled write failed")
+  const errors = []
+  let resolveLogged
+  let logTimeout
+  const logged = new Promise((resolve, reject) => {
+    resolveLogged = resolve
+    logTimeout = setTimeout(() => reject(new Error("timed out waiting for scheduled save error log")), 500)
+  })
+  const logger = {
+    ...makeLogger(),
+    error(...args) {
+      errors.push(args)
+      resolveLogged()
+    },
+  }
+  let writeCalls = 0
+  const store = new StateStore({
+    filePath,
+    logger,
+    writeJsonFileAtomicImpl: async () => {
+      writeCalls += 1
+      throw writeErr
+    },
+  })
+
+  store.state.updateOffset = 123
+  store.scheduleSave(0)
+  await logged
+  clearTimeout(logTimeout)
+
+  assert.equal(writeCalls, 1)
+  assert.equal(errors.length, 1)
+  assert.deepEqual(errors[0], ["Failed to write state:", "scheduled write failed"])
+})
+
 test("resolveDefaultStatePath appends .data/state.json to the cwd", () => {
   const cwd = path.join("workspace", "demo")
   assert.equal(resolveDefaultStatePath({ cwd }), path.resolve(cwd, ".data", "state.json"))
