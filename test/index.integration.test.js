@@ -887,6 +887,37 @@ test("startConnector /use keeps supporting raw session ids", async () => {
   }
 })
 
+test("startConnector /use rejects raw session ids with pipes", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 225,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_current" },
+      },
+      sessionIndex: {
+        "demo:ses_current": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(226, "/use abc|def"))
+
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+    await delay(30)
+    await harness.connector.stop()
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.bindings, {
+      "100:7": { projectAlias: "demo", sessionId: "ses_current" },
+    })
+    assert.ok(harness.tg.sentMessages.some((entry) => /Invalid session id\..*pipe/.test(entry.text)))
+    assert.deepEqual(harness.ocCalls.getSession, [])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
 test("startConnector /use share link requires an existing binding", async () => {
   const harness = await createHarness()
 

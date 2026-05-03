@@ -48,6 +48,14 @@ test("formatSessionsListText limits long lists and ignores invalid entries", () 
   assert.match(text, /…and 2 more\./)
 })
 
+test("formatSessionsListText marks unsafe session ids as unsupported", () => {
+  const text = formatSessionsListText("demo", [{ id: "ses_ok" }, { id: "abc|def", title: "Unsafe" }], { limit: 10 })
+
+  assert.match(text, /- ses_ok/)
+  assert.match(text, /- abc\|def \[unsupported id\] — Unsafe/)
+  assert.match(text, /cannot be selected with buttons/)
+})
+
 test("normalizeSessionsList keeps valid ids and trimmed titles", () => {
   const sessions = normalizeSessionsList([{ id: " ses_1 ", title: "  Demo title  " }, { title: "missing id" }, null])
 

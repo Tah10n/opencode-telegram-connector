@@ -11,6 +11,7 @@ import {
   questionReplyIdempotencyKey,
   questionReplyIdempotencyPrefix,
 } from "./idempotency.js"
+import { callbackPacker } from "./callback-data.js"
 
 export function createPromptHandlers(runtime) {
   const {
@@ -31,6 +32,7 @@ export function createPromptHandlers(runtime) {
     recordPromptDelivered,
     recordPromptAnswered,
   } = runtime
+  const packCallback = callbackPacker(cb)
 
   const wizardKey = (projectAlias, requestId, sessionID = "") => promptKey(projectAlias, requestId, sessionID)
   const initialPendingPrompts = JSON.parse(JSON.stringify(store.getPendingPrompts?.() || store.get?.().pendingPrompts || {}))
@@ -232,19 +234,19 @@ export function createPromptHandlers(runtime) {
         const label = String(q.options[i].label)
         const checked = selectedLabels?.has(label)
         const text = `${checked ? "[x]" : "[ ]"} ${clampString(label, 50)}`
-        rows.push([{ text, callback_data: cb.pack(`q|${projectAlias}|${req.sessionID || ""}|${req.id}|${stepIndex}|t|${i}`) }])
+        rows.push([{ text, callback_data: packCallback("q", projectAlias, req.sessionID || "", req.id, stepIndex, "t", i) }])
       }
-      rows.push([{ text: "Done", callback_data: cb.pack(`q|${projectAlias}|${req.sessionID || ""}|${req.id}|${stepIndex}|done`) }])
+      rows.push([{ text: "Done", callback_data: packCallback("q", projectAlias, req.sessionID || "", req.id, stepIndex, "done") }])
     } else {
       for (let i = 0; i < q.options.length; i++) {
         const label = String(q.options[i].label)
-        rows.push([{ text: clampString(label, 60), callback_data: cb.pack(`q|${projectAlias}|${req.sessionID || ""}|${req.id}|${stepIndex}|o|${i}`) }])
+        rows.push([{ text: clampString(label, 60), callback_data: packCallback("q", projectAlias, req.sessionID || "", req.id, stepIndex, "o", i) }])
       }
     }
 
     const bottomRow = []
-    if (allowCustom) bottomRow.push({ text: "Type answer", callback_data: cb.pack(`q|${projectAlias}|${req.sessionID || ""}|${req.id}|${stepIndex}|custom`) })
-    bottomRow.push({ text: "Reject", callback_data: cb.pack(`q|${projectAlias}|${req.sessionID || ""}|${req.id}|reject`) })
+    if (allowCustom) bottomRow.push({ text: "Type answer", callback_data: packCallback("q", projectAlias, req.sessionID || "", req.id, stepIndex, "custom") })
+    bottomRow.push({ text: "Reject", callback_data: packCallback("q", projectAlias, req.sessionID || "", req.id, "reject") })
     rows.push(bottomRow)
 
     return { html: escapeHtml(lines.join("\n")), replyMarkup: makeInlineKeyboard(rows) }
@@ -292,12 +294,12 @@ export function createPromptHandlers(runtime) {
       ],
       replyMarkup: makeInlineKeyboard([
         [
-          { text: "Allow once", callback_data: cb.pack(`p|${projectAlias}|${props.sessionID || ""}|${props.id}|once`) },
-          { text: "Always allow", callback_data: cb.pack(`p|${projectAlias}|${props.sessionID || ""}|${props.id}|always`) },
+          { text: "Allow once", callback_data: packCallback("p", projectAlias, props.sessionID || "", props.id, "once") },
+          { text: "Always allow", callback_data: packCallback("p", projectAlias, props.sessionID || "", props.id, "always") },
         ],
         [
-          { text: "Reject", callback_data: cb.pack(`p|${projectAlias}|${props.sessionID || ""}|${props.id}|reject`) },
-          { text: "Reject with note", callback_data: cb.pack(`p|${projectAlias}|${props.sessionID || ""}|${props.id}|reject_note`) },
+          { text: "Reject", callback_data: packCallback("p", projectAlias, props.sessionID || "", props.id, "reject") },
+          { text: "Reject with note", callback_data: packCallback("p", projectAlias, props.sessionID || "", props.id, "reject_note") },
         ],
       ]),
     }
@@ -313,7 +315,7 @@ export function createPromptHandlers(runtime) {
     await sendToThread(
       ctxMeta,
       `${prefix}Send rejection note for ${permissionId} (next message will be used).`,
-      makeInlineKeyboard([[{ text: "Cancel", callback_data: cb.pack(`p|${projectAlias}|${sessionID || ""}|${permissionId}|cancel_note`) }]]),
+      makeInlineKeyboard([[{ text: "Cancel", callback_data: packCallback("p", projectAlias, sessionID || "", permissionId, "cancel_note") }]]),
     )
   }
 
@@ -322,7 +324,7 @@ export function createPromptHandlers(runtime) {
     await sendToThread(
       ctxMeta,
       `${prefix}Send your answer for: ${label || "question"} (next message will be used).`,
-      makeInlineKeyboard([[{ text: "Cancel", callback_data: cb.pack(`q|${projectAlias}|${sessionID || ""}|${questionId}|${qIndex}|cancel_custom`) }]]),
+      makeInlineKeyboard([[{ text: "Cancel", callback_data: packCallback("q", projectAlias, sessionID || "", questionId, qIndex, "cancel_custom") }]]),
     )
   }
 

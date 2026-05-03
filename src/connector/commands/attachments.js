@@ -52,15 +52,15 @@ export function createAttachmentHandlers({
   function attachmentConfirmationKeyboard(token) {
     return makeInlineKeyboard([
       [
-        { text: "Send file", callback_data: packCallback(`att|send|${token}`) },
-        { text: "Cancel", callback_data: packCallback(`att|cancel|${token}`) },
+        { text: "Send file", callback_data: packCallback("att", "send", token) },
+        { text: "Cancel", callback_data: packCallback("att", "cancel", token) },
       ],
-      [{ text: "Close", callback_data: packCallback(`att|close|${token}`) }],
+      [{ text: "Close", callback_data: packCallback("att", "close", token) }],
     ])
   }
 
   function closeOnlyKeyboard() {
-    return makeInlineKeyboard([[{ text: "Close", callback_data: packCallback("s|close") }]])
+    return makeInlineKeyboard([[{ text: "Close", callback_data: packCallback("s", "close") }]])
   }
 
   async function safeInformThread(ctxMeta, text, replyMarkup, options) {

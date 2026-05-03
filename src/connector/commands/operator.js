@@ -3,6 +3,7 @@ import { sessionKey } from "../../state/store.js"
 import { sanitizeBaseUrlForDisplay } from "../../url-utils.js"
 import { isStaleBoundaryError } from "../../boundary-errors.js"
 import { formatActiveTurnStatus, resolveActiveTurnStatus } from "../active-turns.js"
+import { callbackPacker } from "./shared.js"
 
 function normalizeEpochMs(value) {
   if (typeof value === "number" && Number.isFinite(value)) return value < 1e12 ? value * 1000 : value
@@ -65,14 +66,15 @@ export function createOperatorCommandHandlers(deps) {
     markProjectUp,
     threadScopeLabel,
   } = deps
+  const packCallback = callbackPacker(cb)
 
   function runtimeControlsKeyboard() {
     return makeInlineKeyboard([
       [
-        { text: "Restart", callback_data: cb.pack("rt|confirm-restart") },
-        { text: "Stop", callback_data: cb.pack("rt|confirm-stop") },
+        { text: "Restart", callback_data: packCallback("rt", "confirm-restart") },
+        { text: "Stop", callback_data: packCallback("rt", "confirm-stop") },
       ],
-      [{ text: "Close", callback_data: cb.pack("rt|close") }],
+      [{ text: "Close", callback_data: packCallback("rt", "close") }],
     ])
   }
 
@@ -88,8 +90,8 @@ export function createOperatorCommandHandlers(deps) {
 
   function unbindConfirmationKeyboard(ctxKey, binding) {
     return makeInlineKeyboard([
-      [{ text: "Remove this thread binding", callback_data: cb.pack(`b|unbind|${ctxKey}|${binding.projectAlias}|${binding.sessionId}`) }],
-      [{ text: "Close", callback_data: cb.pack("b|close") }],
+      [{ text: "Remove this thread binding", callback_data: packCallback("b", "unbind", ctxKey, binding.projectAlias, binding.sessionId) }],
+      [{ text: "Close", callback_data: packCallback("b", "close") }],
     ])
   }
 
@@ -155,17 +157,17 @@ export function createOperatorCommandHandlers(deps) {
       const ctxKey = entry.ctxKey
       const projectAlias = entry.binding?.projectAlias
       const projectKnown = !!projects?.[projectAlias]
-      rows.push([{ text: `Remove ${ctxKey}`, callback_data: cb.pack(`b|confirm-unbind|${ctxKey}`) }])
+      rows.push([{ text: `Remove ${ctxKey}`, callback_data: packCallback("b", "confirm-unbind", ctxKey) }])
       if (projectKnown) {
         rows.push([
-          { text: `Rebind startup ${ctxKey}`, callback_data: cb.pack(`b|rebind|${ctxKey}`) },
-          { text: `New session ${ctxKey}`, callback_data: cb.pack(`b|new|${ctxKey}`) },
+          { text: `Rebind startup ${ctxKey}`, callback_data: packCallback("b", "rebind", ctxKey) },
+          { text: `New session ${ctxKey}`, callback_data: packCallback("b", "new", ctxKey) },
         ])
       }
-      rows.push([{ text: `Keep ${ctxKey}`, callback_data: cb.pack(`b|keep|${ctxKey}`) }])
+      rows.push([{ text: `Keep ${ctxKey}`, callback_data: packCallback("b", "keep", ctxKey) }])
     }
-    if (includeRepair) rows.push([{ text: "Repair index", callback_data: cb.pack("b|repair") }])
-    rows.push([{ text: "Close", callback_data: cb.pack("b|close") }])
+    if (includeRepair) rows.push([{ text: "Repair index", callback_data: packCallback("b", "repair") }])
+    rows.push([{ text: "Close", callback_data: packCallback("b", "close") }])
     return makeInlineKeyboard(rows)
   }
 

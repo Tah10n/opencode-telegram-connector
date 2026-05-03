@@ -582,7 +582,7 @@ function isNonEmptyString(value) {
 }
 
 function isSafeProjectAlias(value) {
-  return isNonEmptyString(value) && !String(value).includes(":")
+  return typeof value === "string" && value === value.trim() && value.length > 0 && !/[|:]/.test(value)
 }
 
 function isStoredOpenCodeId(value) {
