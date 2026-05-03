@@ -604,7 +604,7 @@ function parseStoredSessionKey(key) {
 
 function validateProjectAlias(value, statePath, errors) {
   if (!isSafeProjectAlias(value)) {
-    errors.push(`${statePath} must be a non-empty string without ':'`)
+    errors.push(`${statePath} must be a non-empty trimmed string without ':' or '|'`)
     return false
   }
   return true
@@ -612,7 +612,7 @@ function validateProjectAlias(value, statePath, errors) {
 
 function validateStoredOpenCodeId(value, statePath, errors) {
   if (!isStoredOpenCodeId(value)) {
-    errors.push(`${statePath} must be a non-empty safe opencode id without whitespace, colon, or URL path/query separators`)
+    errors.push(`${statePath} must be a non-empty safe opencode id without whitespace, colon, pipe, or URL path/query separators`)
     return false
   }
   return true
@@ -620,7 +620,7 @@ function validateStoredOpenCodeId(value, statePath, errors) {
 
 function validateOptionalStoredOpenCodeId(value, statePath, errors) {
   if (!isOptionalStoredOpenCodeId(value)) {
-    errors.push(`${statePath} must be a safe opencode id without whitespace, colon, or URL path/query separators when present`)
+    errors.push(`${statePath} must be a safe opencode id without whitespace, colon, pipe, or URL path/query separators when present`)
     return false
   }
   return true

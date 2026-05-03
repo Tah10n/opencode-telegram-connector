@@ -585,6 +585,7 @@ test("StateStore rejects unsafe persisted session identities", async () => {
     assert.equal(err.code, "STATE_SCHEMA_INVALID")
     assert.match(err.message, /state\.bindings\["100:0"\]\.sessionId/)
     assert.match(err.message, /state\.bindings\["100:1"\]\.projectAlias/)
+    assert.match(err.message, /pipe/)
     assert.match(err.message, /state\.sessionIndex\["demo:prod:ses_2"\] key/)
     assert.match(err.message, /state\.pendingPrompts\.permissions\["unsafe"\]\.sessionID/)
     return true
