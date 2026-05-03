@@ -507,6 +507,79 @@ test("TelegramClient sendMessage splits long output and keeps reply markup on th
   assert.equal(result.message_id, 2)
 })
 
+test("TelegramClient sendMessage skips empty and whitespace-only text", async () => {
+  const failures = []
+  const client = new TelegramClient("token", { onApiFailure: (entry) => failures.push(entry) })
+  const calls = []
+  client.call = async (method, params) => {
+    calls.push({ method, params })
+    return { message_id: calls.length }
+  }
+
+  const replyMarkup = makeInlineKeyboard([[{ text: "Open", callback_data: "open" }]])
+
+  assert.equal(await client.sendMessage(100, "", replyMarkup), null)
+  assert.equal(await client.sendMessage(100, " \n\t ", replyMarkup), null)
+  assert.equal(await client.sendMessage(100, "<b> </b>&nbsp;", replyMarkup, { parse_mode: "HTML" }), null)
+
+  const result = await client.sendMessage(100, `hello\n${" ".repeat(3901)}`, replyMarkup, { message_thread_id: 7 })
+
+  assert.equal(result.message_id, 1)
+  assert.deepEqual(calls, [
+    {
+      method: "sendMessage",
+      params: {
+        chat_id: 100,
+        text: "hello",
+        message_thread_id: 7,
+        reply_markup: replyMarkup,
+      },
+    },
+  ])
+  assert.deepEqual(failures, [])
+})
+
+test("TelegramClient sendHtmlBlocks skips empty HTML blocks without consuming reply markup", async () => {
+  const client = new TelegramClient("token")
+  const sendCalls = []
+  client.sendMessage = async (chatId, text, replyMarkup, options) => {
+    sendCalls.push({ chatId, text, replyMarkup, options })
+    return { message_id: sendCalls.length }
+  }
+
+  const replyMarkup = makeInlineKeyboard([[{ text: "Next", callback_data: "next" }]])
+  const result = await client.sendHtmlBlocks(
+    100,
+    [
+      { type: "text", html: "" },
+      { type: "text", html: " \n\t " },
+      { type: "text", html: "<b> </b>&nbsp;" },
+      { type: "noop" },
+      { type: "text", html: "<b>first</b>" },
+      { type: "text", html: "" },
+      { type: "text", html: "<b>second</b>" },
+    ],
+    replyMarkup,
+    { message_thread_id: 7 },
+  )
+
+  assert.equal(result.message_id, 2)
+  assert.deepEqual(sendCalls, [
+    {
+      chatId: 100,
+      text: "<b>first</b>",
+      replyMarkup,
+      options: { message_thread_id: 7, parse_mode: "HTML", disable_web_page_preview: true },
+    },
+    {
+      chatId: 100,
+      text: "<b>second</b>",
+      replyMarkup: null,
+      options: { message_thread_id: 7, parse_mode: "HTML", disable_web_page_preview: true },
+    },
+  ])
+})
+
 test("TelegramClient sendHtmlBlocks, sendDocument, and edit helpers use the expected wrappers", async () => {
   const client = new TelegramClient("token")
   const sendCalls = []
