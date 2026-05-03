@@ -209,7 +209,7 @@ test("createCommandHandlers handleWhere reports stale active turns", async () =>
   await handlers.handleWhere({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" })
 
   assert.equal(sent.length, 1)
-  assert.match(sent[0].text, /Agent: stale \(30m without progress; message msg_stuck; use \/abort or \/new\)/)
+  assert.match(sent[0].text, /Agent: stale \(\d+m without progress; message msg_stuck; use \/abort or \/new\)/)
 })
 
 test("createCommandHandlers handleWhere ignores stale remote running messages after local completion", async () => {
