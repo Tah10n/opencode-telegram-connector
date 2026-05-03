@@ -1,6 +1,6 @@
 const MAX_OPENCODE_ID_LENGTH = 256
 const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/
-const UNSAFE_BINDING_ID_RE = /[:\s\\/?#]/
+const UNSAFE_BINDING_ID_RE = /[:|\s\\/?#]/
 
 export function normalizeOpenCodeId(value) {
   if (typeof value !== "string") return ""
@@ -17,7 +17,7 @@ export function isSafeOpenCodeId(value) {
 export function requireSafeOpenCodeId(value, label = "opencode id") {
   const id = normalizeOpenCodeId(value)
   if (!id || !isSafeOpenCodeId(id)) {
-    throw new Error(`Invalid ${label}: expected a non-empty id without whitespace, colon, or URL path/query separators`)
+    throw new Error(`Invalid ${label}: expected a non-empty id without whitespace, colon, pipe, or URL path/query separators`)
   }
   return id
 }

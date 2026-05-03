@@ -10,6 +10,7 @@ import { createSessionCommandHandlers } from "./commands/sessions.js"
 import { formatModelUiChoices, resolveModelProviderCatalog } from "./model-ui.js"
 import { unsupportedMediaKind, unsupportedMediaText } from "./incoming-attachments.js"
 import { formatStaleActiveTurnNotice, resolveActiveTurnStaleMs, resolveActiveTurnStatus } from "./active-turns.js"
+import { callbackPacker } from "./commands/shared.js"
 
 function helpText({ scopeLabel = "this thread", defaultProject = "", isBound = false } = {}) {
   const next = isBound
@@ -97,6 +98,7 @@ export function createCommandHandlers(runtime) {
 
   const userAttachmentLimits = userAttachmentLimitsFromConfig(config?.limits)
   const activeTurnStaleMs = resolveActiveTurnStaleMs(config?.activeTurnStaleMs)
+  const packCallback = callbackPacker(runtime.cb)
 
   function routeCtxKey(route) {
     if (route?.chatId == null) return ""
@@ -207,31 +209,31 @@ export function createCommandHandlers(runtime) {
   function unboundGuidanceKeyboard() {
     const rows = []
     const def = configuredDefaultProject()
-    if (def) rows.push([{ text: `Bind ${def}`, callback_data: runtime.cb.pack(`srv|${def}|bind`) }])
-    rows.push([{ text: "Projects", callback_data: runtime.cb.pack("srv|projects") }])
-    rows.push([{ text: "Close", callback_data: runtime.cb.pack("srv|close") }])
+    if (def) rows.push([{ text: `Bind ${def}`, callback_data: packCallback("srv", def, "bind") }])
+    rows.push([{ text: "Projects", callback_data: packCallback("srv", "projects") }])
+    rows.push([{ text: "Close", callback_data: packCallback("srv", "close") }])
     return makeInlineKeyboard(rows)
   }
 
   function boundThreadActionsKeyboard(ctxMeta) {
     return makeInlineKeyboard([
       [
-        { text: "Sessions", callback_data: runtime.cb.pack("s|refresh") },
-        { text: "New", callback_data: runtime.cb.pack("s|new") },
+        { text: "Sessions", callback_data: packCallback("s", "refresh") },
+        { text: "New", callback_data: packCallback("s", "new") },
       ],
       [
-        { text: "Feed", callback_data: runtime.cb.pack("feed|settings") },
-        { text: "Model", callback_data: runtime.cb.pack("m|settings") },
+        { text: "Feed", callback_data: packCallback("feed", "settings") },
+        { text: "Model", callback_data: packCallback("m", "settings") },
       ],
       [
-        { text: "Unbind", callback_data: runtime.cb.pack(`b|confirm-unbind|${ctxMeta.ctxKey}`) },
-        { text: "Close", callback_data: runtime.cb.pack("s|close") },
+        { text: "Unbind", callback_data: packCallback("b", "confirm-unbind", ctxMeta.ctxKey) },
+        { text: "Close", callback_data: packCallback("s", "close") },
       ],
     ])
   }
 
   function closeOnlyKeyboard() {
-    return makeInlineKeyboard([[{ text: "Close", callback_data: runtime.cb.pack("s|close") }]])
+    return makeInlineKeyboard([[{ text: "Close", callback_data: packCallback("s", "close") }]])
   }
 
   async function maybeBlockStaleActiveTurn(ctxMeta, binding) {
