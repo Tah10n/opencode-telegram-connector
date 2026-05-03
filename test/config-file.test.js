@@ -54,6 +54,12 @@ test("buildRuntimeConfig loads connector.config.mjs and resolves relative paths"
       mirrorTuiUserMessages: true,
       logFormat: "json",
       allowInsecureHttp: true,
+      activeTurnStaleMs: "60000",
+      opencodeWatchdog: {
+        failureThreshold: "3",
+        windowMs: 120000,
+        cooldownMs: 0,
+      },
       limits: {
         userAttachmentConfirmBytes: 1000,
         userAttachmentMaxBytes: 2000,
@@ -84,6 +90,12 @@ test("buildRuntimeConfig loads connector.config.mjs and resolves relative paths"
   assert.equal(config.cwd, dir)
   assert.equal(config.logFormat, "json")
   assert.equal(config.mirrorTuiUserMessages, true)
+  assert.equal(config.activeTurnStaleMs, 60000)
+  assert.deepEqual(config.opencodeWatchdog, {
+    failureThreshold: 3,
+    windowMs: 120000,
+    cooldownMs: 0,
+  })
   assert.equal(config.projects.demo.directory, path.resolve(dir, "repo"))
   assert.equal(config.allowInsecureHttp, true)
   assert.deepEqual(config.limits, {
@@ -260,6 +272,21 @@ test("buildRuntimeConfig rejects invalid echo filter mode", async (t) => {
   process.env.PROJECTS_JSON = JSON.stringify({ demo: { baseUrl: "http://127.0.0.1:4312" } })
 
   await assert.rejects(() => buildRuntimeConfig({ cwd: dir }), /Invalid echoFilterMode \/ ECHO_FILTER_MODE/)
+})
+
+test("buildRuntimeConfig rejects invalid connector.config runtime knobs", async () => {
+  const cases = [
+    ["activeTurnStaleMs: 0", /Config field 'activeTurnStaleMs' must be a positive integer/],
+    ["opencodeWatchdog: 1", /Config field 'opencodeWatchdog' must be an object/],
+    ["opencodeWatchdog: { failureThreshold: 'many' }", /Config field 'opencodeWatchdog\.failureThreshold' must be a positive integer/],
+    ["opencodeWatchdog: { cooldownMs: -1 }", /Config field 'opencodeWatchdog\.cooldownMs' must be a non-negative integer/],
+  ]
+
+  for (const [snippet, expected] of cases) {
+    const dir = await makeTempDir()
+    await fs.writeFile(path.join(dir, "connector.config.mjs"), `export default { ${snippet} }`, "utf8")
+    await assert.rejects(() => buildRuntimeConfig({ cwd: dir }), expected)
+  }
 })
 
 test("buildRuntimeConfig lets connector.config.mjs override legacy env and projects json", async (t) => {
