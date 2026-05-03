@@ -10,6 +10,7 @@ import {
   questionRejectIdempotencyKey,
   questionReplyIdempotencyPrefix,
 } from "./idempotency.js"
+import { callbackPacker, decodeCallbackData } from "./callback-data.js"
 
 async function defaultBuildSessionSwitchText(_projectAlias, sessionId) {
   return `Switched to session: ${sessionId}`
@@ -65,6 +66,7 @@ export function createCallbackHandlers(runtime) {
     requestRuntimeShutdown,
     scheduleRuntimeShutdown,
   } = runtime
+  const packCallbackData = callbackPacker(cb)
 
   async function answerCallbackQuery(callbackQueryId, text) {
     await tg.answerCallbackQuery(callbackQueryId, text).catch(ignoreError)
@@ -271,26 +273,22 @@ export function createCallbackHandlers(runtime) {
     return `chat ${parsed.chatId} / ${formatThreadLabel?.(parsed.threadIdOr0) || `thread ${parsed.threadIdOr0}`}`
   }
 
-  function packCallbackData(data) {
-    return typeof cb?.pack === "function" ? cb.pack(data) : data
-  }
-
   function unbindConfirmationKeyboard(ctxKey, binding) {
     return makeInlineKeyboard([
-      [{ text: "Remove this thread binding", callback_data: packCallbackData(`b|unbind|${ctxKey}|${binding.projectAlias}|${binding.sessionId}`) }],
-      [{ text: "Close", callback_data: packCallbackData("b|close") }],
+      [{ text: "Remove this thread binding", callback_data: packCallbackData("b", "unbind", ctxKey, binding.projectAlias, binding.sessionId) }],
+      [{ text: "Close", callback_data: packCallbackData("b", "close") }],
     ])
   }
 
   function runtimeCloseKeyboard() {
-    return makeInlineKeyboard([[{ text: "Close", callback_data: packCallbackData("rt|close") }]])
+    return makeInlineKeyboard([[{ text: "Close", callback_data: packCallbackData("rt", "close") }]])
   }
 
   function runtimeConfirmationKeyboard(action) {
     const label = action === "restart" ? "Confirm restart" : "Confirm stop"
     return makeInlineKeyboard([
-      [{ text: label, callback_data: packCallbackData(`rt|${action}`) }],
-      [{ text: "Cancel", callback_data: packCallbackData("rt|cancel") }],
+      [{ text: label, callback_data: packCallbackData("rt", action) }],
+      [{ text: "Cancel", callback_data: packCallbackData("rt", "cancel") }],
     ])
   }
 
@@ -336,13 +334,17 @@ export function createCallbackHandlers(runtime) {
     if (!isAllowedUser(callbackQuery?.from)) return
     const msg = callbackQuery.message
     const ctxMeta = ctxMetaFromMessage(msg)
-    const data = cb.unpack(callbackQuery.data)
+    const data = typeof cb?.unpack === "function" ? cb.unpack(callbackQuery.data) : callbackQuery.data
     if (!data) {
       await answerCallbackQuery(callbackQuery.id, "Invalid")
       return
     }
 
-    const parts = String(data).split("|")
+    const parts = decodeCallbackData(data)
+    if (!parts?.length || !parts[0]) {
+      await answerCallbackQuery(callbackQuery.id, "Invalid")
+      return
+    }
     const kind = parts[0]
     const callbackProjectAlias = projects?.[parts[1]] ? parts[1] : store.getBinding(ctxMeta.ctxKey)?.projectAlias || null
 

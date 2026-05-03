@@ -1,14 +1,15 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { formatModelUiChoices, resolveModelProviderCatalog } from "../src/connector/model-ui.js"
+import { encodeCallback } from "../src/connector/callback-data.js"
 
-function pack(value) {
-  return `packed:${value}`
+function packedCallback(...parts) {
+  return `packed:${encodeCallback(parts)}`
 }
 
 test("formatModelUiChoices renders text and root model controls", () => {
   const result = formatModelUiChoices({
-    cbPack: pack,
+    cbPack: packedCallback,
     noticeText: "Changed.",
     binding: { projectAlias: "demo", sessionId: "ses_1" },
     preference: { mode: "inherit" },
@@ -23,15 +24,15 @@ test("formatModelUiChoices renders text and root model controls", () => {
   assert.match(result.text, /^Changed\.\n\nModel for this thread:/)
   assert.match(result.text, /Project default: openai\/gpt-5/)
   assert.deepEqual(result.replyMarkup.inline_keyboard[0], [
-    { text: "✓ Inherit", callback_data: "packed:m|set|inherit" },
-    { text: "Project default", callback_data: "packed:m|set|project-default" },
+    { text: "✓ Inherit", callback_data: packedCallback("m", "set", "inherit") },
+    { text: "Project default", callback_data: packedCallback("m", "set", "project-default") },
   ])
-  assert.deepEqual(result.replyMarkup.inline_keyboard[1], [{ text: "openai", callback_data: "packed:m|provider|openai" }])
+  assert.deepEqual(result.replyMarkup.inline_keyboard[1], [{ text: "openai", callback_data: packedCallback("m", "provider", "openai") }])
 })
 
-test("formatModelUiChoices renders variant choices without changing callback payloads", () => {
+test("formatModelUiChoices renders encoded variant choices", () => {
   const result = formatModelUiChoices({
-    cbPack: pack,
+    cbPack: packedCallback,
     binding: { projectAlias: "demo", sessionId: "ses_1" },
     preference: { mode: "custom", model: { providerID: "openai", modelID: "gpt-5" }, variant: "high" },
     effectiveState: { label: "openai/gpt-5 high", source: "thread-custom" },
@@ -43,8 +44,8 @@ test("formatModelUiChoices renders variant choices without changing callback pay
   })
 
   assert.match(result.text, /Pick a variant for: openai\/gpt-5/)
-  assert.deepEqual(result.replyMarkup.inline_keyboard[0], [{ text: "No variant", callback_data: "packed:m|apply|openai/gpt-5|~" }])
-  assert.ok(result.replyMarkup.inline_keyboard.some((row) => row.some((button) => button.callback_data === "packed:m|apply|openai/gpt-5|high")))
+  assert.deepEqual(result.replyMarkup.inline_keyboard[0], [{ text: "No variant", callback_data: packedCallback("m", "apply", "openai/gpt-5", "~") }])
+  assert.ok(result.replyMarkup.inline_keyboard.some((row) => row.some((button) => button.callback_data === packedCallback("m", "apply", "openai/gpt-5", "high"))))
 })
 
 test("resolveModelProviderCatalog merges provider config with fallback models", async () => {

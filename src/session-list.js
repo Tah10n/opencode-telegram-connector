@@ -1,3 +1,5 @@
+import { isSafeOpenCodeId } from "./opencode/ids.js"
+
 function clampString(value, max) {
   const str = String(value ?? "").trim()
   if (!str) return ""
@@ -72,13 +74,17 @@ export function formatSessionsListText(
     return lines.join("\n")
   }
 
-  lines.push("Tap a button below to switch:")
+  const visibleSessions = normalized.slice(0, limit)
+  const hasSwitchableSessions = visibleSessions.some((session) => isSafeOpenCodeId(session.id))
+  const hasUnsupportedSessions = visibleSessions.some((session) => !isSafeOpenCodeId(session.id))
+  lines.push(hasSwitchableSessions ? "Tap a button below to switch:" : "Recent sessions (unsupported IDs cannot be selected with buttons):")
   lines.push("")
   lines.push("Recent sessions:")
-  for (const session of normalized.slice(0, limit)) {
+  for (const session of visibleSessions) {
     const markers = sessionMarkers(session.id, { currentSessionId, startupSessionId })
     const suffix = []
     if (markers.length) suffix.push(`[${markers.join(", ")}]`)
+    if (!isSafeOpenCodeId(session.id)) suffix.push("[unsupported id]")
     if (session.title) suffix.push(`— ${session.title}`)
     lines.push(`- ${session.id}${suffix.length ? ` ${suffix.join(" ")}` : ""}`)
   }
@@ -87,6 +93,7 @@ export function formatSessionsListText(
     lines.push(`…and ${normalized.length - limit} more.`)
   }
   lines.push("")
+  if (hasUnsupportedSessions) lines.push("Sessions marked [unsupported id] cannot be selected with buttons; use a session id without whitespace, colon, pipe, or URL path/query separators.")
   lines.push("Use /use <sessionId|shareLink> to switch.")
   return lines.join("\n")
 }

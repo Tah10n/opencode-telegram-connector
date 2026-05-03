@@ -123,6 +123,44 @@ test("loadProjectsConfig rejects project aliases with colons", async () => {
   )
 })
 
+test("loadProjectsConfig rejects project aliases unsafe for callbacks", async () => {
+  await assert.rejects(
+    loadProjectsConfig({
+      projectsJson: JSON.stringify({
+        "bad|alias": { baseUrl: "http://127.0.0.1:4312" },
+      }),
+    }),
+    /Project alias 'bad\|alias' must not contain ':' or '\|'/,
+  )
+
+  await assert.rejects(
+    loadProjectsConfig({
+      projectsJson: JSON.stringify({
+        " alias ": { baseUrl: "http://127.0.0.1:4312" },
+      }),
+    }),
+    /must not have leading or trailing whitespace/,
+  )
+
+  await assert.rejects(
+    loadProjectsConfig({
+      projectsJson: JSON.stringify({
+        "": { baseUrl: "http://127.0.0.1:4312" },
+      }),
+    }),
+    /Project alias must not be empty/,
+  )
+
+  await assert.rejects(
+    loadProjectsConfig({
+      projectsJson: JSON.stringify({
+        "   ": { baseUrl: "http://127.0.0.1:4312" },
+      }),
+    }),
+    /Project alias must not be empty/,
+  )
+})
+
 test("loadProjectsConfig reports a Windows backslash hint for invalid JSON", async () => {
   await assert.rejects(
     loadProjectsConfig({

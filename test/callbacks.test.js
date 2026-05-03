@@ -3,6 +3,11 @@ import assert from "node:assert/strict"
 import { createCallbackHandlers } from "../src/connector/callbacks.js"
 import { makeBoundaryError } from "../src/boundary-errors.js"
 import { redactCmdlineSecrets } from "../src/url-utils.js"
+import { encodeCallback } from "../src/connector/callback-data.js"
+
+function callbackData(...parts) {
+  return encodeCallback(parts)
+}
 
 function makeCallback(data, overrides = {}) {
   const threadIdOr0 = overrides.threadIdOr0 ?? 7
@@ -245,7 +250,7 @@ test("createCallbackHandlers asks for confirmation before runtime stop", async (
   assert.equal(editCalls[0][1], 77)
   assert.match(editCalls[0][2], /Stop connector\?/)
   assert.deepEqual(editCalls[0][3].inline_keyboard.flat().map((button) => button.text), ["Confirm stop", "Cancel"])
-  assert.deepEqual(editCalls[0][3].inline_keyboard.flat().map((button) => button.callback_data), ["rt|stop", "rt|cancel"])
+  assert.deepEqual(editCalls[0][3].inline_keyboard.flat().map((button) => button.callback_data), [callbackData("rt", "stop"), callbackData("rt", "cancel")])
 })
 
 test("createCallbackHandlers asks for confirmation before runtime restart", async () => {
@@ -266,7 +271,7 @@ test("createCallbackHandlers asks for confirmation before runtime restart", asyn
   assert.match(editCalls[0][2], /Restart connector\?/)
   assert.match(editCalls[0][2], /exit with code 1/)
   assert.deepEqual(editCalls[0][3].inline_keyboard.flat().map((button) => button.text), ["Confirm restart", "Cancel"])
-  assert.deepEqual(editCalls[0][3].inline_keyboard.flat().map((button) => button.callback_data), ["rt|restart", "rt|cancel"])
+  assert.deepEqual(editCalls[0][3].inline_keyboard.flat().map((button) => button.callback_data), [callbackData("rt", "restart"), callbackData("rt", "cancel")])
 })
 
 test("createCallbackHandlers deletes runtime confirmation after cancel", async () => {
@@ -483,6 +488,23 @@ test("createCallbackHandlers does not confirm state changes when flush fails", a
   assert.deepEqual(modelState.modelPrefsByContext, {})
 })
 
+test("createCallbackHandlers decodes delimiter-safe model callbacks", async () => {
+  const modelCalls = []
+  const { runtime, callbackAnswers } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    setThreadModelPreference: async (ctxMeta, _binding, value) => {
+      modelCalls.push({ ctxKey: ctxMeta.ctxKey, value })
+      return { ok: true, callbackText: "Model: custom" }
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback(callbackData("m", "apply", "openai/gpt|5", "x|high")))
+
+  assert.deepEqual(callbackAnswers, [{ callbackQueryId: "cb_1", text: "Model: custom" }])
+  assert.deepEqual(modelCalls, [{ ctxKey: "100:7", value: { mode: "custom", model: "openai/gpt|5", variant: "x|high" } }])
+})
+
 test("createCallbackHandlers rejects unsafe session switch callback ids", async () => {
   const getSessionCalls = []
   const { runtime, callbackAnswers, bindCalls } = makeRuntime({
@@ -609,7 +631,7 @@ test("createCallbackHandlers handles server-start, feed, and changed-files callb
 
   await handlers.handleTelegramCallback(makeCallback("srv|demo|start", { chatType: "private", threadIdOr0: 0 }))
   await handlers.handleTelegramCallback(makeCallback("feed|verbose"))
-  await handlers.handleTelegramCallback(makeCallback("cf|demo|ses_1|msg_1|show"))
+  await handlers.handleTelegramCallback(makeCallback(callbackData("cf", "demo", "ses_1", "msg|1", "show")))
 
   assert.equal(callbackAnswers[0].text, "Starting…")
   assert.deepEqual(startCalls, [{ projectAlias: "demo", ctxMeta: { chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" } }])
@@ -626,7 +648,7 @@ test("createCallbackHandlers handles server-start, feed, and changed-files callb
       ctxMeta: { chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" },
       projectAlias: "demo",
       sessionId: "ses_1",
-      opencodeMessageId: "msg_1",
+      opencodeMessageId: "msg|1",
       action: "show",
       options: { editMessageId: 900 },
     },

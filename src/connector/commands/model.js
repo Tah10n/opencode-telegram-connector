@@ -8,6 +8,7 @@ import {
   normalizeVariant,
   pickMostRecentSessionModelInfo,
 } from "../../model-selection.js"
+import { callbackPacker } from "./shared.js"
 
 export function createModelCommandHandlers(deps) {
   const {
@@ -24,6 +25,7 @@ export function createModelCommandHandlers(deps) {
     feedModeLabel,
     cb,
   } = deps
+  const packCallback = callbackPacker(cb)
 
   function getModelPreference(ctxKey) {
     return normalizeModelPreference(store.getModelPreference?.(ctxKey))
@@ -188,7 +190,7 @@ export function createModelCommandHandlers(deps) {
           ? requestedModel.providerID
           : ""
     const { text, replyMarkup } = formatModelUiChoices({
-      cbPack: (value) => cb.pack(value),
+      cbPack: packCallback,
       noticeText,
       binding: currentBinding,
       preference,

@@ -149,7 +149,7 @@ If a Basic Auth project uses a non-loopback `http://` URL, set `OPENCODE_ALLOW_I
 - `/start`, `/help` — show help.
 - `/bind [projectAlias]` — bind the current chat/topic to a project's startup session. Without an argument, the bot asks for the alias interactively.
 - `/new [title]` — create a new session and bind the current Telegram thread to it. With `openAttachOnNewMode: "new-window"` it also opens a fresh attach window; with `same-window` it requests the existing attached TUI to switch to the new session.
-- `/use <sessionId|shareLink>` — bind an existing session. Supports `https://opncd.ai/share/<id>` and `https://opncd.ai/s/<id>`. Session IDs must be non-empty and cannot contain whitespace, colons, or URL path/query separators; share links are accepted only when they resolve to a session ID that meets the same safety rule.
+- `/use <sessionId|shareLink>` — bind an existing session. Supports `https://opncd.ai/share/<id>` and `https://opncd.ai/s/<id>`. Session IDs must be non-empty and cannot contain whitespace, colons, pipes (`|`), or URL path/query separators; share links are accepted only when they resolve to a session ID that meets the same safety rule.
 - `/sessions` — list recent sessions and switch with buttons.
 - `/unbind` — remove the current binding.
 
@@ -502,7 +502,7 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 - Feed mode is stored per Telegram thread/topic; the default is `Main + changes`.
 - Large assistant replies may be delivered as `.txt` attachments, and large changed-file diffs may be delivered as `.patch` attachments instead of many chat messages.
 - Telegram HTML messages are split with tag/entity awareness to avoid malformed chunks.
-- OpenCode path IDs are URL-encoded at the HTTP boundary; user-entered binding/session IDs are validated before being persisted.
+- OpenCode path IDs are URL-encoded at the HTTP boundary; user-entered binding/session IDs are validated before being persisted and cannot contain whitespace, colons, pipes (`|`), or URL path/query separators.
 - Parent-session routing uses a bounded cache for long-running processes.
 - Basic Auth over non-loopback `http://` is blocked unless `OPENCODE_ALLOW_INSECURE_HTTP=1` is set.
 

@@ -16,6 +16,7 @@ import { ATTACHMENT_NOTICES, attachmentCaption, sanitizeFilenamePart, scopedAtta
 import { NOISY_SKIP_REASONS } from "./noisy-skip-reasons.js"
 import { redactSensitiveText } from "../url-utils.js"
 import { classifyBoundaryError, isRetryableBoundaryError } from "../boundary-errors.js"
+import { callbackPacker } from "./callback-data.js"
 
 export function createMirroringHandlers(runtime) {
   const {
@@ -46,6 +47,7 @@ export function createMirroringHandlers(runtime) {
     recordNoisyEventSkipped,
     recordAttachmentFallback,
   } = runtime
+  const packCallback = callbackPacker(cb)
 
   const pause = typeof sleep === "function" ? sleep : (ms) => new Promise((resolve) => setTimeout(resolve, ms))
   const isStopping = () => abortSignal?.aborted === true
@@ -401,12 +403,12 @@ export function createMirroringHandlers(runtime) {
 
   function feedKeyboard(ctxKey) {
     const current = getFeedMode(ctxKey)
-    const button = (mode, label) => ({ text: `${current === mode ? "✓ " : ""}${label}`, callback_data: cb.pack(`feed|${mode}`) })
+    const button = (mode, label) => ({ text: `${current === mode ? "✓ " : ""}${label}`, callback_data: packCallback("feed", mode) })
     return makeInlineKeyboard([
       [button("main", "Main")],
       [button("main+changes", "Main + changes")],
       [button("verbose", "Verbose")],
-      [{ text: "Close", callback_data: cb.pack("feed|close") }],
+      [{ text: "Close", callback_data: packCallback("feed", "close") }],
     ])
   }
 
@@ -429,42 +431,42 @@ export function createMirroringHandlers(runtime) {
     const fileEntries = extractPatchFileEntries(msg).filter((entry) => entry.diff)
     const canLoadFileDiffs = fileEntries.length > 0 || !!msg?.info?.parentID
     const rows = [
-      [{ text: "Show diff", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|show`) }],
+      [{ text: "Show diff", callback_data: packCallback("cf", projectAlias, sessionId, messageId, "show") }],
       [
-        { text: "Send summary", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|summary`) },
-        { text: "Full .patch", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|patch`) },
+        { text: "Send summary", callback_data: packCallback("cf", projectAlias, sessionId, messageId, "summary") },
+        { text: "Full .patch", callback_data: packCallback("cf", projectAlias, sessionId, messageId, "patch") },
       ],
     ]
-    if (canLoadFileDiffs) rows.push([{ text: "File diffs", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|files`) }])
-    rows.push([{ text: "Close", callback_data: cb.pack("cf|close") }])
+    if (canLoadFileDiffs) rows.push([{ text: "File diffs", callback_data: packCallback("cf", projectAlias, sessionId, messageId, "files") }])
+    rows.push([{ text: "Close", callback_data: packCallback("cf", "close") }])
     return makeInlineKeyboard(rows)
   }
 
   function changedFilesDiffKeyboard(projectAlias, sessionId, messageId, { fileIndex = null } = {}) {
-    const rows = [[{ text: "Back", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|back`) }]]
+    const rows = [[{ text: "Back", callback_data: packCallback("cf", projectAlias, sessionId, messageId, "back") }]]
     if (Number.isInteger(fileIndex)) {
-      rows.push([{ text: "Send file .patch", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|filepatch|${fileIndex}`) }])
+      rows.push([{ text: "Send file .patch", callback_data: packCallback("cf", projectAlias, sessionId, messageId, "filepatch", fileIndex) }])
     }
-    rows.push([{ text: "Full .patch", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|patch`) }])
-    rows.push([{ text: "Close", callback_data: cb.pack("cf|close") }])
+    rows.push([{ text: "Full .patch", callback_data: packCallback("cf", projectAlias, sessionId, messageId, "patch") }])
+    rows.push([{ text: "Close", callback_data: packCallback("cf", "close") }])
     return makeInlineKeyboard(rows)
   }
 
   function changedFilesListKeyboard(projectAlias, sessionId, messageId, entries) {
     const rows = entries.slice(0, CHANGED_FILES_LIMIT).map((entry, index) => [{
       text: `${index + 1}. ${sanitizeFilenamePart(entry.file, "file")}`.slice(0, 64),
-      callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|file|${index}`),
+      callback_data: packCallback("cf", projectAlias, sessionId, messageId, "file", index),
     }])
     rows.push([
-      { text: "Back", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|back`) },
-      { text: "Full .patch", callback_data: cb.pack(`cf|${projectAlias}|${sessionId}|${messageId}|patch`) },
+      { text: "Back", callback_data: packCallback("cf", projectAlias, sessionId, messageId, "back") },
+      { text: "Full .patch", callback_data: packCallback("cf", projectAlias, sessionId, messageId, "patch") },
     ])
-    rows.push([{ text: "Close", callback_data: cb.pack("cf|close") }])
+    rows.push([{ text: "Close", callback_data: packCallback("cf", "close") }])
     return makeInlineKeyboard(rows)
   }
 
   function changedFilesCloseKeyboard() {
-    return makeInlineKeyboard([[{ text: "Close", callback_data: cb.pack("cf|close") }]])
+    return makeInlineKeyboard([[{ text: "Close", callback_data: packCallback("cf", "close") }]])
   }
 
   function extractTextParts(message) {

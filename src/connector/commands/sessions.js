@@ -4,6 +4,7 @@ import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList
 import { getLaunchSupport } from "../../opencode/launcher.js"
 import { isSafeOpenCodeId, normalizeOpenCodeId, requireSafeOpenCodeId } from "../../opencode/ids.js"
 import { modelSourceLabel } from "../../model-selection.js"
+import { callbackPacker } from "./shared.js"
 
 export function createSessionCommandHandlers(deps) {
   const {
@@ -34,6 +35,7 @@ export function createSessionCommandHandlers(deps) {
     openAttachWindowWindowsFn,
     markProjectUp,
   } = deps
+  const packCallback = callbackPacker(cb)
 
   function normalizeSafeSessionId(value) {
     const id = normalizeOpenCodeId(value)
@@ -45,11 +47,11 @@ export function createSessionCommandHandlers(deps) {
   }
 
   function invalidSessionReferenceText() {
-    return "Invalid session id. Use a session id without whitespace, colon, or URL path/query characters. Share links are accepted only when they resolve to a safe session id."
+    return "Invalid session id. Use a session id without whitespace, colon, pipe, or URL path/query characters. Share links are accepted only when they resolve to a safe session id."
   }
 
   function unsafeShareLinkSessionText() {
-    return "Share link resolved to a session id this connector cannot safely bind. Use a session id without whitespace, colon, or URL path/query characters."
+    return "Share link resolved to a session id this connector cannot safely bind. Use a session id without whitespace, colon, pipe, or URL path/query characters."
   }
 
   function createSessionOptions(projectAlias, extra = {}) {
@@ -87,23 +89,23 @@ export function createSessionCommandHandlers(deps) {
   }
 
   function sessionsKeyboard(projectAlias, sessions, { currentSessionId, startupSessionId, limit = 10 } = {}) {
-    const normalized = normalizeSessionsList(sessions).slice(0, limit)
+    const normalized = normalizeSessionsList(sessions).slice(0, limit).filter((session) => isSafeOpenCodeId(session.id))
     const rows = normalized.map((session) => [
       {
         text: formatSessionButtonLabel(session, { currentSessionId, startupSessionId }),
-        callback_data: cb.pack(`s|${projectAlias}|${session.id}`),
+        callback_data: packCallback("s", projectAlias, session.id),
       },
     ])
     rows.push([
-      { text: "Refresh", callback_data: cb.pack("s|refresh") },
-      { text: "New", callback_data: cb.pack("s|new") },
-      { text: "Close", callback_data: cb.pack("s|close") },
+      { text: "Refresh", callback_data: packCallback("s", "refresh") },
+      { text: "New", callback_data: packCallback("s", "new") },
+      { text: "Close", callback_data: packCallback("s", "close") },
     ])
     return makeInlineKeyboard(rows)
   }
 
-  function closeKeyboard(callbackData = "s|close") {
-    return makeInlineKeyboard([[{ text: "Close", callback_data: cb.pack(callbackData) }]])
+  function closeKeyboard(callbackParts = ["s", "close"]) {
+    return makeInlineKeyboard([[{ text: "Close", callback_data: packCallback(callbackParts) }]])
   }
 
   async function renderSessionsList(ctxMeta, { binding, editMessageId } = {}) {
@@ -152,7 +154,7 @@ export function createSessionCommandHandlers(deps) {
         .replace("Tap a button below to switch:\n\n", "")
         .replace("Use /new to create one or /use <sessionId|shareLink> to switch.", "Bind the target chat/thread to this project before creating or switching sessions from Telegram.")
         .replace("Use /use <sessionId|shareLink> to switch.", "Use /bind <projectAlias> in the target chat/thread, then /use <sessionId|shareLink> to switch.")
-      const replyMarkup = closeKeyboard("srv|close")
+      const replyMarkup = closeKeyboard(["srv", "close"])
       if (editMessageId) {
         await tg.editMessageText(ctxMeta.chatId, editMessageId, text, replyMarkup)
         return

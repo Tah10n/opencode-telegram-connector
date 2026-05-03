@@ -2,6 +2,7 @@ import { makeInlineKeyboard } from "../telegram/client.js"
 import { redactCmdlineSecrets, sanitizeBaseUrlForDisplay } from "../url-utils.js"
 import { isRetryableBoundaryError, normalizeBoundaryError } from "../boundary-errors.js"
 import { getLaunchSupport } from "../opencode/launcher.js"
+import { callbackPacker } from "./callback-data.js"
 
 export function buildProjectsOverviewText({
   projects,
@@ -59,22 +60,23 @@ export function buildProjectsOverviewKeyboard({
   showBindControls = false,
   currentBinding = null,
 }) {
+  const packCallback = callbackPacker(cb)
   const rows = []
   if (showProjectControls || showBindControls) {
     for (const alias of Object.keys(projects || {})) {
       const row = []
       if (showBindControls && (!currentBinding || currentBinding.projectAlias === alias)) {
-        row.push({ text: currentBinding?.projectAlias === alias ? `Bound ${alias}` : `Bind ${alias}`, callback_data: cb.pack(`srv|${alias}|bind`) })
+        row.push({ text: currentBinding?.projectAlias === alias ? `Bound ${alias}` : `Bind ${alias}`, callback_data: packCallback("srv", alias, "bind") })
       }
       if (showProjectControls && canAutoStartProject?.(alias, { platform })) {
-        row.push({ text: `Start ${alias}`, callback_data: cb.pack(`srv|${alias}|start`) })
+        row.push({ text: `Start ${alias}`, callback_data: packCallback("srv", alias, "start") })
       }
-      if (showProjectControls) row.push({ text: `Status ${alias}`, callback_data: cb.pack(`srv|${alias}|health`) })
-      if (showProjectControls && showSessions) row.push({ text: `Sessions ${alias}`, callback_data: cb.pack(`srv|${alias}|sessions`) })
+      if (showProjectControls) row.push({ text: `Status ${alias}`, callback_data: packCallback("srv", alias, "health") })
+      if (showProjectControls && showSessions) row.push({ text: `Sessions ${alias}`, callback_data: packCallback("srv", alias, "sessions") })
       if (row.length) rows.push(row)
     }
   }
-  rows.push([{ text: "Close", callback_data: cb.pack("srv|close") }])
+  rows.push([{ text: "Close", callback_data: packCallback("srv", "close") }])
   return makeInlineKeyboard(rows)
 }
 
@@ -98,14 +100,15 @@ export function createOverviewHelpers({ projects, store, startInProgress, parseC
   }
 
   function startServerKeyboard(projectAlias) {
+    const packCallback = callbackPacker(cb)
     return makeInlineKeyboard([
       [
         {
           text: `Start '${projectAlias}'`,
-          callback_data: cb.pack(`srv|${projectAlias}|start`),
+          callback_data: packCallback("srv", projectAlias, "start"),
         },
       ],
-      [{ text: "Close", callback_data: cb.pack("srv|close") }],
+      [{ text: "Close", callback_data: packCallback("srv", "close") }],
     ])
   }
 

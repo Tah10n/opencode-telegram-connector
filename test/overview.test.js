@@ -4,6 +4,11 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { buildProjectsOverviewKeyboard, buildProjectsOverviewText, createOverviewHelpers } from "../src/connector/overview.js"
+import { encodeCallback } from "../src/connector/callback-data.js"
+
+function packedCallback(...parts) {
+  return `packed:${encodeCallback(parts)}`
+}
 
 function swapEnv(t, patch) {
   const previous = new Map()
@@ -42,8 +47,8 @@ test("createOverviewHelpers startServerKeyboard packs callback data", () => {
   })
 
   const keyboard = helpers.startServerKeyboard("veryLongAliasNameForProject1234567890")
-  assert.equal(keyboard.inline_keyboard[0][0].callback_data, "packed:srv|veryLongAliasNameForProject1234567890|start")
-  assert.equal(keyboard.inline_keyboard[1][0].callback_data, "packed:srv|close")
+  assert.equal(keyboard.inline_keyboard[0][0].callback_data, packedCallback("srv", "veryLongAliasNameForProject1234567890", "start"))
+  assert.equal(keyboard.inline_keyboard[1][0].callback_data, packedCallback("srv", "close"))
 })
 
 test("buildProjectsOverviewText renders empty and populated project summaries", () => {
@@ -137,15 +142,15 @@ test("buildProjectsOverviewKeyboard includes safe project actions", () => {
 
   assert.deepEqual(keyboard.inline_keyboard, [
     [
-      { text: "Start demo", callback_data: "packed:srv|demo|start" },
-      { text: "Status demo", callback_data: "packed:srv|demo|health" },
-      { text: "Sessions demo", callback_data: "packed:srv|demo|sessions" },
+      { text: "Start demo", callback_data: packedCallback("srv", "demo", "start") },
+      { text: "Status demo", callback_data: packedCallback("srv", "demo", "health") },
+      { text: "Sessions demo", callback_data: packedCallback("srv", "demo", "sessions") },
     ],
     [
-      { text: "Status remote", callback_data: "packed:srv|remote|health" },
-      { text: "Sessions remote", callback_data: "packed:srv|remote|sessions" },
+      { text: "Status remote", callback_data: packedCallback("srv", "remote", "health") },
+      { text: "Sessions remote", callback_data: packedCallback("srv", "remote", "sessions") },
     ],
-    [{ text: "Close", callback_data: "packed:srv|close" }],
+    [{ text: "Close", callback_data: packedCallback("srv", "close") }],
   ])
 })
 
@@ -158,9 +163,9 @@ test("buildProjectsOverviewKeyboard can show bind-only actions for unbound threa
   })
 
   assert.deepEqual(keyboard.inline_keyboard, [
-    [{ text: "Bind demo", callback_data: "packed:srv|demo|bind" }],
-    [{ text: "Bind remote", callback_data: "packed:srv|remote|bind" }],
-    [{ text: "Close", callback_data: "packed:srv|close" }],
+    [{ text: "Bind demo", callback_data: packedCallback("srv", "demo", "bind") }],
+    [{ text: "Bind remote", callback_data: packedCallback("srv", "remote", "bind") }],
+    [{ text: "Close", callback_data: packedCallback("srv", "close") }],
   ])
 })
 
@@ -259,7 +264,7 @@ test("createOverviewHelpers offers a Start button for Linux TUI auto-start proje
 
   assert.equal(sent.length, 1)
   assert.ok(sent[0].replyMarkup)
-  assert.equal(sent[0].replyMarkup.inline_keyboard[0][0].callback_data, "srv|demo|start")
+  assert.equal(sent[0].replyMarkup.inline_keyboard[0][0].callback_data, encodeCallback(["srv", "demo", "start"]))
 })
 
 test("createOverviewHelpers offers the Start button for Linux background auto-start projects without GUI launcher support", async (t) => {
@@ -295,7 +300,7 @@ test("createOverviewHelpers offers the Start button for Linux background auto-st
 
   assert.equal(sent.length, 1)
   assert.ok(sent[0].replyMarkup)
-  assert.equal(sent[0].replyMarkup.inline_keyboard[0][0].callback_data, "srv|demo|start")
+  assert.equal(sent[0].replyMarkup.inline_keyboard[0][0].callback_data, encodeCallback(["srv", "demo", "start"]))
 })
 
 test("createOverviewHelpers offers the Start button for macOS SSH background auto-start projects", async (t) => {
@@ -332,7 +337,7 @@ test("createOverviewHelpers offers the Start button for macOS SSH background aut
 
   assert.equal(sent.length, 1)
   assert.ok(sent[0].replyMarkup)
-  assert.equal(sent[0].replyMarkup.inline_keyboard[0][0].callback_data, "srv|demo|start")
+  assert.equal(sent[0].replyMarkup.inline_keyboard[0][0].callback_data, encodeCallback(["srv", "demo", "start"]))
 })
 
 test("createOverviewHelpers hides the Start button for window-mode projects without GUI launcher support", async (t) => {

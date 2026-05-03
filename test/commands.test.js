@@ -5,6 +5,20 @@ import { createCommandHandlers } from "../src/connector/commands.js"
 import { hashIdempotencyValue, telegramMessageIdempotencyKey } from "../src/connector/idempotency.js"
 import { buildProjectsOverviewText as buildProjectsOverviewTextBase } from "../src/connector/overview.js"
 import { USER_ATTACHMENT_LIMITS } from "../src/connector/incoming-attachments.js"
+import { decodeCallbackData } from "../src/connector/callback-data.js"
+
+function callbackParts(data) {
+  const parts = decodeCallbackData(data)
+  assert.ok(parts, `Expected decodable callback data: ${data}`)
+  return parts
+}
+
+function attachmentTokenFromButton(button) {
+  const parts = callbackParts(button.callback_data)
+  assert.equal(parts[0], "att")
+  assert.equal(parts[1], "send")
+  return parts[2]
+}
 
 function makeRuntime(overrides = {}) {
   const { store: storeOverrides, ...runtimeOverrides } = overrides
@@ -299,7 +313,7 @@ test("createCommandHandlers handleWhere reports stale session health with repair
     sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text),
     ["Sessions", "New", "Feed", "Model", "Remove 100:7", "Rebind startup 100:7", "New session 100:7", "Keep 100:7", "Close"],
   )
-  assert.match(sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Remove 100:7")?.callback_data, /^b\|confirm-unbind\|100:7$/)
+  assert.deepEqual(callbackParts(sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Remove 100:7")?.callback_data), ["b", "confirm-unbind", "100:7"])
 })
 
 test("createCommandHandlers handleProjects renders overview with binding counts and scope preview", async () => {
@@ -366,7 +380,11 @@ test("createCommandHandlers handleRuntime renders private runtime status", async
   assert.match(sent[0].text, /Telegram poll:/)
   assert.match(sent[0].text, /Updates: retryable=1 skipped=2/)
   assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text), ["Restart", "Stop", "Close"])
-  assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.callback_data), ["rt|confirm-restart", "rt|confirm-stop", "rt|close"])
+  assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => callbackParts(button.callback_data)), [
+    ["rt", "confirm-restart"],
+    ["rt", "confirm-stop"],
+    ["rt", "close"],
+  ])
 })
 
 test("createCommandHandlers handleRuntime is private-chat only", async () => {
@@ -491,7 +509,7 @@ test("createCommandHandlers handleBindings shows health labels and index repair 
   assert.match(sent[0].text, /removed \/ ses_old \[stale: project missing\]/)
   assert.match(sent[0].text, /Index repair available: removedBindings=0 removedIndex=1 rebuilt=1/)
   assert.equal(sent[0].replyMarkup.inline_keyboard.flat().some((button) => button.text === "Repair index"), true)
-  assert.match(sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Remove 100:0")?.callback_data, /^b\|confirm-unbind\|100:0$/)
+  assert.deepEqual(callbackParts(sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Remove 100:0")?.callback_data), ["b", "confirm-unbind", "100:0"])
 })
 
 test("createCommandHandlers handleBindings rejects non-private chats", async () => {
@@ -1047,6 +1065,61 @@ test("createCommandHandlers renderSessionsList shows the current model when avai
   assert.match(sent[0].text, /Current: ses_current/)
   assert.match(sent[0].text, /Current model: openai\/gpt-5 xhigh \(Inherited from session history\)/)
   assert.deepEqual(sent[0].replyMarkup.inline_keyboard.at(-1)?.map((button) => button.text), ["Refresh", "New", "Close"])
+})
+
+test("createCommandHandlers renderSessionsList omits buttons for unsafe session ids", async () => {
+  const { runtime, sent } = makeRuntime({
+    ocByAlias: {
+      demo: {
+        async listSessions() {
+          return [
+            { id: "ses_safe", title: "Safe" },
+            { id: "abc|def", title: "Unsafe" },
+          ]
+        },
+        async listMessages() {
+          return []
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderSessionsList(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    { binding: { projectAlias: "demo", sessionId: "ses_safe" } },
+  )
+
+  const buttons = sent[0].replyMarkup.inline_keyboard.flat()
+  assert.match(sent[0].text, /abc\|def \[unsupported id\] — Unsafe/)
+  assert.equal(buttons.some((button) => button.text === "Unsafe"), false)
+  assert.deepEqual(callbackParts(buttons.find((button) => button.text === "✅ Safe")?.callback_data), ["s", "demo", "ses_safe"])
+})
+
+test("createCommandHandlers renderSessionsList keeps buttons aligned with visible sessions", async () => {
+  const { runtime, sent } = makeRuntime({
+    ocByAlias: {
+      demo: {
+        async listSessions() {
+          return [
+            ...Array.from({ length: 10 }, (_, index) => ({ id: `unsafe|${index}`, title: `Unsafe ${index}` })),
+            { id: "ses_after_limit", title: "After limit" },
+          ]
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderSessionsList(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    { binding: { projectAlias: "demo", sessionId: "ses_current" } },
+  )
+
+  const buttons = sent[0].replyMarkup.inline_keyboard.flat()
+  assert.doesNotMatch(sent[0].text, /ses_after_limit/)
+  assert.equal(buttons.some((button) => button.text === "After limit"), false)
+  assert.deepEqual(buttons.map((button) => button.text), ["Refresh", "New", "Close"])
 })
 
 test("createCommandHandlers renderModelSettings shows provider selection before models", async () => {
@@ -2012,7 +2085,7 @@ test("createCommandHandlers requires confirmation for large text documents and c
   assert.equal(promptCalls.length, 0)
   assert.match(sent[0].text, /Confirm sending this file/)
   const sendButton = sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file")
-  const token = sendButton.callback_data.split("|")[2]
+  const token = attachmentTokenFromButton(sendButton)
   const wrongThread = await handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 8, ctxKey: "100:8" }, "cancel", token, { editMessageId: 76 })
   assert.deepEqual(wrongThread, { callbackText: "Wrong thread" })
   assert.equal(editCalls.length, 0)
@@ -2102,7 +2175,7 @@ test("createCommandHandlers sends confirmed large text documents", async () => {
     message_thread_id: 7,
     document: { file_id: "file_large", file_name: "large.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
   })
-  const token = sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file").callback_data.split("|")[2]
+  const token = attachmentTokenFromButton(sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file"))
 
   const result = await handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", token, { editMessageId: 78 })
 
@@ -2177,7 +2250,7 @@ test("createCommandHandlers rolls back confirmed attachment send idempotency whe
     message_thread_id: 7,
     document: { file_id: "file_large", file_name: "large.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
   })
-  const token = sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file").callback_data.split("|")[2]
+  const token = attachmentTokenFromButton(sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file"))
 
   const result = await handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", token, { editMessageId: 78 })
 
@@ -2234,7 +2307,7 @@ test("createCommandHandlers suppresses parallel confirmed attachment sends", asy
     message_thread_id: 7,
     document: { file_id: "file_large", file_name: "large.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
   })
-  const token = sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file").callback_data.split("|")[2]
+  const token = attachmentTokenFromButton(sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file"))
 
   const first = handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", token, { editMessageId: 79 })
   await promptStarted
@@ -2299,7 +2372,7 @@ test("createCommandHandlers refuses confirmed attachment when binding changed", 
     message_thread_id: 7,
     document: { file_id: "file_large", file_name: "large.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
   })
-  const token = sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file").callback_data.split("|")[2]
+  const token = attachmentTokenFromButton(sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file"))
   storeState.bindings["100:7"] = { projectAlias: "demo", sessionId: "ses_new" }
 
   const result = await handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", token, { editMessageId: 81 })
@@ -2350,7 +2423,7 @@ test("createCommandHandlers treats repeated confirmed attachment sends as alread
   const handlers = createCommandHandlers(runtime)
 
   await handlers.handleTelegramMessage(msg)
-  const token = sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file").callback_data.split("|")[2]
+  const token = attachmentTokenFromButton(sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file"))
 
   const result = await handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", token, { editMessageId: 82 })
 
@@ -2397,7 +2470,7 @@ test("createCommandHandlers returns retry guidance for confirmed attachment down
   })
   const tokens = sent
     .filter((entry) => /Confirm sending this file/.test(entry.text))
-    .map((entry) => entry.replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file").callback_data.split("|")[2])
+    .map((entry) => attachmentTokenFromButton(entry.replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file")))
 
   const retryable = await handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", tokens[0], { editMessageId: 83 })
   const fatal = await handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", tokens[1], { editMessageId: 84 })

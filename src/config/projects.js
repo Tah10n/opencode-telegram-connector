@@ -31,6 +31,13 @@ function readOptionalBoolean(value, { alias, fieldName, defaultValue }) {
   throw new Error(`Project '${alias}' ${fieldName} must be a boolean`)
 }
 
+function validateProjectAlias(alias) {
+  const trimmed = alias.trim()
+  if (!trimmed) throw new Error("Project alias must not be empty")
+  if (alias !== trimmed) throw new Error(`Project alias '${alias}' must not have leading or trailing whitespace`)
+  if (alias.includes(":") || alias.includes("|")) throw new Error(`Project alias '${alias}' must not contain ':' or '|'`)
+}
+
 export async function loadProjectsConfig({ projectsFile, projectsJson, baseDir } = {}) {
   let raw
   let resolvedBaseDir = baseDir || process.cwd()
@@ -53,8 +60,7 @@ export function normalizeProjectsConfig(raw, { baseDir, sourceLabel } = {}) {
 
   const projects = {}
   for (const [alias, cfg] of Object.entries(raw)) {
-    if (!alias || typeof alias !== "string") continue
-    if (alias.includes(":")) throw new Error(`Project alias '${alias}' must not contain ':'`)
+    validateProjectAlias(alias)
     if (!isPlainObject(cfg)) throw new Error(`Project '${alias}' must be an object`)
     const directoryRaw = cfg.directory != null ? String(cfg.directory).trim() : ""
     const directory = directoryRaw ? path.resolve(resolvedBaseDir, directoryRaw) : undefined

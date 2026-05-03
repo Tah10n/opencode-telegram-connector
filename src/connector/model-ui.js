@@ -7,6 +7,7 @@ import {
   normalizeVariant,
   modelKeyOf,
 } from "../model-selection.js"
+import { encodeCallback } from "./callback-data.js"
 
 function trimString(value) {
   return typeof value === "string" ? value.trim() : ""
@@ -189,7 +190,7 @@ export function buildModelSettingsText({
 }
 
 export function modelSettingsKeyboard({ cbPack, preference, providerCatalog, selectedProviderId, selectedModelKey }) {
-  const pack = typeof cbPack === "function" ? cbPack : (value) => value
+  const pack = typeof cbPack === "function" ? cbPack : (...parts) => encodeCallback(parts.length === 1 && Array.isArray(parts[0]) ? parts[0] : parts)
   const normalizedPreference = preference || { mode: "inherit" }
 
   const currentCustomModelKey = normalizedPreference.mode === "custom" ? modelKeyOf(normalizedPreference.model) : ""
@@ -203,20 +204,20 @@ export function modelSettingsKeyboard({ cbPack, preference, providerCatalog, sel
     rows.push([
       {
         text: `${normalizedPreference.mode === "custom" && currentCustomModelKey === selectedModelKey && !currentVariant ? "✓ " : ""}No variant`,
-        callback_data: pack(`m|apply|${selectedModelKey}|~`),
+        callback_data: pack("m", "apply", selectedModelKey, "~"),
       },
     ])
     for (const chunk of chunkEntries(commonVariantsForModel(selectedModel), 3)) {
       rows.push(
         chunk.map((variant) => ({
           text: `${currentVariant === variant ? "✓ " : ""}${variant}`,
-          callback_data: pack(`m|apply|${selectedModelKey}|${variant}`),
+          callback_data: pack("m", "apply", selectedModelKey, variant),
         })),
       )
     }
     rows.push([
-      { text: "Back", callback_data: pack(`m|provider|${selectedProvider?.id || selectedModel?.providerID || selectedProviderId}`) },
-      { text: "Close", callback_data: pack("m|close") },
+      { text: "Back", callback_data: pack("m", "provider", selectedProvider?.id || selectedModel?.providerID || selectedProviderId) },
+      { text: "Close", callback_data: pack("m", "close") },
     ])
     return makeInlineKeyboard(rows)
   }
@@ -226,31 +227,31 @@ export function modelSettingsKeyboard({ cbPack, preference, providerCatalog, sel
     const rows = []
     for (const candidate of selectedProvider?.models || []) {
       const prefix = currentCustomModelKey === candidate.key ? "✓ " : ""
-      rows.push([{ text: `${prefix}${formatModelChoiceLabel(candidate)}`, callback_data: pack(`m|model|${candidate.key}`) }])
+      rows.push([{ text: `${prefix}${formatModelChoiceLabel(candidate)}`, callback_data: pack("m", "model", candidate.key) }])
     }
     rows.push([
-      { text: "Back", callback_data: pack("m|root") },
-      { text: "Close", callback_data: pack("m|close") },
+      { text: "Back", callback_data: pack("m", "root") },
+      { text: "Close", callback_data: pack("m", "close") },
     ])
     return makeInlineKeyboard(rows)
   }
 
   const rows = [
     [
-      { text: `${normalizedPreference.mode === "inherit" ? "✓ " : ""}Inherit`, callback_data: pack("m|set|inherit") },
+      { text: `${normalizedPreference.mode === "inherit" ? "✓ " : ""}Inherit`, callback_data: pack("m", "set", "inherit") },
       {
         text: `${normalizedPreference.mode === "project-default" ? "✓ " : ""}Project default`,
-        callback_data: pack("m|set|project-default"),
+        callback_data: pack("m", "set", "project-default"),
       },
     ],
   ]
 
   for (const provider of providerCatalog) {
     const prefix = currentCustomProviderId === provider.id ? "✓ " : ""
-    rows.push([{ text: `${prefix}${formatProviderChoiceLabel(provider)}`, callback_data: pack(`m|provider|${provider.id}`) }])
+    rows.push([{ text: `${prefix}${formatProviderChoiceLabel(provider)}`, callback_data: pack("m", "provider", provider.id) }])
   }
 
-  rows.push([{ text: "Close", callback_data: pack("m|close") }])
+  rows.push([{ text: "Close", callback_data: pack("m", "close") }])
   return makeInlineKeyboard(rows)
 }
 
