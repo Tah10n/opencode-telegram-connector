@@ -93,6 +93,8 @@ export async function buildRuntimeConfig({ args = {}, cwd = process.cwd() } = {}
     limits: normalizeLimits(configFromFile.limits || {}),
     cwd: configFromFile.cwd || configBaseDir,
   }
+  if (configFromFile.activeTurnStaleMs != null) config.activeTurnStaleMs = configFromFile.activeTurnStaleMs
+  if (configFromFile.opencodeWatchdog != null) config.opencodeWatchdog = configFromFile.opencodeWatchdog
 
   return {
     config,

@@ -1,7 +1,16 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { OpenCodeClient } from "../src/opencode/client.js"
-import { redactCmdlineSecrets, redactSensitiveText, sanitizeBaseUrlForCli, sanitizeBaseUrlForDisplay } from "../src/url-utils.js"
+import { normalizeEndpointBaseUrl, redactCmdlineSecrets, redactSensitiveText, sanitizeBaseUrlForCli, sanitizeBaseUrlForDisplay } from "../src/url-utils.js"
+
+test("normalizeEndpointBaseUrl accepts only http and https schemes", () => {
+  assert.equal(normalizeEndpointBaseUrl("http://example.com/api/"), "http://example.com/api")
+  assert.equal(normalizeEndpointBaseUrl("https://example.com/api/"), "https://example.com/api")
+
+  for (const raw of ["file:///tmp/opencode", "ftp://example.com/api", "javascript:alert(1)"]) {
+    assert.throws(() => normalizeEndpointBaseUrl(raw), /baseUrl must use http or https/)
+  }
+})
 
 test("sanitizeBaseUrlForDisplay removes credentials, hash, and query values", () => {
   const sanitized = sanitizeBaseUrlForDisplay("https://user:pass@example.com/api?token=abc&foo=bar#frag")

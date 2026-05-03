@@ -90,6 +90,78 @@ test("startOpenCodeSseLoop forwards parsed SSE events and connects once", async 
   assert.equal(errorCalls, 0)
 })
 
+test("startOpenCodeSseLoop accepts one large chunk with many short SSE lines", async (t) => {
+  swapEnv(t, { OPENCODE_SSE_MAX_LINE_BYTES: "32" })
+  const chunk = `${Array.from({ length: 20 }, (_value, idx) => `: keepalive ${idx}\n`).join("")}data: {"id":"evt_1"}\n\n`
+  assert.ok(Buffer.byteLength(chunk, "utf8") > 32)
+
+  useFetchStub(t, async () => makeSseResponse([chunk]))
+
+  const ocClient = {
+    baseUrl: "http://127.0.0.1:4312",
+    headers: () => ({}),
+    health: async () => ({ ok: true }),
+  }
+
+  let loop
+  const evt = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Timed out waiting for SSE event")), 500)
+    loop = startOpenCodeSseLoop({
+      projectAlias: "demo",
+      ocClient,
+      logger: makeLogger(),
+      onEvent: async ({ evt }) => {
+        loop.stop()
+        clearTimeout(timeout)
+        resolve(evt)
+      },
+      onError: async ({ err }) => {
+        loop?.stop()
+        clearTimeout(timeout)
+        reject(err)
+      },
+    })
+  })
+
+  assert.deepEqual(evt, { id: "evt_1" })
+})
+
+test("startOpenCodeSseLoop rejects one SSE line over the configured limit", async (t) => {
+  swapEnv(t, { OPENCODE_SSE_MAX_LINE_BYTES: "32" })
+  const longLine = `data: ${"x".repeat(40)}\n\n`
+
+  useFetchStub(t, async () => makeSseResponse([longLine]))
+
+  const ocClient = {
+    baseUrl: "http://127.0.0.1:4312",
+    headers: () => ({}),
+    health: async () => ({ ok: true }),
+  }
+
+  let loop
+  const err = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Timed out waiting for SSE line limit error")), 500)
+    loop = startOpenCodeSseLoop({
+      projectAlias: "demo",
+      ocClient,
+      logger: makeLogger(),
+      onEvent: async () => {
+        loop?.stop()
+        clearTimeout(timeout)
+        reject(new Error("Unexpected SSE event"))
+      },
+      onError: async ({ err }) => {
+        loop?.stop()
+        clearTimeout(timeout)
+        resolve(err)
+      },
+    })
+  })
+
+  assert.match(err.message, /SSE line buffer exceeded limit/)
+  assert.equal(classifyBoundaryError(err).retryable, false)
+})
+
 test("startOpenCodeSseLoop appends event path after a base path", async (t) => {
   const fetchUrls = []
   useFetchStub(t, async (url) => {

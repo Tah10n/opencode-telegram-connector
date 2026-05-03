@@ -25,6 +25,12 @@ function parseJsonWithWindowsPathHint(text, { sourceLabel } = {}) {
   }
 }
 
+function readOptionalBoolean(value, { alias, fieldName, defaultValue }) {
+  if (value == null) return defaultValue
+  if (typeof value === "boolean") return value
+  throw new Error(`Project '${alias}' ${fieldName} must be a boolean`)
+}
+
 export async function loadProjectsConfig({ projectsFile, projectsJson, baseDir } = {}) {
   let raw
   let resolvedBaseDir = baseDir || process.cwd()
@@ -68,7 +74,7 @@ export function normalizeProjectsConfig(raw, { baseDir, sourceLabel } = {}) {
       throw new Error(`Project '${alias}' invalid baseUrl: ${err?.message || baseUrlCandidate}`)
     }
 
-    const autoStart = cfg.autoStart === true
+    const autoStart = readOptionalBoolean(cfg.autoStart, { alias, fieldName: "autoStart", defaultValue: false })
     if (cfg.startMode != null) {
       throw new Error(`Project '${alias}' uses removed setting 'startMode'. Use 'openTuiOnAutoStart' instead.`)
     }
@@ -77,7 +83,7 @@ export function normalizeProjectsConfig(raw, { baseDir, sourceLabel } = {}) {
       throw new Error(`Project '${alias}' invalid serverLaunchMode (expected 'background' or 'window')`)
     }
     const serverLaunchMode = serverLaunchModeRaw || "background"
-    const openTuiOnAutoStart = cfg.openTuiOnAutoStart != null ? cfg.openTuiOnAutoStart === true : true
+    const openTuiOnAutoStart = readOptionalBoolean(cfg.openTuiOnAutoStart, { alias, fieldName: "openTuiOnAutoStart", defaultValue: true })
     const openAttachOnNewModeRaw = cfg.openAttachOnNewMode ? String(cfg.openAttachOnNewMode).trim().toLowerCase() : ""
     if (openAttachOnNewModeRaw && openAttachOnNewModeRaw !== "new-window" && openAttachOnNewModeRaw !== "same-window") {
       throw new Error(`Project '${alias}' invalid openAttachOnNewMode (expected 'new-window' or 'same-window')`)
