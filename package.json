@@ -14,6 +14,7 @@
   "files": [
     "src",
     "scripts/check-syntax.mjs",
+    "scripts/verify-callback-data.mjs",
     "index.mjs",
     "README.md",
     "LICENSE",
@@ -34,7 +35,7 @@
   },
   "scripts": {
     "start": "node src/cli.js",
-    "check": "node scripts/check-syntax.mjs",
+    "check": "node scripts/check-syntax.mjs && node scripts/verify-callback-data.mjs",
     "setup:check": "node src/cli.js check",
     "lint": "npm run check",
     "test": "node --test",

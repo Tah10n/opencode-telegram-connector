@@ -382,9 +382,12 @@ test("runSetupCheck fails on shipped Telegram placeholders", async () => {
 test("package scripts keep syntax check, cover starter config, and add setup check", async () => {
   const pkg = JSON.parse(await fs.readFile(new URL("../package.json", import.meta.url), "utf8"))
   const syntaxCheckScript = await fs.readFile(new URL("../scripts/check-syntax.mjs", import.meta.url), "utf8")
+  const callbackGuardScript = await fs.readFile(new URL("../scripts/verify-callback-data.mjs", import.meta.url), "utf8")
 
   assert.equal(pkg.private, true)
-  assert.equal(pkg.scripts.check, "node scripts/check-syntax.mjs")
+  assert.equal(pkg.scripts.check, "node scripts/check-syntax.mjs && node scripts/verify-callback-data.mjs")
+  assert.ok(pkg.files.includes("scripts/verify-callback-data.mjs"))
   assert.match(syntaxCheckScript, /connector\.config\.example\.mjs/)
+  assert.match(callbackGuardScript, /raw callback payload literal/)
   assert.equal(pkg.scripts["setup:check"], "node src/cli.js check")
 })
