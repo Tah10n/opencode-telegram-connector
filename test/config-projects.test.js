@@ -147,6 +147,32 @@ test("loadProjectsConfig rejects autoStart projects without a port", async () =>
   )
 })
 
+test("loadProjectsConfig rejects non-boolean autoStart and openTuiOnAutoStart", async () => {
+  await assert.rejects(
+    loadProjectsConfig({
+      projectsJson: JSON.stringify({
+        demo: {
+          baseUrl: "http://127.0.0.1:4312",
+          autoStart: "true",
+        },
+      }),
+    }),
+    /Project 'demo' autoStart must be a boolean/,
+  )
+
+  await assert.rejects(
+    loadProjectsConfig({
+      projectsJson: JSON.stringify({
+        demo: {
+          baseUrl: "http://127.0.0.1:4312",
+          openTuiOnAutoStart: "false",
+        },
+      }),
+    }),
+    /Project 'demo' openTuiOnAutoStart must be a boolean/,
+  )
+})
+
 test("loadProjectsConfig rejects invalid serverLaunchMode", async () => {
   await assert.rejects(
     loadProjectsConfig({
