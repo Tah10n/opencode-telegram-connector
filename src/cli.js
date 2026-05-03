@@ -24,6 +24,28 @@ function markCliLogged(err) {
   return err
 }
 
+function registerProcessHandler(processImpl, event, handler) {
+  if (!processImpl || typeof processImpl.on !== "function") return () => {}
+  processImpl.on(event, handler)
+  return () => {
+    if (typeof processImpl.off === "function") {
+      processImpl.off(event, handler)
+    } else if (typeof processImpl.removeListener === "function") {
+      processImpl.removeListener(event, handler)
+    }
+  }
+}
+
+function registerCliProcessHandlers(processImpl, handlers) {
+  const cleanupHandlers = handlers.map(([event, handler]) => registerProcessHandler(processImpl, event, handler))
+  let cleaned = false
+  return function cleanupProcessHandlers() {
+    if (cleaned) return
+    cleaned = true
+    for (const cleanup of cleanupHandlers.toReversed()) cleanup()
+  }
+}
+
 function createCliReporter({ stderr, getLogFormat, now = () => new Date().toISOString() }) {
   return {
     error(message, err) {
@@ -75,28 +97,48 @@ export async function runCli({
   buildRuntimeConfigImpl = buildRuntimeConfig,
   startConnectorImpl = startConnector,
   runSetupCheckImpl = runSetupCheck,
+  registerProcessHandlers = true,
 } = {}) {
   const stopConnectorRef = { current: async () => {} }
   let cliLogFormat = normalizeCliLogFormat(envForProcess(processImpl).CONNECTOR_LOG_FORMAT)
   const reporter = createCliReporter({ stderr, getLogFormat: () => cliLogFormat })
-  const shutdown = createShutdownHandler({ stopConnectorRef, exit, stderr, reporter })
-
-  processImpl.on("SIGINT", () => {
-    void shutdown(0, { reason: "SIGINT" })
-  })
-  processImpl.on("SIGTERM", () => {
-    void shutdown(0, { reason: "SIGTERM" })
-  })
-  processImpl.on("unhandledRejection", (reason) => {
-    reporter.error("Unhandled promise rejection:", reason)
-    void shutdown(1, { reason: "unhandledRejection", fatal: true })
-  })
-  processImpl.on("uncaughtException", (err) => {
-    reporter.error("Uncaught exception:", err)
-    void shutdown(1, { reason: "uncaughtException", fatal: true })
+  let cleanupProcessHandlers = () => {}
+  const shutdown = createShutdownHandler({
+    stopConnectorRef,
+    exit: (code) => {
+      cleanupProcessHandlers()
+      exit(code)
+    },
+    stderr,
+    reporter,
   })
 
-  const args = parseCliArgs(argv)
+  if (registerProcessHandlers) {
+    cleanupProcessHandlers = registerCliProcessHandlers(processImpl, [
+      ["SIGINT", () => {
+        void shutdown(0, { reason: "SIGINT" })
+      }],
+      ["SIGTERM", () => {
+        void shutdown(0, { reason: "SIGTERM" })
+      }],
+      ["unhandledRejection", (reason) => {
+        reporter.error("Unhandled promise rejection:", reason)
+        void shutdown(1, { reason: "unhandledRejection", fatal: true })
+      }],
+      ["uncaughtException", (err) => {
+        reporter.error("Uncaught exception:", err)
+        void shutdown(1, { reason: "uncaughtException", fatal: true })
+      }],
+    ])
+  }
+
+  let args
+  try {
+    args = parseCliArgs(argv)
+  } catch (err) {
+    cleanupProcessHandlers()
+    throw err
+  }
   if (args.help) {
     stdout(
       [
@@ -111,17 +153,25 @@ export async function runCli({
         "  --state-file <path>",
       ].join("\n"),
     )
+    cleanupProcessHandlers()
     exit(0)
     return
   }
 
   if (args.check) {
-    const report = await runSetupCheckImpl({
-      args,
-      stdout,
-      buildRuntimeConfigImpl,
-      platform: processImpl?.platform || process.platform,
-    })
+    let report
+    try {
+      report = await runSetupCheckImpl({
+        args,
+        stdout,
+        buildRuntimeConfigImpl,
+        platform: processImpl?.platform || process.platform,
+      })
+    } catch (err) {
+      cleanupProcessHandlers()
+      throw err
+    }
+    cleanupProcessHandlers()
     exit(report?.exitCode === 0 ? 0 : 1)
     return
   }
@@ -140,6 +190,7 @@ export async function runCli({
       },
     }))
   } catch (err) {
+    cleanupProcessHandlers()
     reporter.error("Connector startup failed:", err)
     throw markCliLogged(err)
   }
@@ -150,6 +201,7 @@ export async function runCli({
   } else {
     stdout("State:", stateFileDisplay)
   }
+  return { cleanupProcessHandlers }
 }
 
 export function isModuleEntrypoint(importMetaUrl, { argv = process.argv, env = process.env } = {}) {

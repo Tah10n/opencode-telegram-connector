@@ -149,7 +149,7 @@ If a Basic Auth project uses a non-loopback `http://` URL, set `OPENCODE_ALLOW_I
 - `/start`, `/help` — show help.
 - `/bind [projectAlias]` — bind the current chat/topic to a project's startup session. Without an argument, the bot asks for the alias interactively.
 - `/new [title]` — create a new session and bind the current Telegram thread to it. With `openAttachOnNewMode: "new-window"` it also opens a fresh attach window; with `same-window` it requests the existing attached TUI to switch to the new session.
-- `/use <sessionId|shareLink>` — bind an existing session. Supports `https://opncd.ai/share/<id>` and `https://opncd.ai/s/<id>`. Raw session IDs must be non-empty and cannot contain whitespace or URL path/query separators; use share links for unusual IDs.
+- `/use <sessionId|shareLink>` — bind an existing session. Supports `https://opncd.ai/share/<id>` and `https://opncd.ai/s/<id>`. Session IDs must be non-empty and cannot contain whitespace, colons, or URL path/query separators; share links are accepted only when they resolve to a session ID that meets the same safety rule.
 - `/sessions` — list recent sessions and switch with buttons.
 - `/unbind` — remove the current binding.
 
@@ -235,6 +235,7 @@ If the final assistant message cannot be fetched yet and a Telegram preview/plac
 - `CONNECTOR_LOG_FORMAT` / `logFormat` (`text` or `json`, default `text`)
 - `OPENCODE_ALLOW_INSECURE_HTTP=1` / `allowInsecureHttp`
 - `OPENCODE_TERMINAL` (Linux terminal launcher override)
+- `activeTurnStaleMs` (`connector.config.mjs` only; milliseconds before a running assistant turn is treated as stale)
 - `cwd` (`connector.config.mjs` only; base directory for relative paths)
 
 ### Telegram workflow limits
@@ -252,11 +253,11 @@ Prefer the `limits` object in `connector.config.mjs`; env fallbacks are availabl
 
 ### Per-project fields
 
-- `baseUrl` or `port`
+- `baseUrl` or `port` (`baseUrl` must use `http://` or `https://`)
 - `directory` (required for `autoStart`)
-- `autoStart`
+- `autoStart` (boolean; strings such as `"true"` are rejected)
 - `serverLaunchMode`: `background` or `window`
-- `openTuiOnAutoStart`
+- `openTuiOnAutoStart` (boolean; strings such as `"false"` are rejected)
   - Set this to `false` for headless/server-only deployments where the connector should start or monitor opencode without opening UI windows.
 - `openAttachOnNewMode`: `same-window` or `new-window`
   - `same-window` does not open a new window; it binds Telegram to the new session immediately and requests a switch for the existing attached TUI.
@@ -281,7 +282,7 @@ Prefer the `limits` object in `connector.config.mjs`; env fallbacks are availabl
 - `OPENCODE_SSE_MAX_LINE_BYTES`, `OPENCODE_SSE_MAX_EVENT_BYTES`, `OPENCODE_SSE_MAX_EVENT_LINES` — tune SSE safety limits for unusually large upstream events.
 - `OPENCODE_SSE_CONNECT_TIMEOUT_MS` — timeout for an initial SSE `/event` connection that accepts TCP but never returns headers.
 - `OPENCODE_SSE_HEALTHCHECK_MIN_INTERVAL_MS` — tune health-check throttling after SSE disconnects.
-- `OPENCODE_WATCHDOG_FAILURE_THRESHOLD`, `OPENCODE_WATCHDOG_WINDOW_MS`, `OPENCODE_WATCHDOG_COOLDOWN_MS` — tune the autoStart watchdog that restarts a configured opencode server after repeated retryable health/SSE/prompt-poll failures.
+- `OPENCODE_WATCHDOG_FAILURE_THRESHOLD`, `OPENCODE_WATCHDOG_WINDOW_MS`, `OPENCODE_WATCHDOG_COOLDOWN_MS` / `opencodeWatchdog.{failureThreshold,windowMs,cooldownMs}` — tune the autoStart watchdog that restarts a configured opencode server after repeated retryable health/SSE/prompt-poll failures.
   On Windows, watchdog restarts also close matching stale `opencode attach` UI windows before reopening the TUI for that project.
 
 ### Logging and redaction

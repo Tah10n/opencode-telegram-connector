@@ -982,6 +982,45 @@ test("startConnector /use accepts a shared session link for the current project"
   }
 })
 
+test("startConnector /use rejects share links resolving to unsafe session ids", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 252,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_current" },
+      },
+      sessionIndex: {
+        "demo:ses_current": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    ocOptions: {
+      listSessionsImpl: () => [
+        { id: "ses_current", title: "Current" },
+        { id: "ses/unsafe", title: "Unsafe shared", share: { url: "https://opncd.ai/share/unsafe" } },
+      ],
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(253, "/use https://opncd.ai/share/unsafe"))
+
+    await waitFor(() => harness.tg.sentMessages.length >= 1)
+    await delay(30)
+    await harness.connector.stop()
+
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(state.bindings, {
+      "100:7": { projectAlias: "demo", sessionId: "ses_current" },
+    })
+    assert.ok(
+      harness.tg.sentMessages.some((entry) => entry.text.includes("Share link resolved to a session id this connector cannot safely bind")),
+    )
+    assert.deepEqual(harness.ocCalls.getSession, [])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
 test("startConnector /use reports when a shared session link is not found", async () => {
   const harness = await createHarness({
     statePatch: {

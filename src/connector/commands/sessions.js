@@ -45,7 +45,11 @@ export function createSessionCommandHandlers(deps) {
   }
 
   function invalidSessionReferenceText() {
-    return "Invalid session id. Use a session id without spaces or URL path/query characters, or provide a supported OpenCode share link."
+    return "Invalid session id. Use a session id without whitespace, colon, or URL path/query characters. Share links are accepted only when they resolve to a safe session id."
+  }
+
+  function unsafeShareLinkSessionText() {
+    return "Share link resolved to a session id this connector cannot safely bind. Use a session id without whitespace, colon, or URL path/query characters."
   }
 
   function createSessionOptions(projectAlias, extra = {}) {
@@ -315,7 +319,7 @@ export function createSessionCommandHandlers(deps) {
         if (currentMatch?.id) {
           targetSessionId = normalizeSafeSessionId(currentMatch.id)
           if (!targetSessionId) {
-            await safeInformThread(ctxMeta, "Share link resolved to an invalid session id; refusing to bind it.")
+            await safeInformThread(ctxMeta, unsafeShareLinkSessionText())
             return
           }
         } else {
