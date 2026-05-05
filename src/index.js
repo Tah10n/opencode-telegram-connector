@@ -19,8 +19,10 @@ import { extractPatchDiffText, extractPatchFiles, formatChangedFilesText } from 
 import { findSessionByShareUrl, parseSessionReference } from "./session-ref.js"
 import { resolveSessionRoute } from "./session-route.js"
 import { createLifecycleManager } from "./runtime/lifecycle.js"
+import { startHealthServer } from "./runtime/health-server.js"
 import { collectLoggerRedactionOptions, createConnectorLogger } from "./runtime/logger.js"
 import { createRuntimeObservability } from "./runtime/observability.js"
+import { createCorrelationId, getRequestContext, runWithRequestContext, withRequestContextFields } from "./runtime/request-context.js"
 import { DEFAULT_FEED_MODE, StateStore, normalizeFeedMode, resolveDefaultStatePath, sessionKey } from "./state/store.js"
 import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "./session-list.js"
 import { sanitizeBaseUrlForDisplay } from "./url-utils.js"
@@ -131,6 +133,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const createTelegramClient = deps?.createTelegramClient || ((token, options) => new TelegramClient(token, options))
   const createOpenCodeClient = deps?.createOpenCodeClient || ((options) => new OpenCodeClient(options))
   const startSseLoop = deps?.startSseLoop || startOpenCodeSseLoop
+  const startHealthServerFn = deps?.startHealthServer || startHealthServer
   const ensureStartupSessionFn = deps?.ensureStartupSession || ensureStartupSession
   const ensureOpenCodeRunningFn = deps?.ensureOpenCodeRunning || ensureOpenCodeRunning
   const stopOpenCodeServeOnPortFn = deps?.stopOpenCodeServeOnPort || stopOpenCodeServeOnPort
@@ -203,8 +206,16 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
 
   const tg = createTelegramClient(config.telegram.botToken, {
     logger,
-    onApiFailure: ({ method, params }) => {
+    onApiFailure: ({ method, params, requestContext }) => {
       runtimeObservability.recordTelegramFailure({ projectAlias: projectAliasFromTelegramParams(params), operation: method })
+      logger.debug?.("Telegram API delivery failure recorded", {
+        source: "telegram",
+        operation: method,
+        correlationId: requestContext?.correlationId,
+        ctxKey: requestContext?.ctxKey,
+        projectAlias: requestContext?.projectAlias,
+        sessionId: requestContext?.sessionId,
+      })
     },
   })
   const me = await tg.getMe().catch(() => null)
@@ -245,6 +256,32 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   }
   const lifecycle = createLifecycleManager()
   const abortController = new AbortController()
+
+  function runtimeHealthSnapshot() {
+    return runtimeObservability.buildHealthSnapshot({
+      managedTasks: lifecycle.snapshot(),
+      shutdownState: abortController.signal.aborted ? "stopping" : "running",
+      state: typeof store.healthSnapshot === "function" ? store.healthSnapshot() : { loaded: true },
+    })
+  }
+
+  if (config?.healthServer?.enabled === true) {
+    const healthHandle = await startHealthServerFn({
+      host: config.healthServer.host || "127.0.0.1",
+      port: Number.isInteger(config.healthServer.port) ? config.healthServer.port : 8787,
+      logger,
+      getSnapshot: runtimeHealthSnapshot,
+    })
+    lifecycle.registerHandle("healthServer", healthHandle, {
+      kind: "server",
+      metadata: {
+        source: "health",
+        operation: "listen",
+        host: config.healthServer.host || "127.0.0.1",
+        port: typeof healthHandle?.address === "object" && healthHandle.address ? healthHandle.address.port : config.healthServer.port,
+      },
+    })
+  }
 
   // Auto-start opencode servers (best-effort) and pick a startup session per project.
   // Important: do not block connector startup on auto-start (Telegram should stay responsive).
@@ -876,6 +913,37 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     return { chatId, chatType, threadIdOr0, ctxKey: ctxKeyFrom(chatId, threadIdOr0) }
   }
 
+  function requestContextForCtxMeta(ctxMeta, binding) {
+    if (!ctxMeta) return {}
+    return {
+      chatId: ctxMeta.chatId,
+      chatType: ctxMeta.chatType,
+      threadIdOr0: ctxMeta.threadIdOr0,
+      ctxKey: ctxMeta.ctxKey,
+      ...(binding?.projectAlias ? { projectAlias: binding.projectAlias } : {}),
+      ...(binding?.sessionId ? { sessionId: binding.sessionId } : {}),
+    }
+  }
+
+  function telegramUpdateContext(update) {
+    const eventType = update?.message ? "message" : update?.callback_query ? "callback" : "unknown"
+    const msg = update?.message || update?.callback_query?.message || null
+    const ctxMeta = msg ? ctxMetaFromMessage(msg) : null
+    const binding = ctxMeta?.ctxKey ? store.getBinding(ctxMeta.ctxKey) : null
+    return {
+      correlationId: createCorrelationId("tg", [update?.update_id, eventType]),
+      source: "telegram",
+      operation: eventType,
+      updateId: update?.update_id,
+      eventType,
+      ...requestContextForCtxMeta(ctxMeta, binding),
+    }
+  }
+
+  function runTelegramUpdateContext(update, fn) {
+    return runWithRequestContext(telegramUpdateContext(update), fn)
+  }
+
   function isAllowedUser(from) {
     const allowedUserId = config.telegram.allowedUserId
     return from && typeof from.id === "number" && from.id === allowedUserId
@@ -883,20 +951,41 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
 
   async function sendToThread(ctxMeta, text, replyMarkup, options = {}) {
     if (!ctxMeta?.chatId) return
-    try {
-      await tg.sendMessage(ctxMeta.chatId, text, replyMarkup, {
-        ...options,
-        message_thread_id: ctxMeta.threadIdOr0 || undefined,
-      })
-    } catch (err) {
-      throw normalizeBoundaryError(err, {
-        source: "telegram",
-        operation: "sendMessage",
-        method: "POST",
-        pathname: "/sendMessage",
-        ...(err?.isBoundaryError === true ? {} : { outcome: "retryable" }),
-      })
-    }
+    return withRequestContextFields(requestContextForCtxMeta(ctxMeta, store.getBinding(ctxMeta.ctxKey)), async () => {
+      try {
+        await tg.sendMessage(ctxMeta.chatId, text, replyMarkup, {
+          ...options,
+          message_thread_id: ctxMeta.threadIdOr0 || undefined,
+        })
+      } catch (err) {
+        throw normalizeBoundaryError(err, {
+          source: "telegram",
+          operation: "sendMessage",
+          method: "POST",
+          pathname: "/sendMessage",
+          ...(err?.isBoundaryError === true ? {} : { outcome: "retryable" }),
+        })
+      }
+    })
+  }
+
+  async function sendBlocksToThread(ctxMeta, blocks, replyMarkup) {
+    if (!ctxMeta?.chatId) return
+    return withRequestContextFields(requestContextForCtxMeta(ctxMeta, store.getBinding(ctxMeta.ctxKey)), async () => {
+      try {
+        await tg.sendHtmlBlocks(ctxMeta.chatId, blocks, replyMarkup, {
+          message_thread_id: ctxMeta.threadIdOr0 || undefined,
+        })
+      } catch (err) {
+        throw normalizeBoundaryError(err, {
+          source: "telegram",
+          operation: "sendHtmlBlocks",
+          method: "POST",
+          pathname: "/sendMessage",
+          ...(err?.isBoundaryError === true ? {} : { outcome: "retryable" }),
+        })
+      }
+    })
   }
 
   function parseCtxKey(key) {
@@ -925,44 +1014,31 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     }
   }
 
-  async function sendBlocksToThread(ctxMeta, blocks, replyMarkup) {
-    if (!ctxMeta?.chatId) return
-    try {
-      await tg.sendHtmlBlocks(ctxMeta.chatId, blocks, replyMarkup, {
-        message_thread_id: ctxMeta.threadIdOr0 || undefined,
-      })
-    } catch (err) {
-      throw normalizeBoundaryError(err, {
-        source: "telegram",
-        operation: "sendHtmlBlocks",
-        method: "POST",
-        pathname: "/sendMessage",
-        ...(err?.isBoundaryError === true ? {} : { outcome: "retryable" }),
-      })
-    }
-  }
-
   async function validateProject(alias) {
-    const oc = ocByAlias[alias]
-    if (!oc) throw new Error(`Unknown project: ${alias}`)
-    await oc.health()
-    resetProjectHealthFailures(alias)
-    markProjectUp(alias)
-    return oc
+    return withRequestContextFields({ projectAlias: alias }, async () => {
+      const oc = ocByAlias[alias]
+      if (!oc) throw new Error(`Unknown project: ${alias}`)
+      await oc.health()
+      resetProjectHealthFailures(alias)
+      markProjectUp(alias)
+      return oc
+    })
   }
 
   async function bindCtxToSession(ctxMeta, projectAlias, sessionId) {
-    const result = store.setBinding(ctxMeta.ctxKey, { projectAlias, sessionId }, { chatId: ctxMeta.chatId, threadIdOr0: ctxMeta.threadIdOr0 })
-    logger.info("Telegram context bound to session", {
-      source: "telegram",
-      operation: "bind session",
-      projectAlias,
-      sessionId,
-      ctxKey: ctxMeta.ctxKey,
-      chatId: ctxMeta.chatId,
-      threadIdOr0: ctxMeta.threadIdOr0,
+    return withRequestContextFields({ ...requestContextForCtxMeta(ctxMeta), projectAlias, sessionId }, async () => {
+      const result = store.setBinding(ctxMeta.ctxKey, { projectAlias, sessionId }, { chatId: ctxMeta.chatId, threadIdOr0: ctxMeta.threadIdOr0 })
+      logger.info("Telegram context bound to session", {
+        source: "telegram",
+        operation: "bind session",
+        projectAlias,
+        sessionId,
+        ctxKey: ctxMeta.ctxKey,
+        chatId: ctxMeta.chatId,
+        threadIdOr0: ctxMeta.threadIdOr0,
+      })
+      return result
     })
-    return result
   }
 
   function getBoundCtxForSession(projectAlias, sessionId) {
@@ -1252,43 +1328,62 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   })
   const { handleTelegramCallback } = callbackHandlers
 
-  async function onSseEvent({ projectAlias, evt }) {
-    const type = evt?.type
+  function sseRequestContextFields(projectAlias, evt) {
     const props = evt?.properties || {}
-
-    function isInitialBaselinePrompt(kind) {
-      const identity = promptIdentity(props?.id, props?.sessionID)
-      const base = promptBaseline[projectAlias]
-      return !!identity && !!base?.loaded && !!base[kind]?.has(identity)
+    const part = props?.part || {}
+    const info = props?.info || {}
+    const sessionId = props.sessionID || props.sessionId || part.sessionID || part.sessionId || ""
+    const messageId = info.id || props.messageID || props.messageId || part.messageID || part.messageId || ""
+    return {
+      source: "opencode",
+      operation: "handle SSE event",
+      projectAlias,
+      eventType: evt?.type || "unknown",
+      ...(sessionId ? { sessionId } : {}),
+      ...(messageId ? { messageId } : {}),
+      ...(getRequestContext().correlationId ? {} : { correlationId: createCorrelationId("sse", [projectAlias, evt?.type || "event"]) }),
     }
+  }
 
-    if (type === "message.updated") {
-      await handleMessageUpdated({ projectAlias, props })
-      return false
-    }
+  async function onSseEvent({ projectAlias, evt }) {
+    return runWithRequestContext(sseRequestContextFields(projectAlias, evt), async () => {
+      const type = evt?.type
+      const props = evt?.properties || {}
 
-    if (type === "message.part.updated") {
-      await handleMessagePartUpdated({ projectAlias, props })
-      return false
-    }
+      function isInitialBaselinePrompt(kind) {
+        const identity = promptIdentity(props?.id, props?.sessionID)
+        const base = promptBaseline[projectAlias]
+        return !!identity && !!base?.loaded && !!base[kind]?.has(identity)
+      }
 
-    if (type === "permission.asked") {
-      if (isInitialBaselinePrompt("permission")) {
-        logSseDebug(projectAlias, props.sessionID, `drop=permission_initial_baseline id=${props.id}`)
+      if (type === "message.updated") {
+        await handleMessageUpdated({ projectAlias, props })
         return false
       }
-      return handlePermissionAsked({ projectAlias, props, resolveBoundRoute, logSseDebug })
-    }
 
-    if (type === "question.asked") {
-      if (isInitialBaselinePrompt("question")) {
-        logSseDebug(projectAlias, props.sessionID, `drop=question_initial_baseline id=${props.id}`)
+      if (type === "message.part.updated") {
+        await handleMessagePartUpdated({ projectAlias, props })
         return false
       }
-      return handleQuestionAsked({ projectAlias, props, resolveBoundRoute, logSseDebug })
-    }
 
-    return false
+      if (type === "permission.asked") {
+        if (isInitialBaselinePrompt("permission")) {
+          logSseDebug(projectAlias, props.sessionID, `drop=permission_initial_baseline id=${props.id}`)
+          return false
+        }
+        return handlePermissionAsked({ projectAlias, props, resolveBoundRoute, logSseDebug })
+      }
+
+      if (type === "question.asked") {
+        if (isInitialBaselinePrompt("question")) {
+          logSseDebug(projectAlias, props.sessionID, `drop=question_initial_baseline id=${props.id}`)
+          return false
+        }
+        return handleQuestionAsked({ projectAlias, props, resolveBoundRoute, logSseDebug })
+      }
+
+      return false
+    })
   }
 
   async function drainTelegramBacklogIfNeeded() {
@@ -1395,42 +1490,44 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
           await flushCriticalState("persist replayed Telegram update offset")
           continue
         }
-        try {
-          if (u.message) await handleTelegramMessage(u.message, { updateId: u.update_id })
-          if (u.callback_query) await handleTelegramCallback(u.callback_query)
-          shouldAdvanceOffset = true
-        } catch (err) {
-          const classification = classifyBoundaryError(err)
-          if (classification.retryable) {
-            retryDelayMs = classification.retryAfterMs || retryDelayMs
-            runtimeObservability.recordUpdateRetry()
-            logger.warn("Retryable update handler error", {
-              source: "telegram",
-              operation: u.message ? "message" : u.callback_query ? "callback" : "unknown",
-              updateId: u.update_id,
-              outcome: classification.outcome,
-              kind: classification.kind,
-              status: classification.status,
-              code: classification.code,
-              retryable: true,
-              error: classification.error.message,
-            })
-          } else {
-            runtimeObservability.recordUpdateSkip()
-            logger.error("Skipping non-retryable update", {
-              source: "telegram",
-              operation: u.message ? "message" : u.callback_query ? "callback" : "unknown",
-              updateId: u.update_id,
-              outcome: classification.outcome,
-              kind: classification.kind,
-              status: classification.status,
-              code: classification.code,
-              retryable: false,
-              error: classification.error.message,
-            })
+        await runTelegramUpdateContext(u, async () => {
+          try {
+            if (u.message) await handleTelegramMessage(u.message, { updateId: u.update_id })
+            if (u.callback_query) await handleTelegramCallback(u.callback_query, { updateId: u.update_id })
             shouldAdvanceOffset = true
+          } catch (err) {
+            const classification = classifyBoundaryError(err)
+            if (classification.retryable) {
+              retryDelayMs = classification.retryAfterMs || retryDelayMs
+              runtimeObservability.recordUpdateRetry()
+              logger.warn("Retryable update handler error", {
+                source: "telegram",
+                operation: u.message ? "message" : u.callback_query ? "callback" : "unknown",
+                updateId: u.update_id,
+                outcome: classification.outcome,
+                kind: classification.kind,
+                status: classification.status,
+                code: classification.code,
+                retryable: true,
+                error: classification.error.message,
+              })
+            } else {
+              runtimeObservability.recordUpdateSkip()
+              logger.error("Skipping non-retryable update", {
+                source: "telegram",
+                operation: u.message ? "message" : u.callback_query ? "callback" : "unknown",
+                updateId: u.update_id,
+                outcome: classification.outcome,
+                kind: classification.kind,
+                status: classification.status,
+                code: classification.code,
+                retryable: false,
+                error: classification.error.message,
+              })
+              shouldAdvanceOffset = true
+            }
           }
-        }
+        })
 
         if (shouldAdvanceOffset) {
           store.markIdempotencyKey?.(updateKey, {

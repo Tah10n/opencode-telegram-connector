@@ -9,6 +9,8 @@ import { startConnector } from "../src/index.js"
 import { makeBoundaryError } from "../src/boundary-errors.js"
 import { defaultState, StateStore } from "../src/state/store.js"
 import { questionReplyIdempotencyKey } from "../src/connector/idempotency.js"
+import { getRequestContext } from "../src/runtime/request-context.js"
+import { startHealthServer } from "../src/runtime/health-server.js"
 
 function makeLogger() {
   return { info() {}, warn() {}, error() {}, debug() {} }
@@ -114,6 +116,8 @@ function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, sendMessag
   const editedMessages = []
   const deletedMessages = []
   const getUpdatesCalls = []
+  const getUpdatesErrors = []
+  let getUpdatesError = null
 
   return {
     sentMessages,
@@ -129,6 +133,12 @@ function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, sendMessag
     enqueueBatch(batch) {
       updates.push(batch)
     },
+    enqueueGetUpdatesError(err) {
+      getUpdatesErrors.push(err)
+    },
+    setGetUpdatesError(err) {
+      getUpdatesError = err || null
+    },
     get pendingUpdates() {
       return updates.length
     },
@@ -141,6 +151,8 @@ function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, sendMessag
     },
     async getUpdates(input) {
       getUpdatesCalls.push(input)
+      if (getUpdatesError) throw getUpdatesError
+      if (getUpdatesErrors.length > 0) throw getUpdatesErrors.shift()
       if (updates.length === 0) {
         await delay(emptyPollDelayMs)
         return []
@@ -320,6 +332,7 @@ async function createHarness({
   extraProjects,
   initialUpdates = [],
   startSseLoopImpl,
+  startHealthServerImpl,
   onFatalErrorImpl,
   ensureOpenCodeRunningImpl,
   stopOpenCodeServeOnPortImpl,
@@ -396,6 +409,7 @@ async function createHarness({
         sseHandlers.set(projectAlias, rest)
         return startSseLoopImpl ? startSseLoopImpl({ projectAlias, ...rest }) : { stop() {} }
       },
+      ...(startHealthServerImpl ? { startHealthServer: startHealthServerImpl } : {}),
       ...(onFatalErrorImpl ? { onFatalError: onFatalErrorImpl } : {}),
       ...(ensureOpenCodeRunningImpl ? { ensureOpenCodeRunning: ensureOpenCodeRunningImpl } : {}),
       ...(stopOpenCodeServeOnPortImpl ? { stopOpenCodeServeOnPort: stopOpenCodeServeOnPortImpl } : {}),
@@ -463,6 +477,73 @@ test("startConnector binds a thread and forwards only allowed-user messages", as
     assert.equal(state.updateOffset, 104)
     assert.deepEqual(harness.ocCalls.promptAsync, [{ sessionId: "ses_startup", text: "[TG] hello from telegram" }])
     assert.ok(harness.tg.sentMessages.some((entry) => entry.text.includes("Bound to project 'demo'")))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector scopes Telegram message context through OpenCode prompts", async () => {
+  const seenContexts = []
+  const harness = await createHarness({
+    statePatch: {
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_startup" } },
+      sessionIndex: { "demo:ses_startup": { chatId: 100, threadIdOr0: 7 } },
+    },
+    ocOptions: {
+      promptAsyncImpl: async () => {
+        seenContexts.push(getRequestContext())
+        return { ok: true }
+      },
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(101, "hello from telegram"))
+
+    await waitFor(() => harness.ocCalls.promptAsync.length === 1 && seenContexts.length === 1)
+    await harness.connector.stop()
+
+    assert.match(seenContexts[0].correlationId, /^tg-101-message-/)
+    assert.equal(seenContexts[0].source, "telegram")
+    assert.equal(seenContexts[0].eventType, "message")
+    assert.equal(seenContexts[0].updateId, 101)
+    assert.equal(seenContexts[0].ctxKey, "100:7")
+    assert.equal(seenContexts[0].projectAlias, "demo")
+    assert.equal(seenContexts[0].sessionId, "ses_startup")
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector scopes Telegram callback context through OpenCode calls", async () => {
+  const seenContexts = []
+  const harness = await createHarness({
+    statePatch: {
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_startup" } },
+      sessionIndex: { "demo:ses_startup": { chatId: 100, threadIdOr0: 7 } },
+    },
+    startupSessions: [{ id: "ses_startup" }, { id: "ses_other" }],
+    ocOptions: {
+      getSessionImpl: async (sessionId) => {
+        seenContexts.push(getRequestContext())
+        return { id: sessionId, parentID: null }
+      },
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeCallbackUpdate(101, JSON.stringify(["s", "demo", "ses_other"])))
+
+    await waitFor(() => seenContexts.length >= 1)
+    await harness.connector.stop()
+
+    assert.match(seenContexts[0].correlationId, /^tg-101-callback-/)
+    assert.equal(seenContexts[0].source, "telegram")
+    assert.equal(seenContexts[0].eventType, "callback")
+    assert.equal(seenContexts[0].updateId, 101)
+    assert.equal(seenContexts[0].ctxKey, "100:7")
+    assert.equal(seenContexts[0].projectAlias, "demo")
+    assert.equal(seenContexts[0].sessionId, "ses_startup")
   } finally {
     await harness.connector.stop()
   }
@@ -1464,6 +1545,49 @@ test("startConnector /runtime refuses group chats", async () => {
     await waitFor(() => harness.tg.sentMessages.length >= 1)
 
     assert.match(harness.tg.sentMessages.at(-1)?.text || "", /Use \/runtime only in a private chat/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector serves optional health endpoints", async () => {
+  let healthAddress = null
+  const harness = await createHarness({
+    configPatch: { healthServer: { enabled: true, host: "127.0.0.1", port: 0 } },
+    startHealthServerImpl: async (options) => {
+      const handle = await startHealthServer(options)
+      healthAddress = handle.address
+      return handle
+    },
+  })
+
+  try {
+    assert.ok(healthAddress?.port)
+    const baseUrl = `http://127.0.0.1:${healthAddress.port}`
+
+    const live = await fetch(`${baseUrl}/livez`)
+    assert.equal(live.status, 200)
+    assert.equal((await live.json()).status, "live")
+
+    const ready = await waitFor(async () => {
+      const res = await fetch(`${baseUrl}/readyz`)
+      if (res.status !== 200) return null
+      return res
+    })
+    const payload = await ready.json()
+    assert.equal(payload.status, "ready")
+    assert.equal(payload.checks.state.ok, true)
+    assert.equal(payload.checks.telegramPoll.ok, true)
+
+    harness.tg.setGetUpdatesError(new Error("network down while polling Telegram"))
+    const notReady = await waitFor(async () => {
+      const res = await fetch(`${baseUrl}/readyz`)
+      if (res.status !== 503) return null
+      const body = await res.json()
+      return body.checks?.telegramPoll?.ok === false ? body : null
+    })
+    assert.equal(notReady.status, "not_ready")
+    assert.match(notReady.checks.telegramPoll.lastError, /network down while polling Telegram/)
   } finally {
     await harness.connector.stop()
   }

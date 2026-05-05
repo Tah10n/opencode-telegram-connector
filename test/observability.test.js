@@ -39,3 +39,62 @@ test("createRuntimeObservability records compact privacy-safe counters", () => {
     assert.doesNotMatch(text, /chat|session|state\.json|token/i)
   }
 })
+
+test("createRuntimeObservability builds readiness health snapshots", () => {
+  const observability = createRuntimeObservability({ projectAliases: ["demo"] })
+  const readyInputs = {
+    managedTasks: [{ name: "telegramLoop", kind: "loop", stopCalled: false }],
+    shutdownState: "running",
+    state: { loaded: true, lastFlushError: "", lastFlushOk: true },
+  }
+
+  let snapshot = observability.buildHealthSnapshot(readyInputs)
+  assert.equal(snapshot.ready, false)
+  assert.equal(snapshot.checks.telegramPoll.ok, false)
+
+  observability.recordLoopSuccess("telegramPoll")
+  snapshot = observability.buildHealthSnapshot(readyInputs)
+  assert.equal(snapshot.live, true)
+  assert.equal(snapshot.ready, true)
+
+  observability.recordLoopRetry("telegramPoll", { err: new Error("Telegram getUpdates failed") })
+  snapshot = observability.buildHealthSnapshot(readyInputs)
+  assert.equal(snapshot.ready, false)
+  assert.equal(snapshot.checks.telegramPoll.ok, false)
+  assert.match(snapshot.checks.telegramPoll.lastError, /Telegram getUpdates failed/)
+
+  observability.recordLoopSuccess("telegramPoll")
+  snapshot = observability.buildHealthSnapshot(readyInputs)
+  assert.equal(snapshot.ready, true)
+
+  snapshot = observability.buildHealthSnapshot({
+    managedTasks: [{ name: "telegramLoop", kind: "loop", stopCalled: false }],
+    shutdownState: "running",
+    state: { loaded: true, lastFlushError: "disk full", lastFlushOk: false },
+  })
+  assert.equal(snapshot.ready, false)
+  assert.equal(snapshot.checks.state.ok, false)
+
+  for (const state of [
+    { loaded: true, lastFlushError: "", lastFlushOk: true, pendingSave: true },
+    { loaded: true, lastFlushError: "", lastFlushOk: true, flushInFlight: true },
+  ]) {
+    snapshot = observability.buildHealthSnapshot({ ...readyInputs, state })
+    assert.equal(snapshot.ready, false)
+    assert.equal(snapshot.checks.state.ok, false)
+  }
+
+  snapshot = observability.buildHealthSnapshot({
+    ...readyInputs,
+    state: {
+      loaded: true,
+      lastFlushOk: false,
+      lastLoadError: "Cannot load C:\\operator\\private\\state.json",
+      lastFlushError: "Cannot write C:/operator/private/state.json.tmp.123",
+      lastFlushErrorAt: 1,
+    },
+  })
+  const stateChecks = JSON.stringify(snapshot.checks.state)
+  assert.doesNotMatch(stateChecks, /operator|private|state\.json/)
+  assert.match(stateChecks, /<state-file>/)
+})

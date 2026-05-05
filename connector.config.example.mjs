@@ -12,6 +12,10 @@ export default {
   // mirrorTuiUserMessages: true,
   logFormat: "text", // "text" or "json"
 
+  // Optional local health endpoints for supervisors/probes.
+  // Disabled by default and loopback-bound by default; not a Telegram webhook.
+  // healthServer: { enabled: true, host: "127.0.0.1", port: 8787 },
+
   // Uncomment only if you intentionally use Basic Auth over
   // non-loopback http:// for a configured project.
   // allowInsecureHttp: process.env.OPENCODE_ALLOW_INSECURE_HTTP === "1",

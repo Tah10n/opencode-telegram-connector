@@ -39,6 +39,9 @@ test("buildRuntimeConfig loads connector.config.mjs and resolves relative paths"
     ECHO_FILTER_MODE: undefined,
     MIRROR_TUI_USER_MESSAGES: undefined,
     CONNECTOR_LOG_FORMAT: undefined,
+    CONNECTOR_HEALTH_ENABLED: undefined,
+    CONNECTOR_HEALTH_HOST: undefined,
+    CONNECTOR_HEALTH_PORT: undefined,
     OPENCODE_ALLOW_INSECURE_HTTP: undefined,
     PROJECTS_FILE: undefined,
     PROJECTS_JSON: undefined,
@@ -53,6 +56,7 @@ test("buildRuntimeConfig loads connector.config.mjs and resolves relative paths"
       echoFilterMode: "recent",
       mirrorTuiUserMessages: true,
       logFormat: "json",
+      healthServer: { enabled: true, host: "127.0.0.1", port: 0 },
       allowInsecureHttp: true,
       activeTurnStaleMs: "60000",
       opencodeWatchdog: {
@@ -89,6 +93,7 @@ test("buildRuntimeConfig loads connector.config.mjs and resolves relative paths"
   assert.equal(config.stateFile, path.resolve(dir, "state/custom.json"))
   assert.equal(config.cwd, dir)
   assert.equal(config.logFormat, "json")
+  assert.deepEqual(config.healthServer, { enabled: true, host: "127.0.0.1", port: 0 })
   assert.equal(config.mirrorTuiUserMessages, true)
   assert.equal(config.activeTurnStaleMs, 60000)
   assert.deepEqual(config.opencodeWatchdog, {

@@ -8,6 +8,24 @@ import {
   makeBoundaryError,
 } from "../boundary-errors.js"
 import { appendPathToBaseUrl } from "../url-utils.js"
+import { createCorrelationId, runWithRequestContext } from "../runtime/request-context.js"
+
+function sseEventContext(projectAlias, evt) {
+  const props = evt?.properties || {}
+  const part = props?.part || {}
+  const info = props?.info || {}
+  const sessionId = props.sessionID || props.sessionId || part.sessionID || part.sessionId || ""
+  const messageId = info.id || props.messageID || props.messageId || part.messageID || part.messageId || ""
+  return {
+    correlationId: createCorrelationId("sse", [projectAlias, evt?.type || "event"]),
+    source: "opencode",
+    operation: "handle SSE event",
+    projectAlias,
+    eventType: evt?.type || "unknown",
+    ...(sessionId ? { sessionId } : {}),
+    ...(messageId ? { messageId } : {}),
+  }
+}
 
 function readIntEnv(name, fallback) {
   const raw = process.env?.[name]
@@ -120,11 +138,23 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
           ctrl.abort()
         }, CONNECT_TIMEOUT_MS)
         connectTimer.unref?.()
-        const res = await fetch(url, {
-          method: "GET",
-          headers: ocClient.headers({ accept: "text/event-stream" }),
-          signal: ctrl.signal,
-        })
+        const connectCorrelationId = createCorrelationId("sse-connect", [projectAlias])
+        const headers = ocClient.headers({ accept: "text/event-stream" }, { correlationId: connectCorrelationId })
+        const res = await runWithRequestContext(
+          {
+            correlationId: connectCorrelationId,
+            source: "opencode",
+            operation: "GET /event",
+            method: "GET",
+            pathname: "/event",
+            projectAlias,
+          },
+          () => fetch(url, {
+            method: "GET",
+            headers,
+            signal: ctrl.signal,
+          }),
+        )
         if (connectTimer) clearTimeout(connectTimer)
         connectTimer = null
         if (!res.ok) {
@@ -169,7 +199,7 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
               continue
             }
             try {
-              await onEvent({ projectAlias, evt })
+              await runWithRequestContext(sseEventContext(projectAlias, evt), () => onEvent({ projectAlias, evt }))
             } catch (err) {
               logger?.error?.("SSE event handler error", { projectAlias, source: "opencode", operation: "handle SSE event", error: err?.message || String(err) })
               if (shouldPropagateHandlerError(err)) throw err

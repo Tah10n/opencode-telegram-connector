@@ -1,5 +1,5 @@
 import { normalizeBoundaryError } from "../boundary-errors.js"
-import { redactCmdlineSecrets } from "../url-utils.js"
+import { redactCmdlineSecrets, redactSensitiveText } from "../url-utils.js"
 
 function createLoopState() {
   return {
@@ -56,6 +56,10 @@ function createGlobalState() {
 function safeErrorMessage(err) {
   if (!err) return ""
   return redactCmdlineSecrets(normalizeBoundaryError(err, { source: err?.source || "runtime" }).message)
+}
+
+function safeDiagnosticText(value) {
+  return redactSensitiveText(value)
 }
 
 function formatTime(value) {
@@ -264,6 +268,54 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
     ]
   }
 
+  function buildHealthSnapshot({ managedTasks = [], shutdownState = "running", state = {} } = {}) {
+    const taskList = Array.isArray(managedTasks) ? managedTasks : []
+    const activeTaskNames = new Set(taskList.filter((task) => task?.stopCalled !== true).map((task) => task.name))
+    const telegramLoop = globalState.loops.telegramPoll
+    const backlogDrain = globalState.loops.backlogDrain
+    const stateLoaded = state?.loaded === true
+    const stateFlushOk = !state?.lastFlushError
+    const statePendingSave = state?.pendingSave === true
+    const stateFlushInFlight = state?.flushInFlight === true
+    const telegramLoopActive = activeTaskNames.has("telegramLoop")
+    const telegramObservedAt = Math.max(telegramLoop.lastSuccessAt || 0, backlogDrain.lastSuccessAt || 0)
+    const telegramObserved = telegramObservedAt > 0
+    const telegramFailureAt = Math.max(telegramLoop.lastErrorAt || 0, telegramLoop.lastRetryAt || 0)
+    const telegramCurrentFailure = !!telegramLoop.lastError && telegramFailureAt >= telegramObservedAt
+    const running = shutdownState === "running"
+    const checks = {
+      shutdown: { ok: running, state: shutdownState },
+      state: {
+        ok: stateLoaded && stateFlushOk && !statePendingSave && !stateFlushInFlight,
+        loaded: stateLoaded,
+        pendingSave: statePendingSave,
+        flushInFlight: stateFlushInFlight,
+        lastFlushOk: state?.lastFlushOk === true,
+        ...(state?.lastLoadError ? { lastLoadError: safeDiagnosticText(state.lastLoadError) } : {}),
+        ...(state?.lastFlushError ? { lastFlushError: safeDiagnosticText(state.lastFlushError), lastFlushErrorAt: state.lastFlushErrorAt || 0 } : {}),
+      },
+      telegramPoll: {
+        ok: telegramLoopActive && telegramObserved && !telegramCurrentFailure,
+        active: telegramLoopActive,
+        lastOk: telegramLoop.lastSuccessAt || 0,
+        backlogLastOk: backlogDrain.lastSuccessAt || 0,
+        retries: telegramLoop.retries,
+        lastError: telegramLoop.lastError || "",
+        lastErrorAt: telegramLoop.lastErrorAt || 0,
+      },
+      lifecycle: {
+        ok: telegramLoopActive,
+        managedTasks: taskList.length,
+        activeTasks: taskList.filter((task) => task?.stopCalled !== true).length,
+      },
+    }
+    return {
+      live: shutdownState !== "stopped",
+      ready: checks.shutdown.ok && checks.state.ok && checks.telegramPoll.ok && checks.lifecycle.ok,
+      checks,
+    }
+  }
+
   return {
     recordLoopRetry,
     recordLoopError,
@@ -283,5 +335,6 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
     recordAttachmentFallback,
     buildStatusLines,
     buildRuntimeStatusLines,
+    buildHealthSnapshot,
   }
 }

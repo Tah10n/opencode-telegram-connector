@@ -1045,6 +1045,52 @@ test("handleMessageUpdated sends assistant error notification when no preview ex
   assert.match(calls.sendToThread[0][1], /boom/)
 })
 
+test("handleMessageUpdated renders object assistant errors readably", async () => {
+  const { calls, handlers } = createHarness()
+
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: {
+      sessionID: "ses_1",
+      info: {
+        id: "msg_1",
+        role: "assistant",
+        error: {
+          code: "provider_error",
+          error: { message: "Provider rejected the request. Cookie: sid=abc; refresh=def token=replace_me" },
+        },
+      },
+    },
+  })
+
+  assert.equal(calls.sendToThread.length, 1)
+  assert.match(calls.sendToThread[0][1], /Assistant reply failed\./)
+  assert.match(calls.sendToThread[0][1], /Provider rejected the request/)
+  assert.doesNotMatch(calls.sendToThread[0][1], /\[object Object\]/)
+  assert.doesNotMatch(calls.sendToThread[0][1], /sid=abc|refresh=def|replace_me/)
+})
+
+test("handleMessageUpdated keeps unreadable object assistant errors safe", async () => {
+  const { calls, handlers } = createHarness()
+  const providerError = { code: "provider_error", headers: { cookie: "session=supersecret" } }
+  Object.defineProperty(providerError, "message", {
+    get() {
+      throw new Error("getter leaked supersecret")
+    },
+  })
+
+  await handlers.handleMessageUpdated({
+    projectAlias: "demo",
+    props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", error: providerError } },
+  })
+
+  assert.equal(calls.sendToThread.length, 1)
+  assert.match(calls.sendToThread[0][1], /Assistant reply failed\./)
+  assert.match(calls.sendToThread[0][1], /code=provider_error/)
+  assert.doesNotMatch(calls.sendToThread[0][1], /\[object Object\]/)
+  assert.doesNotMatch(calls.sendToThread[0][1], /supersecret|cookie/)
+})
+
 test("handleMessageUpdated deduplicates repeated assistant error notifications", async () => {
   const { calls, handlers } = createHarness()
   const update = {

@@ -1,7 +1,8 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { OpenCodeClient } from "../src/opencode/client.js"
+import { OpenCodeClient, OPENCODE_CORRELATION_HEADER } from "../src/opencode/client.js"
 import { classifyBoundaryError } from "../src/boundary-errors.js"
+import { runWithRequestContext } from "../src/runtime/request-context.js"
 
 test("OpenCodeClient request sends query params, auth headers, and JSON bodies", async () => {
   const originalFetch = globalThis.fetch
@@ -249,6 +250,25 @@ test("OpenCodeClient headers keep accept header and default auth username", () =
   assert.equal(headers.accept, "application/json")
   assert.equal(headers["x-test"], "1")
   assert.match(headers.authorization, /^Basic /)
+})
+
+test("OpenCodeClient sends correlation header from request context", async () => {
+  const originalFetch = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init })
+    return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true }) }
+  }
+
+  try {
+    const client = new OpenCodeClient({ baseUrl: "https://example.com" })
+    await runWithRequestContext({ correlationId: "corr/unsafe value?x=1" }, () => client.health())
+
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].init.headers[OPENCODE_CORRELATION_HEADER], "corr-unsafe-value-x-1")
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })
 
 test("OpenCodeClient request keeps timeout behavior when an external abort signal is provided", async () => {

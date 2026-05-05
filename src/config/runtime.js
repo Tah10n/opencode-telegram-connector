@@ -23,6 +23,16 @@ function normalizeLogFormat(value) {
   return format
 }
 
+function normalizeHealthServerConfig(value = {}) {
+  const enabled = value.enabled === true
+  const host = String(value.host || "127.0.0.1").trim() || "127.0.0.1"
+  const port = Number(value.port ?? 8787)
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new Error("Invalid healthServer.port / CONNECTOR_HEALTH_PORT (expected 0..65535)")
+  }
+  return { enabled, host, port }
+}
+
 function normalizeEchoFilterMode(value) {
   const raw = String(value ?? "recent").trim()
   const mode = raw || "recent"
@@ -90,6 +100,11 @@ export async function buildRuntimeConfig({ args = {}, cwd = process.cwd() } = {}
     mirrorTuiUserMessages: configFromFile.mirrorTuiUserMessages ?? envBool("MIRROR_TUI_USER_MESSAGES", false),
     allowInsecureHttp: configFromFile.allowInsecureHttp ?? envBool("OPENCODE_ALLOW_INSECURE_HTTP", false),
     logFormat: normalizeLogFormat(configFromFile.logFormat ?? envOptional("CONNECTOR_LOG_FORMAT", "text")),
+    healthServer: normalizeHealthServerConfig({
+      enabled: configFromFile.healthServer?.enabled ?? envBool("CONNECTOR_HEALTH_ENABLED", false),
+      host: configFromFile.healthServer?.host ?? envOptional("CONNECTOR_HEALTH_HOST", "127.0.0.1"),
+      port: configFromFile.healthServer?.port ?? envInt("CONNECTOR_HEALTH_PORT", 8787),
+    }),
     limits: normalizeLimits(configFromFile.limits || {}),
     cwd: configFromFile.cwd || configBaseDir,
   }

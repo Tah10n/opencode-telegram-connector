@@ -1,6 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { collectLoggerRedactionOptions, createConnectorLogger } from "../src/runtime/logger.js"
+import { runWithRequestContext } from "../src/runtime/request-context.js"
 
 test("collectLoggerRedactionOptions returns empty options for missing config", () => {
   assert.deepEqual(collectLoggerRedactionOptions(), { knownSecrets: [], sensitivePaths: [] })
@@ -240,4 +241,26 @@ test("createConnectorLogger recursively sanitizes circular values, bigint, and b
     stack_redacted: true,
   })
   assert.doesNotMatch(output[0], /123456789:replace_me|basic-auth-secret|C:\\tmp/)
+})
+
+test("createConnectorLogger includes request context and child fields", async () => {
+  const output = []
+  const logger = createConnectorLogger({
+    format: "json",
+    stdout: (line) => output.push(line),
+    now: () => "2026-04-25T00:00:00.000Z",
+  })
+
+  await runWithRequestContext({ correlationId: "corr_1", ctxKey: "10:0" }, async () => {
+    const child = logger.child({ projectAlias: "demo", sessionId: "ses_1" })
+    child.info("Scoped", { operation: "promptAsync", sessionId: "ses_override" })
+  })
+
+  const entry = JSON.parse(output[0])
+  assert.equal(entry.msg, "Scoped")
+  assert.equal(entry.correlationId, "corr_1")
+  assert.equal(entry.ctxKey, "10:0")
+  assert.equal(entry.projectAlias, "demo")
+  assert.equal(entry.sessionId, "ses_override")
+  assert.equal(entry.operation, "promptAsync")
 })

@@ -1,7 +1,10 @@
 import { Buffer } from "node:buffer"
 import { boundaryErrorFromException, boundaryErrorFromHttpResponse } from "../boundary-errors.js"
 import { appendPathToBaseUrl, isLoopbackHostname, normalizeEndpointBaseUrl } from "../url-utils.js"
+import { getRequestContext, normalizeCorrelationId } from "../runtime/request-context.js"
 import { encodeOpenCodePathSegment, normalizeOpenCodeId } from "./ids.js"
+
+export const OPENCODE_CORRELATION_HEADER = "X-Connector-Correlation"
 
 function basicAuthHeader(username, password) {
   const token = Buffer.from(`${username}:${password}`, "utf8").toString("base64")
@@ -58,10 +61,14 @@ export class OpenCodeClient {
     }
   }
 
-  headers(extra) {
+  headers(extra, { correlationId } = {}) {
     const h = {
       accept: "application/json",
       ...(extra || {}),
+    }
+    const requestCorrelationId = normalizeCorrelationId(correlationId ?? getRequestContext().correlationId)
+    if (requestCorrelationId && h[OPENCODE_CORRELATION_HEADER] == null) {
+      h[OPENCODE_CORRELATION_HEADER] = requestCorrelationId
     }
     if (this.password) {
       h.authorization = basicAuthHeader(this.username || "opencode", this.password)
@@ -69,7 +76,7 @@ export class OpenCodeClient {
     return h
   }
 
-  async request(pathname, { method = "GET", query, json, timeoutMs = 30_000, signal } = {}) {
+  async request(pathname, { method = "GET", query, json, timeoutMs = 30_000, signal, correlationId } = {}) {
     const url = appendPathToBaseUrl(this.baseUrl, pathname)
     const operation = `${method} ${url.pathname}`
     if (query) {
@@ -83,7 +90,7 @@ export class OpenCodeClient {
     try {
       const res = await fetch(url, {
         method,
-        headers: this.headers(json ? { "content-type": "application/json" } : undefined),
+        headers: this.headers(json ? { "content-type": "application/json" } : undefined, { correlationId }),
         signal: requestSignal,
         body: json ? JSON.stringify(json) : undefined,
       })

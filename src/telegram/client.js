@@ -1,5 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises"
 import { boundaryErrorFromException, boundaryErrorFromHttpResponse, makeBoundaryError } from "../boundary-errors.js"
+import { getRequestContext } from "../runtime/request-context.js"
 
 function makeTimeoutSignal(timeoutMs = 30_000) {
   if (!timeoutMs) return { signal: undefined, cancel: () => {} }
@@ -235,7 +236,7 @@ export class TelegramClient {
   recordApiFailure(method, params, err) {
     if (!this.onApiFailure) return
     try {
-      this.onApiFailure({ method, params, err })
+      this.onApiFailure({ method, params, err, requestContext: getRequestContext() })
     } catch (observabilityErr) {
       // Observability must never change Telegram API behavior.
       this._logger?.warn("onApiFailure callback threw", { error: observabilityErr?.message })
