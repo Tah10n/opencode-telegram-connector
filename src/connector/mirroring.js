@@ -302,9 +302,74 @@ export function createMirroringHandlers(runtime) {
     return String(entry?.kind || "").startsWith("agent-stop-error")
   }
 
+  const AGENT_STOP_ERROR_TEXT_KEYS = ["message", "error", "errorMessage", "error_description", "reason", "description", "detail", "details", "body", "data", "response", "cause", "errors"]
+  const AGENT_STOP_ERROR_METADATA_KEYS = ["name", "type", "code", "status", "statusCode", "kind", "outcome", "providerID", "providerId", "modelID", "modelId"]
+
+  function safeReadAgentStopErrorField(value, key) {
+    try {
+      return value?.[key]
+    } catch {
+      return undefined
+    }
+  }
+
+  function primitiveAgentStopErrorText(value) {
+    if (typeof value === "string") return value
+    if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value)
+    return ""
+  }
+
+  function agentStopErrorMetadata(value) {
+    const parts = []
+    for (const key of AGENT_STOP_ERROR_METADATA_KEYS) {
+      const entry = safeReadAgentStopErrorField(value, key)
+      const text = primitiveAgentStopErrorText(entry).trim()
+      if (text) parts.push(`${key}=${text}`)
+    }
+    return parts.join(" ")
+  }
+
+  function readableAgentStopErrorText(value, seen = new WeakSet()) {
+    if (typeof value === "string") return value
+    if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value)
+    if (!value || typeof value !== "object") return ""
+    if (seen.has(value)) return "[Circular]"
+    seen.add(value)
+
+    if (value instanceof Error || safeReadAgentStopErrorField(value, "isBoundaryError") === true) {
+      return [agentStopErrorMetadata(value), primitiveAgentStopErrorText(safeReadAgentStopErrorField(value, "message")).trim()].filter(Boolean).join("\n")
+    }
+
+    if (Array.isArray(value)) {
+      const entries = []
+      let sample = []
+      try {
+        sample = value.slice(0, 3)
+      } catch {
+        sample = []
+      }
+      for (const entry of sample) {
+        const text = readableAgentStopErrorText(entry, seen).trim()
+        if (text && text !== "[Circular]") entries.push(text)
+      }
+      return entries.join("\n")
+    }
+
+    const metadata = agentStopErrorMetadata(value)
+    for (const key of AGENT_STOP_ERROR_TEXT_KEYS) {
+      const entry = safeReadAgentStopErrorField(value, key)
+      if (entry == null) continue
+      const text = readableAgentStopErrorText(entry, seen).trim()
+      if (text && text !== "[Circular]") return [metadata, text].filter(Boolean).join("\n")
+    }
+
+    return metadata
+  }
+
   function redactAgentStopErrorText(value) {
-    return redactSensitiveText(String(value || ""))
-      .replace(/(^|[^A-Za-z0-9_-])([A-Za-z0-9_-]*(?:token|password|passwd|secret|api[_-]?key|authorization)[A-Za-z0-9_-]*)\s*[:=]\s*[^,;\n\r]+/gi, "$1$2=***")
+    return redactSensitiveText(readableAgentStopErrorText(value))
+      .replace(/(^|[^A-Za-z0-9_-])(["']?)(set[-_]?cookie|cookie|authorization)\2(\s*[:=]\s*)[^\n\r]+/gi, "$1$2$3$2$4***")
+      .replace(/(^|[^A-Za-z0-9_-])(["']?)([A-Za-z0-9_-]*(?:token|password|passwd|secret|api[_-]?key|auth|authorization|cookie|set[-_]?cookie|session|credential)[A-Za-z0-9_-]*)\2(\s*[:=]\s*)("[^"\n\r]*"|'[^'\n\r]*'|[^,;\n\r]+)/gi, "$1$2$3$2$4***")
       .trim()
   }
 
