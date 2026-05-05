@@ -1,4 +1,14 @@
 import http from "node:http"
+import { redactSensitiveText } from "../url-utils.js"
+
+function sanitizeHealthValue(value) {
+  if (typeof value === "string") return redactSensitiveText(value)
+  if (!value || typeof value !== "object") return value
+  if (Array.isArray(value)) return value.map((entry) => sanitizeHealthValue(entry))
+  const out = {}
+  for (const [key, entry] of Object.entries(value)) out[key] = sanitizeHealthValue(entry)
+  return out
+}
 
 function writeJson(res, statusCode, body) {
   const payload = JSON.stringify(body)
@@ -34,7 +44,7 @@ export async function startHealthServer({ host = "127.0.0.1", port = 8787, getSn
     try {
       snapshot = typeof getSnapshot === "function" ? getSnapshot() : {}
     } catch (err) {
-      writeJson(res, 503, { ok: false, status: "snapshot_error", error: err?.message || String(err) })
+      writeJson(res, 503, { ok: false, status: "snapshot_error", error: redactSensitiveText(err?.message || String(err)) })
       return
     }
 
@@ -43,7 +53,7 @@ export async function startHealthServer({ host = "127.0.0.1", port = 8787, getSn
       writeJson(res, live ? 200 : 503, {
         ok: live,
         status: live ? "live" : "not_live",
-        checks: snapshot?.checks || {},
+        checks: sanitizeHealthValue(snapshot?.checks || {}),
       })
       return
     }
@@ -52,7 +62,7 @@ export async function startHealthServer({ host = "127.0.0.1", port = 8787, getSn
     writeJson(res, ready ? 200 : 503, {
       ok: ready,
       status: ready ? "ready" : "not_ready",
-      checks: snapshot?.checks || {},
+      checks: sanitizeHealthValue(snapshot?.checks || {}),
     })
   })
 

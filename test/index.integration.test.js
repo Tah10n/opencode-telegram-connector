@@ -116,6 +116,8 @@ function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, sendMessag
   const editedMessages = []
   const deletedMessages = []
   const getUpdatesCalls = []
+  const getUpdatesErrors = []
+  let getUpdatesError = null
 
   return {
     sentMessages,
@@ -131,6 +133,12 @@ function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, sendMessag
     enqueueBatch(batch) {
       updates.push(batch)
     },
+    enqueueGetUpdatesError(err) {
+      getUpdatesErrors.push(err)
+    },
+    setGetUpdatesError(err) {
+      getUpdatesError = err || null
+    },
     get pendingUpdates() {
       return updates.length
     },
@@ -143,6 +151,8 @@ function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, sendMessag
     },
     async getUpdates(input) {
       getUpdatesCalls.push(input)
+      if (getUpdatesError) throw getUpdatesError
+      if (getUpdatesErrors.length > 0) throw getUpdatesErrors.shift()
       if (updates.length === 0) {
         await delay(emptyPollDelayMs)
         return []
@@ -1568,6 +1578,16 @@ test("startConnector serves optional health endpoints", async () => {
     assert.equal(payload.status, "ready")
     assert.equal(payload.checks.state.ok, true)
     assert.equal(payload.checks.telegramPoll.ok, true)
+
+    harness.tg.setGetUpdatesError(new Error("network down while polling Telegram"))
+    const notReady = await waitFor(async () => {
+      const res = await fetch(`${baseUrl}/readyz`)
+      if (res.status !== 503) return null
+      const body = await res.json()
+      return body.checks?.telegramPoll?.ok === false ? body : null
+    })
+    assert.equal(notReady.status, "not_ready")
+    assert.match(notReady.checks.telegramPoll.lastError, /network down while polling Telegram/)
   } finally {
     await harness.connector.stop()
   }

@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks"
 import crypto from "node:crypto"
 
 const storage = new AsyncLocalStorage()
+const MAX_CORRELATION_ID_LENGTH = 128
 
 function isPlainObject(value) {
   return !!value && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype
@@ -13,7 +14,7 @@ export function normalizeCorrelationId(value) {
   return raw
     .replace(/[^A-Za-z0-9._:-]+/g, "-")
     .replace(/^-+|-+$/g, "")
-    .slice(0, 128)
+    .slice(0, MAX_CORRELATION_ID_LENGTH)
 }
 
 export function createCorrelationId(prefix = "req", parts = []) {
@@ -22,7 +23,10 @@ export function createCorrelationId(prefix = "req", parts = []) {
     .map((part) => normalizeCorrelationId(part))
     .filter(Boolean)
   const suffix = crypto.randomBytes(6).toString("base64url")
-  return [safePrefix, ...safeParts, suffix].join("-").slice(0, 128)
+  const base = [safePrefix, ...safeParts].join("-")
+  const maxBaseLength = MAX_CORRELATION_ID_LENGTH - suffix.length - 1
+  const truncatedBase = base.length > maxBaseLength ? base.slice(0, maxBaseLength).replace(/-+$/g, "") : base
+  return `${truncatedBase}-${suffix}`
 }
 
 function normalizeContextFields(fields = {}) {

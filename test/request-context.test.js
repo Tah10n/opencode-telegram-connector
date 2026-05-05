@@ -63,3 +63,16 @@ test("correlation ids are safe for HTTP headers", () => {
   assert.match(id, /^tg-update-42-message-[A-Za-z0-9_-]+$/)
   assert.ok(id.length <= 128)
 })
+
+test("correlation ids preserve the random suffix for long inputs", () => {
+  const longPrefix = `tg${"p".repeat(90)}`
+  const longParts = [`update${"u".repeat(90)}`, `message${"m".repeat(90)}`]
+  const id = createCorrelationId(longPrefix, longParts)
+
+  assert.ok(id.length <= 128)
+  assert.match(id, /^[A-Za-z0-9._:\-]+$/)
+
+  const suffix = id.slice(id.lastIndexOf("-") + 1)
+  assert.match(suffix, /^[A-Za-z0-9_-]{8}$/)
+  assert.ok(id.endsWith(`-${suffix}`))
+})

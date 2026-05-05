@@ -32,18 +32,53 @@ test("StateStore exposes load and flush health", async () => {
 
   const healthy = store.healthSnapshot()
   assert.equal(healthy.pendingSave, false)
+  assert.equal(healthy.flushInFlight, false)
   assert.equal(healthy.lastFlushOk, true)
   assert.equal(healthy.lastFlushError, "")
   assert.ok(healthy.lastFlushAt > 0)
 })
 
-test("StateStore marks failed flushes unhealthy", async () => {
+test("StateStore reports in-flight flush health", async () => {
   const dir = await makeTempDir()
+  let writeStarted
+  let finishWrite
+  const started = new Promise((resolve) => {
+    writeStarted = resolve
+  })
+  const finish = new Promise((resolve) => {
+    finishWrite = resolve
+  })
   const store = new StateStore({
     filePath: path.join(dir, "state.json"),
     logger: makeLogger(),
     writeJsonFileAtomicImpl: async () => {
-      throw new Error("disk full")
+      writeStarted()
+      await finish
+    },
+  })
+
+  await store.load()
+  store.setUpdateOffset(123)
+  const flush = store.flush()
+  await started
+
+  assert.equal(store.healthSnapshot().pendingSave, false)
+  assert.equal(store.healthSnapshot().flushInFlight, true)
+
+  finishWrite()
+  await flush
+  assert.equal(store.healthSnapshot().flushInFlight, false)
+  assert.equal(store.healthSnapshot().lastFlushOk, true)
+})
+
+test("StateStore marks failed flushes unhealthy", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  const store = new StateStore({
+    filePath,
+    logger: makeLogger(),
+    writeJsonFileAtomicImpl: async () => {
+      throw new Error(`disk full at ${filePath}.tmp.secret`)
     },
   })
 
@@ -54,7 +89,21 @@ test("StateStore marks failed flushes unhealthy", async () => {
   assert.equal(health.loaded, true)
   assert.equal(health.lastFlushOk, false)
   assert.match(health.lastFlushError, /disk full/)
+  assert.doesNotMatch(health.lastFlushError, /telegram-connector-|state\.json/)
+  assert.match(health.lastFlushError, /<state-file>/)
   assert.ok(health.lastFlushErrorAt > 0)
+})
+
+test("StateStore redacts load health errors", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "bad\u0000state.json")
+  const store = new StateStore({ filePath, logger: makeLogger() })
+
+  await assert.rejects(() => store.load())
+
+  const health = store.healthSnapshot()
+  assert.equal(health.loaded, false)
+  assert.doesNotMatch(health.lastLoadError, /telegram-connector-|state\.json/)
 })
 
 test("StateStore moves an existing session binding to the new context", () => {

@@ -4,6 +4,7 @@ import { createStateFileBackup, readJsonFile, writeJsonFileAtomic } from "./file
 import { loadStateWithMigration, migrateStateIfNeeded, preserveStateBeforeRecovery } from "./backup.js"
 import { normalizeModelPreference, storedModelPreference } from "../model-selection.js"
 import { isSafeOpenCodeId } from "../opencode/ids.js"
+import { redactSensitiveText } from "../url-utils.js"
 
 export const STATE_SCHEMA_VERSION = 5
 export const DEFAULT_FEED_MODE = "main+changes"
@@ -92,6 +93,12 @@ function cloneStateForWrite(state) {
   return JSON.parse(JSON.stringify(state))
 }
 
+function safeStateHealthErrorMessage(err, { filePath } = {}) {
+  return redactSensitiveText(err?.message || String(err), {
+    sensitivePaths: filePath ? [{ path: filePath, label: "state-file" }] : [],
+  })
+}
+
 export function sessionKey(projectAlias, sessionId) {
   return `${projectAlias}:${sessionId}`
 }
@@ -111,6 +118,7 @@ export class StateStore {
     this.state = defaultState()
     this._saveTimer = null
     this._writeChain = Promise.resolve()
+    this._flushInFlight = 0
     this._health = {
       loaded: false,
       lastLoadError: "",
@@ -122,7 +130,7 @@ export class StateStore {
   }
 
   healthSnapshot() {
-    return { ...this._health, pendingSave: !!this._saveTimer }
+    return { ...this._health, pendingSave: !!this._saveTimer, flushInFlight: this._flushInFlight > 0 }
   }
 
   _markLoadOk() {
@@ -132,7 +140,7 @@ export class StateStore {
 
   _markLoadError(err) {
     this._health.loaded = false
-    this._health.lastLoadError = err?.message || String(err)
+    this._health.lastLoadError = safeStateHealthErrorMessage(err, { filePath: this.filePath })
   }
 
   _markFlushOk() {
@@ -144,7 +152,7 @@ export class StateStore {
 
   _markFlushError(err) {
     this._health.lastFlushOk = false
-    this._health.lastFlushError = err?.message || String(err)
+    this._health.lastFlushError = safeStateHealthErrorMessage(err, { filePath: this.filePath })
     this._health.lastFlushErrorAt = Date.now()
   }
 
@@ -355,6 +363,7 @@ export class StateStore {
       this._saveTimer = null
     }
     const snapshot = cloneStateForWrite(this.state)
+    this._flushInFlight += 1
     const write = this._writeChain.then(() => this._writeJsonFileAtomic(this.filePath, snapshot))
     this._writeChain = write.catch(() => {})
     try {
@@ -364,6 +373,8 @@ export class StateStore {
       this._markFlushError(err)
       if (logErrors) this.logger?.error?.("Failed to write state:", err?.message || String(err))
       throw err
+    } finally {
+      this._flushInFlight = Math.max(0, this._flushInFlight - 1)
     }
   }
 
