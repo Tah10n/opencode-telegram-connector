@@ -12,11 +12,12 @@ import {
   questionReplyIdempotencyPrefix,
 } from "./idempotency.js"
 import { callbackPacker } from "./callback-data.js"
-import { t as translate } from "../i18n/index.js"
+import { matchSupportedLocale, normalizeLocale, t as translate } from "../i18n/index.js"
 
 export function createPromptHandlers(runtime) {
   const {
     store,
+    config,
     tg,
     cb,
     ocByAlias,
@@ -34,6 +35,15 @@ export function createPromptHandlers(runtime) {
     recordPromptAnswered,
   } = runtime
   const packCallback = callbackPacker(cb)
+
+  function localeForCtx(ctxKey) {
+    const record = store.getLocaleRecord?.(ctxKey)
+    if (!(record?.source === "telegram" && config?.i18n?.autoDetectTelegramLanguage === false)) {
+      const storedLocale = matchSupportedLocale(record?.locale, config?.i18n?.supportedLocales)
+      if (storedLocale) return storedLocale
+    }
+    return normalizeLocale(config?.i18n?.defaultLocale, config?.i18n)
+  }
 
   const wizardKey = (projectAlias, requestId, sessionID = "") => promptKey(projectAlias, requestId, sessionID)
   const initialPendingPrompts = JSON.parse(JSON.stringify(store.getPendingPrompts?.() || store.get?.().pendingPrompts || {}))
@@ -414,7 +424,8 @@ export function createPromptHandlers(runtime) {
     if (prompted[projectAlias].permission.has(permissionIdentity)) return false
     prompted[projectAlias].permission.add(permissionIdentity)
     const ctxKey = ctxKeyFrom(route.chatId, route.threadIdOr0)
-    const ctxMeta = { chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey, ...(store.getLocale?.(ctxKey) ? { locale: store.getLocale(ctxKey) } : {}) }
+    const locale = localeForCtx(ctxKey)
+    const ctxMeta = { chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey, locale }
     store.setPendingPermission({
       projectAlias,
       permissionId: props.id,
@@ -451,7 +462,8 @@ export function createPromptHandlers(runtime) {
     prompted[projectAlias].question.add(questionIdentity)
 
     const ctxKey = ctxKeyFrom(route.chatId, route.threadIdOr0)
-    const ctx = { chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey, ...(store.getLocale?.(ctxKey) ? { locale: store.getLocale(ctxKey) } : {}) }
+    const locale = localeForCtx(ctxKey)
+    const ctx = { chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey, locale }
     const wizard = {
       projectAlias,
       id: props.id,

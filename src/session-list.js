@@ -54,7 +54,7 @@ export function formatSessionButtonLabel(session, { currentSessionId, startupSes
 export function formatSessionsListText(
   projectAlias,
   sessions,
-  { currentSessionId, currentSessionModelLabel, currentSessionModelSourceLabel, startupSessionId, limit = 10, locale = "en" } = {},
+  { currentSessionId, currentSessionModelLabel, currentSessionModelSourceLabel, startupSessionId, limit = 10, locale = "en", viewOnly = false } = {},
 ) {
   const safeProjectAlias = String(projectAlias || "").trim() || "(unknown)"
   const normalized = normalizeSessionsList(sessions)
@@ -73,15 +73,17 @@ export function formatSessionsListText(
 
   if (normalized.length === 0) {
     lines.push(translate(locale, "sessions.noneFound"))
-    lines.push(translate(locale, "sessions.createOrUse"))
+    lines.push(viewOnly ? translate(locale, "sessions.bindBeforeCreateSwitch") : translate(locale, "sessions.createOrUse"))
     return lines.join("\n")
   }
 
   const visibleSessions = normalized.slice(0, limit)
   const hasSwitchableSessions = visibleSessions.some((session) => isSafeOpenCodeId(session.id))
   const hasUnsupportedSessions = visibleSessions.some((session) => !isSafeOpenCodeId(session.id))
-  lines.push(hasSwitchableSessions ? translate(locale, "sessions.tapToSwitch") : translate(locale, "sessions.recentUnsupported"))
-  lines.push("")
+  if (!viewOnly || !hasSwitchableSessions) {
+    lines.push(hasSwitchableSessions ? translate(locale, "sessions.tapToSwitch") : translate(locale, "sessions.recentUnsupported"))
+    lines.push("")
+  }
   lines.push(translate(locale, "sessions.recent"))
   for (const session of visibleSessions) {
     const markers = sessionMarkers(session.id, { currentSessionId, startupSessionId })
@@ -97,6 +99,6 @@ export function formatSessionsListText(
   }
   lines.push("")
   if (hasUnsupportedSessions) lines.push(translate(locale, "sessions.unsupportedHelp"))
-  lines.push(translate(locale, "sessions.useToSwitch"))
+  lines.push(viewOnly ? translate(locale, "sessions.bindBeforeSwitch") : translate(locale, "sessions.useToSwitch"))
   return lines.join("\n")
 }

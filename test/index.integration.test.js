@@ -504,6 +504,63 @@ test("startConnector detects and changes thread language", async () => {
   }
 })
 
+test("startConnector ignores stored Telegram-detected locales when auto-detect is disabled", async () => {
+  const harness = await createHarness({
+    configPatch: { i18n: { defaultLocale: "en", autoDetectTelegramLanguage: false } },
+    statePatch: { localeByContext: { "100:7": { locale: "ru", source: "telegram" } } },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(103, "/language", { languageCode: "ru-RU" }))
+    await waitFor(() => harness.tg.sentMessages.length > 0)
+
+    assert.match(harness.tg.sentMessages.at(-1).text, /Language for this thread:/)
+    assert.doesNotMatch(harness.tg.sentMessages.at(-1).text, /Язык для этого треда:/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector language reset falls back to default when detection is disabled", async () => {
+  const harness = await createHarness({
+    configPatch: { i18n: { defaultLocale: "en", autoDetectTelegramLanguage: false } },
+    statePatch: { localeByContext: { "100:7": { locale: "ru", source: "manual" } } },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(104, "/language reset", { languageCode: "ru-RU" }))
+    await waitFor(() => harness.tg.sentMessages.length > 0)
+
+    assert.match(harness.tg.sentMessages.at(-1).text, /Language preference reset/)
+    assert.match(harness.tg.sentMessages.at(-1).text, /Current: English/)
+    const state = await waitFor(async () => {
+      const current = await readState(harness.stateFile)
+      return !current.localeByContext?.["100:7"] ? current : null
+    })
+    assert.deepEqual(state.localeByContext, {})
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector ignores stored locales outside current supportedLocales", async () => {
+  const harness = await createHarness({
+    configPatch: { i18n: { defaultLocale: "en", supportedLocales: ["en"] } },
+    statePatch: { localeByContext: { "100:7": { locale: "ru", source: "manual" } } },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(105, "/language"))
+    await waitFor(() => harness.tg.sentMessages.length > 0)
+
+    assert.match(harness.tg.sentMessages.at(-1).text, /Language for this thread:/)
+    assert.match(harness.tg.sentMessages.at(-1).text, /Current: English/)
+    assert.doesNotMatch(harness.tg.sentMessages.at(-1).text, /русский/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
 test("startConnector binds a thread and forwards only allowed-user messages", async () => {
   const harness = await createHarness()
 

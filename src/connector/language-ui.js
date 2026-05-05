@@ -1,9 +1,17 @@
 import { makeInlineKeyboard } from "../telegram/client.js"
-import { localeDisplayName, t as translate } from "../i18n/index.js"
+import { localeDisplayName, matchSupportedLocale, t as translate } from "../i18n/index.js"
 
 function localeFromContext(ctxMeta, { store, config } = {}) {
   const defaultLocale = config?.i18n?.defaultLocale || "en"
-  return store?.getLocale?.(ctxMeta?.ctxKey) || ctxMeta?.locale || defaultLocale
+  const record = activeLocaleRecord(ctxMeta, { store, config })
+  return record?.locale || ctxMeta?.locale || defaultLocale
+}
+
+function activeLocaleRecord(ctxMeta, { store, config } = {}) {
+  const record = store?.getLocaleRecord?.(ctxMeta?.ctxKey)
+  if (record?.source === "telegram" && config?.i18n?.autoDetectTelegramLanguage === false) return null
+  const locale = matchSupportedLocale(record?.locale, config?.i18n?.supportedLocales)
+  return locale ? { ...record, locale } : null
 }
 
 function sourceKey(record) {
@@ -19,7 +27,7 @@ export function supportedLocaleSummary({ config, displayLocale } = {}) {
 
 export function languageSettingsView(ctxMeta, { store, config, packCallback, t = translate } = {}) {
   const locale = localeFromContext(ctxMeta, { store, config })
-  const record = store?.getLocaleRecord?.(ctxMeta?.ctxKey)
+  const record = activeLocaleRecord(ctxMeta, { store, config })
   const currentLanguage = localeDisplayName(locale, locale)
   const text = [
     t(locale, "language.title"),

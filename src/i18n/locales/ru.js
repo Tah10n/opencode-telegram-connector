@@ -195,6 +195,9 @@ export default {
     more: "…и ещё {count}.",
     unsupportedHelp: "Сессии с [unsupported id] нельзя выбрать кнопками; используйте ID без пробелов, двоеточий, pipe или URL-разделителей.",
     useToSwitch: "Используйте /use <sessionId|shareLink> для переключения.",
+    viewOnly: "Только просмотр. Привяжите целевой чат/тред, чтобы переключать сессии кнопками.",
+    bindBeforeCreateSwitch: "Привяжите целевой чат/тред к этому проекту перед созданием или переключением сессий из Telegram.",
+    bindBeforeSwitch: "Используйте /bind <projectAlias> в целевом чате/треде, затем /use <sessionId|shareLink> для переключения.",
   },
   callbacks: {
     closed: "Закрыто",

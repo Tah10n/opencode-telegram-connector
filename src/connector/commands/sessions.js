@@ -154,10 +154,7 @@ export function createSessionCommandHandlers(deps) {
       const oc = ocByAlias[projectAlias]
       const sessions = await oc.listSessions({ directory: projects?.[projectAlias]?.directory, limit: 10 })
       markProjectUp?.(projectAlias)
-      const text = `${formatSessionsListText(projectAlias, sessions, { startupSessionId: startupSid, locale: ctxMeta.locale })}\n\nViewing only. Bind the target chat/thread to switch sessions with buttons.`
-        .replace("Tap a button below to switch:\n\n", "")
-        .replace("Use /new to create one or /use <sessionId|shareLink> to switch.", "Bind the target chat/thread to this project before creating or switching sessions from Telegram.")
-        .replace("Use /use <sessionId|shareLink> to switch.", "Use /bind <projectAlias> in the target chat/thread, then /use <sessionId|shareLink> to switch.")
+      const text = `${formatSessionsListText(projectAlias, sessions, { startupSessionId: startupSid, locale: ctxMeta.locale, viewOnly: true })}\n\n${t(ctxMeta, "sessions.viewOnly")}`
       const replyMarkup = closeKeyboard(["srv", "close"], ctxMeta.locale)
       if (editMessageId) {
         await tg.editMessageText(ctxMeta.chatId, editMessageId, text, replyMarkup)

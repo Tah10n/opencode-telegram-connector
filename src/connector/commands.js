@@ -441,7 +441,7 @@ export function createCommandHandlers(runtime) {
     if (arg) {
       if (arg.toLowerCase() === "reset") {
         store.clearLocale?.(ctxMeta.ctxKey)
-        ctxMeta = ctxMetaWithLocale?.(ctxMeta) || ctxMeta
+        ctxMeta = ctxMetaWithLocale?.({ ...ctxMeta, locale: "" }) || { ...ctxMeta, locale: "" }
         const view = languageSettingsView(ctxMeta, { store, config, packCallback, t })
         await sendToThread(ctxMeta, `${t(ctxMeta, "language.reset")}\n\n${view.text}`, view.replyMarkup)
         return

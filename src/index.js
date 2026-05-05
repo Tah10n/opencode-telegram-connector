@@ -623,6 +623,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const overviewHelpers = createOverviewHelpers({
     projects,
     store,
+    config,
     startInProgress,
     parseCtxKey,
     sendToThread,
@@ -644,6 +645,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const promptHandlers = createPromptHandlers({
     store,
     tg,
+    config,
     cb,
     ocByAlias,
     promptBaseline,
@@ -906,8 +908,10 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   }
 
   function effectiveLocaleForContext(ctxKey, detectedLocale = "") {
-    const storedLocale = store.getLocale?.(ctxKey)
-    if (storedLocale) return normalizeLocale(storedLocale, config.i18n)
+    const storedRecord = store.getLocaleRecord?.(ctxKey)
+    if (storedRecord?.locale && (storedRecord.source === "manual" || config.i18n?.autoDetectTelegramLanguage !== false)) {
+      return normalizeLocale(storedRecord.locale, config.i18n)
+    }
     if (detectedLocale) return normalizeLocale(detectedLocale, config.i18n)
     return config.i18n?.defaultLocale || "en"
   }

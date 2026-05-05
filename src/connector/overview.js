@@ -3,7 +3,7 @@ import { redactCmdlineSecrets, sanitizeBaseUrlForDisplay } from "../url-utils.js
 import { isRetryableBoundaryError, normalizeBoundaryError } from "../boundary-errors.js"
 import { getLaunchSupport } from "../opencode/launcher.js"
 import { callbackPacker } from "./callback-data.js"
-import { t as translate } from "../i18n/index.js"
+import { matchSupportedLocale, t as translate } from "../i18n/index.js"
 
 export function buildProjectsOverviewText({
   projects,
@@ -85,10 +85,16 @@ export function buildProjectsOverviewKeyboard({
   return makeInlineKeyboard(rows)
 }
 
-export function createOverviewHelpers({ projects, store, startInProgress, parseCtxKey, sendToThread, cb }) {
+export function createOverviewHelpers({ projects, store, config, startInProgress, parseCtxKey, sendToThread, cb }) {
   const projectLastUnavailableNoticeAt = new Map()
   const projectIsDown = new Map()
   const projectSseState = new Map(Object.keys(projects).map((alias) => [alias, "unknown"]))
+
+  function storedLocaleForCtx(ctxKey) {
+    const record = store.getLocaleRecord?.(ctxKey)
+    if (record?.source === "telegram" && config?.i18n?.autoDetectTelegramLanguage === false) return ""
+    return matchSupportedLocale(record?.locale, config?.i18n?.supportedLocales)
+  }
 
   function canAutoStartProject(alias, { platform }) {
     return getLaunchSupport({ project: projects?.[alias], platform }).canAutoStart
@@ -124,7 +130,7 @@ export function createOverviewHelpers({ projects, store, startInProgress, parseC
       if (binding?.projectAlias !== projectAlias) continue
       const ctx = parseCtxKey(ctxKey)
       if (!ctx) continue
-      const locale = store.getLocale?.(ctxKey) || "en"
+      const locale = storedLocaleForCtx(ctxKey) || config?.i18n?.defaultLocale || "en"
       const message = translate(locale, "overview.recovered", { project: projectAlias, baseUrl })
       await sendToThread(ctx, message).catch(() => {})
     }
@@ -166,7 +172,7 @@ export function createOverviewHelpers({ projects, store, startInProgress, parseC
       if (binding?.projectAlias !== projectAlias) continue
       const ctx = parseCtxKey(ctxKey)
       if (!ctx) continue
-      const locale = store.getLocale?.(ctxKey) || "en"
+      const locale = storedLocaleForCtx(ctxKey) || config?.i18n?.defaultLocale || "en"
       const message = formatProjectUnavailable(projectAlias, err, { locale })
       const replyMarkup = canAutoStartProject(projectAlias, { platform }) ? startServerKeyboard(projectAlias, { locale }) : null
       await sendToThread(ctx, message, replyMarkup).catch(() => {})

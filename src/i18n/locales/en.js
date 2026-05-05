@@ -195,6 +195,9 @@ export default {
     more: "…and {count} more.",
     unsupportedHelp: "Sessions marked [unsupported id] cannot be selected with buttons; use a session id without whitespace, colon, pipe, or URL path/query separators.",
     useToSwitch: "Use /use <sessionId|shareLink> to switch.",
+    viewOnly: "Viewing only. Bind the target chat/thread to switch sessions with buttons.",
+    bindBeforeCreateSwitch: "Bind the target chat/thread to this project before creating or switching sessions from Telegram.",
+    bindBeforeSwitch: "Use /bind <projectAlias> in the target chat/thread, then /use <sessionId|shareLink> to switch.",
   },
   callbacks: {
     closed: "Closed",

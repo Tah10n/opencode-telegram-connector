@@ -419,7 +419,7 @@ export function createCallbackHandlers(runtime) {
         if (action === "reset") {
           store.clearLocale?.(ctxMeta.ctxKey)
           await flushStoreIfAvailable()
-          ctxMeta = ctxMetaWithLocale?.(ctxMeta) || ctxMeta
+          ctxMeta = ctxMetaWithLocale?.({ ...ctxMeta, locale: "" }) || { ...ctxMeta, locale: "" }
           const view = languageSettingsView(ctxMeta, { store, config, packCallback: packCallbackData, t })
           await answerCallbackQuery(callbackQuery.id, t(ctxMeta, "language.reset"))
           if (msg?.message_id && typeof tg.editMessageText === "function") {
