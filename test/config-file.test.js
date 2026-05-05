@@ -57,6 +57,12 @@ test("buildRuntimeConfig loads connector.config.mjs and resolves relative paths"
       mirrorTuiUserMessages: true,
       logFormat: "json",
       healthServer: { enabled: true, host: "127.0.0.1", port: 0 },
+      i18n: {
+        defaultLocale: "ru-RU",
+        supportedLocales: ["en", "ru"],
+        autoDetectTelegramLanguage: false,
+        botCommandLocales: ["ru"],
+      },
       allowInsecureHttp: true,
       activeTurnStaleMs: "60000",
       opencodeWatchdog: {
@@ -94,6 +100,12 @@ test("buildRuntimeConfig loads connector.config.mjs and resolves relative paths"
   assert.equal(config.cwd, dir)
   assert.equal(config.logFormat, "json")
   assert.deepEqual(config.healthServer, { enabled: true, host: "127.0.0.1", port: 0 })
+  assert.deepEqual(config.i18n, {
+    defaultLocale: "ru",
+    supportedLocales: ["en", "ru"],
+    autoDetectTelegramLanguage: false,
+    botCommandLocales: ["ru"],
+  })
   assert.equal(config.mirrorTuiUserMessages, true)
   assert.equal(config.activeTurnStaleMs, 60000)
   assert.deepEqual(config.opencodeWatchdog, {
@@ -223,6 +235,41 @@ test("buildRuntimeConfig loads configurable Telegram workflow limits from env", 
     inlineDiffTextMaxChars: 333,
     streamPreviewMaxChars: 444,
     textAttachmentThreshold: 555,
+  })
+})
+
+test("buildRuntimeConfig loads i18n options from env", async (t) => {
+  const dir = await makeTempDir()
+  swapEnv(t, {
+    TELEGRAM_BOT_TOKEN: undefined,
+    TELEGRAM_ALLOWED_USER_ID: undefined,
+    PROJECTS_JSON: undefined,
+    CONNECTOR_DEFAULT_LOCALE: undefined,
+    CONNECTOR_SUPPORTED_LOCALES: undefined,
+    CONNECTOR_BOT_COMMAND_LOCALES: undefined,
+    CONNECTOR_AUTO_DETECT_LANGUAGE: undefined,
+  })
+  await fs.writeFile(
+    path.join(dir, ".env"),
+    [
+      "TELEGRAM_BOT_TOKEN=env-token",
+      "TELEGRAM_ALLOWED_USER_ID=77",
+      'PROJECTS_JSON={"demo":{"baseUrl":"http://127.0.0.1:4312"}}',
+      "CONNECTOR_DEFAULT_LOCALE=ru-RU",
+      "CONNECTOR_SUPPORTED_LOCALES=en,ru",
+      "CONNECTOR_BOT_COMMAND_LOCALES=ru",
+      "CONNECTOR_AUTO_DETECT_LANGUAGE=0",
+    ].join("\n"),
+    "utf8",
+  )
+
+  const { config } = await buildRuntimeConfig({ cwd: dir })
+
+  assert.deepEqual(config.i18n, {
+    defaultLocale: "ru",
+    supportedLocales: ["en", "ru"],
+    autoDetectTelegramLanguage: false,
+    botCommandLocales: ["ru"],
   })
 })
 

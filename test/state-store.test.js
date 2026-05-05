@@ -4,7 +4,7 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import crypto from "node:crypto"
-import { DEFAULT_FEED_MODE, StateStore, resolveDefaultStatePath } from "../src/state/store.js"
+import { DEFAULT_FEED_MODE, STATE_SCHEMA_VERSION, StateStore, resolveDefaultStatePath } from "../src/state/store.js"
 
 function makeLogger() {
   return { info() {}, warn() {}, error() {} }
@@ -364,6 +364,23 @@ test("StateStore keeps feed mode per context and defaults to main+changes", () =
   })
 })
 
+test("StateStore keeps locale per context and preserves manual choices", () => {
+  const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-state.json"), logger: makeLogger() })
+  store.scheduleSave = () => {}
+
+  assert.equal(store.getLocale("100:7"), "")
+  assert.equal(store.noteTelegramLocale("100:7", "ru-RU"), true)
+  assert.deepEqual(store.getLocaleRecord("100:7"), { locale: "ru", source: "telegram" })
+
+  assert.equal(store.setLocale("100:7", "en", { source: "manual" }), true)
+  assert.deepEqual(store.getLocaleRecord("100:7"), { locale: "en", source: "manual" })
+  assert.equal(store.noteTelegramLocale("100:7", "ru"), false)
+  assert.deepEqual(store.getLocaleRecord("100:7"), { locale: "en", source: "manual" })
+
+  assert.equal(store.clearLocale("100:7"), true)
+  assert.equal(store.getLocale("100:7"), "")
+})
+
 test("StateStore keeps model preference per context and clears it on project rebind/unbind", () => {
   const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-state.json"), logger: makeLogger() })
   store.scheduleSave = () => {}
@@ -440,7 +457,7 @@ test("StateStore persists and clears pending runtime online notices", async () =
   assert.equal(cleared.getPendingRuntimeOnlineNotice(), null)
 })
 
-test("StateStore migrates schema version 1 state to version 5", async () => {
+test("StateStore migrates schema version 1 state to version 6", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -452,9 +469,10 @@ test("StateStore migrates schema version 1 state to version 5", async () => {
   const store = new StateStore({ filePath, logger: makeLogger() })
   const loaded = await store.load()
 
-  assert.equal(loaded.schemaVersion, 5)
+  assert.equal(loaded.schemaVersion, STATE_SCHEMA_VERSION)
   assert.equal(loaded.updateOffset, 77)
   assert.deepEqual(loaded.feedByContext, {})
+  assert.deepEqual(loaded.localeByContext, {})
   assert.deepEqual(loaded.modelPrefsByContext, {})
   assert.deepEqual(loaded.pendingPrompts, {
     permissions: {},
@@ -466,7 +484,7 @@ test("StateStore migrates schema version 1 state to version 5", async () => {
   assert.deepEqual(loaded.idempotency, { keys: {} })
 })
 
-test("StateStore migrates schema version 2 state to version 5", async () => {
+test("StateStore migrates schema version 2 state to version 6", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -488,16 +506,17 @@ test("StateStore migrates schema version 2 state to version 5", async () => {
   const store = new StateStore({ filePath, logger: makeLogger() })
   const loaded = await store.load()
 
-  assert.equal(loaded.schemaVersion, 5)
+  assert.equal(loaded.schemaVersion, STATE_SCHEMA_VERSION)
   assert.equal(loaded.updateOffset, 88)
   assert.deepEqual(loaded.feedByContext, {})
+  assert.deepEqual(loaded.localeByContext, {})
   assert.deepEqual(loaded.modelPrefsByContext, {})
   assert.deepEqual(loaded.bindings, { "100:7": { projectAlias: "demo", sessionId: "ses_1" } })
   assert.equal(loaded.pendingRuntimeOnlineNotice, null)
   assert.deepEqual(loaded.idempotency, { keys: {} })
 })
 
-test("StateStore migrates schema version 3 state to version 5", async () => {
+test("StateStore migrates schema version 3 state to version 6", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -520,15 +539,16 @@ test("StateStore migrates schema version 3 state to version 5", async () => {
   const store = new StateStore({ filePath, logger: makeLogger() })
   const loaded = await store.load()
 
-  assert.equal(loaded.schemaVersion, 5)
+  assert.equal(loaded.schemaVersion, STATE_SCHEMA_VERSION)
   assert.equal(loaded.updateOffset, 99)
   assert.deepEqual(loaded.feedByContext, { "100:7": { mode: "verbose" } })
+  assert.deepEqual(loaded.localeByContext, {})
   assert.deepEqual(loaded.modelPrefsByContext, {})
   assert.equal(loaded.pendingRuntimeOnlineNotice, null)
   assert.deepEqual(loaded.idempotency, { keys: {} })
 })
 
-test("StateStore migrates schema version 4 state to version 5", async () => {
+test("StateStore migrates schema version 4 state to version 6", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -552,15 +572,16 @@ test("StateStore migrates schema version 4 state to version 5", async () => {
   const store = new StateStore({ filePath, logger: makeLogger() })
   const loaded = await store.load()
 
-  assert.equal(loaded.schemaVersion, 5)
+  assert.equal(loaded.schemaVersion, STATE_SCHEMA_VERSION)
   assert.equal(loaded.updateOffset, 100)
   assert.deepEqual(loaded.feedByContext, { "100:7": { mode: "main" } })
+  assert.deepEqual(loaded.localeByContext, {})
   assert.deepEqual(loaded.modelPrefsByContext, { "100:7": { mode: "project-default" } })
   assert.equal(loaded.pendingRuntimeOnlineNotice, null)
   assert.deepEqual(loaded.idempotency, { keys: {} })
 })
 
-test("StateStore rejects malformed schema version 5 sections with actionable paths", async () => {
+test("StateStore migrates schema version 5 state to version 6", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -568,6 +589,38 @@ test("StateStore rejects malformed schema version 5 sections with actionable pat
     JSON.stringify(
       {
         schemaVersion: 5,
+        updateOffset: 111,
+        bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+        sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+        feedByContext: { "100:7": { mode: "main" } },
+        modelPrefsByContext: { "100:7": { mode: "project-default" } },
+        pendingPrompts: { permissions: {}, rejectNotes: {}, customAnswers: {}, questionWizards: {} },
+        pendingRuntimeOnlineNotice: null,
+        idempotency: { keys: {} },
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  )
+
+  const store = new StateStore({ filePath, logger: makeLogger() })
+  const loaded = await store.load()
+
+  assert.equal(loaded.schemaVersion, STATE_SCHEMA_VERSION)
+  assert.deepEqual(loaded.localeByContext, {})
+  assert.deepEqual(loaded.feedByContext, { "100:7": { mode: "main" } })
+  assert.deepEqual(loaded.modelPrefsByContext, { "100:7": { mode: "project-default" } })
+})
+
+test("StateStore rejects malformed schema version 6 sections with actionable paths", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  await fs.writeFile(
+    filePath,
+    JSON.stringify(
+      {
+        schemaVersion: 6,
         updateOffset: 101,
         bindings: {
           "100:7": { projectAlias: "demo", sessionId: "ses_1", extra: true },
@@ -582,6 +635,10 @@ test("StateStore rejects malformed schema version 5 sections with actionable pat
           "100:7": { mode: "verbose" },
           "100:9": { mode: "nonsense" },
           "": { mode: "main" },
+        },
+        localeByContext: {
+          "100:7": { locale: "ru", source: "telegram" },
+          "100:8": { locale: "de", source: "manual" },
         },
         modelPrefsByContext: {
           "100:7": { mode: "custom", model: { providerID: "openai", modelID: "gpt-5" }, variant: "xhigh" },
@@ -617,11 +674,12 @@ test("StateStore rejects malformed schema version 5 sections with actionable pat
     return true
   })
   assert.deepEqual(store.get(), {
-    schemaVersion: 5,
+    schemaVersion: STATE_SCHEMA_VERSION,
     updateOffset: null,
     bindings: {},
     sessionIndex: {},
     feedByContext: {},
+    localeByContext: {},
     modelPrefsByContext: {},
     pendingPrompts: { permissions: {}, rejectNotes: {}, customAnswers: {}, questionWizards: {} },
     pendingRuntimeOnlineNotice: null,
@@ -639,7 +697,7 @@ test("StateStore rejects unsafe persisted session identities", async () => {
     filePath,
     JSON.stringify(
       {
-        schemaVersion: 5,
+        schemaVersion: 6,
         updateOffset: 101,
         bindings: {
           "100:0": { projectAlias: "demo", sessionId: " ses_1 " },
@@ -651,6 +709,7 @@ test("StateStore rejects unsafe persisted session identities", async () => {
           "demo:prod:ses_2": { chatId: 100, threadIdOr0: 1 },
         },
         feedByContext: {},
+        localeByContext: {},
         modelPrefsByContext: {},
         pendingPrompts: {
           permissions: {
@@ -696,11 +755,12 @@ test("StateStore migrates legacy state and flush persists the new schema", async
   const store = new StateStore({ filePath, logger: makeLogger() })
   const loaded = await store.load()
 
-  assert.equal(loaded.schemaVersion, 5)
+  assert.equal(loaded.schemaVersion, STATE_SCHEMA_VERSION)
   assert.equal(loaded.updateOffset, 123)
   assert.deepEqual(loaded.bindings, {})
   assert.deepEqual(loaded.sessionIndex, {})
   assert.deepEqual(loaded.feedByContext, {})
+  assert.deepEqual(loaded.localeByContext, {})
   assert.deepEqual(loaded.modelPrefsByContext, {})
   assert.deepEqual(loaded.pendingPrompts, {
     permissions: {},
@@ -717,7 +777,7 @@ test("StateStore migrates legacy state and flush persists the new schema", async
   await store.flush()
 
   const persisted = JSON.parse(await fs.readFile(filePath, "utf8"))
-  assert.equal(persisted.schemaVersion, 5)
+  assert.equal(persisted.schemaVersion, STATE_SCHEMA_VERSION)
   assert.equal(persisted.updateOffset, 456)
   assert.deepEqual(persisted.bindings, {
     "42:0": { projectAlias: "demo", sessionId: "ses_9" },
@@ -726,6 +786,7 @@ test("StateStore migrates legacy state and flush persists the new schema", async
     "demo:ses_9": { chatId: 42, threadIdOr0: 0 },
   })
   assert.deepEqual(persisted.feedByContext, {})
+  assert.deepEqual(persisted.localeByContext, {})
   assert.deepEqual(persisted.modelPrefsByContext, {})
   assert.deepEqual(persisted.pendingPrompts, {
     permissions: {},
@@ -749,14 +810,14 @@ test("StateStore creates a bounded backup before schema migration", async () => 
   const store = new StateStore({ filePath, logger: makeLogger(), backupMaxFiles: 2 })
   const loaded = await store.load()
 
-  assert.equal(loaded.schemaVersion, 5)
+  assert.equal(loaded.schemaVersion, STATE_SCHEMA_VERSION)
   assert.equal(loaded.updateOffset, 222)
   const backups = (await fs.readdir(dir)).filter((name) => name.startsWith("state.json.backup.") && name.includes(".migration."))
   assert.equal(backups.length, 1)
   const backup = JSON.parse(await fs.readFile(path.join(dir, backups[0]), "utf8"))
   assert.equal(backup.schemaVersion, 4)
   const persisted = JSON.parse(await fs.readFile(filePath, "utf8"))
-  assert.equal(persisted.schemaVersion, 5)
+  assert.equal(persisted.schemaVersion, STATE_SCHEMA_VERSION)
 })
 
 test("StateStore rejects unknown schema versions and preserves the file", async () => {
@@ -795,7 +856,7 @@ test("StateStore migration rollback keeps the original file when migrated flush 
   assert.deepEqual(JSON.parse(await fs.readFile(filePath, "utf8")), original)
   const backups = (await fs.readdir(dir)).filter((name) => name.startsWith("state.json.backup.") && name.includes(".migration."))
   assert.equal(backups.length, 1)
-  assert.equal(store.get().schemaVersion, 5)
+  assert.equal(store.get().schemaVersion, STATE_SCHEMA_VERSION)
   assert.equal(store.get().updateOffset, null)
 })
 
@@ -816,11 +877,12 @@ test("StateStore recovers an emergency bak instead of silently resetting missing
   const filePath = path.join(dir, "state.json")
   const backupPath = `${filePath}.bak.123456.abcdef123456`
   const saved = {
-    schemaVersion: 5,
+    schemaVersion: STATE_SCHEMA_VERSION,
     updateOffset: 777,
     bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_1" } },
     sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 0 } },
     feedByContext: {},
+    localeByContext: {},
     modelPrefsByContext: {},
     pendingPrompts: { permissions: {}, rejectNotes: {}, customAnswers: {}, questionWizards: {} },
     pendingRuntimeOnlineNotice: null,

@@ -49,11 +49,13 @@ export function migrateStateIfNeeded(
     normalizeBindings,
     normalizeSessionIndex,
     normalizeFeedByContext,
+    normalizeLocaleByContext,
     normalizeModelPrefsByContext,
     normalizePendingPrompts,
     normalizePendingRuntimeOnlineNotice,
     normalizeIdempotencyLedger,
     defaultFeedByContext,
+    defaultLocaleByContext,
     defaultModelPrefsByContext,
     defaultPendingPrompts,
     defaultIdempotencyLedger,
@@ -70,12 +72,31 @@ export function migrateStateIfNeeded(
         bindings: normalizeBindings(loaded.bindings),
         sessionIndex: normalizeSessionIndex(loaded.sessionIndex),
         feedByContext: normalizeFeedByContext(loaded.feedByContext),
+        localeByContext: normalizeLocaleByContext(loaded.localeByContext),
         modelPrefsByContext: normalizeModelPrefsByContext(loaded.modelPrefsByContext),
         pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
         pendingRuntimeOnlineNotice: normalizePendingRuntimeOnlineNotice(loaded.pendingRuntimeOnlineNotice),
         idempotency: normalizeIdempotencyLedger(loaded.idempotency),
       },
     }
+  }
+
+  if (loaded && typeof loaded === "object" && loaded.schemaVersion === 5) {
+    return migratedState(
+      {
+        schemaVersion,
+        updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
+        bindings: normalizeBindings(loaded.bindings),
+        sessionIndex: normalizeSessionIndex(loaded.sessionIndex),
+        feedByContext: normalizeFeedByContext(loaded.feedByContext),
+        localeByContext: defaultLocaleByContext(),
+        modelPrefsByContext: normalizeModelPrefsByContext(loaded.modelPrefsByContext),
+        pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
+        pendingRuntimeOnlineNotice: normalizePendingRuntimeOnlineNotice(loaded.pendingRuntimeOnlineNotice),
+        idempotency: normalizeIdempotencyLedger(loaded.idempotency),
+      },
+      { filePath, assertValidCurrentState },
+    )
   }
 
   if (loaded && typeof loaded === "object" && loaded.schemaVersion === 4) {
@@ -86,6 +107,7 @@ export function migrateStateIfNeeded(
         bindings: normalizeBindings(loaded.bindings),
         sessionIndex: normalizeSessionIndex(loaded.sessionIndex),
         feedByContext: normalizeFeedByContext(loaded.feedByContext),
+        localeByContext: defaultLocaleByContext(),
         modelPrefsByContext: normalizeModelPrefsByContext(loaded.modelPrefsByContext),
         pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
         pendingRuntimeOnlineNotice: normalizePendingRuntimeOnlineNotice(loaded.pendingRuntimeOnlineNotice),
@@ -103,6 +125,7 @@ export function migrateStateIfNeeded(
         bindings: normalizeBindings(loaded.bindings),
         sessionIndex: normalizeSessionIndex(loaded.sessionIndex),
         feedByContext: normalizeFeedByContext(loaded.feedByContext),
+        localeByContext: defaultLocaleByContext(),
         modelPrefsByContext: defaultModelPrefsByContext(),
         pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
         pendingRuntimeOnlineNotice: null,
@@ -120,6 +143,7 @@ export function migrateStateIfNeeded(
         bindings: normalizeBindings(loaded.bindings),
         sessionIndex: normalizeSessionIndex(loaded.sessionIndex),
         feedByContext: defaultFeedByContext(),
+        localeByContext: defaultLocaleByContext(),
         modelPrefsByContext: defaultModelPrefsByContext(),
         pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
         pendingRuntimeOnlineNotice: null,
@@ -137,6 +161,7 @@ export function migrateStateIfNeeded(
         bindings: normalizeBindings(loaded.bindings),
         sessionIndex: normalizeSessionIndex(loaded.sessionIndex),
         feedByContext: defaultFeedByContext(),
+        localeByContext: defaultLocaleByContext(),
         modelPrefsByContext: defaultModelPrefsByContext(),
         pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
         pendingRuntimeOnlineNotice: null,
@@ -156,6 +181,7 @@ export function migrateStateIfNeeded(
         bindings: {},
         sessionIndex: {},
         feedByContext: defaultFeedByContext(),
+        localeByContext: defaultLocaleByContext(),
         modelPrefsByContext: defaultModelPrefsByContext(),
         pendingPrompts: defaultPendingPrompts(),
         pendingRuntimeOnlineNotice: null,

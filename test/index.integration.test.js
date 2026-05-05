@@ -77,25 +77,25 @@ async function waitFor(predicate, { timeoutMs = 1500, intervalMs = 10 } = {}) {
   throw new Error("Timed out waiting for condition")
 }
 
-function makeMessageUpdate(updateId, text, { userId = 42, chatId = 100, chatType = "supergroup", threadIdOr0 = 7, messageId = updateId } = {}) {
+function makeMessageUpdate(updateId, text, { userId = 42, chatId = 100, chatType = "supergroup", threadIdOr0 = 7, messageId = updateId, languageCode } = {}) {
   return {
     update_id: updateId,
     message: {
       message_id: messageId,
       chat: { id: chatId, type: chatType },
-      from: { id: userId },
+      from: { id: userId, ...(languageCode ? { language_code: languageCode } : {}) },
       ...(threadIdOr0 ? { message_thread_id: threadIdOr0 } : {}),
       text,
     },
   }
 }
 
-function makeCallbackUpdate(updateId, data, { userId = 42, chatId = 100, chatType = "supergroup", threadIdOr0 = 7, messageId = 900 } = {}) {
+function makeCallbackUpdate(updateId, data, { userId = 42, chatId = 100, chatType = "supergroup", threadIdOr0 = 7, messageId = 900, languageCode } = {}) {
   return {
     update_id: updateId,
     callback_query: {
       id: `cb_${updateId}`,
-      from: { id: userId },
+      from: { id: userId, ...(languageCode ? { language_code: languageCode } : {}) },
       data,
       message: {
         message_id: messageId,
@@ -116,6 +116,7 @@ function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, sendMessag
   const editedMessages = []
   const deletedMessages = []
   const getUpdatesCalls = []
+  const setMyCommandsCalls = []
   const getUpdatesErrors = []
   let getUpdatesError = null
 
@@ -127,6 +128,7 @@ function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, sendMessag
     editedMessages,
     deletedMessages,
     getUpdatesCalls,
+    setMyCommandsCalls,
     enqueue(update) {
       updates.push(update)
     },
@@ -146,7 +148,8 @@ function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, sendMessag
       if (getMeImpl) return getMeImpl()
       return { id: 1, username: "test_bot", has_topics_enabled: true }
     },
-    async setMyCommands() {
+    async setMyCommands(commands, options = {}) {
+      setMyCommandsCalls.push({ commands, options })
       return true
     },
     async getUpdates(input) {
@@ -454,6 +457,52 @@ async function createHarness({
     },
   }
 }
+
+test("startConnector publishes localized Telegram command menus", async () => {
+  const harness = await createHarness()
+
+  try {
+    await waitFor(() => harness.tg.setMyCommandsCalls.length >= 2)
+
+    assert.equal(harness.tg.setMyCommandsCalls[0].options.language_code, undefined)
+    assert.ok(harness.tg.setMyCommandsCalls[0].commands.some((entry) => entry.command === "language" && entry.description === "Choose bot language"))
+    assert.equal(harness.tg.setMyCommandsCalls[1].options.language_code, "ru")
+    assert.ok(harness.tg.setMyCommandsCalls[1].commands.some((entry) => entry.command === "language" && entry.description === "Выбрать язык бота"))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector detects and changes thread language", async () => {
+  const harness = await createHarness()
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(101, "/language", { languageCode: "ru-RU" }))
+    await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("Язык для этого треда")))
+
+    let state = await waitFor(async () => {
+      const current = await readState(harness.stateFile)
+      return current.localeByContext?.["100:7"]?.locale === "ru" ? current : null
+    })
+    assert.deepEqual(state.localeByContext, { "100:7": { locale: "ru", source: "telegram" } })
+
+    const keyboard = harness.tg.sentMessages.at(-1).replyMarkup.inline_keyboard
+    const englishButton = keyboard.flat().find((button) => button.text.includes("English"))
+    assert.ok(englishButton)
+
+    harness.tg.enqueue(makeCallbackUpdate(102, englishButton.callback_data, { languageCode: "ru-RU", messageId: harness.tg.sentMessages.at(-1).result.message_id }))
+    await waitFor(() => harness.tg.editedMessages.some((entry) => entry.kind === "text" && entry.text.includes("Language for this thread")))
+
+    state = await waitFor(async () => {
+      const current = await readState(harness.stateFile)
+      return current.localeByContext?.["100:7"]?.locale === "en" ? current : null
+    })
+    assert.deepEqual(state.localeByContext, { "100:7": { locale: "en", source: "manual" } })
+    assert.ok(harness.tg.callbackAnswers.some((entry) => entry.text === "Language changed to English."))
+  } finally {
+    await harness.connector.stop()
+  }
+})
 
 test("startConnector binds a thread and forwards only allowed-user messages", async () => {
   const harness = await createHarness()

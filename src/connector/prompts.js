@@ -410,7 +410,8 @@ export function createPromptHandlers(runtime) {
     if (hasIdempotencyPrefix(permissionReplyIdempotencyPrefix(projectAlias, props.sessionID, props.id)) || hasIdempotencyPrefix(permissionNoteIdempotencyPrefix(projectAlias, props.sessionID, props.id))) return false
     if (prompted[projectAlias].permission.has(permissionIdentity)) return false
     prompted[projectAlias].permission.add(permissionIdentity)
-    const ctxMeta = { chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey: ctxKeyFrom(route.chatId, route.threadIdOr0) }
+    const ctxKey = ctxKeyFrom(route.chatId, route.threadIdOr0)
+    const ctxMeta = { chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey, ...(store.getLocale?.(ctxKey) ? { locale: store.getLocale(ctxKey) } : {}) }
     store.setPendingPermission({
       projectAlias,
       permissionId: props.id,
@@ -446,7 +447,8 @@ export function createPromptHandlers(runtime) {
     if (!props?.id || !Array.isArray(props.questions) || props.questions.length === 0) return false
     prompted[projectAlias].question.add(questionIdentity)
 
-    const ctx = { chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey: ctxKeyFrom(route.chatId, route.threadIdOr0) }
+    const ctxKey = ctxKeyFrom(route.chatId, route.threadIdOr0)
+    const ctx = { chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey, ...(store.getLocale?.(ctxKey) ? { locale: store.getLocale(ctxKey) } : {}) }
     const wizard = {
       projectAlias,
       id: props.id,

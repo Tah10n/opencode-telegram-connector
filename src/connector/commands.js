@@ -11,6 +11,8 @@ import { formatModelUiChoices, resolveModelProviderCatalog } from "./model-ui.js
 import { unsupportedMediaKind, unsupportedMediaText } from "./incoming-attachments.js"
 import { formatStaleActiveTurnNotice, resolveActiveTurnStaleMs, resolveActiveTurnStatus } from "./active-turns.js"
 import { callbackPacker } from "./commands/shared.js"
+import { localeDisplayName, matchSupportedLocale, t as translate } from "../i18n/index.js"
+import { languageSettingsView, supportedLocaleSummary } from "./language-ui.js"
 
 function helpText({ scopeLabel = "this thread", defaultProject = "", isBound = false } = {}) {
   const next = isBound
@@ -94,6 +96,9 @@ export function createCommandHandlers(runtime) {
     buildGlobalRuntimeStatusLines,
     clearAgentActivity,
     getAgentActivityStatus,
+    rememberTelegramLocale,
+    ctxMetaWithLocale,
+    t = (ctxOrLocale, key, params) => translate(typeof ctxOrLocale === "string" ? ctxOrLocale : ctxOrLocale?.locale, key, params),
   } = runtime
 
   const userAttachmentLimits = userAttachmentLimitsFromConfig(config?.limits)
@@ -425,9 +430,42 @@ export function createCommandHandlers(runtime) {
     await renderFeedSettings(ctxMeta, { editMessageId })
   }
 
+  async function handleLanguage(ctxMeta, argv = []) {
+    const arg = String(argv?.[0] || "").trim()
+    if (arg) {
+      if (arg.toLowerCase() === "reset") {
+        store.clearLocale?.(ctxMeta.ctxKey)
+        ctxMeta = ctxMetaWithLocale?.(ctxMeta) || ctxMeta
+        const view = languageSettingsView(ctxMeta, { store, config, packCallback, t })
+        await sendToThread(ctxMeta, `${t(ctxMeta, "language.reset")}\n\n${view.text}`, view.replyMarkup)
+        return
+      }
+
+      const locale = matchSupportedLocale(arg, config.i18n?.supportedLocales)
+      if (!locale) {
+        await sendToThread(
+          ctxMeta,
+          t(ctxMeta, "language.unsupported", { locale: arg, supported: supportedLocaleSummary({ config, displayLocale: ctxMeta.locale }) }),
+          closeOnlyKeyboard(),
+        )
+        return
+      }
+
+      store.setLocale?.(ctxMeta.ctxKey, locale, { source: "manual" })
+      ctxMeta = ctxMetaWithLocale?.(ctxMeta) || { ...ctxMeta, locale }
+      const view = languageSettingsView(ctxMeta, { store, config, packCallback, t })
+      await sendToThread(ctxMeta, `${t(ctxMeta, "language.changed", { language: localeDisplayName(locale, locale) })}\n\n${view.text}`, view.replyMarkup)
+      return
+    }
+
+    const view = languageSettingsView(ctxMeta, { store, config, packCallback, t })
+    await sendToThread(ctxMeta, view.text, view.replyMarkup)
+  }
+
   async function handleTelegramMessage(msg, options = {}) {
     if (!runtime.isAllowedUser(msg?.from)) return
-    const ctxMeta = runtime.ctxMetaFromMessage(msg)
+    let ctxMeta = runtime.ctxMetaFromMessage(msg, msg?.from)
+    ctxMeta = rememberTelegramLocale?.(ctxMeta) || ctxMeta
     if (!ctxMeta.chatId) return
 
     const text = typeof msg?.text === "string" ? msg.text : ""
@@ -714,6 +752,11 @@ export function createCommandHandlers(runtime) {
       if (cmd === "/feed") {
         await handleFeed(ctxMeta)
         await markMessageHandled("feed")
+        return
+      }
+      if (cmd === "/language") {
+        await handleLanguage(ctxMeta, argv)
+        await markMessageHandled("language")
         return
       }
       if (cmd === "/status") {

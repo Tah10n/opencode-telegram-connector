@@ -11,6 +11,8 @@ import {
   questionReplyIdempotencyPrefix,
 } from "./idempotency.js"
 import { callbackPacker, decodeCallbackData } from "./callback-data.js"
+import { localeDisplayName, matchSupportedLocale, t as translate } from "../i18n/index.js"
+import { languageSettingsView, supportedLocaleSummary } from "./language-ui.js"
 
 async function defaultBuildSessionSwitchText(_projectAlias, sessionId) {
   return `Switched to session: ${sessionId}`
@@ -65,6 +67,10 @@ export function createCallbackHandlers(runtime) {
     resolveBoundRoute,
     requestRuntimeShutdown,
     scheduleRuntimeShutdown,
+    rememberTelegramLocale,
+    ctxMetaWithLocale,
+    t = (ctxOrLocale, key, params) => translate(typeof ctxOrLocale === "string" ? ctxOrLocale : ctxOrLocale?.locale, key, params),
+    config,
   } = runtime
   const packCallbackData = callbackPacker(cb)
 
@@ -333,7 +339,8 @@ export function createCallbackHandlers(runtime) {
   async function handleTelegramCallback(callbackQuery) {
     if (!isAllowedUser(callbackQuery?.from)) return
     const msg = callbackQuery.message
-    const ctxMeta = ctxMetaFromMessage(msg)
+    let ctxMeta = ctxMetaFromMessage(msg, callbackQuery?.from)
+    ctxMeta = rememberTelegramLocale?.(ctxMeta) || ctxMeta
     const data = typeof cb?.unpack === "function" ? cb.unpack(callbackQuery.data) : callbackQuery.data
     if (!data) {
       await answerCallbackQuery(callbackQuery.id, "Invalid")
@@ -349,6 +356,46 @@ export function createCallbackHandlers(runtime) {
     const callbackProjectAlias = projects?.[parts[1]] ? parts[1] : store.getBinding(ctxMeta.ctxKey)?.projectAlias || null
 
     try {
+      if (kind === "lang") {
+        const action = parts[1]
+        if (action === "close") {
+          await closeInteractiveMessage(callbackQuery.id, ctxMeta, msg?.message_id)
+          return
+        }
+        if (action === "reset") {
+          store.clearLocale?.(ctxMeta.ctxKey)
+          await flushStoreIfAvailable()
+          ctxMeta = ctxMetaWithLocale?.(ctxMeta) || ctxMeta
+          const view = languageSettingsView(ctxMeta, { store, config, packCallback: packCallbackData, t })
+          await answerCallbackQuery(callbackQuery.id, t(ctxMeta, "language.reset"))
+          if (msg?.message_id && typeof tg.editMessageText === "function") {
+            await tg.editMessageText(ctxMeta.chatId, msg.message_id, view.text, view.replyMarkup).catch(ignoreError)
+          }
+          return
+        }
+        if (action === "set") {
+          const locale = matchSupportedLocale(parts[2], config?.i18n?.supportedLocales)
+          if (!locale) {
+            await answerCallbackQuery(
+              callbackQuery.id,
+              t(ctxMeta, "language.unsupported", { locale: parts[2] || "", supported: supportedLocaleSummary({ config, displayLocale: ctxMeta.locale }) }),
+            )
+            return
+          }
+          store.setLocale?.(ctxMeta.ctxKey, locale, { source: "manual" })
+          await flushStoreIfAvailable()
+          ctxMeta = ctxMetaWithLocale?.(ctxMeta) || { ...ctxMeta, locale }
+          const view = languageSettingsView(ctxMeta, { store, config, packCallback: packCallbackData, t })
+          await answerCallbackQuery(callbackQuery.id, t(ctxMeta, "language.changed", { language: localeDisplayName(locale, locale) }))
+          if (msg?.message_id && typeof tg.editMessageText === "function") {
+            await tg.editMessageText(ctxMeta.chatId, msg.message_id, view.text, view.replyMarkup).catch(ignoreError)
+          }
+          return
+        }
+        await answerCallbackQuery(callbackQuery.id, "Invalid")
+        return
+      }
+
       if (kind === "rt") {
         const action = parts[1]
         if (ctxMeta?.chatType !== "private") {
