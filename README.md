@@ -17,6 +17,7 @@ This Node.js connector binds each Telegram chat or forum topic to a specific `{ 
 - **Telegram-first workflow** — send prompts from Telegram and get assistant replies back in the same thread.
 - **Prompt handling in chat** — approve or deny permission requests and answer questions with inline buttons.
 - **Multi-project friendly** — different chats/topics can stay bound to different projects at the same time.
+- **Localized Telegram UI** — English and Russian bot menus/messages with per-thread `/language` selection.
 - **Optional local auto-start** — start local opencode servers and optionally open attach/TUI windows.
 - **Restart-safe, fail-closed state** — bindings, feed mode, model preference, pending prompts, offsets, and idempotency survive restarts; corrupt or unwritable state is surfaced instead of silently reset.
 - **Operator-safe observability** — compact Telegram runtime counters, redacted text/JSON logs with correlation IDs, and optional loopback health probes for supervisors.
@@ -100,6 +101,13 @@ export default {
   defaultProject: "localDesktop",
   logFormat: "text",
 
+  i18n: {
+    defaultLocale: "en",
+    supportedLocales: ["en", "ru"],
+    autoDetectTelegramLanguage: true,
+    botCommandLocales: ["en", "ru"],
+  },
+
   // Optional local health endpoints for supervisors/probes.
   // Disabled by default and loopback-bound by default; not a Telegram webhook.
   // healthServer: { enabled: true, host: "127.0.0.1", port: 8787 },
@@ -163,6 +171,7 @@ In groups and forum topics, Telegram commands addressed to another bot are ignor
 
 - `/model`, `/model default`, `/model reset`, `/model <provider/model> [variant]` — show or change the model for the current thread.
 - `/feed` — choose mirrored updates for the current thread.
+- `/language`, `/language <en|ru>`, `/language reset` — show or change the bot UI language for the current thread.
 - `/status` — show the current binding, model, feed mode, whether the agent is running, SSE status, and base URL.
 - `/runtime` or `/health` — show compact connector runtime counters (**private chat only**): managed tasks, Telegram polling, backlog drain, update retry/skip counts, prompt polling, mirrored/skipped message counts, prompt delivery/answer counts, Telegram send/edit failures, attachment fallbacks, and shutdown state. The message includes **Restart**, **Stop**, and **Close** buttons. Restart and Stop always ask for confirmation first; after a supervised Restart, the bot sends a private-chat notice when the connector is online again.
 - Observability note: `Telegram send/edit failures` count only delivery/edit attempts that affect visible messages (`sendMessage`, `sendDocument`, `editMessageText`, `editMessageReplyMarkup`); polling/control methods such as `getUpdates`, `getMe`, `setMyCommands`, `deleteMessage`, and `answerCallbackQuery` are intentionally excluded.
@@ -190,6 +199,25 @@ User messages typed directly in opencode TUI are mirrored separately from `/feed
 Agent-stop error notices are delivered separately from `/feed`: if an assistant reply fails, the bound thread gets a redacted `Agent stopped due to error` warning. If only a tool error arrives first, the connector waits briefly and verifies the assistant message before sending the warning so recovered tool failures do not create false stop notices.
 
 If a session still has a running assistant turn with no recent progress, new Telegram prompts are not sent into that stale queue. The thread receives a warning with `/abort` and `/new` recovery options instead.
+
+## Localization
+
+Supported UI locales are `en` and `ru`. The connector publishes Telegram command menus for both languages, auto-detects `message.from.language_code` per chat/topic, and persists the effective locale for async prompt/SSE messages. Users can override the language for the current chat/topic with `/language` or `/language <en|ru>`; `/language reset` returns to auto-detection/default behavior.
+
+Configuration knobs:
+
+```js
+i18n: {
+  defaultLocale: "en",
+  supportedLocales: ["en", "ru"],
+  autoDetectTelegramLanguage: true,
+  botCommandLocales: ["en", "ru"],
+}
+```
+
+Equivalent env overrides are available for simple deployments: `CONNECTOR_DEFAULT_LOCALE`, `CONNECTOR_SUPPORTED_LOCALES`, `CONNECTOR_BOT_COMMAND_LOCALES`, and `CONNECTOR_AUTO_DETECT_LANGUAGE`.
+
+The connector localizes Telegram UI chrome, buttons, command menus, prompts, session/model/feed/status text, and common callback toasts. It does not translate user messages, assistant/opencode output, filenames, diffs, model/provider IDs, or diagnostic logs.
 
 ## File, code, and log workflow
 

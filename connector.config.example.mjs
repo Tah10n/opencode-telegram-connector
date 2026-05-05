@@ -12,6 +12,16 @@ export default {
   // mirrorTuiUserMessages: true,
   logFormat: "text", // "text" or "json"
 
+  // Optional localization. Supported locales in this release: "en", "ru".
+  // Telegram language is detected automatically per chat/topic unless the user
+  // chooses a language with /language.
+  i18n: {
+    defaultLocale: "en",
+    supportedLocales: ["en", "ru"],
+    autoDetectTelegramLanguage: true,
+    botCommandLocales: ["en", "ru"],
+  },
+
   // Optional local health endpoints for supervisors/probes.
   // Disabled by default and loopback-bound by default; not a Telegram webhook.
   // healthServer: { enabled: true, host: "127.0.0.1", port: 8787 },
