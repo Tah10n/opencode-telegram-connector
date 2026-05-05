@@ -1,4 +1,5 @@
 import { redactSensitiveText } from "../url-utils.js"
+import { getRequestContext } from "./request-context.js"
 
 const LEVEL_TO_STREAM = {
   debug: "stdout",
@@ -108,12 +109,18 @@ export function createConnectorLogger({
   const logFormat = normalizeFormat(format)
   const redactionOptions = { knownSecrets, sensitivePaths }
 
-  function write(level, args) {
+  function sanitizeFields(fields) {
+    return isPlainObject(fields) ? sanitizeValue(fields, redactionOptions) : {}
+  }
+
+  function write(level, args, scopedFields = {}) {
     const { msg, fields } = splitMessageAndFields(args, redactionOptions)
     const entry = {
       ts: now(),
       level,
       msg,
+      ...sanitizeFields(getRequestContext()),
+      ...sanitizeFields(scopedFields),
       ...fields,
     }
     const line = logFormat === "json" ? JSON.stringify(entry) : serializeText(entry)
@@ -121,12 +128,20 @@ export function createConnectorLogger({
     stream(line)
   }
 
-  return {
-    debug: (...args) => write("debug", args),
-    info: (...args) => write("info", args),
-    warn: (...args) => write("warn", args),
-    error: (...args) => write("error", args),
+  function createScopedLogger(scopedFields = {}) {
+    return {
+      debug: (...args) => write("debug", args, scopedFields),
+      info: (...args) => write("info", args, scopedFields),
+      warn: (...args) => write("warn", args, scopedFields),
+      error: (...args) => write("error", args, scopedFields),
+      child: (fields = {}) => createScopedLogger({
+        ...(isPlainObject(scopedFields) ? scopedFields : {}),
+        ...(isPlainObject(fields) ? fields : {}),
+      }),
+    }
   }
+
+  return createScopedLogger()
 }
 
 export function collectLoggerRedactionOptions(config = {}) {
