@@ -43,6 +43,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - State migrations and invalid parsed state files are preserved in bounded `state.json.backup.*` files before recovery attempts.
 
 ### Added
+- Update-scoped correlation IDs now flow through Telegram update handling, connector handlers, OpenCode HTTP/SSE requests, mirroring, Telegram delivery logs, and `logger.child()` scoped fields. OpenCode requests include `X-Connector-Correlation` when a context is active.
+- Optional no-dependency HTTP health endpoints (`/livez`, `/readyz`, `/healthz`) are available via `CONNECTOR_HEALTH_ENABLED` / `healthServer`, disabled by default and loopback-bound by default.
 - `/status` now reports an explicit agent state (`running`, `not running`, or `unknown`) for the bound session.
 - Verbose feed mode now mirrors concise agent action/tool-use updates from opencode tool parts.
 - Optional JSON log mode for supervisors and hosted runtimes via `CONNECTOR_LOG_FORMAT=json` or `logFormat: "json"`.
