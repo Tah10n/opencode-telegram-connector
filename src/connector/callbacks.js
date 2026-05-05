@@ -13,6 +13,59 @@ import {
 import { callbackPacker, decodeCallbackData } from "./callback-data.js"
 import { localeDisplayName, matchSupportedLocale, t as translate } from "../i18n/index.js"
 import { languageSettingsView, supportedLocaleSummary } from "./language-ui.js"
+import { getRequestContext } from "../runtime/request-context.js"
+
+const CALLBACK_TOAST_KEYS = Object.freeze({
+  Closed: "closed",
+  Invalid: "invalid",
+  "Private chat only": "privateChatOnly",
+  Cancelled: "cancelled",
+  "Confirm restart": "confirmRestart",
+  "Confirm stop": "confirmStop",
+  Unavailable: "unavailable",
+  "Restarting…": "restarting",
+  "Stopping…": "stopping",
+  "Not bound": "notBound",
+  Sessions: "sessions",
+  "Creating…": "creating",
+  "Binding changed": "bindingChanged",
+  "Already current": "alreadyCurrent",
+  Switched: "switched",
+  Projects: "projects",
+  "Unknown project": "unknownProject",
+  "Starting…": "starting",
+  "Binding…": "binding",
+  "Checking…": "checking",
+  Repaired: "repaired",
+  "Already clean": "alreadyClean",
+  Kept: "kept",
+  Confirm: "confirm",
+  Unbound: "unbound",
+  Rebound: "rebound",
+  Created: "created",
+  "Action failed": "actionFailed",
+  Feed: "feed",
+  Model: "model",
+  Back: "back",
+  "Pick model": "pickModel",
+  "Model: inherit": "modelInherit",
+  "Model: project default": "modelProjectDefault",
+  "Pick variant": "pickVariant",
+  "Sending…": "sending",
+  "Already handled": "alreadyHandled",
+  "No longer active": "noLongerActive",
+  "Temporarily unavailable": "temporarilyUnavailable",
+  OK: "ok",
+  "Send note": "sendNote",
+  Selected: "selected",
+  Done: "done",
+  Unsupported: "unsupported",
+})
+
+function localizeCallbackToast(text, locale) {
+  const key = CALLBACK_TOAST_KEYS[text]
+  return key ? translate(locale, `callbacks.${key}`) : text
+}
 
 async function defaultBuildSessionSwitchText(_projectAlias, sessionId) {
   return `Switched to session: ${sessionId}`
@@ -75,7 +128,8 @@ export function createCallbackHandlers(runtime) {
   const packCallbackData = callbackPacker(cb)
 
   async function answerCallbackQuery(callbackQueryId, text) {
-    await tg.answerCallbackQuery(callbackQueryId, text).catch(ignoreError)
+    const locale = getRequestContext()?.locale || "en"
+    await tg.answerCallbackQuery(callbackQueryId, typeof text === "string" ? localizeCallbackToast(text, locale) : text).catch(ignoreError)
   }
 
   async function deleteInteractiveMessage(ctxMeta, messageId) {
@@ -453,7 +507,7 @@ export function createCallbackHandlers(runtime) {
           await answerCallbackQuery(callbackQuery.id, "Sessions")
           await renderSessionsList(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(async (err) => {
             runtime.logger?.error?.("Failed to refresh sessions list:", err?.message || String(err))
-            await sendToThread(ctxMeta, formatProjectUnavailable(binding.projectAlias, err)).catch(ignoreError)
+            await sendToThread(ctxMeta, formatProjectUnavailable(binding.projectAlias, err, { locale: ctxMeta.locale })).catch(ignoreError)
           })
           return
         }
@@ -504,7 +558,7 @@ export function createCallbackHandlers(runtime) {
           await oc.getSession(safeTargetSessionId)
         } catch (err) {
           await answerCallbackQuery(callbackQuery.id, "Unavailable")
-          await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err)).catch(ignoreError)
+          await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err, { locale: ctxMeta.locale })).catch(ignoreError)
           return
         }
 
@@ -562,7 +616,7 @@ export function createCallbackHandlers(runtime) {
           await answerCallbackQuery(callbackQuery.id, "Binding…")
           await handleBindCommand(ctxMeta, [projectAlias]).then(() => flushStoreIfAvailable()).catch(async (err) => {
             runtime.logger?.error?.("Failed to bind project from callback:", err?.message || String(err))
-            await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err)).catch(ignoreError)
+            await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err, { locale: ctxMeta.locale })).catch(ignoreError)
           })
           return
         }
@@ -577,7 +631,7 @@ export function createCallbackHandlers(runtime) {
             await sendToThread(ctxMeta, `Project '${projectAlias}' health check: online.`).catch(ignoreError)
           } catch (err) {
             const replyMarkup = canAutoStartProject?.(projectAlias, { platform }) ? startServerKeyboard?.(projectAlias) : null
-            await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err), replyMarkup).catch(ignoreError)
+            await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err, { locale: ctxMeta.locale }), replyMarkup).catch(ignoreError)
           }
           return
         }
@@ -585,7 +639,7 @@ export function createCallbackHandlers(runtime) {
           await answerCallbackQuery(callbackQuery.id, "Sessions")
           await renderProjectSessions(ctxMeta, projectAlias, { editMessageId: msg?.message_id }).catch(async (err) => {
             runtime.logger?.error?.("Failed to render project sessions:", err?.message || String(err))
-            await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err)).catch(ignoreError)
+            await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err, { locale: ctxMeta.locale })).catch(ignoreError)
           })
           return
         }
@@ -708,7 +762,7 @@ export function createCallbackHandlers(runtime) {
               throw err
             }
             await answerCallbackQuery(callbackQuery.id, "Unavailable")
-            await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err)).catch(ignoreError)
+            await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err, { locale: ctxMeta.locale })).catch(ignoreError)
           }
           return
         }

@@ -157,7 +157,7 @@ export function createModelCommandHandlers(deps) {
   async function renderModelSettings(ctxMeta, { binding, editMessageId, selectedProviderId, selectedModelKey, noticeText = "" } = {}) {
     const currentBinding = binding || store.getBinding(ctxMeta.ctxKey)
     if (!currentBinding) {
-      await sendToThread(ctxMeta, unboundGuidanceText(ctxMeta, "Model settings need a bound thread."), unboundGuidanceKeyboard())
+      await sendToThread(ctxMeta, unboundGuidanceText(ctxMeta, "Model settings need a bound thread."), unboundGuidanceKeyboard(ctxMeta))
       return
     }
 
@@ -200,6 +200,7 @@ export function createModelCommandHandlers(deps) {
       providerCatalog,
       selectedProviderId: normalizedSelectedProviderId,
       selectedModelKey: normalizedSelectedModelKey,
+      locale: ctxMeta.locale,
     })
 
     if (editMessageId) {
@@ -216,7 +217,7 @@ export function createModelCommandHandlers(deps) {
   async function handleModelCommand(ctxMeta, argv) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await sendToThread(ctxMeta, unboundGuidanceText(ctxMeta, "Model changes need a bound thread."), unboundGuidanceKeyboard())
+      await sendToThread(ctxMeta, unboundGuidanceText(ctxMeta, "Model changes need a bound thread."), unboundGuidanceKeyboard(ctxMeta))
       return
     }
 

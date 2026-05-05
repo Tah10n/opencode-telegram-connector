@@ -12,6 +12,7 @@ import {
   questionReplyIdempotencyPrefix,
 } from "./idempotency.js"
 import { callbackPacker } from "./callback-data.js"
+import { t as translate } from "../i18n/index.js"
 
 export function createPromptHandlers(runtime) {
   const {
@@ -206,18 +207,18 @@ export function createPromptHandlers(runtime) {
     target.messageIdByIndex = source.messageIdByIndex
   }
 
-  function renderQuestionStep(projectAlias, req, stepIndex, selectedLabels) {
+  function renderQuestionStep(projectAlias, req, stepIndex, selectedLabels, locale = "en") {
     const q = req.questions[stepIndex]
     const total = req.questions.length
     const multiple = q.multiple === true
     const allowCustom = q.custom !== false
 
-    const header = q.header ? `${q.header}` : `Question ${stepIndex + 1}/${total}`
+    const header = q.header ? `${q.header}` : translate(locale, "prompts.question", { current: stepIndex + 1, total })
     const lines = []
     lines.push(`${header} (${stepIndex + 1}/${total})`)
     lines.push(q.question)
     lines.push("")
-    lines.push("Options:")
+    lines.push(translate(locale, "prompts.options"))
     q.options.forEach((opt, idx) => {
       const label = String(opt.label)
       const desc = String(opt.description || "").trim()
@@ -225,8 +226,8 @@ export function createPromptHandlers(runtime) {
       lines.push(`${idx + 1}) ${label}${descPart}`)
     })
     lines.push("")
-    lines.push(multiple ? "Select any options, then press Done." : "Select one option.")
-    if (allowCustom) lines.push("Or press Type answer.")
+    lines.push(multiple ? translate(locale, "prompts.selectAny") : translate(locale, "prompts.selectOne"))
+    if (allowCustom) lines.push(translate(locale, "prompts.typeAnswerHelp"))
 
     const rows = []
     if (multiple) {
@@ -236,7 +237,7 @@ export function createPromptHandlers(runtime) {
         const text = `${checked ? "[x]" : "[ ]"} ${clampString(label, 50)}`
         rows.push([{ text, callback_data: packCallback("q", projectAlias, req.sessionID || "", req.id, stepIndex, "t", i) }])
       }
-      rows.push([{ text: "Done", callback_data: packCallback("q", projectAlias, req.sessionID || "", req.id, stepIndex, "done") }])
+      rows.push([{ text: translate(locale, "prompts.done"), callback_data: packCallback("q", projectAlias, req.sessionID || "", req.id, stepIndex, "done") }])
     } else {
       for (let i = 0; i < q.options.length; i++) {
         const label = String(q.options[i].label)
@@ -245,8 +246,8 @@ export function createPromptHandlers(runtime) {
     }
 
     const bottomRow = []
-    if (allowCustom) bottomRow.push({ text: "Type answer", callback_data: packCallback("q", projectAlias, req.sessionID || "", req.id, stepIndex, "custom") })
-    bottomRow.push({ text: "Reject", callback_data: packCallback("q", projectAlias, req.sessionID || "", req.id, "reject") })
+    if (allowCustom) bottomRow.push({ text: translate(locale, "prompts.typeAnswer"), callback_data: packCallback("q", projectAlias, req.sessionID || "", req.id, stepIndex, "custom") })
+    bottomRow.push({ text: translate(locale, "prompts.reject"), callback_data: packCallback("q", projectAlias, req.sessionID || "", req.id, "reject") })
     rows.push(bottomRow)
 
     return { html: escapeHtml(lines.join("\n")), replyMarkup: makeInlineKeyboard(rows) }
@@ -257,7 +258,7 @@ export function createPromptHandlers(runtime) {
     const req = wizard.request
     if (!req?.questions?.[idx]) return
     const selectedSet = new Set(wizard.selectedByIndex?.[idx] || [])
-    const rendered = renderQuestionStep(wizard.projectAlias, req, idx, selectedSet)
+    const rendered = renderQuestionStep(wizard.projectAlias, req, idx, selectedSet, wizard.ctx?.locale || "en")
     const { chatId, threadIdOr0 } = wizard.ctx
 
     if (editMessageId) {
@@ -277,54 +278,56 @@ export function createPromptHandlers(runtime) {
     wizard.messageIdByIndex[idx] = msg?.message_id
   }
 
-  function renderPermissionPrompt(projectAlias, props) {
+  function renderPermissionPrompt(projectAlias, props, locale = "en") {
     return {
       blocks: [
         {
           type: "text",
           html:
-            `<b>Permission request</b>\n<code>${escapeHtml(props.id)}</code>\n\n` +
-            escapeHtml(`Project: ${projectAlias}`) +
+            `<b>${escapeHtml(translate(locale, "prompts.permissionRequest"))}</b>\n<code>${escapeHtml(props.id)}</code>\n\n` +
+            escapeHtml(translate(locale, "prompts.project", { project: projectAlias })) +
             "\n" +
-            escapeHtml(`Permission: ${props.permission}`) +
+            escapeHtml(translate(locale, "prompts.permission", { permission: props.permission })) +
             (Array.isArray(props.patterns) && props.patterns.length
-              ? "\n\n" + escapeHtml("Patterns:\n" + props.patterns.map((p) => `- ${p}`).join("\n"))
+              ? "\n\n" + escapeHtml(`${translate(locale, "prompts.patterns")}\n` + props.patterns.map((p) => `- ${p}`).join("\n"))
               : ""),
         },
       ],
       replyMarkup: makeInlineKeyboard([
         [
-          { text: "Allow once", callback_data: packCallback("p", projectAlias, props.sessionID || "", props.id, "once") },
-          { text: "Always allow", callback_data: packCallback("p", projectAlias, props.sessionID || "", props.id, "always") },
+          { text: translate(locale, "prompts.allowOnce"), callback_data: packCallback("p", projectAlias, props.sessionID || "", props.id, "once") },
+          { text: translate(locale, "prompts.alwaysAllow"), callback_data: packCallback("p", projectAlias, props.sessionID || "", props.id, "always") },
         ],
         [
-          { text: "Reject", callback_data: packCallback("p", projectAlias, props.sessionID || "", props.id, "reject") },
-          { text: "Reject with note", callback_data: packCallback("p", projectAlias, props.sessionID || "", props.id, "reject_note") },
+          { text: translate(locale, "prompts.reject"), callback_data: packCallback("p", projectAlias, props.sessionID || "", props.id, "reject") },
+          { text: translate(locale, "prompts.rejectWithNote"), callback_data: packCallback("p", projectAlias, props.sessionID || "", props.id, "reject_note") },
         ],
       ]),
     }
   }
 
   async function sendPermissionPrompt(projectAlias, props, ctxMeta) {
-    const rendered = renderPermissionPrompt(projectAlias, props)
+    const rendered = renderPermissionPrompt(projectAlias, props, ctxMeta?.locale || "en")
     await sendBlocksToThread(ctxMeta, rendered.blocks, rendered.replyMarkup)
   }
 
   async function sendRejectNotePrompt(ctxMeta, projectAlias, permissionId, { resumed = false, sessionID = "" } = {}) {
-    const prefix = resumed ? "Resumed. " : ""
+    const locale = ctxMeta?.locale || "en"
+    const prefix = resumed ? translate(locale, "prompts.resumedPrefix") : ""
     await sendToThread(
       ctxMeta,
-      `${prefix}Send rejection note for ${permissionId} (next message will be used).`,
-      makeInlineKeyboard([[{ text: "Cancel", callback_data: packCallback("p", projectAlias, sessionID || "", permissionId, "cancel_note") }]]),
+      translate(locale, "prompts.sendRejectionNote", { prefix, permissionId }),
+      makeInlineKeyboard([[{ text: translate(locale, "common.cancel"), callback_data: packCallback("p", projectAlias, sessionID || "", permissionId, "cancel_note") }]]),
     )
   }
 
   async function sendQuestionCustomAnswerPrompt(ctxMeta, projectAlias, questionId, qIndex, label, { resumed = false, sessionID = "" } = {}) {
-    const prefix = resumed ? "Resumed. " : ""
+    const locale = ctxMeta?.locale || "en"
+    const prefix = resumed ? translate(locale, "prompts.resumedPrefix") : ""
     await sendToThread(
       ctxMeta,
-      `${prefix}Send your answer for: ${label || "question"} (next message will be used).`,
-      makeInlineKeyboard([[{ text: "Cancel", callback_data: packCallback("q", projectAlias, sessionID || "", questionId, qIndex, "cancel_custom") }]]),
+      translate(locale, "prompts.sendAnswer", { prefix, label: label || translate(locale, "prompts.questionFallback") }),
+      makeInlineKeyboard([[{ text: translate(locale, "common.cancel"), callback_data: packCallback("q", projectAlias, sessionID || "", questionId, qIndex, "cancel_custom") }]]),
     )
   }
 
@@ -349,7 +352,7 @@ export function createPromptHandlers(runtime) {
         })
         await markIdempotencyEntries(idempotencyEntries)
         await clearQuestionWizardStateDurably(wizard, "persist stale question reply state", { rollbackIdempotencyEntries: idempotencyEntries })
-        await sendToThread(wizard.ctx, "Question is no longer active.").catch(() => {})
+        await sendToThread(wizard.ctx, translate(wizard.ctx?.locale || "en", "prompts.questionInactive")).catch(() => {})
         return { outcome: "stale", stale: true }
       }
       if (isRetryableBoundaryError(err, { source: "opencode", pathname: `/question/${wizard.request.id}/reply`, method: "POST" })) {

@@ -8,6 +8,7 @@ import {
   modelKeyOf,
 } from "../model-selection.js"
 import { encodeCallback } from "./callback-data.js"
+import { t as translate } from "../i18n/index.js"
 
 function trimString(value) {
   return typeof value === "string" ? value.trim() : ""
@@ -139,12 +140,12 @@ function chunkEntries(items, size) {
   return chunks
 }
 
-export function modelModeLabel(preference, effectiveState) {
+export function modelModeLabel(preference, effectiveState, locale = "en") {
   if (preference?.mode === "project-default") {
-    return effectiveState?.source === "thread-project-default" ? "Project default override" : "Project default override (unavailable)"
+    return effectiveState?.source === "thread-project-default" ? translate(locale, "model.modeProjectDefault") : translate(locale, "model.modeProjectDefaultUnavailable")
   }
-  if (preference?.mode === "custom") return "Custom override"
-  return "Inherit"
+  if (preference?.mode === "custom") return translate(locale, "model.modeCustom")
+  return translate(locale, "model.modeInherit")
 }
 
 export function buildModelSettingsText({
@@ -156,40 +157,41 @@ export function buildModelSettingsText({
   providerCatalog,
   selectedProviderId,
   selectedModelKey,
+  locale = "en",
 }) {
   const normalizedPreference = preference || { mode: "inherit" }
   const lines = [
-    "Model for this thread:",
-    `Project: ${binding.projectAlias}`,
-    `Session: ${binding.sessionId}`,
-    `Mode: ${modelModeLabel(normalizedPreference, effectiveState)}`,
-    `Active: ${effectiveState?.label || "unknown"}`,
+    translate(locale, "model.title"),
+    translate(locale, "model.project", { project: binding.projectAlias }),
+    translate(locale, "model.session", { session: binding.sessionId }),
+    translate(locale, "model.mode", { mode: modelModeLabel(normalizedPreference, effectiveState, locale) }),
+    translate(locale, "model.active", { active: effectiveState?.label || "unknown" }),
   ]
 
   if (effectiveState?.source && effectiveState.source !== "unknown") {
-    lines.push(`Source: ${modelSourceLabel(effectiveState.source)}`)
+    lines.push(translate(locale, "model.source", { source: modelSourceLabel(effectiveState.source) }))
   }
 
-  lines.push(`Project default: ${configuredInfo?.label || "unknown"}`)
-  if (sessionModelInfo?.label) lines.push(`Last session model: ${sessionModelInfo.label}`)
+  lines.push(translate(locale, "model.projectDefault", { model: configuredInfo?.label || "unknown" }))
+  if (sessionModelInfo?.label) lines.push(translate(locale, "model.lastSessionModel", { model: sessionModelInfo.label }))
 
   lines.push("")
   if (selectedModelKey) {
-    lines.push(`Pick a variant for: ${selectedModelKey}`)
-    lines.push("Use 'No variant' to keep only provider/model.")
+    lines.push(translate(locale, "model.pickVariant", { model: selectedModelKey }))
+    lines.push(translate(locale, "model.noVariantHelp"))
   } else if (selectedProviderId) {
     const selectedProvider = providerCatalog.find((provider) => provider.id === selectedProviderId)
-    lines.push(`Pick a model from provider: ${selectedProvider ? formatProviderChoiceLabel(selectedProvider) : selectedProviderId}`)
+    lines.push(translate(locale, "model.pickProviderModel", { provider: selectedProvider ? formatProviderChoiceLabel(selectedProvider) : selectedProviderId }))
   } else {
-    lines.push("Pick a mode, then choose a provider below.")
-    if (!providerCatalog.length) lines.push("No providers discovered automatically. Use a typed /model command if needed.")
+    lines.push(translate(locale, "model.pickMode"))
+    if (!providerCatalog.length) lines.push(translate(locale, "model.noProviders"))
   }
-  lines.push("Typed forms: /model default, /model reset, /model <provider/model> [variant]")
+  lines.push(translate(locale, "model.typedForms"))
 
   return lines.join("\n")
 }
 
-export function modelSettingsKeyboard({ cbPack, preference, providerCatalog, selectedProviderId, selectedModelKey }) {
+export function modelSettingsKeyboard({ cbPack, preference, providerCatalog, selectedProviderId, selectedModelKey, locale = "en" }) {
   const pack = typeof cbPack === "function" ? cbPack : (...parts) => encodeCallback(parts.length === 1 && Array.isArray(parts[0]) ? parts[0] : parts)
   const normalizedPreference = preference || { mode: "inherit" }
 
@@ -203,7 +205,7 @@ export function modelSettingsKeyboard({ cbPack, preference, providerCatalog, sel
     const currentVariant = normalizedPreference.mode === "custom" && currentCustomModelKey === selectedModelKey ? normalizeVariant(normalizedPreference.variant) : ""
     rows.push([
       {
-        text: `${normalizedPreference.mode === "custom" && currentCustomModelKey === selectedModelKey && !currentVariant ? "✓ " : ""}No variant`,
+        text: `${normalizedPreference.mode === "custom" && currentCustomModelKey === selectedModelKey && !currentVariant ? "✓ " : ""}${translate(locale, "model.noVariant")}`,
         callback_data: pack("m", "apply", selectedModelKey, "~"),
       },
     ])
@@ -216,8 +218,8 @@ export function modelSettingsKeyboard({ cbPack, preference, providerCatalog, sel
       )
     }
     rows.push([
-      { text: "Back", callback_data: pack("m", "provider", selectedProvider?.id || selectedModel?.providerID || selectedProviderId) },
-      { text: "Close", callback_data: pack("m", "close") },
+      { text: translate(locale, "model.back"), callback_data: pack("m", "provider", selectedProvider?.id || selectedModel?.providerID || selectedProviderId) },
+      { text: translate(locale, "common.close"), callback_data: pack("m", "close") },
     ])
     return makeInlineKeyboard(rows)
   }
@@ -230,17 +232,17 @@ export function modelSettingsKeyboard({ cbPack, preference, providerCatalog, sel
       rows.push([{ text: `${prefix}${formatModelChoiceLabel(candidate)}`, callback_data: pack("m", "model", candidate.key) }])
     }
     rows.push([
-      { text: "Back", callback_data: pack("m", "root") },
-      { text: "Close", callback_data: pack("m", "close") },
+      { text: translate(locale, "model.back"), callback_data: pack("m", "root") },
+      { text: translate(locale, "common.close"), callback_data: pack("m", "close") },
     ])
     return makeInlineKeyboard(rows)
   }
 
   const rows = [
     [
-      { text: `${normalizedPreference.mode === "inherit" ? "✓ " : ""}Inherit`, callback_data: pack("m", "set", "inherit") },
+      { text: `${normalizedPreference.mode === "inherit" ? "✓ " : ""}${translate(locale, "model.modeInherit")}`, callback_data: pack("m", "set", "inherit") },
       {
-        text: `${normalizedPreference.mode === "project-default" ? "✓ " : ""}Project default`,
+        text: `${normalizedPreference.mode === "project-default" ? "✓ " : ""}${translate(locale, "model.projectDefaultButton")}`,
         callback_data: pack("m", "set", "project-default"),
       },
     ],
@@ -251,7 +253,7 @@ export function modelSettingsKeyboard({ cbPack, preference, providerCatalog, sel
     rows.push([{ text: `${prefix}${formatProviderChoiceLabel(provider)}`, callback_data: pack("m", "provider", provider.id) }])
   }
 
-  rows.push([{ text: "Close", callback_data: pack("m", "close") }])
+  rows.push([{ text: translate(locale, "common.close"), callback_data: pack("m", "close") }])
   return makeInlineKeyboard(rows)
 }
 
@@ -266,6 +268,7 @@ export function formatModelUiChoices({
   providerCatalog,
   selectedProviderId,
   selectedModelKey,
+  locale = "en",
 }) {
   const settingsText = buildModelSettingsText({
     binding,
@@ -276,6 +279,7 @@ export function formatModelUiChoices({
     providerCatalog,
     selectedProviderId,
     selectedModelKey,
+    locale,
   })
   return {
     text: noticeText ? `${noticeText}\n\n${settingsText}` : settingsText,
@@ -285,6 +289,7 @@ export function formatModelUiChoices({
       providerCatalog,
       selectedProviderId,
       selectedModelKey,
+      locale,
     }),
   }
 }

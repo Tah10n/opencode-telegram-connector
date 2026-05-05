@@ -4,6 +4,7 @@ import { sanitizeBaseUrlForDisplay } from "../../url-utils.js"
 import { isStaleBoundaryError } from "../../boundary-errors.js"
 import { formatActiveTurnStatus, resolveActiveTurnStatus } from "../active-turns.js"
 import { callbackPacker } from "./shared.js"
+import { t as translate } from "../../i18n/index.js"
 
 function normalizeEpochMs(value) {
   if (typeof value === "number" && Number.isFinite(value)) return value < 1e12 ? value * 1000 : value
@@ -65,33 +66,34 @@ export function createOperatorCommandHandlers(deps) {
     compareNumbers,
     markProjectUp,
     threadScopeLabel,
+    t = (ctxOrLocale, key, params) => translate(typeof ctxOrLocale === "string" ? ctxOrLocale : ctxOrLocale?.locale, key, params),
   } = deps
   const packCallback = callbackPacker(cb)
 
-  function runtimeControlsKeyboard() {
+  function runtimeControlsKeyboard(locale = "en") {
     return makeInlineKeyboard([
       [
-        { text: "Restart", callback_data: packCallback("rt", "confirm-restart") },
-        { text: "Stop", callback_data: packCallback("rt", "confirm-stop") },
+        { text: t(locale, "operator.restart"), callback_data: packCallback("rt", "confirm-restart") },
+        { text: t(locale, "operator.stop"), callback_data: packCallback("rt", "confirm-stop") },
       ],
-      [{ text: "Close", callback_data: packCallback("rt", "close") }],
+      [{ text: t(locale, "common.close"), callback_data: packCallback("rt", "close") }],
     ])
   }
 
   function unbindConfirmationText(ctxMeta, binding) {
     return [
-      "Confirm unbind for this thread:",
-      `Scope: ${threadScopeLabel(ctxMeta)}`,
-      `Project: ${binding.projectAlias}`,
-      `Session: ${binding.sessionId}`,
-      "This only removes the Telegram binding; it does not delete the opencode session.",
+      t(ctxMeta, "operator.confirmUnbind"),
+      t(ctxMeta, "operator.scope", { scope: threadScopeLabel(ctxMeta) }),
+      t(ctxMeta, "operator.project", { project: binding.projectAlias }),
+      t(ctxMeta, "operator.session", { session: binding.sessionId }),
+      t(ctxMeta, "operator.unbindNote"),
     ].join("\n")
   }
 
-  function unbindConfirmationKeyboard(ctxKey, binding) {
+  function unbindConfirmationKeyboard(ctxKey, binding, locale = "en") {
     return makeInlineKeyboard([
-      [{ text: "Remove this thread binding", callback_data: packCallback("b", "unbind", ctxKey, binding.projectAlias, binding.sessionId) }],
-      [{ text: "Close", callback_data: packCallback("b", "close") }],
+      [{ text: t(locale, "operator.removeBinding"), callback_data: packCallback("b", "unbind", ctxKey, binding.projectAlias, binding.sessionId) }],
+      [{ text: t(locale, "common.close"), callback_data: packCallback("b", "close") }],
     ])
   }
 
@@ -208,7 +210,7 @@ export function createOperatorCommandHandlers(deps) {
   async function handleAbort(ctxMeta) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Abort needs a bound thread."), unboundGuidanceKeyboard())
+      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Abort needs a bound thread."), unboundGuidanceKeyboard(ctxMeta))
       return
     }
     const oc = ocByAlias[binding.projectAlias]
@@ -221,21 +223,21 @@ export function createOperatorCommandHandlers(deps) {
         aborted === false ? `No active run to abort for session: ${binding.sessionId}` : `Abort requested for session: ${binding.sessionId}`,
       )
     } catch (err) {
-      await sendToThread(ctxMeta, formatProjectUnavailable(binding.projectAlias, err)).catch(() => {})
+      await sendToThread(ctxMeta, formatProjectUnavailable(binding.projectAlias, err, { locale: ctxMeta.locale })).catch(() => {})
     }
   }
 
   async function handleWhere(ctxMeta) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Status needs a bound thread."), unboundGuidanceKeyboard())
+      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Status needs a bound thread."), unboundGuidanceKeyboard(ctxMeta))
       return
     }
     const health = await resolveBindingHealth(ctxMeta.ctxKey, binding)
     const startupSessionId = startupSessionByProject[binding.projectAlias] || "unknown"
     const sseStatus = getProjectSseStatus(binding.projectAlias)
     const baseUrl = sanitizeBaseUrlForDisplay(projects?.[binding.projectAlias]?.baseUrl) || "unknown"
-    const feedMode = feedModeLabel(getFeedMode(ctxMeta.ctxKey))
+    const feedMode = feedModeLabel(getFeedMode(ctxMeta.ctxKey), ctxMeta.locale)
     const effectiveState = await resolveEffectiveModelState(ctxMeta.ctxKey, binding)
     const agentStatus = await resolveAgentStatus(binding, health)
     const runtimeLines = buildRuntimeStatusLines?.(binding.projectAlias) || []
@@ -267,16 +269,16 @@ export function createOperatorCommandHandlers(deps) {
 
   async function handleRuntime(ctxMeta) {
     if (ctxMeta?.chatType !== "private") {
-      await safeInformThread(ctxMeta, "Use /runtime only in a private chat with the bot. Runtime state can include project aliases and operational details.")
+      await safeInformThread(ctxMeta, t(ctxMeta, "operator.privateRuntimeOnly"))
       return
     }
-    const lines = buildGlobalRuntimeStatusLines?.() || ["Runtime status is unavailable."]
-    await sendToThread(ctxMeta, ["Runtime:", ...lines].join("\n"), runtimeControlsKeyboard())
+    const lines = buildGlobalRuntimeStatusLines?.() || [t(ctxMeta, "operator.runtimeUnavailable")]
+    await sendToThread(ctxMeta, [t(ctxMeta, "operator.runtimeTitle"), ...lines].join("\n"), runtimeControlsKeyboard(ctxMeta.locale))
   }
 
   async function handleBindings(ctxMeta) {
     if (ctxMeta?.chatType !== "private") {
-      await safeInformThread(ctxMeta, "Use /bindings only in a private chat with the bot. Bindings contain sensitive session IDs.")
+      await safeInformThread(ctxMeta, t(ctxMeta, "operator.privateBindingsOnly"))
       return
     }
     const entries = Object.entries(store.get().bindings || {})
@@ -290,14 +292,14 @@ export function createOperatorCommandHandlers(deps) {
       })
 
     if (!entries.length) {
-      await safeInformThread(ctxMeta, "No bindings.")
+      await safeInformThread(ctxMeta, t(ctxMeta, "operator.noBindings"))
       return
     }
 
     const repairPreview = store.repairBindingIndex?.({ dryRun: true })
     const healthByCtx = await resolveBindingHealthMap(entries)
 
-    const lines = ["Bindings:"]
+    const lines = [t(ctxMeta, "operator.bindingsTitle")]
     for (const entry of entries) {
       const scope = entry.ctx ? `chat ${entry.ctx.chatId} / ${formatThreadLabel(entry.ctx.threadIdOr0)}` : entry.ctxKey
       const current = entry.ctxKey === ctxMeta.ctxKey ? " (current)" : ""
@@ -314,7 +316,7 @@ export function createOperatorCommandHandlers(deps) {
   async function handleSendLast(ctxMeta) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Sending the last assistant reply needs a bound thread."), unboundGuidanceKeyboard())
+      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Sending the last assistant reply needs a bound thread."), unboundGuidanceKeyboard(ctxMeta))
       return
     }
     const oc = ocByAlias[binding.projectAlias]
@@ -346,7 +348,7 @@ export function createOperatorCommandHandlers(deps) {
     }
 
     if (!text || !text.trim()) {
-      await safeInformThread(ctxMeta, "No assistant message yet.")
+      await safeInformThread(ctxMeta, t(ctxMeta, "operator.noAssistantYet"))
       return
     }
     await deliverAssistantText(ctxMeta, binding.projectAlias, messageSessionId, messageId || "sendlast", text)
@@ -362,6 +364,7 @@ export function createOperatorCommandHandlers(deps) {
       previewLimit: 3,
       showBindingScopes: ctxMeta?.chatType === "private",
       showProjectDetails: ctxMeta?.chatType === "private",
+      ...(ctxMeta.locale ? { locale: ctxMeta.locale } : {}),
     })]
     if (ctxMeta?.chatType === "private") {
       const entries = Object.entries(store.get().bindings || {}).map(([ctxKey, binding]) => ({ ctxKey, binding }))
@@ -376,7 +379,7 @@ export function createOperatorCommandHandlers(deps) {
         byProject.set(alias, bucket)
       }
       if (byProject.size) {
-        lines.push("Binding health:")
+        lines.push(t(ctxMeta, "operator.bindingHealthTitle"))
         for (const [alias, bucket] of [...byProject.entries()].sort(([a], [b]) => a.localeCompare(b))) {
           lines.push(`- ${alias}: ok=${bucket.ok} stale=${bucket.stale} unreachable=${bucket.unreachable} unknown=${bucket.unknown}`)
         }
@@ -388,6 +391,7 @@ export function createOperatorCommandHandlers(deps) {
       showSessions: ctxMeta?.chatType === "private",
       showBindControls: ctxMeta?.chatType === "private" || !currentBinding,
       currentBinding,
+      ...(ctxMeta.locale ? { locale: ctxMeta.locale } : {}),
     })
     await sendToThread(ctxMeta, lines.join("\n"), replyMarkup)
   }
@@ -395,10 +399,10 @@ export function createOperatorCommandHandlers(deps) {
   async function handleUnbind(ctxMeta) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await sendToThread(ctxMeta, unboundGuidanceText(ctxMeta, "This thread is already unbound."), unboundGuidanceKeyboard())
+      await sendToThread(ctxMeta, unboundGuidanceText(ctxMeta, t(ctxMeta, "operator.alreadyUnbound")), unboundGuidanceKeyboard(ctxMeta))
       return
     }
-    await sendToThread(ctxMeta, unbindConfirmationText(ctxMeta, binding), unbindConfirmationKeyboard(ctxMeta.ctxKey, binding))
+    await sendToThread(ctxMeta, unbindConfirmationText(ctxMeta, binding), unbindConfirmationKeyboard(ctxMeta.ctxKey, binding, ctxMeta.locale))
   }
 
   return {

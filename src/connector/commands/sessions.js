@@ -5,6 +5,7 @@ import { getLaunchSupport } from "../../opencode/launcher.js"
 import { isSafeOpenCodeId, normalizeOpenCodeId, requireSafeOpenCodeId } from "../../opencode/ids.js"
 import { modelSourceLabel } from "../../model-selection.js"
 import { callbackPacker } from "./shared.js"
+import { t as translate } from "../../i18n/index.js"
 
 export function createSessionCommandHandlers(deps) {
   const {
@@ -34,6 +35,7 @@ export function createSessionCommandHandlers(deps) {
     openAttachWindowFn,
     openAttachWindowWindowsFn,
     markProjectUp,
+    t = (ctxOrLocale, key, params) => translate(typeof ctxOrLocale === "string" ? ctxOrLocale : ctxOrLocale?.locale, key, params),
   } = deps
   const packCallback = callbackPacker(cb)
 
@@ -88,7 +90,7 @@ export function createSessionCommandHandlers(deps) {
     }
   }
 
-  function sessionsKeyboard(projectAlias, sessions, { currentSessionId, startupSessionId, limit = 10 } = {}) {
+  function sessionsKeyboard(projectAlias, sessions, { currentSessionId, startupSessionId, limit = 10, locale = "en" } = {}) {
     const normalized = normalizeSessionsList(sessions).slice(0, limit).filter((session) => isSafeOpenCodeId(session.id))
     const rows = normalized.map((session) => [
       {
@@ -97,15 +99,15 @@ export function createSessionCommandHandlers(deps) {
       },
     ])
     rows.push([
-      { text: "Refresh", callback_data: packCallback("s", "refresh") },
-      { text: "New", callback_data: packCallback("s", "new") },
-      { text: "Close", callback_data: packCallback("s", "close") },
+      { text: t(locale, "sessions.refresh"), callback_data: packCallback("s", "refresh") },
+      { text: t(locale, "common.newSession"), callback_data: packCallback("s", "new") },
+      { text: t(locale, "common.close"), callback_data: packCallback("s", "close") },
     ])
     return makeInlineKeyboard(rows)
   }
 
-  function closeKeyboard(callbackParts = ["s", "close"]) {
-    return makeInlineKeyboard([[{ text: "Close", callback_data: packCallback(callbackParts) }]])
+  function closeKeyboard(callbackParts = ["s", "close"], locale = "en") {
+    return makeInlineKeyboard([[{ text: t(locale, "common.close"), callback_data: packCallback(callbackParts) }]])
   }
 
   async function renderSessionsList(ctxMeta, { binding, editMessageId } = {}) {
@@ -123,10 +125,12 @@ export function createSessionCommandHandlers(deps) {
       currentSessionModelSourceLabel:
         effectiveState?.source && effectiveState.source !== "unknown" ? modelSourceLabel(effectiveState.source) : "",
       startupSessionId: startupSessionByProject[binding.projectAlias],
+      locale: ctxMeta.locale,
     })
     const replyMarkup = sessionsKeyboard(binding.projectAlias, sessions, {
       currentSessionId: binding.sessionId,
       startupSessionId: startupSessionByProject[binding.projectAlias],
+      locale: ctxMeta.locale,
     })
     if (editMessageId) {
       await tg.editMessageText(ctxMeta.chatId, editMessageId, text, replyMarkup)
@@ -137,12 +141,12 @@ export function createSessionCommandHandlers(deps) {
 
   async function renderProjectSessions(ctxMeta, projectAlias, { editMessageId } = {}) {
     if (!projectAlias || !projects?.[projectAlias]) {
-      await safeInformThread(ctxMeta, "Unknown project.")
+      await safeInformThread(ctxMeta, t(ctxMeta, "sessions.unknownProject"))
       return
     }
     const existing = store.getBinding(ctxMeta.ctxKey)
     if (ctxMeta?.chatType !== "private" && existing?.projectAlias !== projectAlias) {
-      await safeInformThread(ctxMeta, "Use project session actions only in a private chat unless this thread is bound to that project.")
+      await safeInformThread(ctxMeta, t(ctxMeta, "sessions.privateProjectActions"))
       return
     }
     const startupSid = startupSessionByProject[projectAlias] || (await resolveStartupSession(projectAlias)) || ""
@@ -150,11 +154,11 @@ export function createSessionCommandHandlers(deps) {
       const oc = ocByAlias[projectAlias]
       const sessions = await oc.listSessions({ directory: projects?.[projectAlias]?.directory, limit: 10 })
       markProjectUp?.(projectAlias)
-      const text = `${formatSessionsListText(projectAlias, sessions, { startupSessionId: startupSid })}\n\nViewing only. Bind the target chat/thread to switch sessions with buttons.`
+      const text = `${formatSessionsListText(projectAlias, sessions, { startupSessionId: startupSid, locale: ctxMeta.locale })}\n\nViewing only. Bind the target chat/thread to switch sessions with buttons.`
         .replace("Tap a button below to switch:\n\n", "")
         .replace("Use /new to create one or /use <sessionId|shareLink> to switch.", "Bind the target chat/thread to this project before creating or switching sessions from Telegram.")
         .replace("Use /use <sessionId|shareLink> to switch.", "Use /bind <projectAlias> in the target chat/thread, then /use <sessionId|shareLink> to switch.")
-      const replyMarkup = closeKeyboard(["srv", "close"])
+      const replyMarkup = closeKeyboard(["srv", "close"], ctxMeta.locale)
       if (editMessageId) {
         await tg.editMessageText(ctxMeta.chatId, editMessageId, text, replyMarkup)
         return
@@ -171,7 +175,7 @@ export function createSessionCommandHandlers(deps) {
   async function handleBindCommand(ctxMeta, argv) {
     const alias = argv[0]
     if (!alias) {
-      await sendToThread(ctxMeta, "Usage: /bind <projectAlias>")
+      await sendToThread(ctxMeta, t(ctxMeta, "sessions.usageBind"))
       return
     }
     try {
@@ -180,30 +184,30 @@ export function createSessionCommandHandlers(deps) {
 
       const existing = store.getBinding(ctxMeta.ctxKey)
       if (existing && existing.projectAlias === alias && existing.sessionId) {
-        await sendToThread(ctxMeta, `Already bound: ${alias} / ${existing.sessionId}`)
+        await sendToThread(ctxMeta, t(ctxMeta, "sessions.alreadyBound", { project: alias, session: existing.sessionId }))
         return
       }
       const startupSid = await resolveValidStartupSession(alias, oc)
       if (startupSid) {
         const bindResult = await bindCtxToSession(ctxMeta, alias, startupSid)
-        await sendToThread(ctxMeta, appendMoveConflict([`Bound to project '${alias}' (startup session): ${startupSid}`], bindResult).join("\n"))
+        await sendToThread(ctxMeta, appendMoveConflict([t(ctxMeta, "sessions.boundStartup", { project: alias, session: startupSid })], bindResult).join("\n"))
       } else {
         const created = await oc.createSession(createSessionOptions(alias))
         const createdId = requireSessionIdFromBackend(created?.id, "created session id")
         logger.info(`[${alias}] created session for bind:`, createdId)
         startupSessionByProject[alias] = createdId
         const bindResult = await bindCtxToSession(ctxMeta, alias, createdId)
-        await sendToThread(ctxMeta, appendMoveConflict([`Bound to project '${alias}' with new session: ${createdId}`], bindResult).join("\n"))
+        await sendToThread(ctxMeta, appendMoveConflict([t(ctxMeta, "sessions.boundNew", { project: alias, session: createdId })], bindResult).join("\n"))
       }
     } catch (err) {
-      await sendToThread(ctxMeta, formatProjectUnavailable(alias, err)).catch(() => {})
+      await sendToThread(ctxMeta, formatProjectUnavailable(alias, err, { locale: ctxMeta.locale })).catch(() => {})
     }
   }
 
   async function handleNewCommand(ctxMeta, title) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Creating a session needs a bound thread."), unboundGuidanceKeyboard())
+      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Creating a session needs a bound thread."), unboundGuidanceKeyboard(ctxMeta))
       return
     }
     const oc = ocByAlias[binding.projectAlias]
@@ -278,14 +282,14 @@ export function createSessionCommandHandlers(deps) {
         logger.info(`[${binding.projectAlias}] /new created ${createdId}; openAttachOnNewMode=same-window (no new window spawned).`)
       }
     } catch (err) {
-      await sendToThread(ctxMeta, formatProjectUnavailable(binding.projectAlias, err)).catch(() => {})
+      await sendToThread(ctxMeta, formatProjectUnavailable(binding.projectAlias, err, { locale: ctxMeta.locale })).catch(() => {})
     }
   }
 
   async function handleUseCommand(ctxMeta, sessionId) {
     const sessionRef = parseSessionReference(sessionId)
     if (!sessionRef) {
-      await safeInformThread(ctxMeta, "Usage: /use <sessionId|shareLink>")
+      await safeInformThread(ctxMeta, t(ctxMeta, "sessions.usageUse"))
       return
     }
     if (sessionRef.type === "invalid-link") {
@@ -297,7 +301,7 @@ export function createSessionCommandHandlers(deps) {
     }
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Switching sessions needs a bound thread."), unboundGuidanceKeyboard())
+      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Switching sessions needs a bound thread."), unboundGuidanceKeyboard(ctxMeta))
       return
     }
     const oc = ocByAlias[binding.projectAlias]
@@ -375,20 +379,20 @@ export function createSessionCommandHandlers(deps) {
       const bindResult = await bindCtxToSession(ctxMeta, binding.projectAlias, targetSessionId)
       await sendToThread(ctxMeta, appendMoveConflict([await buildSessionSwitchText(binding.projectAlias, targetSessionId, { ctxKey: ctxMeta.ctxKey })], bindResult).join("\n"))
     } catch (err) {
-      await sendToThread(ctxMeta, formatProjectUnavailable(binding.projectAlias, err)).catch(() => {})
+      await sendToThread(ctxMeta, formatProjectUnavailable(binding.projectAlias, err, { locale: ctxMeta.locale })).catch(() => {})
     }
   }
 
   async function handleSessions(ctxMeta) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Session list needs a bound thread."), unboundGuidanceKeyboard())
+      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Session list needs a bound thread."), unboundGuidanceKeyboard(ctxMeta))
       return
     }
     try {
       await renderSessionsList(ctxMeta, { binding })
     } catch (err) {
-      await sendToThread(ctxMeta, formatProjectUnavailable(binding.projectAlias, err)).catch(() => {})
+      await sendToThread(ctxMeta, formatProjectUnavailable(binding.projectAlias, err, { locale: ctxMeta.locale })).catch(() => {})
     }
   }
 

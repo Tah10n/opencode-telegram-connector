@@ -14,6 +14,7 @@ import {
 } from "../incoming-attachments.js"
 import { hashIdempotencyValue } from "../idempotency.js"
 import { callbackPacker } from "./shared.js"
+import { t as translate } from "../../i18n/index.js"
 
 const ATTACHMENT_CONFIRMATION_TTL_MS = 30 * 60 * 1000
 const MAX_PENDING_ATTACHMENT_CONFIRMATIONS = 200
@@ -49,18 +50,18 @@ export function createAttachmentHandlers({
   const pendingAttachmentConfirmations = new Map()
   const pendingAttachmentSends = new Set()
 
-  function attachmentConfirmationKeyboard(token) {
+  function attachmentConfirmationKeyboard(token, locale = "en") {
     return makeInlineKeyboard([
       [
-        { text: "Send file", callback_data: packCallback("att", "send", token) },
-        { text: "Cancel", callback_data: packCallback("att", "cancel", token) },
+        { text: translate(locale, "common.sendFile"), callback_data: packCallback("att", "send", token) },
+        { text: translate(locale, "common.cancel"), callback_data: packCallback("att", "cancel", token) },
       ],
-      [{ text: "Close", callback_data: packCallback("att", "close", token) }],
+      [{ text: translate(locale, "common.close"), callback_data: packCallback("att", "close", token) }],
     ])
   }
 
-  function closeOnlyKeyboard() {
-    return makeInlineKeyboard([[{ text: "Close", callback_data: packCallback("s", "close") }]])
+  function closeOnlyKeyboard(locale = "en") {
+    return makeInlineKeyboard([[{ text: translate(locale, "common.close"), callback_data: packCallback("s", "close") }]])
   }
 
   async function safeInformThread(ctxMeta, text, replyMarkup, options) {
@@ -218,7 +219,7 @@ export function createAttachmentHandlers({
 
   async function requestAttachmentConfirmation(ctxMeta, record, markMessageHandled) {
     const token = rememberPendingAttachmentConfirmation(record)
-    await sendToThread(ctxMeta, attachmentConfirmationText(record.documentInfo, { limits }), attachmentConfirmationKeyboard(token))
+    await sendToThread(ctxMeta, attachmentConfirmationText(record.documentInfo, { limits }), attachmentConfirmationKeyboard(token, ctxMeta.locale))
     if (markMessageHandled) {
       await markMessageHandled("attachmentConfirmRequested", {
         projectAlias: record.projectAlias,
@@ -244,7 +245,7 @@ export function createAttachmentHandlers({
     }
 
     if (!documentInfo.supported) {
-      await safeInformThread(ctxMeta, unsupportedAttachmentText(documentInfo, { limits }), closeOnlyKeyboard())
+      await safeInformThread(ctxMeta, unsupportedAttachmentText(documentInfo, { limits }), closeOnlyKeyboard(ctxMeta.locale))
       await markMessageHandled("unsupportedAttachment", { projectAlias: binding.projectAlias, sessionId: binding.sessionId })
       return
     }
@@ -264,14 +265,14 @@ export function createAttachmentHandlers({
       loaded = await loadTelegramAttachment(record)
     } catch (err) {
       const classification = classifyBoundaryError(err, { source: "telegram", operation: "download attachment" })
-      await safeInformThread(ctxMeta, attachmentDownloadFailedText(documentInfo), closeOnlyKeyboard())
+      await safeInformThread(ctxMeta, attachmentDownloadFailedText(documentInfo), closeOnlyKeyboard(ctxMeta.locale))
       if (classification.retryable) throw err
       await markMessageHandled("attachmentDownloadFailed", { projectAlias: binding.projectAlias, sessionId: binding.sessionId })
       return
     }
 
     if (loaded.outcome === "too_large") {
-      await safeInformThread(ctxMeta, unsupportedAttachmentText(loaded.documentInfo, { limits }), closeOnlyKeyboard())
+      await safeInformThread(ctxMeta, unsupportedAttachmentText(loaded.documentInfo, { limits }), closeOnlyKeyboard(ctxMeta.locale))
       await markMessageHandled("attachmentTooLarge", { projectAlias: binding.projectAlias, sessionId: binding.sessionId })
       return
     }
@@ -279,7 +280,7 @@ export function createAttachmentHandlers({
       await safeInformThread(
         ctxMeta,
         `${unsupportedAttachmentText(documentInfo, { limits })}\nReason: ${loaded.error?.message || "not UTF-8 text"}`,
-        closeOnlyKeyboard(),
+        closeOnlyKeyboard(ctxMeta.locale),
       )
       await markMessageHandled("unsupportedAttachmentText", { projectAlias: binding.projectAlias, sessionId: binding.sessionId })
       return
@@ -298,7 +299,7 @@ export function createAttachmentHandlers({
     )
     try {
       await sendAttachmentPromptToOpenCode(ctxMeta, binding, record, loaded)
-      await safeInformThread(ctxMeta, attachmentSentText(loaded.documentInfo, binding), closeOnlyKeyboard())
+      await safeInformThread(ctxMeta, attachmentSentText(loaded.documentInfo, binding), closeOnlyKeyboard(ctxMeta.locale))
     } catch (err) {
       let cleanupErr = null
       try {
@@ -315,7 +316,7 @@ export function createAttachmentHandlers({
           pathname: `/session/${binding.sessionId}/prompt_async`,
         })
       }
-      await safeInformThread(ctxMeta, formatProjectUnavailable(alias, err), withButton ? startServerKeyboard?.(alias) : closeOnlyKeyboard())
+      await safeInformThread(ctxMeta, formatProjectUnavailable(alias, err, { locale: ctxMeta.locale }), withButton ? startServerKeyboard?.(alias, { locale: ctxMeta.locale }) : closeOnlyKeyboard(ctxMeta.locale))
       if (cleanupErr) throw cleanupErr
       if (isRetryableProjectError?.(err)) throw err
     }
@@ -329,12 +330,12 @@ export function createAttachmentHandlers({
     }
     if (action === "cancel" || action === "close") {
       if (record) pendingAttachmentConfirmations.delete(token)
-      if (action === "cancel") await safeEditMessage(ctxMeta, editMessageId, "Attachment sending cancelled.", closeOnlyKeyboard())
+      if (action === "cancel") await safeEditMessage(ctxMeta, editMessageId, "Attachment sending cancelled.", closeOnlyKeyboard(ctxMeta.locale))
       return { callbackText: action === "cancel" ? "Cancelled" : "Closed" }
     }
 
     if (!record) {
-      await safeEditMessage(ctxMeta, editMessageId, "Attachment confirmation expired. Send the file again.", closeOnlyKeyboard())
+      await safeEditMessage(ctxMeta, editMessageId, "Attachment confirmation expired. Send the file again.", closeOnlyKeyboard(ctxMeta.locale))
       return { callbackText: "Expired" }
     }
 
@@ -345,7 +346,7 @@ export function createAttachmentHandlers({
         ctxMeta,
         editMessageId,
         "Attachment was not sent because this thread's binding changed. Send the file again for the current session.",
-        closeOnlyKeyboard(),
+        closeOnlyKeyboard(ctxMeta.locale),
       )
       return { callbackText: "Binding changed" }
     }
@@ -360,7 +361,7 @@ export function createAttachmentHandlers({
     }
     if (hasIdempotencyKey(sendKey)) {
       pendingAttachmentConfirmations.delete(token)
-      await safeEditMessage(ctxMeta, editMessageId, "Attachment was already sent to OpenCode.", closeOnlyKeyboard())
+      await safeEditMessage(ctxMeta, editMessageId, "Attachment was already sent to OpenCode.", closeOnlyKeyboard(ctxMeta.locale))
       return { callbackText: "Already sent" }
     }
     pendingAttachmentSends.add(sendKey)
@@ -371,13 +372,13 @@ export function createAttachmentHandlers({
         loaded = await loadTelegramAttachment(record)
       } catch (err) {
         const classification = classifyBoundaryError(err, { source: "telegram", operation: "download attachment" })
-        await safeInformThread(ctxMeta, attachmentDownloadFailedText(record.documentInfo), closeOnlyKeyboard())
+        await safeInformThread(ctxMeta, attachmentDownloadFailedText(record.documentInfo), closeOnlyKeyboard(ctxMeta.locale))
         return { callbackText: classification.retryable ? "Try again" : "Download failed" }
       }
 
       if (loaded.outcome === "too_large") {
         pendingAttachmentConfirmations.delete(token)
-        await safeEditMessage(ctxMeta, editMessageId, unsupportedAttachmentText(loaded.documentInfo, { limits }), closeOnlyKeyboard())
+        await safeEditMessage(ctxMeta, editMessageId, unsupportedAttachmentText(loaded.documentInfo, { limits }), closeOnlyKeyboard(ctxMeta.locale))
         return { callbackText: "Too large" }
       }
       if (loaded.outcome === "unsupported_text") {
@@ -386,7 +387,7 @@ export function createAttachmentHandlers({
           ctxMeta,
           editMessageId,
           `${unsupportedAttachmentText(record.documentInfo, { limits })}\nReason: ${loaded.error?.message || "not UTF-8 text"}`,
-          closeOnlyKeyboard(),
+          closeOnlyKeyboard(ctxMeta.locale),
         )
         return { callbackText: "Unsupported" }
       }
@@ -427,13 +428,13 @@ export function createAttachmentHandlers({
             pathname: `/session/${currentBinding.sessionId}/prompt_async`,
           })
         }
-        await safeInformThread(ctxMeta, formatProjectUnavailable(alias, err), withButton ? startServerKeyboard?.(alias) : closeOnlyKeyboard())
+        await safeInformThread(ctxMeta, formatProjectUnavailable(alias, err, { locale: ctxMeta.locale }), withButton ? startServerKeyboard?.(alias, { locale: ctxMeta.locale }) : closeOnlyKeyboard(ctxMeta.locale))
         if (cleanupErr) throw cleanupErr
         if (isRetryableProjectError?.(err)) return { callbackText: "Temporarily unavailable" }
         throw err
       }
       pendingAttachmentConfirmations.delete(token)
-      await safeEditMessage(ctxMeta, editMessageId, attachmentSentText(loaded.documentInfo, currentBinding), closeOnlyKeyboard())
+      await safeEditMessage(ctxMeta, editMessageId, attachmentSentText(loaded.documentInfo, currentBinding), closeOnlyKeyboard(ctxMeta.locale))
       return { callbackText: "Sent" }
     } finally {
       pendingAttachmentSends.delete(sendKey)

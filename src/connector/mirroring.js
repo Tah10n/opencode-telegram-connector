@@ -18,6 +18,7 @@ import { redactSensitiveText } from "../url-utils.js"
 import { classifyBoundaryError, isRetryableBoundaryError } from "../boundary-errors.js"
 import { bindRequestContext } from "../runtime/request-context.js"
 import { callbackPacker } from "./callback-data.js"
+import { t as translate } from "../i18n/index.js"
 
 export function createMirroringHandlers(runtime) {
   const {
@@ -438,11 +439,11 @@ export function createMirroringHandlers(runtime) {
     return store.getFeedMode?.(ctxKey) || DEFAULT_FEED_MODE
   }
 
-  function feedModeLabel(mode) {
+  function feedModeLabel(mode, locale = "en") {
     const normalized = normalizeFeedMode(mode)
-    if (normalized === "main") return "Main"
-    if (normalized === "verbose") return "Verbose"
-    return "Main + changes"
+    if (normalized === "main") return translate(locale, "feed.main")
+    if (normalized === "verbose") return translate(locale, "feed.verbose")
+    return translate(locale, "feed.mainChanges")
   }
 
   function shouldMirrorToFeed(ctxKey, kind) {
@@ -453,35 +454,36 @@ export function createMirroringHandlers(runtime) {
     return kind === "assistant-final" || kind === "assistant-stream" || kind === "changed-files" || kind === "agent-action"
   }
 
-  function renderFeedSettingsText(ctxKey) {
+  function renderFeedSettingsText(ctxKey, locale = "en") {
     const mode = getFeedMode(ctxKey)
     return [
-      `Feed for this thread: ${feedModeLabel(mode)}`,
+      translate(locale, "feed.title", { mode: feedModeLabel(mode, locale) }),
       "",
-      "Main — final assistant replies only.",
-      "Main + changes — final assistant replies and changed files.",
-      "Verbose — final replies, streaming previews, agent actions, and changed files.",
-      "TUI user-message mirroring is controlled by the runtime mirrorTuiUserMessages setting.",
+      translate(locale, "feed.mainDescription"),
+      translate(locale, "feed.mainChangesDescription"),
+      translate(locale, "feed.verboseDescription"),
+      translate(locale, "feed.tuiMirror"),
       "",
-      "Internal compaction output stays hidden in all modes.",
+      translate(locale, "feed.compactionHidden"),
     ].join("\n")
   }
 
-  function feedKeyboard(ctxKey) {
+  function feedKeyboard(ctxKey, locale = "en") {
     const current = getFeedMode(ctxKey)
     const button = (mode, label) => ({ text: `${current === mode ? "✓ " : ""}${label}`, callback_data: packCallback("feed", mode) })
     return makeInlineKeyboard([
-      [button("main", "Main")],
-      [button("main+changes", "Main + changes")],
-      [button("verbose", "Verbose")],
-      [{ text: "Close", callback_data: packCallback("feed", "close") }],
+      [button("main", feedModeLabel("main", locale))],
+      [button("main+changes", feedModeLabel("main+changes", locale))],
+      [button("verbose", feedModeLabel("verbose", locale))],
+      [{ text: translate(locale, "common.close"), callback_data: packCallback("feed", "close") }],
     ])
   }
 
   async function renderFeedSettings(ctxMeta, { editMessageId, noticeText = "" } = {}) {
-    const settingsText = renderFeedSettingsText(ctxMeta.ctxKey)
+    const locale = ctxMeta?.locale || "en"
+    const settingsText = renderFeedSettingsText(ctxMeta.ctxKey, locale)
     const text = noticeText ? `${noticeText}\n\n${settingsText}` : settingsText
-    const replyMarkup = feedKeyboard(ctxMeta.ctxKey)
+    const replyMarkup = feedKeyboard(ctxMeta.ctxKey, locale)
     if (editMessageId) {
       await tg.editMessageText(ctxMeta.chatId, editMessageId, text, replyMarkup)
       return
