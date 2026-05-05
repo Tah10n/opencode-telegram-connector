@@ -9,6 +9,7 @@ import { startConnector } from "../src/index.js"
 import { makeBoundaryError } from "../src/boundary-errors.js"
 import { defaultState, StateStore } from "../src/state/store.js"
 import { questionReplyIdempotencyKey } from "../src/connector/idempotency.js"
+import { getRequestContext } from "../src/runtime/request-context.js"
 
 function makeLogger() {
   return { info() {}, warn() {}, error() {}, debug() {} }
@@ -463,6 +464,73 @@ test("startConnector binds a thread and forwards only allowed-user messages", as
     assert.equal(state.updateOffset, 104)
     assert.deepEqual(harness.ocCalls.promptAsync, [{ sessionId: "ses_startup", text: "[TG] hello from telegram" }])
     assert.ok(harness.tg.sentMessages.some((entry) => entry.text.includes("Bound to project 'demo'")))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector scopes Telegram message context through OpenCode prompts", async () => {
+  const seenContexts = []
+  const harness = await createHarness({
+    statePatch: {
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_startup" } },
+      sessionIndex: { "demo:ses_startup": { chatId: 100, threadIdOr0: 7 } },
+    },
+    ocOptions: {
+      promptAsyncImpl: async () => {
+        seenContexts.push(getRequestContext())
+        return { ok: true }
+      },
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeMessageUpdate(101, "hello from telegram"))
+
+    await waitFor(() => harness.ocCalls.promptAsync.length === 1 && seenContexts.length === 1)
+    await harness.connector.stop()
+
+    assert.match(seenContexts[0].correlationId, /^tg-101-message-/)
+    assert.equal(seenContexts[0].source, "telegram")
+    assert.equal(seenContexts[0].eventType, "message")
+    assert.equal(seenContexts[0].updateId, 101)
+    assert.equal(seenContexts[0].ctxKey, "100:7")
+    assert.equal(seenContexts[0].projectAlias, "demo")
+    assert.equal(seenContexts[0].sessionId, "ses_startup")
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector scopes Telegram callback context through OpenCode calls", async () => {
+  const seenContexts = []
+  const harness = await createHarness({
+    statePatch: {
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_startup" } },
+      sessionIndex: { "demo:ses_startup": { chatId: 100, threadIdOr0: 7 } },
+    },
+    startupSessions: [{ id: "ses_startup" }, { id: "ses_other" }],
+    ocOptions: {
+      getSessionImpl: async (sessionId) => {
+        seenContexts.push(getRequestContext())
+        return { id: sessionId, parentID: null }
+      },
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeCallbackUpdate(101, JSON.stringify(["s", "demo", "ses_other"])))
+
+    await waitFor(() => seenContexts.length >= 1)
+    await harness.connector.stop()
+
+    assert.match(seenContexts[0].correlationId, /^tg-101-callback-/)
+    assert.equal(seenContexts[0].source, "telegram")
+    assert.equal(seenContexts[0].eventType, "callback")
+    assert.equal(seenContexts[0].updateId, 101)
+    assert.equal(seenContexts[0].ctxKey, "100:7")
+    assert.equal(seenContexts[0].projectAlias, "demo")
+    assert.equal(seenContexts[0].sessionId, "ses_startup")
   } finally {
     await harness.connector.stop()
   }

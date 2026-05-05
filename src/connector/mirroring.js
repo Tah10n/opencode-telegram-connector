@@ -16,6 +16,7 @@ import { ATTACHMENT_NOTICES, attachmentCaption, sanitizeFilenamePart, scopedAtta
 import { NOISY_SKIP_REASONS } from "./noisy-skip-reasons.js"
 import { redactSensitiveText } from "../url-utils.js"
 import { classifyBoundaryError, isRetryableBoundaryError } from "../boundary-errors.js"
+import { bindRequestContext } from "../runtime/request-context.js"
 import { callbackPacker } from "./callback-data.js"
 
 export function createMirroringHandlers(runtime) {
@@ -1102,7 +1103,7 @@ export function createMirroringHandlers(runtime) {
     if (sets.agentStopErrors.has(key)) return false
     const deliveryKey = agentStopErrorDebounceKey(projectAlias, sessionId, key)
     if (isAgentStopErrorDebounce(assistantDebounce.get(deliveryKey))) return false
-    const run = (deliveryOptions = {}) =>
+    const run = bindRequestContext((deliveryOptions = {}) =>
       deliverAgentStopErrorNotice({
         projectAlias,
         sessionId,
@@ -1112,7 +1113,7 @@ export function createMirroringHandlers(runtime) {
         allowParentRoute,
         verifyMessageError,
         deliveryOptions,
-      })
+      }), { projectAlias, sessionId, messageId })
     const timer = setTimeout(() => {
       void run()
     }, AGENT_STOP_ERROR_FALLBACK_GRACE_MS)
@@ -1594,7 +1595,7 @@ export function createMirroringHandlers(runtime) {
         deliveryState.inFlight = false
       }
     }
-    const run = async (deliveryOptions = {}) => {
+    const run = bindRequestContext(async (deliveryOptions = {}) => {
       try {
         deliveryState.deliveryOptions = deliveryOptions
         await runDelivery(deliveryOptions)
@@ -1632,7 +1633,7 @@ export function createMirroringHandlers(runtime) {
         runtime.logger?.error?.("Assistant final delivery failed:", projectAlias, sessionId, info.id, message)
         logSseDebug(projectAlias, sessionId, `error=assistant_final_delivery msg=${info.id} ${message}`)
       }
-    }
+    }, { projectAlias, sessionId, messageId: info.id })
     const t = setTimeout(() => {
       void run(initialDeliveryOptions)
     }, 250)

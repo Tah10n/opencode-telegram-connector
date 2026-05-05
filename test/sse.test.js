@@ -3,7 +3,9 @@ import assert from "node:assert/strict"
 import { setTimeout as delay } from "node:timers/promises"
 import { ReadableStream } from "node:stream/web"
 import { startOpenCodeSseLoop } from "../src/opencode/sse.js"
+import { OpenCodeClient, OPENCODE_CORRELATION_HEADER } from "../src/opencode/client.js"
 import { classifyBoundaryError } from "../src/boundary-errors.js"
+import { getRequestContext } from "../src/runtime/request-context.js"
 
 function makeLogger() {
   return { info() {}, error() {}, warn() {}, debug() {} }
@@ -88,6 +90,42 @@ test("startOpenCodeSseLoop forwards parsed SSE events and connects once", async 
   assert.equal(fetchCalls, 1)
   assert.equal(connectCalls, 1)
   assert.equal(errorCalls, 0)
+})
+
+test("startOpenCodeSseLoop sends correlation header and scopes event context", async (t) => {
+  const headersSeen = []
+  useFetchStub(t, async (_url, init) => {
+    headersSeen.push(init.headers)
+    return makeSseResponse([
+      'data: {"id":"evt_1","type":"message.updated","properties":{"sessionID":"ses_1","info":{"id":"msg_1"}}}\n',
+      "\n",
+    ])
+  })
+
+  const ocClient = new OpenCodeClient({ baseUrl: "http://127.0.0.1:4312" })
+
+  let loop
+  const context = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Timed out waiting for SSE context")), 500)
+    loop = startOpenCodeSseLoop({
+      projectAlias: "demo",
+      ocClient,
+      logger: makeLogger(),
+      onEvent: async () => {
+        loop.stop()
+        clearTimeout(timeout)
+        resolve(getRequestContext())
+      },
+    })
+  })
+
+  assert.match(headersSeen[0][OPENCODE_CORRELATION_HEADER], /^sse-connect-demo-/)
+  assert.match(context.correlationId, /^sse-demo-message.updated-/)
+  assert.equal(context.source, "opencode")
+  assert.equal(context.projectAlias, "demo")
+  assert.equal(context.eventType, "message.updated")
+  assert.equal(context.sessionId, "ses_1")
+  assert.equal(context.messageId, "msg_1")
 })
 
 test("startOpenCodeSseLoop accepts one large chunk with many short SSE lines", async (t) => {
