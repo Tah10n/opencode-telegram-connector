@@ -264,6 +264,47 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
     ]
   }
 
+  function buildHealthSnapshot({ managedTasks = [], shutdownState = "running", state = {} } = {}) {
+    const taskList = Array.isArray(managedTasks) ? managedTasks : []
+    const activeTaskNames = new Set(taskList.filter((task) => task?.stopCalled !== true).map((task) => task.name))
+    const telegramLoop = globalState.loops.telegramPoll
+    const backlogDrain = globalState.loops.backlogDrain
+    const stateLoaded = state?.loaded === true
+    const stateFlushOk = !state?.lastFlushError
+    const telegramLoopActive = activeTaskNames.has("telegramLoop")
+    const telegramObserved = telegramLoop.lastSuccessAt > 0 || backlogDrain.lastSuccessAt > 0
+    const running = shutdownState === "running"
+    const checks = {
+      shutdown: { ok: running, state: shutdownState },
+      state: {
+        ok: stateLoaded && stateFlushOk,
+        loaded: stateLoaded,
+        pendingSave: state?.pendingSave === true,
+        lastFlushOk: state?.lastFlushOk === true,
+        ...(state?.lastLoadError ? { lastLoadError: state.lastLoadError } : {}),
+        ...(state?.lastFlushError ? { lastFlushError: state.lastFlushError, lastFlushErrorAt: state.lastFlushErrorAt || 0 } : {}),
+      },
+      telegramPoll: {
+        ok: telegramLoopActive && telegramObserved,
+        active: telegramLoopActive,
+        lastOk: telegramLoop.lastSuccessAt || 0,
+        backlogLastOk: backlogDrain.lastSuccessAt || 0,
+        retries: telegramLoop.retries,
+        lastError: telegramLoop.lastError || "",
+      },
+      lifecycle: {
+        ok: telegramLoopActive,
+        managedTasks: taskList.length,
+        activeTasks: taskList.filter((task) => task?.stopCalled !== true).length,
+      },
+    }
+    return {
+      live: shutdownState !== "stopped",
+      ready: checks.shutdown.ok && checks.state.ok && checks.telegramPoll.ok && checks.lifecycle.ok,
+      checks,
+    }
+  }
+
   return {
     recordLoopRetry,
     recordLoopError,
@@ -283,5 +324,6 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
     recordAttachmentFallback,
     buildStatusLines,
     buildRuntimeStatusLines,
+    buildHealthSnapshot,
   }
 }

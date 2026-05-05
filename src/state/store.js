@@ -111,6 +111,41 @@ export class StateStore {
     this.state = defaultState()
     this._saveTimer = null
     this._writeChain = Promise.resolve()
+    this._health = {
+      loaded: false,
+      lastLoadError: "",
+      lastFlushOk: false,
+      lastFlushAt: 0,
+      lastFlushError: "",
+      lastFlushErrorAt: 0,
+    }
+  }
+
+  healthSnapshot() {
+    return { ...this._health, pendingSave: !!this._saveTimer }
+  }
+
+  _markLoadOk() {
+    this._health.loaded = true
+    this._health.lastLoadError = ""
+  }
+
+  _markLoadError(err) {
+    this._health.loaded = false
+    this._health.lastLoadError = err?.message || String(err)
+  }
+
+  _markFlushOk() {
+    this._health.lastFlushOk = true
+    this._health.lastFlushAt = Date.now()
+    this._health.lastFlushError = ""
+    this._health.lastFlushErrorAt = 0
+  }
+
+  _markFlushError(err) {
+    this._health.lastFlushOk = false
+    this._health.lastFlushError = err?.message || String(err)
+    this._health.lastFlushErrorAt = Date.now()
   }
 
   async load() {
@@ -118,30 +153,42 @@ export class StateStore {
     try {
       loaded = await readJsonFile(this.filePath)
     } catch (err) {
+      this._markLoadError(err)
       this.logger?.error?.("Failed to read state file:", err?.message || String(err))
       throw err
     }
     if (loaded === null) {
-      if (!(await stateFileExists(this.filePath))) return this.state
+      if (!(await stateFileExists(this.filePath))) {
+        this._markLoadOk()
+        return this.state
+      }
       const err = new StateSchemaValidationError(["state must be an object, not null"], { filePath: this.filePath })
+      this._markLoadError(err)
       await this.preserveStateBeforeRecovery(loaded, { reason: "invalid" }).catch((backupErr) => {
         this.logger?.error?.("Failed to preserve invalid state file:", backupErr?.message || String(backupErr))
       })
       throw err
     }
 
-    const state = await loadStateWithMigration({
-      loaded,
-      filePath: this.filePath,
-      logger: this.logger,
-      backupMaxFiles: this.backupMaxFiles,
-      migrateStateIfNeededImpl: (candidate, options = {}) => migrateStateIfNeeded(candidate, { ...migrationOptionsForLoad(this.filePath), ...options }),
-      writeJsonFileAtomicImpl: this._writeJsonFileAtomic,
-      createStateFileBackupImpl: this._createStateFileBackup,
-      schemaVersion: STATE_SCHEMA_VERSION,
-    })
+    let state
+    try {
+      state = await loadStateWithMigration({
+        loaded,
+        filePath: this.filePath,
+        logger: this.logger,
+        backupMaxFiles: this.backupMaxFiles,
+        migrateStateIfNeededImpl: (candidate, options = {}) => migrateStateIfNeeded(candidate, { ...migrationOptionsForLoad(this.filePath), ...options }),
+        writeJsonFileAtomicImpl: this._writeJsonFileAtomic,
+        createStateFileBackupImpl: this._createStateFileBackup,
+        schemaVersion: STATE_SCHEMA_VERSION,
+      })
+    } catch (err) {
+      this._markLoadError(err)
+      throw err
+    }
 
     this.state = state
+    this._markLoadOk()
     return this.state
   }
 
@@ -312,7 +359,9 @@ export class StateStore {
     this._writeChain = write.catch(() => {})
     try {
       await write
+      this._markFlushOk()
     } catch (err) {
+      this._markFlushError(err)
       if (logErrors) this.logger?.error?.("Failed to write state:", err?.message || String(err))
       throw err
     }

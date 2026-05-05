@@ -10,6 +10,7 @@ import { makeBoundaryError } from "../src/boundary-errors.js"
 import { defaultState, StateStore } from "../src/state/store.js"
 import { questionReplyIdempotencyKey } from "../src/connector/idempotency.js"
 import { getRequestContext } from "../src/runtime/request-context.js"
+import { startHealthServer } from "../src/runtime/health-server.js"
 
 function makeLogger() {
   return { info() {}, warn() {}, error() {}, debug() {} }
@@ -321,6 +322,7 @@ async function createHarness({
   extraProjects,
   initialUpdates = [],
   startSseLoopImpl,
+  startHealthServerImpl,
   onFatalErrorImpl,
   ensureOpenCodeRunningImpl,
   stopOpenCodeServeOnPortImpl,
@@ -397,6 +399,7 @@ async function createHarness({
         sseHandlers.set(projectAlias, rest)
         return startSseLoopImpl ? startSseLoopImpl({ projectAlias, ...rest }) : { stop() {} }
       },
+      ...(startHealthServerImpl ? { startHealthServer: startHealthServerImpl } : {}),
       ...(onFatalErrorImpl ? { onFatalError: onFatalErrorImpl } : {}),
       ...(ensureOpenCodeRunningImpl ? { ensureOpenCodeRunning: ensureOpenCodeRunningImpl } : {}),
       ...(stopOpenCodeServeOnPortImpl ? { stopOpenCodeServeOnPort: stopOpenCodeServeOnPortImpl } : {}),
@@ -1532,6 +1535,39 @@ test("startConnector /runtime refuses group chats", async () => {
     await waitFor(() => harness.tg.sentMessages.length >= 1)
 
     assert.match(harness.tg.sentMessages.at(-1)?.text || "", /Use \/runtime only in a private chat/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector serves optional health endpoints", async () => {
+  let healthAddress = null
+  const harness = await createHarness({
+    configPatch: { healthServer: { enabled: true, host: "127.0.0.1", port: 0 } },
+    startHealthServerImpl: async (options) => {
+      const handle = await startHealthServer(options)
+      healthAddress = handle.address
+      return handle
+    },
+  })
+
+  try {
+    assert.ok(healthAddress?.port)
+    const baseUrl = `http://127.0.0.1:${healthAddress.port}`
+
+    const live = await fetch(`${baseUrl}/livez`)
+    assert.equal(live.status, 200)
+    assert.equal((await live.json()).status, "live")
+
+    const ready = await waitFor(async () => {
+      const res = await fetch(`${baseUrl}/readyz`)
+      if (res.status !== 200) return null
+      return res
+    })
+    const payload = await ready.json()
+    assert.equal(payload.status, "ready")
+    assert.equal(payload.checks.state.ok, true)
+    assert.equal(payload.checks.telegramPoll.ok, true)
   } finally {
     await harness.connector.stop()
   }

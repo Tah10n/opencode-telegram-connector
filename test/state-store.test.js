@@ -16,6 +16,47 @@ async function makeTempDir() {
   return dir
 }
 
+test("StateStore exposes load and flush health", async () => {
+  const dir = await makeTempDir()
+  const store = new StateStore({ filePath: path.join(dir, "state.json"), logger: makeLogger() })
+
+  assert.equal(store.healthSnapshot().loaded, false)
+
+  await store.load()
+  assert.equal(store.healthSnapshot().loaded, true)
+  assert.equal(store.healthSnapshot().lastLoadError, "")
+
+  store.setUpdateOffset(123)
+  assert.equal(store.healthSnapshot().pendingSave, true)
+  await store.flush()
+
+  const healthy = store.healthSnapshot()
+  assert.equal(healthy.pendingSave, false)
+  assert.equal(healthy.lastFlushOk, true)
+  assert.equal(healthy.lastFlushError, "")
+  assert.ok(healthy.lastFlushAt > 0)
+})
+
+test("StateStore marks failed flushes unhealthy", async () => {
+  const dir = await makeTempDir()
+  const store = new StateStore({
+    filePath: path.join(dir, "state.json"),
+    logger: makeLogger(),
+    writeJsonFileAtomicImpl: async () => {
+      throw new Error("disk full")
+    },
+  })
+
+  await store.load()
+  await assert.rejects(() => store.flush(), /disk full/)
+
+  const health = store.healthSnapshot()
+  assert.equal(health.loaded, true)
+  assert.equal(health.lastFlushOk, false)
+  assert.match(health.lastFlushError, /disk full/)
+  assert.ok(health.lastFlushErrorAt > 0)
+})
+
 test("StateStore moves an existing session binding to the new context", () => {
   const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-state.json"), logger: makeLogger() })
   store.scheduleSave = () => {}

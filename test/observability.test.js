@@ -39,3 +39,32 @@ test("createRuntimeObservability records compact privacy-safe counters", () => {
     assert.doesNotMatch(text, /chat|session|state\.json|token/i)
   }
 })
+
+test("createRuntimeObservability builds readiness health snapshots", () => {
+  const observability = createRuntimeObservability({ projectAliases: ["demo"] })
+
+  let snapshot = observability.buildHealthSnapshot({
+    managedTasks: [{ name: "telegramLoop", kind: "loop", stopCalled: false }],
+    shutdownState: "running",
+    state: { loaded: true, lastFlushError: "", lastFlushOk: true },
+  })
+  assert.equal(snapshot.ready, false)
+  assert.equal(snapshot.checks.telegramPoll.ok, false)
+
+  observability.recordLoopSuccess("telegramPoll")
+  snapshot = observability.buildHealthSnapshot({
+    managedTasks: [{ name: "telegramLoop", kind: "loop", stopCalled: false }],
+    shutdownState: "running",
+    state: { loaded: true, lastFlushError: "", lastFlushOk: true },
+  })
+  assert.equal(snapshot.live, true)
+  assert.equal(snapshot.ready, true)
+
+  snapshot = observability.buildHealthSnapshot({
+    managedTasks: [{ name: "telegramLoop", kind: "loop", stopCalled: false }],
+    shutdownState: "running",
+    state: { loaded: true, lastFlushError: "disk full", lastFlushOk: false },
+  })
+  assert.equal(snapshot.ready, false)
+  assert.equal(snapshot.checks.state.ok, false)
+})

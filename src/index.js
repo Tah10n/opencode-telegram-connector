@@ -19,6 +19,7 @@ import { extractPatchDiffText, extractPatchFiles, formatChangedFilesText } from 
 import { findSessionByShareUrl, parseSessionReference } from "./session-ref.js"
 import { resolveSessionRoute } from "./session-route.js"
 import { createLifecycleManager } from "./runtime/lifecycle.js"
+import { startHealthServer } from "./runtime/health-server.js"
 import { collectLoggerRedactionOptions, createConnectorLogger } from "./runtime/logger.js"
 import { createRuntimeObservability } from "./runtime/observability.js"
 import { createCorrelationId, getRequestContext, runWithRequestContext, withRequestContextFields } from "./runtime/request-context.js"
@@ -132,6 +133,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const createTelegramClient = deps?.createTelegramClient || ((token, options) => new TelegramClient(token, options))
   const createOpenCodeClient = deps?.createOpenCodeClient || ((options) => new OpenCodeClient(options))
   const startSseLoop = deps?.startSseLoop || startOpenCodeSseLoop
+  const startHealthServerFn = deps?.startHealthServer || startHealthServer
   const ensureStartupSessionFn = deps?.ensureStartupSession || ensureStartupSession
   const ensureOpenCodeRunningFn = deps?.ensureOpenCodeRunning || ensureOpenCodeRunning
   const stopOpenCodeServeOnPortFn = deps?.stopOpenCodeServeOnPort || stopOpenCodeServeOnPort
@@ -254,6 +256,32 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   }
   const lifecycle = createLifecycleManager()
   const abortController = new AbortController()
+
+  function runtimeHealthSnapshot() {
+    return runtimeObservability.buildHealthSnapshot({
+      managedTasks: lifecycle.snapshot(),
+      shutdownState: abortController.signal.aborted ? "stopping" : "running",
+      state: typeof store.healthSnapshot === "function" ? store.healthSnapshot() : { loaded: true },
+    })
+  }
+
+  if (config?.healthServer?.enabled === true) {
+    const healthHandle = await startHealthServerFn({
+      host: config.healthServer.host || "127.0.0.1",
+      port: Number.isInteger(config.healthServer.port) ? config.healthServer.port : 8787,
+      logger,
+      getSnapshot: runtimeHealthSnapshot,
+    })
+    lifecycle.registerHandle("healthServer", healthHandle, {
+      kind: "server",
+      metadata: {
+        source: "health",
+        operation: "listen",
+        host: config.healthServer.host || "127.0.0.1",
+        port: typeof healthHandle?.address === "object" && healthHandle.address ? healthHandle.address.port : config.healthServer.port,
+      },
+    })
+  }
 
   // Auto-start opencode servers (best-effort) and pick a startup session per project.
   // Important: do not block connector startup on auto-start (Telegram should stay responsive).

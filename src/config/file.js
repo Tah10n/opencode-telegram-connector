@@ -44,6 +44,15 @@ function normalizeOpenCodeWatchdog(value) {
   return out
 }
 
+function normalizeHealthServer(value) {
+  if (!isPlainObject(value)) throw new Error("Config field 'healthServer' must be an object")
+  const out = {}
+  if (value.enabled != null && value.enabled !== "") out.enabled = parseConfigBool("healthServer.enabled", value.enabled)
+  if (value.host != null && value.host !== "") out.host = String(value.host)
+  if (value.port != null && value.port !== "") out.port = parseConfigInteger("healthServer.port", value.port, { min: 0 })
+  return out
+}
+
 function normalizeEchoFilterMode(value, { fieldName = "echoFilterMode" } = {}) {
   const mode = String(value ?? "").trim()
   if (!mode) return undefined
@@ -92,6 +101,7 @@ export function normalizeConnectorConfig(raw, { configFilePath } = {}) {
     out.activeTurnStaleMs = parseConfigInteger("activeTurnStaleMs", raw.activeTurnStaleMs)
   }
   if (raw.opencodeWatchdog != null) out.opencodeWatchdog = normalizeOpenCodeWatchdog(raw.opencodeWatchdog)
+  if (raw.healthServer != null) out.healthServer = normalizeHealthServer(raw.healthServer)
   if (raw.limits != null) {
     if (!isPlainObject(raw.limits)) throw new Error("Config field 'limits' must be an object")
     out.limits = { ...raw.limits }
