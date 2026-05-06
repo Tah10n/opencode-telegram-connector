@@ -129,6 +129,7 @@ function extractTextParts(message) {
 
 export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   if (!config?.telegram?.botToken) throw new Error("config.telegram.botToken is required")
+  // startConnector is public API too; normalize again for callers that bypass buildRuntimeConfig.
   config = { ...config, i18n: normalizeI18nConfig(config?.i18n || {}) }
   const logger = loggerIn || createConnectorLogger({ format: config?.logFormat, ...collectLoggerRedactionOptions(config) })
   const createStateStore = deps?.createStateStore || ((options) => new StateStore(options))

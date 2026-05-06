@@ -2,9 +2,15 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { botCommandsForLocale, CATALOGS, localeDisplayName, matchSupportedLocale, normalizeI18nConfig, normalizeLocale, t } from "../src/i18n/index.js"
 
-function flattenKeys(value, prefix = "") {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return [prefix]
-  return Object.entries(value).flatMap(([key, child]) => flattenKeys(child, prefix ? `${prefix}.${key}` : key))
+function flattenShape(value, prefix = "") {
+  if (Array.isArray(value)) {
+    return [
+      `${prefix}:array:${value.length}`,
+      ...value.flatMap((child, index) => flattenShape(child, `${prefix}[${index}]`)),
+    ]
+  }
+  if (!value || typeof value !== "object") return [`${prefix}:${typeof value}`]
+  return Object.entries(value).flatMap(([key, child]) => flattenShape(child, prefix ? `${prefix}.${key}` : key))
 }
 
 test("i18n normalizes Telegram locale codes and falls back to default", () => {
@@ -40,8 +46,8 @@ test("i18n builds localized Telegram command menus", () => {
   assert.equal(en.length, ru.length)
 })
 
-test("i18n locale catalogs expose the same keys", () => {
-  const enKeys = flattenKeys(CATALOGS.en).sort()
-  const ruKeys = flattenKeys(CATALOGS.ru).sort()
-  assert.deepEqual(ruKeys, enKeys)
+test("i18n locale catalogs expose the same shape", () => {
+  const enShape = flattenShape(CATALOGS.en).sort()
+  const ruShape = flattenShape(CATALOGS.ru).sort()
+  assert.deepEqual(ruShape, enShape)
 })

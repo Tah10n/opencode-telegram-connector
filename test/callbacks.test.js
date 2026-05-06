@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { createCallbackHandlers, localizeCallbackToast } from "../src/connector/callbacks.js"
+import { callbackToast, createCallbackHandlers, localizeCallbackToast } from "../src/connector/callbacks.js"
 import { makeBoundaryError } from "../src/boundary-errors.js"
 import { redactCmdlineSecrets } from "../src/url-utils.js"
 import { encodeCallback } from "../src/connector/callback-data.js"
@@ -23,6 +23,7 @@ test("localizeCallbackToast covers attachment and dynamic callback statuses", ()
   ]) {
     assert.notEqual(localizeCallbackToast(text, "ru"), text)
   }
+  assert.equal(localizeCallbackToast(callbackToast("modelValue", { value: "openai/gpt-5" }), "ru"), "Модель: openai/gpt-5")
   assert.equal(localizeCallbackToast("Model: openai/gpt-5", "ru"), "Модель: openai/gpt-5")
   assert.equal(localizeCallbackToast("Feed: Verbose", "ru"), "Feed: Verbose")
 })

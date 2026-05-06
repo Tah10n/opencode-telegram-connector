@@ -20,8 +20,12 @@ function sourceKey(record) {
   return "language.sourceDefault"
 }
 
+function supportedLocales(config) {
+  return config?.i18n?.supportedLocales?.length ? config.i18n.supportedLocales : ["en"]
+}
+
 export function supportedLocaleSummary({ config, displayLocale } = {}) {
-  const locales = config?.i18n?.supportedLocales || ["en"]
+  const locales = supportedLocales(config)
   return locales.map((locale) => `${locale} (${localeDisplayName(locale, displayLocale || locale)})`).join(", ")
 }
 
@@ -37,7 +41,7 @@ export function languageSettingsView(ctxMeta, { store, config, packCallback, t =
     t(locale, "language.choose"),
   ].join("\n")
 
-  const rows = (config?.i18n?.supportedLocales || ["en"]).map((candidate) => [
+  const rows = supportedLocales(config).map((candidate) => [
     {
       text: `${candidate === locale ? "✓ " : ""}${localeDisplayName(candidate, candidate)}`,
       callback_data: packCallback("lang", "set", candidate),

@@ -14,77 +14,9 @@ import { callbackPacker, decodeCallbackData } from "./callback-data.js"
 import { localeDisplayName, matchSupportedLocale, t as translate } from "../i18n/index.js"
 import { languageSettingsView, supportedLocaleSummary } from "./language-ui.js"
 import { getRequestContext } from "../runtime/request-context.js"
+import { CALLBACK_TOAST_KEYS, callbackToast, localizeCallbackToast } from "./callback-toast.js"
 
-export const CALLBACK_TOAST_KEYS = Object.freeze({
-  Closed: "closed",
-  Invalid: "invalid",
-  "Private chat only": "privateChatOnly",
-  Cancelled: "cancelled",
-  "Confirm restart": "confirmRestart",
-  "Confirm stop": "confirmStop",
-  Unavailable: "unavailable",
-  "Restarting…": "restarting",
-  "Stopping…": "stopping",
-  "Not bound": "notBound",
-  Sessions: "sessions",
-  "Creating…": "creating",
-  "Binding changed": "bindingChanged",
-  "Already current": "alreadyCurrent",
-  Switched: "switched",
-  Projects: "projects",
-  "Unknown project": "unknownProject",
-  "Starting…": "starting",
-  "Binding…": "binding",
-  "Checking…": "checking",
-  Repaired: "repaired",
-  "Already clean": "alreadyClean",
-  Kept: "kept",
-  Confirm: "confirm",
-  Unbound: "unbound",
-  Rebound: "rebound",
-  Created: "created",
-  "Action failed": "actionFailed",
-  Feed: "feed",
-  Model: "model",
-  Back: "back",
-  "Pick model": "pickModel",
-  "Model: inherit": "modelInherit",
-  "Model: project default": "modelProjectDefault",
-  "Pick variant": "pickVariant",
-  "Sending…": "sending",
-  "Already handled": "alreadyHandled",
-  "No longer active": "noLongerActive",
-  "Temporarily unavailable": "temporarilyUnavailable",
-  OK: "ok",
-  "Send note": "sendNote",
-  Selected: "selected",
-  Done: "done",
-  Unsupported: "unsupported",
-  "Wrong thread": "wrongThread",
-  Expired: "expired",
-  "Agent busy": "agentBusy",
-  "Already sending": "alreadySending",
-  "Already sent": "alreadySent",
-  "Too large": "tooLarge",
-  "Try again": "tryAgain",
-  "Download failed": "downloadFailed",
-  Sent: "sent",
-  "No project default": "noProjectDefault",
-  Rejected: "rejected",
-  "Not found": "notFound",
-  "Out of date": "outOfDate",
-  "Custom disabled": "customDisabled",
-  "Send answer": "sendAnswer",
-})
-
-export function localizeCallbackToast(text, locale) {
-  if (typeof text !== "string") return text
-  const key = CALLBACK_TOAST_KEYS[text]
-  if (key) return translate(locale, `callbacks.${key}`)
-  if (text.startsWith("Model: ")) return translate(locale, "callbacks.modelValue", { value: text.slice("Model: ".length) })
-  if (text.startsWith("Feed: ")) return translate(locale, "callbacks.feedValue", { value: text.slice("Feed: ".length) })
-  return text
-}
+export { CALLBACK_TOAST_KEYS, callbackToast, localizeCallbackToast }
 
 async function defaultBuildSessionSwitchText(_projectAlias, sessionId) {
   return `Switched to session: ${sessionId}`
@@ -148,7 +80,7 @@ export function createCallbackHandlers(runtime) {
 
   async function answerCallbackQuery(callbackQueryId, text) {
     const locale = getRequestContext()?.locale || config?.i18n?.defaultLocale || "en"
-    await tg.answerCallbackQuery(callbackQueryId, typeof text === "string" ? localizeCallbackToast(text, locale) : text).catch(ignoreError)
+    await tg.answerCallbackQuery(callbackQueryId, localizeCallbackToast(text, locale)).catch(ignoreError)
   }
 
   async function deleteInteractiveMessage(ctxMeta, messageId) {
@@ -815,7 +747,7 @@ export function createCallbackHandlers(runtime) {
         }
         const mode = normalizeFeedMode(rawMode)
         await commitStateMutation(() => store.setFeedMode(ctxMeta.ctxKey, mode))
-        await answerCallbackQuery(callbackQuery.id, `Feed: ${feedModeLabel(mode)}`)
+        await answerCallbackQuery(callbackQuery.id, callbackToast("feedValue", { value: feedModeLabel(mode, ctxMeta.locale) }))
         await renderFeedSettings(ctxMeta, { editMessageId: msg?.message_id, noticeText: t(ctxMeta, "callbacks.feedChanged", { mode: feedModeLabel(mode, ctxMeta.locale) }) }).catch(ignoreError)
         return
       }
@@ -861,15 +793,15 @@ export function createCallbackHandlers(runtime) {
           let setResult = null
           if (nextMode === "inherit") {
             setResult = await commitStateMutation(() => setThreadModelPreference(ctxMeta, binding, null), { shouldCommit: (result) => result?.ok !== false })
-            await answerCallbackQuery(callbackQuery.id, setResult?.callbackText || "Model: inherit")
+            await answerCallbackQuery(callbackQuery.id, setResult?.callbackToast || setResult?.callbackText || callbackToast("modelInherit"))
           } else if (nextMode === "project-default") {
             setResult = await commitStateMutation(() => setThreadModelPreference(ctxMeta, binding, { mode: "project-default" }), { shouldCommit: (result) => result?.ok !== false })
             if (!setResult?.ok) {
-              await answerCallbackQuery(callbackQuery.id, setResult?.callbackText || "Unavailable")
+              await answerCallbackQuery(callbackQuery.id, setResult?.callbackToast || setResult?.callbackText || "Unavailable")
               await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(ignoreError)
               return
             }
-            await answerCallbackQuery(callbackQuery.id, setResult.callbackText || "Model: project default")
+            await answerCallbackQuery(callbackQuery.id, setResult.callbackToast || setResult.callbackText || callbackToast("modelProjectDefault"))
           } else {
             await answerCallbackQuery(callbackQuery.id, "Invalid")
             return
@@ -916,7 +848,7 @@ export function createCallbackHandlers(runtime) {
           }
           const variant = variantToken === "~" ? "" : variantToken
           const result = await commitStateMutation(() => setThreadModelPreference(ctxMeta, binding, { mode: "custom", model: modelKey, variant }), { shouldCommit: (mutationResult) => mutationResult?.ok !== false })
-          await answerCallbackQuery(callbackQuery.id, result?.callbackText || (variant ? `Model: ${modelKey} ${variant}` : `Model: ${modelKey}`))
+          await answerCallbackQuery(callbackQuery.id, result?.callbackToast || result?.callbackText || callbackToast("modelValue", { value: variant ? `${modelKey} ${variant}` : modelKey }))
           await renderModelSettings(ctxMeta, {
             binding,
             editMessageId: msg?.message_id,

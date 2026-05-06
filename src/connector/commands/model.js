@@ -9,6 +9,7 @@ import {
   pickMostRecentSessionModelInfo,
 } from "../../model-selection.js"
 import { t as translate } from "../../i18n/index.js"
+import { callbackToast } from "../callback-toast.js"
 import { callbackPacker } from "./shared.js"
 
 export function createModelCommandHandlers(deps) {
@@ -128,6 +129,7 @@ export function createModelCommandHandlers(deps) {
         return {
           ok: false,
           callbackText: "No project default",
+          callbackToast: callbackToast("noProjectDefault"),
           message: t(ctxMeta, "modelCommands.noProjectDefaultMessage"),
         }
       }
@@ -135,16 +137,19 @@ export function createModelCommandHandlers(deps) {
       return {
         ok: true,
         callbackText: "Model: project default",
+        callbackToast: callbackToast("modelProjectDefault"),
         noticeText: t(ctxMeta, "modelCommands.noticeProjectDefault"),
       }
     }
 
     if (preference.mode === "custom") {
+      const modelLabel = formatModelLabel(preference.model, preference.variant)
       setModelPreference(ctxMeta.ctxKey, preference)
       return {
         ok: true,
-        callbackText: preference.variant ? `Model: ${formatModelLabel(preference.model, preference.variant)}` : `Model: ${formatModelLabel(preference.model)}`,
-        noticeText: t(ctxMeta, "modelCommands.noticeCustom", { model: formatModelLabel(preference.model, preference.variant) }),
+        callbackText: `Model: ${modelLabel}`,
+        callbackToast: callbackToast("modelValue", { value: modelLabel }),
+        noticeText: t(ctxMeta, "modelCommands.noticeCustom", { model: modelLabel }),
       }
     }
 
@@ -152,6 +157,7 @@ export function createModelCommandHandlers(deps) {
     return {
       ok: true,
       callbackText: "Model: inherit",
+      callbackToast: callbackToast("modelInherit"),
       noticeText: t(ctxMeta, "modelCommands.noticeInherit"),
     }
   }
