@@ -1,4 +1,5 @@
 import { isSafeOpenCodeId } from "./opencode/ids.js"
+import { t as translate } from "./i18n/index.js"
 
 function clampString(value, max) {
   const str = String(value ?? "").trim()
@@ -53,33 +54,37 @@ export function formatSessionButtonLabel(session, { currentSessionId, startupSes
 export function formatSessionsListText(
   projectAlias,
   sessions,
-  { currentSessionId, currentSessionModelLabel, currentSessionModelSourceLabel, startupSessionId, limit = 10 } = {},
+  { currentSessionId, currentSessionModelLabel, currentSessionModelSourceLabel, startupSessionId, limit = 10, locale = "en", viewOnly = false } = {},
 ) {
   const safeProjectAlias = String(projectAlias || "").trim() || "(unknown)"
   const normalized = normalizeSessionsList(sessions)
 
-  const lines = [`Sessions for '${safeProjectAlias}':`]
-  if (currentSessionId) lines.push(`Current: ${currentSessionId}`)
+  const lines = [translate(locale, "sessions.title", { project: safeProjectAlias })]
+  if (currentSessionId) lines.push(translate(locale, "sessions.current", { session: currentSessionId }))
   if (currentSessionModelLabel) {
     lines.push(
-      currentSessionModelSourceLabel ? `Current model: ${currentSessionModelLabel} (${currentSessionModelSourceLabel})` : `Current model: ${currentSessionModelLabel}`,
+      currentSessionModelSourceLabel
+        ? translate(locale, "sessions.currentModelWithSource", { model: currentSessionModelLabel, source: currentSessionModelSourceLabel })
+        : translate(locale, "sessions.currentModel", { model: currentSessionModelLabel }),
     )
   }
-  if (startupSessionId && startupSessionId !== currentSessionId) lines.push(`Startup: ${startupSessionId}`)
+  if (startupSessionId && startupSessionId !== currentSessionId) lines.push(translate(locale, "sessions.startup", { session: startupSessionId }))
   lines.push("")
 
   if (normalized.length === 0) {
-    lines.push("No sessions found.")
-    lines.push("Use /new to create one or /use <sessionId|shareLink> to switch.")
+    lines.push(translate(locale, "sessions.noneFound"))
+    lines.push(viewOnly ? translate(locale, "sessions.bindBeforeCreateSwitch") : translate(locale, "sessions.createOrUse"))
     return lines.join("\n")
   }
 
   const visibleSessions = normalized.slice(0, limit)
   const hasSwitchableSessions = visibleSessions.some((session) => isSafeOpenCodeId(session.id))
   const hasUnsupportedSessions = visibleSessions.some((session) => !isSafeOpenCodeId(session.id))
-  lines.push(hasSwitchableSessions ? "Tap a button below to switch:" : "Recent sessions (unsupported IDs cannot be selected with buttons):")
-  lines.push("")
-  lines.push("Recent sessions:")
+  if (!viewOnly || !hasSwitchableSessions) {
+    lines.push(hasSwitchableSessions ? translate(locale, "sessions.tapToSwitch") : translate(locale, "sessions.recentUnsupported"))
+    lines.push("")
+  }
+  lines.push(translate(locale, "sessions.recent"))
   for (const session of visibleSessions) {
     const markers = sessionMarkers(session.id, { currentSessionId, startupSessionId })
     const suffix = []
@@ -90,10 +95,10 @@ export function formatSessionsListText(
   }
 
   if (normalized.length > limit) {
-    lines.push(`…and ${normalized.length - limit} more.`)
+    lines.push(translate(locale, "sessions.more", { count: normalized.length - limit }))
   }
   lines.push("")
-  if (hasUnsupportedSessions) lines.push("Sessions marked [unsupported id] cannot be selected with buttons; use a session id without whitespace, colon, pipe, or URL path/query separators.")
-  lines.push("Use /use <sessionId|shareLink> to switch.")
+  if (hasUnsupportedSessions) lines.push(translate(locale, "sessions.unsupportedHelp"))
+  lines.push(viewOnly ? translate(locale, "sessions.bindBeforeSwitch") : translate(locale, "sessions.useToSwitch"))
   return lines.join("\n")
 }

@@ -214,6 +214,63 @@ test("createOverviewHelpers sends unavailable and recovered notices only to thre
   assert.ok(!sent.some((entry) => entry.ctx.ctxKey === "200:0"))
 })
 
+test("createOverviewHelpers ignores Telegram-detected locale when unavailable notices run with auto-detect disabled", async () => {
+  const sent = []
+  const helpers = createOverviewHelpers({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312" } },
+    config: { i18n: { defaultLocale: "en", supportedLocales: ["en", "ru"], autoDetectTelegramLanguage: false } },
+    store: {
+      get: () => ({ bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_demo" } } }),
+      getLocaleRecord(ctxKey) {
+        assert.equal(ctxKey, "100:7")
+        return { locale: "ru", source: "telegram" }
+      },
+    },
+    startInProgress: new Map(),
+    parseCtxKey: (ctxKey) => ({ chatId: 100, threadIdOr0: 7, ctxKey }),
+    sendToThread: async (ctx, text, replyMarkup) => {
+      sent.push({ ctx, text, replyMarkup })
+    },
+    cb: { pack: (value) => value },
+  })
+
+  await helpers.notifyProjectUnavailable("demo", new Error("fetch failed"), { platform: "win32" })
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Project 'demo' is unavailable/)
+  assert.doesNotMatch(sent[0].text, /Проект 'demo' недоступен/)
+})
+
+test("createOverviewHelpers falls back when stored notice locale is no longer supported", async () => {
+  const sent = []
+  const helpers = createOverviewHelpers({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312" } },
+    config: { i18n: { defaultLocale: "en", supportedLocales: ["en"], autoDetectTelegramLanguage: true } },
+    store: {
+      get: () => ({ bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_demo" } } }),
+      getLocaleRecord(ctxKey) {
+        assert.equal(ctxKey, "100:7")
+        return { locale: "ru", source: "manual" }
+      },
+    },
+    startInProgress: new Map(),
+    parseCtxKey: (ctxKey) => ({ chatId: 100, threadIdOr0: 7, ctxKey }),
+    sendToThread: async (ctx, text, replyMarkup) => {
+      sent.push({ ctx, text, replyMarkup })
+    },
+    cb: { pack: (value) => value },
+  })
+
+  await helpers.notifyProjectUnavailable("demo", new Error("fetch failed"), { platform: "win32" })
+  helpers.markProjectUp("demo")
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.equal(sent.length, 2)
+  assert.match(sent[0].text, /Project 'demo' is unavailable/)
+  assert.match(sent[1].text, /Project 'demo' is back online/)
+  assert.doesNotMatch(sent.map((entry) => entry.text).join("\n"), /Проект 'demo'/)
+})
+
 test("createOverviewHelpers redacts sensitive error details in unavailable notices", async () => {
   const helpers = createOverviewHelpers({
     projects: { demo: { baseUrl: "http://user:secret@example.test:4312/path?token=abc#frag" } },

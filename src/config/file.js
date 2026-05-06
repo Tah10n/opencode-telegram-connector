@@ -2,6 +2,7 @@ import fs from "node:fs/promises"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { normalizeProjectsConfig } from "./projects.js"
+import { normalizeI18nConfig } from "../i18n/index.js"
 
 function isPlainObject(v) {
   return !!v && typeof v === "object" && !Array.isArray(v)
@@ -102,6 +103,7 @@ export function normalizeConnectorConfig(raw, { configFilePath } = {}) {
   }
   if (raw.opencodeWatchdog != null) out.opencodeWatchdog = normalizeOpenCodeWatchdog(raw.opencodeWatchdog)
   if (raw.healthServer != null) out.healthServer = normalizeHealthServer(raw.healthServer)
+  if (raw.i18n != null) out.i18n = normalizeI18nConfig(raw.i18n)
   if (raw.limits != null) {
     if (!isPlainObject(raw.limits)) throw new Error("Config field 'limits' must be an object")
     out.limits = { ...raw.limits }

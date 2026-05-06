@@ -11,32 +11,36 @@ import { formatModelUiChoices, resolveModelProviderCatalog } from "./model-ui.js
 import { unsupportedMediaKind, unsupportedMediaText } from "./incoming-attachments.js"
 import { formatStaleActiveTurnNotice, resolveActiveTurnStaleMs, resolveActiveTurnStatus } from "./active-turns.js"
 import { callbackPacker } from "./commands/shared.js"
+import { localeDisplayName, matchSupportedLocale, t as translate } from "../i18n/index.js"
+import { languageSettingsView, supportedLocaleSummary } from "./language-ui.js"
 
-function helpText({ scopeLabel = "this thread", defaultProject = "", isBound = false } = {}) {
+function helpText({ scopeLabel = "this thread", defaultProject = "", isBound = false, locale = "en", t = translate } = {}) {
+  const bindCommand = defaultProject ? `/bind ${defaultProject}` : "/bind <projectAlias>"
   const next = isBound
-    ? "Next: use the buttons below for Sessions, New, Feed, Model, or Unbind."
-    : `Next: tap Projects, or send ${defaultProject ? `/bind ${defaultProject}` : "/bind <projectAlias>"}.`
+    ? t(locale, "commands.help.nextBound")
+    : t(locale, "commands.help.nextUnbound", { bindCommand })
   return [
-    "Telegram connector help:",
-    `Scope: ${scopeLabel}`,
+    t(locale, "commands.help.title"),
+    t(locale, "commands.help.scope", { scope: scopeLabel }),
     next,
-    defaultProject && !isBound ? `Default project hint: ${defaultProject}` : "",
+    defaultProject && !isBound ? t(locale, "commands.help.defaultProjectHint", { project: defaultProject }) : "",
     "",
-    "Thread commands:",
-    "/bind <projectAlias> — bind this chat/thread",
-    "/new [title] — create a session for this thread",
-    "/use <sessionId|shareLink> — switch this thread",
-    "/sessions — recent sessions for this thread's project",
-    "/model — model override for this thread",
-    "/feed — Telegram feed mode for this thread",
-    "/status — current binding for this thread",
-    "/unbind — remove this thread's binding after confirmation",
+    t(locale, "commands.help.threadCommands"),
+    t(locale, "commands.help.bind"),
+    t(locale, "commands.help.new"),
+    t(locale, "commands.help.use"),
+    t(locale, "commands.help.sessions"),
+    t(locale, "commands.help.model"),
+    t(locale, "commands.help.feed"),
+    t(locale, "commands.help.language"),
+    t(locale, "commands.help.status"),
+    t(locale, "commands.help.unbind"),
     "",
-    "Operator commands:",
-    "/projects — project overview",
-    "/runtime or /health — private chat only",
-    "/bindings — private chat only",
-    "/abort, /sendlast, /cancel",
+    t(locale, "commands.help.operatorCommands"),
+    t(locale, "commands.help.projects"),
+    t(locale, "commands.help.runtime"),
+    t(locale, "commands.help.bindings"),
+    t(locale, "commands.help.controls"),
   ].filter((line) => line !== "").join("\n")
 }
 
@@ -94,6 +98,9 @@ export function createCommandHandlers(runtime) {
     buildGlobalRuntimeStatusLines,
     clearAgentActivity,
     getAgentActivityStatus,
+    rememberTelegramLocale,
+    ctxMetaWithLocale,
+    t = (ctxOrLocale, key, params) => translate(typeof ctxOrLocale === "string" ? ctxOrLocale : ctxOrLocale?.locale, key, params),
   } = runtime
 
   const userAttachmentLimits = userAttachmentLimitsFromConfig(config?.limits)
@@ -171,6 +178,7 @@ export function createCommandHandlers(runtime) {
     ensureRecentPromptSet,
     hashTextForEcho,
     staleActiveTurnGuard: maybeBlockStaleActiveTurn,
+    t,
   })
 
   async function resolveStartupSession(alias, { forceRefresh = false } = {}) {
@@ -196,44 +204,49 @@ export function createCommandHandlers(runtime) {
     return alias && projects?.[alias] ? alias : ""
   }
 
-  function unboundGuidanceText(ctxMeta, reason = "This thread is not bound yet.") {
+  function unboundGuidanceText(ctxMeta, reason = t(ctxMeta, "commands.unbound.defaultReason")) {
     const def = configuredDefaultProject()
     return [
       reason,
-      `Scope: ${threadScopeLabel(ctxMeta)}`,
-      `Next: tap Projects${def ? `, tap Bind ${def}, or send /bind ${def}` : ", then bind a project with /bind <projectAlias>"}.`,
-      def ? `Default project hint: ${def}` : "Use /projects to see available aliases.",
+      t(ctxMeta, "commands.unbound.scope", { scope: threadScopeLabel(ctxMeta) }),
+      def ? t(ctxMeta, "commands.unbound.nextWithDefault", { project: def }) : t(ctxMeta, "commands.unbound.nextWithoutDefault"),
+      def ? t(ctxMeta, "commands.unbound.defaultProjectHint", { project: def }) : t(ctxMeta, "commands.unbound.useProjects"),
     ].join("\n")
   }
 
-  function unboundGuidanceKeyboard() {
+  function unboundGuidanceKeyboard(ctxMeta = null) {
     const rows = []
     const def = configuredDefaultProject()
-    if (def) rows.push([{ text: `Bind ${def}`, callback_data: packCallback("srv", def, "bind") }])
-    rows.push([{ text: "Projects", callback_data: packCallback("srv", "projects") }])
-    rows.push([{ text: "Close", callback_data: packCallback("srv", "close") }])
+    const locale = ctxMeta?.locale || config.i18n?.defaultLocale || "en"
+    if (def) rows.push([{ text: `${translate(locale, "common.bind")} ${def}`, callback_data: packCallback("srv", def, "bind") }])
+    rows.push([{ text: translate(locale, "common.projects"), callback_data: packCallback("srv", "projects") }])
+    rows.push([{ text: translate(locale, "common.close"), callback_data: packCallback("srv", "close") }])
     return makeInlineKeyboard(rows)
   }
 
   function boundThreadActionsKeyboard(ctxMeta) {
     return makeInlineKeyboard([
       [
-        { text: "Sessions", callback_data: packCallback("s", "refresh") },
-        { text: "New", callback_data: packCallback("s", "new") },
+        { text: t(ctxMeta, "common.sessions"), callback_data: packCallback("s", "refresh") },
+        { text: t(ctxMeta, "common.newSession"), callback_data: packCallback("s", "new") },
       ],
       [
-        { text: "Feed", callback_data: packCallback("feed", "settings") },
-        { text: "Model", callback_data: packCallback("m", "settings") },
+        { text: t(ctxMeta, "common.feed"), callback_data: packCallback("feed", "settings") },
+        { text: t(ctxMeta, "common.model"), callback_data: packCallback("m", "settings") },
       ],
       [
-        { text: "Unbind", callback_data: packCallback("b", "confirm-unbind", ctxMeta.ctxKey) },
-        { text: "Close", callback_data: packCallback("s", "close") },
+        { text: t(ctxMeta, "common.unbind"), callback_data: packCallback("b", "confirm-unbind", ctxMeta.ctxKey) },
+        { text: t(ctxMeta, "common.close"), callback_data: packCallback("s", "close") },
       ],
     ])
   }
 
-  function closeOnlyKeyboard() {
-    return makeInlineKeyboard([[{ text: "Close", callback_data: packCallback("s", "close") }]])
+  function localeForCtx(ctxMeta = null) {
+    return ctxMeta?.locale || config.i18n?.defaultLocale || "en"
+  }
+
+  function closeOnlyKeyboard(ctxMeta = null) {
+    return makeInlineKeyboard([[{ text: translate(localeForCtx(ctxMeta), "common.close"), callback_data: packCallback("s", "close") }]])
   }
 
   async function maybeBlockStaleActiveTurn(ctxMeta, binding) {
@@ -254,7 +267,7 @@ export function createCommandHandlers(runtime) {
       return false
     }
     if (status?.state !== "stale") return false
-    await sendToThread(ctxMeta, formatStaleActiveTurnNotice(status, binding), closeOnlyKeyboard())
+    await sendToThread(ctxMeta, formatStaleActiveTurnNotice(status, binding), closeOnlyKeyboard(ctxMeta))
     return true
   }
 
@@ -327,13 +340,16 @@ export function createCommandHandlers(runtime) {
     return deleted
   }
 
-  function moveConflictNote(result) {
+  function moveConflictNote(result, locale = "en") {
     if (!result?.movedFromRoute) return ""
-    return `Note: this session was already bound to chat ${result.movedFromRoute.chatId} / ${formatThreadLabel(result.movedFromRoute.threadIdOr0)} and was moved to this thread.`
+    return t(locale, "sessions.moveConflictNote", {
+      chat: result.movedFromRoute.chatId,
+      thread: formatThreadLabel(result.movedFromRoute.threadIdOr0),
+    })
   }
 
-  function appendMoveConflict(lines, result) {
-    const note = moveConflictNote(result)
+  function appendMoveConflict(lines, result, locale = "en") {
+    const note = moveConflictNote(result, locale)
     if (note) lines.push(note)
     return lines
   }
@@ -372,6 +388,7 @@ export function createCommandHandlers(runtime) {
     openAttachWindowFn,
     openAttachWindowWindowsFn,
     markProjectUp: runtime.markProjectUp,
+    t,
   })
 
   const {
@@ -419,15 +436,49 @@ export function createCommandHandlers(runtime) {
     parseCtxKey,
     markProjectUp: runtime.markProjectUp,
     threadScopeLabel,
+    t,
   })
 
   async function handleFeed(ctxMeta, { editMessageId } = {}) {
     await renderFeedSettings(ctxMeta, { editMessageId })
   }
 
+  async function handleLanguage(ctxMeta, argv = []) {
+    const arg = String(argv?.[0] || "").trim()
+    if (arg) {
+      if (arg.toLowerCase() === "reset") {
+        store.clearLocale?.(ctxMeta.ctxKey)
+        ctxMeta = ctxMetaWithLocale?.({ ...ctxMeta, locale: "" }) || { ...ctxMeta, locale: "" }
+        const view = languageSettingsView(ctxMeta, { store, config, packCallback, t })
+        await sendToThread(ctxMeta, `${t(ctxMeta, "language.reset")}\n\n${view.text}`, view.replyMarkup)
+        return
+      }
+
+      const locale = matchSupportedLocale(arg, config.i18n?.supportedLocales)
+      if (!locale) {
+        await sendToThread(
+          ctxMeta,
+          t(ctxMeta, "language.unsupported", { locale: arg, supported: supportedLocaleSummary({ config, displayLocale: ctxMeta.locale }) }),
+          closeOnlyKeyboard(ctxMeta),
+        )
+        return
+      }
+
+      store.setLocale?.(ctxMeta.ctxKey, locale, { source: "manual" })
+      ctxMeta = ctxMetaWithLocale?.(ctxMeta) || { ...ctxMeta, locale }
+      const view = languageSettingsView(ctxMeta, { store, config, packCallback, t })
+      await sendToThread(ctxMeta, `${t(ctxMeta, "language.changed", { language: localeDisplayName(locale, locale) })}\n\n${view.text}`, view.replyMarkup)
+      return
+    }
+
+    const view = languageSettingsView(ctxMeta, { store, config, packCallback, t })
+    await sendToThread(ctxMeta, view.text, view.replyMarkup)
+  }
+
   async function handleTelegramMessage(msg, options = {}) {
     if (!runtime.isAllowedUser(msg?.from)) return
-    const ctxMeta = runtime.ctxMetaFromMessage(msg)
+    let ctxMeta = runtime.ctxMetaFromMessage(msg, msg?.from)
+    ctxMeta = rememberTelegramLocale?.(ctxMeta) || ctxMeta
     if (!ctxMeta.chatId) return
 
     const text = typeof msg?.text === "string" ? msg.text : ""
@@ -481,24 +532,24 @@ export function createCommandHandlers(runtime) {
     if (awaitingQ) {
       const bindingStatus = await promptContinuationBindingStatus(ctxMeta.ctxKey, awaitingQ.projectAlias, awaitingQ.sessionID)
       if (bindingStatus === "retryable") {
-        await sendToThread(ctxMeta, "Question answer is temporarily unavailable. Send the answer again or /cancel.").catch(() => {})
+        await sendToThread(ctxMeta, t(ctxMeta, "commands.questionRetry")).catch(() => {})
         return
       }
       if (bindingStatus !== "current") {
         setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
-        await sendToThread(ctxMeta, "Question is no longer active.").catch(() => {})
+        await sendToThread(ctxMeta, t(ctxMeta, "prompts.questionInactive")).catch(() => {})
         await markMessageHandled("customAnswerStale", { projectAlias: awaitingQ.projectAlias })
         return
       }
       if (!hasText) {
-        await sendToThread(ctxMeta, "This question expects a text answer. Send text or /cancel.", closeOnlyKeyboard())
+        await sendToThread(ctxMeta, t(ctxMeta, "commands.questionTextExpected"), closeOnlyKeyboard(ctxMeta))
         await markMessageHandled("questionNonText", { projectAlias: awaitingQ.projectAlias })
         return
       }
       const wizard = getWizard(awaitingQ.projectAlias, awaitingQ.requestId, awaitingQ.sessionID)
       if (!wizard || wizard.index !== awaitingQ.qIndex) {
         setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
-        await sendToThread(ctxMeta, "Question is no longer active.")
+        await sendToThread(ctxMeta, t(ctxMeta, "prompts.questionInactive"))
         await markMessageHandled("customAnswerStale", { projectAlias: awaitingQ.projectAlias })
         return
       }
@@ -512,7 +563,7 @@ export function createCommandHandlers(runtime) {
           idempotencyEntries: [messageIdempotencyEntry("replyQuestion", { projectAlias: awaitingQ.projectAlias, sessionId: wizard.sessionID })],
         })
         if (result?.outcome === "retryable") {
-          await sendToThread(ctxMeta, "Question answer is temporarily unavailable. Send the answer again or /cancel.").catch(() => {})
+          await sendToThread(ctxMeta, t(ctxMeta, "commands.questionRetry")).catch(() => {})
           return
         }
       } else {
@@ -531,18 +582,18 @@ export function createCommandHandlers(runtime) {
     if (awaiting) {
       const bindingStatus = await promptContinuationBindingStatus(ctxMeta.ctxKey, awaiting.projectAlias, awaiting.sessionID)
       if (bindingStatus === "retryable") {
-        await sendToThread(ctxMeta, "Permission reply is temporarily unavailable. Send the note again or /cancel.").catch(() => {})
+        await sendToThread(ctxMeta, t(ctxMeta, "commands.permissionRetry")).catch(() => {})
         return
       }
       if (bindingStatus !== "current") {
         store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId, awaiting.sessionID)
         setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
-        await sendToThread(ctxMeta, "Permission request is no longer active.").catch(() => {})
+        await sendToThread(ctxMeta, t(ctxMeta, "commands.permissionInactive")).catch(() => {})
         await markMessageHandled("permissionNoteStale", { projectAlias: awaiting.projectAlias })
         return
       }
       if (!hasText) {
-        await sendToThread(ctxMeta, "This permission flow expects a text rejection note. Send text or /cancel.", closeOnlyKeyboard())
+        await sendToThread(ctxMeta, t(ctxMeta, "commands.permissionTextExpected"), closeOnlyKeyboard(ctxMeta))
         await markMessageHandled("permissionNoteNonText", { projectAlias: awaiting.projectAlias })
         return
       }
@@ -552,7 +603,7 @@ export function createCommandHandlers(runtime) {
         store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId, awaiting.sessionID)
         setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
         await markMessageHandled("replyPermissionNote", { projectAlias: awaiting.projectAlias })
-        await sendToThread(ctxMeta, "Rejection note already sent.").catch(() => {})
+        await sendToThread(ctxMeta, t(ctxMeta, "commands.rejectionNoteAlreadySent")).catch(() => {})
         return
       }
       try {
@@ -585,11 +636,11 @@ export function createCommandHandlers(runtime) {
           store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId, awaiting.sessionID)
           setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
           await flushDurableState("persist stale permission note state")
-          await sendToThread(ctxMeta, "Permission request is no longer active.").catch(() => {})
+          await sendToThread(ctxMeta, t(ctxMeta, "commands.permissionInactive")).catch(() => {})
           return
         }
         if (isRetryableBoundaryError(err, { source: "opencode", pathname: `/permission/${awaiting.permissionId}/reply`, method: "POST" })) {
-          await sendToThread(ctxMeta, "Permission reply is temporarily unavailable. Send the note again or /cancel.").catch(() => {})
+          await sendToThread(ctxMeta, t(ctxMeta, "commands.permissionRetry")).catch(() => {})
           return
         }
         throw err
@@ -621,14 +672,14 @@ export function createCommandHandlers(runtime) {
       store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId, awaiting.sessionID)
       setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
       await flushDurableState("persist permission note state")
-      await sendToThread(ctxMeta, "Rejection note sent.").catch(() => {})
+      await sendToThread(ctxMeta, t(ctxMeta, "commands.rejectionNoteSent")).catch(() => {})
       return
     }
 
     const awaitingBind = bindAliasAwaiting.get(ctxMeta.ctxKey)
     if (awaitingBind) {
       if (!hasText) {
-        await sendToThread(ctxMeta, "This bind flow expects a project alias as text. Send an alias or /cancel.", closeOnlyKeyboard())
+        await sendToThread(ctxMeta, t(ctxMeta, "commands.bindTextExpected"), closeOnlyKeyboard(ctxMeta))
         await markMessageHandled("bindAliasNonText")
         return
       }
@@ -637,7 +688,7 @@ export function createCommandHandlers(runtime) {
         if (!cmd) return
         if (cmd === "/cancel") {
           bindAliasAwaiting.delete(ctxMeta.ctxKey)
-          await sendToThread(ctxMeta, "Cancelled.")
+          await sendToThread(ctxMeta, t(ctxMeta, "commands.cancelled"))
           await markMessageHandled("bindAliasCancel")
           return
         }
@@ -645,7 +696,7 @@ export function createCommandHandlers(runtime) {
       } else {
         const alias = String(text).trim().split(/\s+/)[0]
         if (!alias) {
-          await sendToThread(ctxMeta, "Send project alias (e.g. 'myproj') or /cancel.")
+          await sendToThread(ctxMeta, t(ctxMeta, "commands.bindAliasPrompt"))
           return
         }
         bindAliasAwaiting.delete(ctxMeta.ctxKey)
@@ -665,7 +716,7 @@ export function createCommandHandlers(runtime) {
         if (hadRejectNote) setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
         if (hadCustomAnswer) setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
         const cancelled = hadBind || hadRejectNote || hadCustomAnswer
-        await sendToThread(ctxMeta, cancelled ? "Cancelled." : "Nothing to cancel.")
+        await sendToThread(ctxMeta, cancelled ? t(ctxMeta, "commands.cancelled") : t(ctxMeta, "commands.nothingToCancel"))
         await markMessageHandled("cancel")
         return
       }
@@ -673,8 +724,8 @@ export function createCommandHandlers(runtime) {
         const binding = store.getBinding(ctxMeta.ctxKey)
         await sendToThread(
           ctxMeta,
-          helpText({ scopeLabel: threadScopeLabel(ctxMeta), defaultProject: configuredDefaultProject(), isBound: !!binding }),
-          binding ? boundThreadActionsKeyboard(ctxMeta) : unboundGuidanceKeyboard(),
+          helpText({ scopeLabel: threadScopeLabel(ctxMeta), defaultProject: configuredDefaultProject(), isBound: !!binding, locale: ctxMeta.locale, t }),
+          binding ? boundThreadActionsKeyboard(ctxMeta) : unboundGuidanceKeyboard(ctxMeta),
         )
         await markMessageHandled(cmd)
         return
@@ -682,7 +733,7 @@ export function createCommandHandlers(runtime) {
       if (cmd === "/bind") {
         if (!argv?.[0]) {
           bindAliasAwaiting.set(ctxMeta.ctxKey, { startedAt: Date.now() })
-          await sendToThread(ctxMeta, `${unboundGuidanceText(ctxMeta, "Send a project alias for this thread, or tap a button below.")}\nYou can /cancel.`, unboundGuidanceKeyboard())
+          await sendToThread(ctxMeta, `${unboundGuidanceText(ctxMeta, t(ctxMeta, "commands.unbound.bindPromptReason"))}\n${t(ctxMeta, "commands.unbound.bindPromptCancel")}`, unboundGuidanceKeyboard(ctxMeta))
           await markMessageHandled("bindPrompt")
           return
         }
@@ -714,6 +765,11 @@ export function createCommandHandlers(runtime) {
       if (cmd === "/feed") {
         await handleFeed(ctxMeta)
         await markMessageHandled("feed")
+        return
+      }
+      if (cmd === "/language") {
+        await handleLanguage(ctxMeta, argv)
+        await markMessageHandled("language")
         return
       }
       if (cmd === "/status") {
@@ -751,14 +807,14 @@ export function createCommandHandlers(runtime) {
         await markMessageHandled("unbind")
         return
       }
-      await sendToThread(ctxMeta, "Unknown command. Use /help.")
+      await sendToThread(ctxMeta, t(ctxMeta, "commands.unknown"))
       await markMessageHandled("unknownCommand")
       return
     }
 
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await sendToThread(ctxMeta, unboundGuidanceText(ctxMeta), unboundGuidanceKeyboard())
+      await sendToThread(ctxMeta, unboundGuidanceText(ctxMeta), unboundGuidanceKeyboard(ctxMeta))
       await markMessageHandled("unbound")
       return
     }
@@ -769,7 +825,7 @@ export function createCommandHandlers(runtime) {
     }
 
     if (mediaKind) {
-      await sendToThread(ctxMeta, unsupportedMediaText(mediaKind, { limits: userAttachmentLimits }), closeOnlyKeyboard())
+      await sendToThread(ctxMeta, unsupportedMediaText(mediaKind, { limits: userAttachmentLimits, locale: ctxMeta.locale }), closeOnlyKeyboard(ctxMeta))
       await markMessageHandled("unsupportedMedia", { projectAlias: binding.projectAlias, sessionId: binding.sessionId, action: mediaKind })
       return
     }
@@ -808,7 +864,7 @@ export function createCommandHandlers(runtime) {
         method: "POST",
         pathname: `/session/${binding.sessionId}/prompt_async`,
       })
-      await sendToThread(ctxMeta, formatProjectUnavailable(alias, err), withButton ? startServerKeyboard(alias) : null).catch(() => {})
+      await sendToThread(ctxMeta, formatProjectUnavailable(alias, err, { locale: ctxMeta.locale }), withButton ? startServerKeyboard(alias, { locale: ctxMeta.locale }) : null).catch(() => {})
       if (cleanupErr) throw cleanupErr
       if (isRetryableProjectError(err)) throw err
       return

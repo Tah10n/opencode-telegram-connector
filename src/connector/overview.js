@@ -3,6 +3,7 @@ import { redactCmdlineSecrets, sanitizeBaseUrlForDisplay } from "../url-utils.js
 import { isRetryableBoundaryError, normalizeBoundaryError } from "../boundary-errors.js"
 import { getLaunchSupport } from "../opencode/launcher.js"
 import { callbackPacker } from "./callback-data.js"
+import { matchSupportedLocale, t as translate } from "../i18n/index.js"
 
 export function buildProjectsOverviewText({
   projects,
@@ -14,12 +15,14 @@ export function buildProjectsOverviewText({
   previewLimit = 3,
   showBindingScopes = true,
   showProjectDetails = true,
-  hiddenBindingsLabel = "hidden outside private chat",
+  hiddenBindingsLabel,
+  locale = "en",
+  t = translate,
 }) {
   const aliases = Object.keys(projects || {})
-  if (!aliases.length) return "No projects"
+  if (!aliases.length) return t(locale, "overview.noProjects")
 
-  const lines = ["Projects:"]
+  const lines = [t(locale, "overview.title")]
   for (const alias of aliases) {
     const project = projects?.[alias] || {}
     const url = sanitizeBaseUrlForDisplay(project.baseUrl)
@@ -33,18 +36,18 @@ export function buildProjectsOverviewText({
       .map((ctx) => `chat ${ctx.chatId}/${formatThreadLabel(ctx.threadIdOr0)}`)
 
     const shownScopes = scopes.slice(0, previewLimit)
-    const suffix = scopes.length > previewLimit ? `, +${scopes.length - previewLimit} more` : ""
+    const suffix = scopes.length > previewLimit ? `, ${t(locale, "overview.more", { count: scopes.length - previewLimit })}` : ""
     const bindingSummary = showBindingScopes
       ? `${scopes.length}${shownScopes.length ? ` (${shownScopes.join(", ")}${suffix})` : ""}`
-      : hiddenBindingsLabel
+      : hiddenBindingsLabel || t(locale, "overview.hiddenBindings")
 
     lines.push(`- ${alias}`)
     if (showProjectDetails) {
-      lines.push(`  URL: ${url || "unknown"}`)
-      lines.push(`  Startup session: ${startupSessionId}`)
+      lines.push(`  ${t(locale, "overview.url", { url: url || "unknown" })}`)
+      lines.push(`  ${t(locale, "overview.startupSession", { session: startupSessionId })}`)
     }
-    lines.push(`  SSE: ${sseStatus}`)
-    lines.push(`  Bindings: ${bindingSummary}`)
+    lines.push(`  ${t(locale, "overview.sse", { status: sseStatus })}`)
+    lines.push(`  ${t(locale, "overview.bindings", { summary: bindingSummary })}`)
   }
 
   return lines.join("\n")
@@ -59,6 +62,8 @@ export function buildProjectsOverviewKeyboard({
   showSessions = false,
   showBindControls = false,
   currentBinding = null,
+  locale = "en",
+  t = translate,
 }) {
   const packCallback = callbackPacker(cb)
   const rows = []
@@ -66,24 +71,30 @@ export function buildProjectsOverviewKeyboard({
     for (const alias of Object.keys(projects || {})) {
       const row = []
       if (showBindControls && (!currentBinding || currentBinding.projectAlias === alias)) {
-        row.push({ text: currentBinding?.projectAlias === alias ? `Bound ${alias}` : `Bind ${alias}`, callback_data: packCallback("srv", alias, "bind") })
+        row.push({ text: currentBinding?.projectAlias === alias ? t(locale, "overview.bound", { alias }) : t(locale, "overview.bind", { alias }), callback_data: packCallback("srv", alias, "bind") })
       }
       if (showProjectControls && canAutoStartProject?.(alias, { platform })) {
-        row.push({ text: `Start ${alias}`, callback_data: packCallback("srv", alias, "start") })
+        row.push({ text: t(locale, "overview.start", { alias }), callback_data: packCallback("srv", alias, "start") })
       }
-      if (showProjectControls) row.push({ text: `Status ${alias}`, callback_data: packCallback("srv", alias, "health") })
-      if (showProjectControls && showSessions) row.push({ text: `Sessions ${alias}`, callback_data: packCallback("srv", alias, "sessions") })
+      if (showProjectControls) row.push({ text: t(locale, "overview.status", { alias }), callback_data: packCallback("srv", alias, "health") })
+      if (showProjectControls && showSessions) row.push({ text: t(locale, "overview.sessions", { alias }), callback_data: packCallback("srv", alias, "sessions") })
       if (row.length) rows.push(row)
     }
   }
-  rows.push([{ text: "Close", callback_data: packCallback("srv", "close") }])
+  rows.push([{ text: t(locale, "common.close"), callback_data: packCallback("srv", "close") }])
   return makeInlineKeyboard(rows)
 }
 
-export function createOverviewHelpers({ projects, store, startInProgress, parseCtxKey, sendToThread, cb }) {
+export function createOverviewHelpers({ projects, store, config, startInProgress, parseCtxKey, sendToThread, cb }) {
   const projectLastUnavailableNoticeAt = new Map()
   const projectIsDown = new Map()
   const projectSseState = new Map(Object.keys(projects).map((alias) => [alias, "unknown"]))
+
+  function storedLocaleForCtx(ctxKey) {
+    const record = store.getLocaleRecord?.(ctxKey)
+    if (record?.source === "telegram" && config?.i18n?.autoDetectTelegramLanguage === false) return ""
+    return matchSupportedLocale(record?.locale, config?.i18n?.supportedLocales)
+  }
 
   function canAutoStartProject(alias, { platform }) {
     return getLaunchSupport({ project: projects?.[alias], platform }).canAutoStart
@@ -93,33 +104,34 @@ export function createOverviewHelpers({ projects, store, startInProgress, parseC
     return isRetryableBoundaryError(err, { source: "opencode" })
   }
 
-  function formatProjectUnavailable(projectAlias, err) {
+  function formatProjectUnavailable(projectAlias, err, { locale = "en" } = {}) {
     const baseUrl = sanitizeBaseUrlForDisplay(projects?.[projectAlias]?.baseUrl)
     const msg = redactCmdlineSecrets(normalizeBoundaryError(err, { source: "opencode" }).message)
-    return `Project '${projectAlias}' is unavailable. Start opencode at ${baseUrl}.\n\n${msg}`
+    return `${translate(locale, "overview.projectUnavailable", { project: projectAlias, baseUrl })}\n\n${msg}`
   }
 
-  function startServerKeyboard(projectAlias) {
+  function startServerKeyboard(projectAlias, { locale = "en" } = {}) {
     const packCallback = callbackPacker(cb)
     return makeInlineKeyboard([
       [
         {
-          text: `Start '${projectAlias}'`,
+          text: translate(locale, "overview.startQuoted", { project: projectAlias }),
           callback_data: packCallback("srv", projectAlias, "start"),
         },
       ],
-      [{ text: "Close", callback_data: packCallback("srv", "close") }],
+      [{ text: translate(locale, "common.close"), callback_data: packCallback("srv", "close") }],
     ])
   }
 
   async function notifyProjectRecovered(projectAlias) {
     const st = store.get()
     const baseUrl = sanitizeBaseUrlForDisplay(projects?.[projectAlias]?.baseUrl) || "unknown"
-    const message = `Project '${projectAlias}' is back online at ${baseUrl}.`
     for (const [ctxKey, binding] of Object.entries(st.bindings || {})) {
       if (binding?.projectAlias !== projectAlias) continue
       const ctx = parseCtxKey(ctxKey)
       if (!ctx) continue
+      const locale = storedLocaleForCtx(ctxKey) || config?.i18n?.defaultLocale || "en"
+      const message = translate(locale, "overview.recovered", { project: projectAlias, baseUrl })
       await sendToThread(ctx, message).catch(() => {})
     }
   }
@@ -156,12 +168,13 @@ export function createOverviewHelpers({ projects, store, startInProgress, parseC
     projectIsDown.set(projectAlias, true)
 
     const st = store.get()
-    const message = formatProjectUnavailable(projectAlias, err)
-    const replyMarkup = canAutoStartProject(projectAlias, { platform }) ? startServerKeyboard(projectAlias) : null
     for (const [ctxKey, binding] of Object.entries(st.bindings || {})) {
       if (binding?.projectAlias !== projectAlias) continue
       const ctx = parseCtxKey(ctxKey)
       if (!ctx) continue
+      const locale = storedLocaleForCtx(ctxKey) || config?.i18n?.defaultLocale || "en"
+      const message = formatProjectUnavailable(projectAlias, err, { locale })
+      const replyMarkup = canAutoStartProject(projectAlias, { platform }) ? startServerKeyboard(projectAlias, { locale }) : null
       await sendToThread(ctx, message, replyMarkup).catch(() => {})
     }
   }
@@ -179,6 +192,7 @@ export function createOverviewHelpers({ projects, store, startInProgress, parseC
         showBindingScopes: input.showBindingScopes,
         showProjectDetails: input.showProjectDetails,
         hiddenBindingsLabel: input.hiddenBindingsLabel,
+        locale: input.locale,
       }),
     buildProjectsOverviewKeyboard: (input = {}) =>
       buildProjectsOverviewKeyboard({
@@ -190,6 +204,7 @@ export function createOverviewHelpers({ projects, store, startInProgress, parseC
         showSessions: input.showSessions,
         showBindControls: input.showBindControls,
         currentBinding: input.currentBinding,
+        locale: input.locale,
       }),
     canAutoStartProject,
     isRetryableProjectError,

@@ -8,7 +8,7 @@ const projectRoot = path.resolve(scriptDir, "..")
 const srcDir = path.join(projectRoot, "src")
 const scanRoot = process.argv[2] ? path.resolve(process.argv[2]) : srcDir
 const allowedPipeSplitFiles = new Set(["src/connector/callback-data.js"])
-const RAW_CALLBACK_LITERAL_RE = /(?:^|[^A-Za-z0-9_$])(?:rt|s|srv|b|feed|m|cf|att|p|q)\|/
+const RAW_CALLBACK_LITERAL_RE = /(?:^|[^A-Za-z0-9_$])(?:rt|s|srv|b|feed|m|cf|att|p|q|lang)\|/
 
 function normalizePath(filePath) {
   return path.relative(projectRoot, filePath).replaceAll(path.sep, "/")

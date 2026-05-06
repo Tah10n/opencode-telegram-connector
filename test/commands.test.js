@@ -79,7 +79,10 @@ function makeRuntime(overrides = {}) {
     renderFeedSettings: async (ctxMeta, options) => {
       feedCalls.push({ ctxMeta, options })
     },
-    feedModeLabel: (mode) => ({ main: "Main", verbose: "Verbose" }[mode] || "Main + changes"),
+    feedModeLabel: (mode, locale = "en") => {
+      if (locale === "ru") return { main: "Основное", verbose: "Подробно" }[mode] || "Основное + изменения"
+      return { main: "Main", verbose: "Verbose" }[mode] || "Main + changes"
+    },
     getFeedMode: (ctxKey) => overrides.feedByContext?.[ctxKey] || "main+changes",
     deliverAssistantText: async () => {},
     extractAssistantDisplayText: () => "",
@@ -779,6 +782,37 @@ test("createCommandHandlers handleUseCommand reports moved session conflicts", a
   assert.match(sent[0].text, /already bound to chat 200 \/ topic 3 and was moved to this thread/)
 })
 
+test("createCommandHandlers handleUseCommand localizes switch notices and moved conflicts", async () => {
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    ocByAlias: {
+      demo: {
+        async getSession(sessionId) {
+          return { id: sessionId }
+        },
+        async getConfig(input) {
+          assert.deepEqual(input, { directory: undefined })
+          return { model: "openai/gpt-5" }
+        },
+      },
+    },
+    bindCtxToSession: async () => ({ movedFromCtxKey: "200:3", movedFromRoute: { chatId: 200, threadIdOr0: 3 } }),
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleUseCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7", locale: "ru" }, "ses_shared")
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Изменено: этот тред теперь использует сессию ses_shared\./)
+  assert.match(sent[0].text, /Проект: demo/)
+  assert.match(sent[0].text, /Сессия: ses_shared/)
+  assert.match(sent[0].text, /Feed: Основное \+ изменения/)
+  assert.match(sent[0].text, /Модель: openai\/gpt-5/)
+  assert.match(sent[0].text, /Источник: Наследуется из дефолта проекта/)
+  assert.match(sent[0].text, /Заметка: эта сессия уже была привязана к chat 200 \/ topic 3/)
+  assert.doesNotMatch(sent[0].text, /Changed:|Project:|Session:|Main \+ changes|Source:|Note:/)
+})
+
 test("createCommandHandlers handleUseCommand rejects unsafe raw session ids", async () => {
   const getSessionCalls = []
   const bindCalls = []
@@ -889,6 +923,52 @@ test("createCommandHandlers handleNewCommand reports configured model and varian
   ])
   assert.equal(sent.length, 1)
   assert.equal(sent[0].text, "Changed: this thread now uses new session ses_new.\nProject: demo\nSession: ses_new\nFeed: Main + changes\nModel: openai/gpt-5 xhigh\nSource: Inherited from project default")
+})
+
+test("createCommandHandlers handleNewCommand localizes new-session notices", async () => {
+  const bindCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", openAttachOnNewMode: "new-window" } },
+    ocByAlias: {
+      demo: {
+        async createSession() {
+          return { id: "ses_new" }
+        },
+        async getConfig(input) {
+          assert.deepEqual(input, { directory: undefined })
+          return {
+            model: "openai/gpt-5",
+            default_agent: "build",
+            agent: {
+              build: {
+                variant: "xhigh",
+              },
+            },
+          }
+        },
+      },
+    },
+    bindCtxToSession: async (ctxMeta, alias, sessionId) => {
+      bindCalls.push({ ctxMeta, alias, sessionId })
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleNewCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7", locale: "ru" }, "")
+
+  assert.deepEqual(bindCalls, [
+    {
+      ctxMeta: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7", locale: "ru" },
+      alias: "demo",
+      sessionId: "ses_new",
+    },
+  ])
+  assert.equal(sent.length, 1)
+  assert.equal(
+    sent[0].text,
+    "Изменено: этот тред теперь использует новую сессию ses_new.\nПроект: demo\nСессия: ses_new\nFeed: Основное + изменения\nМодель: openai/gpt-5 xhigh\nИсточник: Наследуется из дефолта проекта",
+  )
 })
 
 test("createCommandHandlers handleNewCommand refuses invalid created session ids", async () => {

@@ -2,6 +2,7 @@ import path from "node:path"
 import { loadEnvFromFile, envOptional, envRequired, envInt, envBool } from "./env.js"
 import { loadConnectorConfigFile } from "./file.js"
 import { loadProjectsConfig } from "./projects.js"
+import { normalizeI18nConfig } from "../i18n/index.js"
 import { normalizeLimits } from "../limits.js"
 
 function resolveCliPath(filePath) {
@@ -38,6 +39,11 @@ function normalizeEchoFilterMode(value) {
   const mode = raw || "recent"
   if (mode !== "recent" && mode !== "prefix") throw new Error("Invalid echoFilterMode / ECHO_FILTER_MODE (expected 'recent' or 'prefix')")
   return mode
+}
+
+function splitLocaleList(value) {
+  if (value == null || value === "") return undefined
+  return String(value).split(",").map((entry) => entry.trim()).filter(Boolean)
 }
 
 export function parseCliArgs(argv) {
@@ -104,6 +110,13 @@ export async function buildRuntimeConfig({ args = {}, cwd = process.cwd() } = {}
       enabled: configFromFile.healthServer?.enabled ?? envBool("CONNECTOR_HEALTH_ENABLED", false),
       host: configFromFile.healthServer?.host ?? envOptional("CONNECTOR_HEALTH_HOST", "127.0.0.1"),
       port: configFromFile.healthServer?.port ?? envInt("CONNECTOR_HEALTH_PORT", 8787),
+    }),
+    i18n: normalizeI18nConfig({
+      ...(configFromFile.i18n || {}),
+      ...(envOptional("CONNECTOR_DEFAULT_LOCALE") ? { defaultLocale: envOptional("CONNECTOR_DEFAULT_LOCALE") } : {}),
+      ...(envOptional("CONNECTOR_SUPPORTED_LOCALES") ? { supportedLocales: splitLocaleList(envOptional("CONNECTOR_SUPPORTED_LOCALES")) } : {}),
+      ...(envOptional("CONNECTOR_BOT_COMMAND_LOCALES") ? { botCommandLocales: splitLocaleList(envOptional("CONNECTOR_BOT_COMMAND_LOCALES")) } : {}),
+      ...(envOptional("CONNECTOR_AUTO_DETECT_LANGUAGE") != null ? { autoDetectTelegramLanguage: envBool("CONNECTOR_AUTO_DETECT_LANGUAGE", true) } : {}),
     }),
     limits: normalizeLimits(configFromFile.limits || {}),
     cwd: configFromFile.cwd || configBaseDir,

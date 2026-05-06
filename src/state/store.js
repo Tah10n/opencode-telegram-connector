@@ -5,8 +5,9 @@ import { loadStateWithMigration, migrateStateIfNeeded, preserveStateBeforeRecove
 import { normalizeModelPreference, storedModelPreference } from "../model-selection.js"
 import { isSafeOpenCodeId } from "../opencode/ids.js"
 import { redactSensitiveText } from "../url-utils.js"
+import { matchSupportedLocale } from "../i18n/index.js"
 
-export const STATE_SCHEMA_VERSION = 5
+export const STATE_SCHEMA_VERSION = 6
 export const DEFAULT_FEED_MODE = "main+changes"
 export const DEFAULT_IDEMPOTENCY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 export const DEFAULT_IDEMPOTENCY_MAX_ENTRIES = 5000
@@ -43,11 +44,13 @@ function migrationOptionsForLoad(filePath) {
     normalizeBindings,
     normalizeSessionIndex,
     normalizeFeedByContext,
+    normalizeLocaleByContext,
     normalizeModelPrefsByContext,
     normalizePendingPrompts,
     normalizePendingRuntimeOnlineNotice,
     normalizeIdempotencyLedger,
     defaultFeedByContext,
+    defaultLocaleByContext,
     defaultModelPrefsByContext,
     defaultPendingPrompts,
     defaultIdempotencyLedger,
@@ -55,6 +58,10 @@ function migrationOptionsForLoad(filePath) {
 }
 
 function defaultFeedByContext() {
+  return {}
+}
+
+function defaultLocaleByContext() {
   return {}
 }
 
@@ -82,6 +89,7 @@ export function defaultState() {
     bindings: {},
     sessionIndex: {},
     feedByContext: defaultFeedByContext(),
+    localeByContext: defaultLocaleByContext(),
     modelPrefsByContext: defaultModelPrefsByContext(),
     pendingPrompts: defaultPendingPrompts(),
     pendingRuntimeOnlineNotice: null,
@@ -323,6 +331,14 @@ export class StateStore {
     return normalizeModelPreference(this.state.modelPrefsByContext?.[ctxKey])
   }
 
+  getLocaleRecord(ctxKey) {
+    return this.state.localeByContext?.[ctxKey] || null
+  }
+
+  getLocale(ctxKey) {
+    return this.getLocaleRecord(ctxKey)?.locale || ""
+  }
+
   setFeedMode(ctxKey, mode) {
     if (!ctxKey) return
     this.state.feedByContext[ctxKey] = { mode: normalizeFeedMode(mode) }
@@ -338,6 +354,32 @@ export class StateStore {
     }
     this.state.modelPrefsByContext[ctxKey] = stored
     this.scheduleSave()
+  }
+
+  setLocale(ctxKey, locale, { source = "manual" } = {}) {
+    if (!ctxKey) return false
+    const normalized = matchSupportedLocale(locale)
+    if (!normalized) return false
+    const normalizedSource = source === "telegram" ? "telegram" : "manual"
+    const previous = this.state.localeByContext?.[ctxKey]
+    if (previous?.locale === normalized && previous?.source === normalizedSource) return false
+    this.state.localeByContext[ctxKey] = { locale: normalized, source: normalizedSource }
+    this.scheduleSave()
+    return true
+  }
+
+  noteTelegramLocale(ctxKey, locale) {
+    if (!ctxKey) return false
+    const previous = this.getLocaleRecord(ctxKey)
+    if (previous?.source === "manual") return false
+    return this.setLocale(ctxKey, locale, { source: "telegram" })
+  }
+
+  clearLocale(ctxKey) {
+    if (!ctxKey) return false
+    const existed = delete this.state.localeByContext[ctxKey]
+    if (existed) this.scheduleSave()
+    return existed
   }
 
   clearModelPreference(ctxKey) {
@@ -399,6 +441,7 @@ export class StateStore {
         chatId: record?.ctx?.chatId,
         threadIdOr0: record?.ctx?.threadIdOr0 || 0,
         ctxKey: record?.ctx?.ctxKey || "",
+        ...(matchSupportedLocale(record?.ctx?.locale) ? { locale: matchSupportedLocale(record.ctx.locale) } : {}),
       },
       createdAt: typeof record?.createdAt === "number" ? record.createdAt : Date.now(),
     }
@@ -486,6 +529,7 @@ export class StateStore {
         chatId: wizard?.ctx?.chatId,
         threadIdOr0: wizard?.ctx?.threadIdOr0 || 0,
         ctxKey: wizard?.ctx?.ctxKey || "",
+        ...(matchSupportedLocale(wizard?.ctx?.locale) ? { locale: matchSupportedLocale(wizard.ctx.locale) } : {}),
       },
     }
     this.scheduleSave()
@@ -715,6 +759,7 @@ function validateCurrentState(state) {
   validateBindingsSection(state.bindings, errors)
   validateSessionIndexSection(state.sessionIndex, errors)
   validateFeedByContextSection(state.feedByContext, errors)
+  validateLocaleByContextSection(state.localeByContext, errors)
   validateModelPrefsByContextSection(state.modelPrefsByContext, errors)
   validatePendingPromptsSection(state.pendingPrompts, errors)
   validatePendingRuntimeOnlineNoticeSection(state.pendingRuntimeOnlineNotice, errors)
@@ -761,6 +806,18 @@ function validateFeedByContextSection(value, errors) {
   }
 }
 
+function validateLocaleByContextSection(value, errors) {
+  if (!pushRecordError(errors, value, "state.localeByContext")) return
+  for (const [ctxKey, record] of Object.entries(value)) {
+    validateCtxKey(ctxKey, `state.localeByContext${pathKey(ctxKey)}`, errors)
+    if (!pushRecordError(errors, record, `state.localeByContext${pathKey(ctxKey)}`)) continue
+    if (!matchSupportedLocale(record.locale)) errors.push(`state.localeByContext${pathKey(ctxKey)}.locale must be a supported locale`)
+    if (record.source !== "telegram" && record.source !== "manual") {
+      errors.push(`state.localeByContext${pathKey(ctxKey)}.source must be telegram or manual`)
+    }
+  }
+}
+
 function validateModelPrefsByContextSection(value, errors) {
   if (!pushRecordError(errors, value, "state.modelPrefsByContext")) return
   for (const [ctxKey, pref] of Object.entries(value)) {
@@ -795,6 +852,7 @@ function validatePromptCtx(value, statePath, errors, { required = false } = {}) 
   if (!Number.isInteger(value.chatId)) errors.push(`${statePath}.chatId must be an integer`)
   if (!Number.isInteger(value.threadIdOr0) || value.threadIdOr0 < 0) errors.push(`${statePath}.threadIdOr0 must be a non-negative integer`)
   validateCtxKey(value.ctxKey, `${statePath}.ctxKey`, errors)
+  if (value.locale != null && !matchSupportedLocale(value.locale)) errors.push(`${statePath}.locale must be a supported locale when present`)
 }
 
 function validatePendingPermissions(value, errors) {
@@ -1053,6 +1111,15 @@ function normalizeFeedByContext(value) {
     Object.entries(value)
       .filter(([ctxKey]) => typeof ctxKey === "string" && ctxKey)
       .map(([ctxKey, settings]) => [ctxKey, { mode: normalizeFeedMode(settings?.mode) }]),
+  )
+}
+
+function normalizeLocaleByContext(value) {
+  if (!value || typeof value !== "object") return defaultLocaleByContext()
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([ctxKey, record]) => typeof ctxKey === "string" && ctxKey && !!matchSupportedLocale(record?.locale))
+      .map(([ctxKey, record]) => [ctxKey, { locale: matchSupportedLocale(record.locale), source: record.source === "manual" ? "manual" : "telegram" }]),
   )
 }
 

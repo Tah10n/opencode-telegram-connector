@@ -97,6 +97,121 @@ function makePromptRuntime(overrides = {}) {
 const routeResolver = async () => ({ route: { chatId: 100, threadIdOr0: 7 } })
 const logSseDebug = () => {}
 
+test("handlePermissionAsked ignores Telegram-detected locale when auto-detect is disabled", async () => {
+  const { calls, handlers } = makePromptRuntime({
+    config: { i18n: { defaultLocale: "en", supportedLocales: ["en", "ru"], autoDetectTelegramLanguage: false } },
+    store: {
+      getLocaleRecord(ctxKey) {
+        assert.equal(ctxKey, "100:7")
+        return { locale: "ru", source: "telegram" }
+      },
+    },
+  })
+
+  await handlers.handlePermissionAsked({
+    projectAlias: "demo",
+    props: { id: "perm_locale", sessionID: "ses_1", permission: "shell", patterns: ["npm test"] },
+    resolveBoundRoute: routeResolver,
+    logSseDebug,
+  })
+
+  assert.equal(calls.sendBlocksToThread.length, 1)
+  const [ctxMeta, blocks, replyMarkup] = calls.sendBlocksToThread[0]
+  assert.equal(ctxMeta.locale, "en")
+  assert.match(blocks[0].html, /Permission request/)
+  assert.doesNotMatch(blocks[0].html, /Запрос разрешения/)
+  assert.equal(replyMarkup.inline_keyboard[0][0].text, "Allow once")
+})
+
+test("handlePermissionAsked falls back to a non-English default locale for stale stored locales", async () => {
+  const { calls, handlers } = makePromptRuntime({
+    config: { i18n: { defaultLocale: "ru", supportedLocales: ["ru"], autoDetectTelegramLanguage: true } },
+    store: {
+      getLocaleRecord(ctxKey) {
+        assert.equal(ctxKey, "100:7")
+        return { locale: "en", source: "manual" }
+      },
+    },
+  })
+
+  await handlers.handlePermissionAsked({
+    projectAlias: "demo",
+    props: { id: "perm_default_locale", sessionID: "ses_1", permission: "shell", patterns: ["npm test"] },
+    resolveBoundRoute: routeResolver,
+    logSseDebug,
+  })
+
+  assert.equal(calls.sendBlocksToThread.length, 1)
+  const [ctxMeta, blocks, replyMarkup] = calls.sendBlocksToThread[0]
+  assert.equal(ctxMeta.locale, "ru")
+  assert.match(blocks[0].html, /Запрос разрешения/)
+  assert.doesNotMatch(blocks[0].html, /Permission request/)
+  assert.equal(replyMarkup.inline_keyboard[0][0].text, "Разрешить разово")
+})
+
+test("handleQuestionAsked falls back when the stored locale is no longer supported", async () => {
+  const { calls, handlers } = makePromptRuntime({
+    config: { i18n: { defaultLocale: "en", supportedLocales: ["en"], autoDetectTelegramLanguage: true } },
+    store: {
+      getLocaleRecord(ctxKey) {
+        assert.equal(ctxKey, "100:7")
+        return { locale: "ru", source: "manual" }
+      },
+    },
+  })
+  const request = {
+    id: "q_locale",
+    sessionID: "ses_1",
+    questions: [{ question: "Pick one?", custom: false, options: [{ label: "A" }] }],
+  }
+
+  await handlers.handleQuestionAsked({ projectAlias: "demo", props: request, resolveBoundRoute: routeResolver, logSseDebug })
+
+  assert.equal(calls.sendMessage.length, 1)
+  const [, html, replyMarkup] = calls.sendMessage[0]
+  assert.match(html, /Question 1\/1/)
+  assert.match(html, /Options:/)
+  assert.doesNotMatch(html, /Варианты:/)
+  assert.equal(replyMarkup.inline_keyboard.at(-1)[0].text, "Reject")
+})
+
+test("sendCurrentQuestionStep refreshes wizard locale before rendering", async () => {
+  let locale = "en"
+  const { calls, handlers } = makePromptRuntime({
+    config: { i18n: { defaultLocale: "en", supportedLocales: ["en", "ru"], autoDetectTelegramLanguage: true } },
+    store: {
+      getLocaleRecord(ctxKey) {
+        assert.equal(ctxKey, "100:7")
+        return { locale, source: "manual" }
+      },
+    },
+  })
+  const wizard = {
+    projectAlias: "demo",
+    id: "q_locale_refresh",
+    sessionID: "ses_1",
+    request: {
+      id: "q_locale_refresh",
+      sessionID: "ses_1",
+      questions: [{ question: "Pick one?", custom: false, options: [{ label: "A" }] }],
+    },
+    index: 0,
+    answers: [[]],
+    selectedByIndex: {},
+    messageIdByIndex: {},
+    ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7", locale: "en" },
+  }
+
+  locale = "ru"
+  await handlers.sendCurrentQuestionStep(wizard)
+
+  assert.equal(wizard.ctx.locale, "ru")
+  assert.equal(calls.sendMessage.length, 1)
+  const [, html, replyMarkup] = calls.sendMessage[0]
+  assert.match(html, /Варианты:/)
+  assert.equal(replyMarkup.inline_keyboard.at(-1)[0].text, "Отклонить")
+})
+
 test("handlePermissionAsked retries after Telegram prompt delivery fails", async () => {
   let fail = true
   const delivered = []

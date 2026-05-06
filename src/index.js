@@ -28,6 +28,7 @@ import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList
 import { sanitizeBaseUrlForDisplay } from "./url-utils.js"
 import { normalizeLimits } from "./limits.js"
 import { createParentSessionCache, LruMap, LruSet } from "./util/lru.js"
+import { botCommandsForLocale, matchSupportedLocale, normalizeI18nConfig, normalizeLocale, t } from "./i18n/index.js"
 
 function parseSseDebugFilter(rawValue) {
   const raw = String(rawValue || "").trim()
@@ -128,6 +129,8 @@ function extractTextParts(message) {
 
 export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   if (!config?.telegram?.botToken) throw new Error("config.telegram.botToken is required")
+  // startConnector is public API too; normalize again for callers that bypass buildRuntimeConfig.
+  config = { ...config, i18n: normalizeI18nConfig(config?.i18n || {}) }
   const logger = loggerIn || createConnectorLogger({ format: config?.logFormat, ...collectLoggerRedactionOptions(config) })
   const createStateStore = deps?.createStateStore || ((options) => new StateStore(options))
   const createTelegramClient = deps?.createTelegramClient || ((token, options) => new TelegramClient(token, options))
@@ -223,27 +226,28 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const botUsername = typeof me?.username === "string" ? me.username : ""
   logger.info("Telegram bot:", me?.username ? `@${me.username}` : "(unknown)", "topics:", hasTopicsEnabled)
 
-  // Best-effort: publish Telegram built-in command menu.
+  // Best-effort: publish Telegram built-in command menus.
   // Note: Telegram expects command names WITHOUT the leading '/'.
-  await tg
-    .setMyCommands([
-      { command: "help", description: "Справка по командам" },
-      { command: "projects", description: "Список проектов" },
-      { command: "bind", description: "Привязать чат к проекту (спросит alias)" },
-      { command: "new", description: "Создать новую сессию" },
-      { command: "use", description: "Переключиться на сессию" },
-      { command: "sessions", description: "Недавние сессии проекта" },
-      { command: "model", description: "Настроить модель для текущего треда" },
-      { command: "feed", description: "Настроить Telegram feed для треда" },
-      { command: "status", description: "Показать текущую привязку" },
-      { command: "runtime", description: "Показать состояние коннектора в личке" },
-      { command: "bindings", description: "Показать все активные привязки в личке" },
-      { command: "abort", description: "Прервать текущую сессию" },
-      { command: "sendlast", description: "Отправить последнее сообщение модели" },
-      { command: "unbind", description: "Убрать привязку" },
-      { command: "cancel", description: "Отменить текущий ввод" },
-    ])
-    .catch((err) => logger.error("Failed to set bot commands:", err?.message || String(err)))
+  async function publishBotCommandMenus() {
+    const i18nConfig = config.i18n
+    const defaultLocale = i18nConfig.defaultLocale
+    async function publishLocale(locale, options = {}) {
+      try {
+        await tg.setMyCommands(botCommandsForLocale(locale), options)
+      } catch (err) {
+        const scope = options.language_code ? `locale ${options.language_code}` : `default locale ${locale}`
+        logger.error(`Failed to set bot commands for ${scope}:`, err?.message || String(err))
+      }
+    }
+
+    await publishLocale(defaultLocale)
+    for (const locale of i18nConfig.botCommandLocales || []) {
+      if (locale === defaultLocale) continue
+      await publishLocale(locale, { language_code: locale })
+    }
+  }
+
+  await publishBotCommandMenus().catch((err) => logger.error("Failed to set bot commands:", err?.message || String(err)))
 
   const ocByAlias = {}
   for (const [alias, p] of Object.entries(projects)) {
@@ -629,6 +633,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const overviewHelpers = createOverviewHelpers({
     projects,
     store,
+    config,
     startInProgress,
     parseCtxKey,
     sendToThread,
@@ -650,6 +655,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const promptHandlers = createPromptHandlers({
     store,
     tg,
+    config,
     cb,
     ocByAlias,
     promptBaseline,
@@ -906,11 +912,51 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   } = mirroringHandlers
   flushPendingAssistantDeliveries = drainPendingAssistantDeliveries
 
-  function ctxMetaFromMessage(msg) {
+  function detectedLocaleFromTelegram(from) {
+    if (config.i18n?.autoDetectTelegramLanguage === false) return ""
+    return matchSupportedLocale(from?.language_code, config.i18n?.supportedLocales)
+  }
+
+  function effectiveLocaleForContext(ctxKey, detectedLocale = "") {
+    const storedRecord = store.getLocaleRecord?.(ctxKey)
+    if (storedRecord?.locale && (storedRecord.source === "manual" || config.i18n?.autoDetectTelegramLanguage !== false)) {
+      return normalizeLocale(storedRecord.locale, config.i18n)
+    }
+    if (detectedLocale) return normalizeLocale(detectedLocale, config.i18n)
+    return config.i18n?.defaultLocale || "en"
+  }
+
+  function ctxMetaWithLocale(ctxMeta) {
+    if (!ctxMeta) return ctxMeta
+    const chatId = ctxMeta.chatId
+    const threadIdOr0 = ctxMeta.threadIdOr0 || 0
+    const ctxKey = ctxMeta.ctxKey || ctxKeyFrom(chatId, threadIdOr0)
+    return {
+      ...ctxMeta,
+      threadIdOr0,
+      ctxKey,
+      locale: effectiveLocaleForContext(ctxKey, ctxMeta.detectedLocale || ctxMeta.locale),
+    }
+  }
+
+  function rememberTelegramLocale(ctxMeta) {
+    if (!ctxMeta?.ctxKey || !ctxMeta.detectedLocale) return ctxMetaWithLocale(ctxMeta)
+    store.noteTelegramLocale?.(ctxMeta.ctxKey, ctxMeta.detectedLocale)
+    return ctxMetaWithLocale(ctxMeta)
+  }
+
+  function localize(ctxMetaOrLocale, key, params) {
+    const locale = typeof ctxMetaOrLocale === "string" ? ctxMetaOrLocale : ctxMetaWithLocale(ctxMetaOrLocale)?.locale
+    return t(locale || config.i18n?.defaultLocale || "en", key, params)
+  }
+
+  function ctxMetaFromMessage(msg, from = msg?.from) {
     const chatId = msg?.chat?.id
     const chatType = msg?.chat?.type
     const threadIdOr0 = threadIdOr0FromMessage(msg)
-    return { chatId, chatType, threadIdOr0, ctxKey: ctxKeyFrom(chatId, threadIdOr0) }
+    const ctxKey = ctxKeyFrom(chatId, threadIdOr0)
+    const detectedLocale = detectedLocaleFromTelegram(from || msg?.from)
+    return ctxMetaWithLocale({ chatId, chatType, threadIdOr0, ctxKey, detectedLocale })
   }
 
   function requestContextForCtxMeta(ctxMeta, binding) {
@@ -920,6 +966,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       chatType: ctxMeta.chatType,
       threadIdOr0: ctxMeta.threadIdOr0,
       ctxKey: ctxMeta.ctxKey,
+      ...(ctxMeta.locale ? { locale: ctxMeta.locale } : {}),
       ...(binding?.projectAlias ? { projectAlias: binding.projectAlias } : {}),
       ...(binding?.sessionId ? { sessionId: binding.sessionId } : {}),
     }
@@ -928,7 +975,8 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   function telegramUpdateContext(update) {
     const eventType = update?.message ? "message" : update?.callback_query ? "callback" : "unknown"
     const msg = update?.message || update?.callback_query?.message || null
-    const ctxMeta = msg ? ctxMetaFromMessage(msg) : null
+    const from = update?.message?.from || update?.callback_query?.from || null
+    const ctxMeta = msg ? ctxMetaFromMessage(msg, from) : null
     const binding = ctxMeta?.ctxKey ? store.getBinding(ctxMeta.ctxKey) : null
     return {
       correlationId: createCorrelationId("tg", [update?.update_id, eventType]),
@@ -950,6 +998,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   }
 
   async function sendToThread(ctxMeta, text, replyMarkup, options = {}) {
+    ctxMeta = ctxMetaWithLocale(ctxMeta)
     if (!ctxMeta?.chatId) return
     return withRequestContextFields(requestContextForCtxMeta(ctxMeta, store.getBinding(ctxMeta.ctxKey)), async () => {
       try {
@@ -970,6 +1019,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   }
 
   async function sendBlocksToThread(ctxMeta, blocks, replyMarkup) {
+    ctxMeta = ctxMetaWithLocale(ctxMeta)
     if (!ctxMeta?.chatId) return
     return withRequestContextFields(requestContextForCtxMeta(ctxMeta, store.getBinding(ctxMeta.ctxKey)), async () => {
       try {
@@ -1048,13 +1098,13 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     const ctxKey = ctxKeyFrom(route.chatId, route.threadIdOr0)
     const binding = store.getBinding(ctxKey)
     if (binding?.projectAlias !== projectAlias || binding?.sessionId !== sessionId) return null
-    return { chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey }
+    return ctxMetaWithLocale({ chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey })
   }
 
   function parseBoundCtxKey(ctxKey) {
     const match = String(ctxKey || "").match(/^(-?\d+):(\d+)$/)
     if (!match) return null
-    return { chatId: Number(match[1]), threadIdOr0: Number(match[2]), ctxKey: String(ctxKey) }
+    return ctxMetaWithLocale({ chatId: Number(match[1]), threadIdOr0: Number(match[2]), ctxKey: String(ctxKey) })
   }
 
   function primeTuiActiveSessionFollow(projectAlias, ctxMeta, sessionId, options = {}) {
@@ -1295,6 +1345,9 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     recordPromptAnswered: runtimeObservability.recordPromptAnswered,
     isAllowedUser,
     ctxMetaFromMessage,
+    rememberTelegramLocale,
+    ctxMetaWithLocale,
+    t: localize,
     mirrorCompaction,
   })
   const { handleTelegramMessage, renderSessionsList, handleFeed } = commandHandlers
@@ -1305,6 +1358,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     ...mirroringHandlers,
     ...commandHandlers,
     store,
+    config,
     projects,
     ocByAlias,
     tg,
@@ -1314,6 +1368,9 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     recordPromptAnswered: runtimeObservability.recordPromptAnswered,
     questionWizards,
     ctxMetaFromMessage,
+    rememberTelegramLocale,
+    ctxMetaWithLocale,
+    t: localize,
     parseCtxKey,
     formatThreadLabel,
     isAllowedUser,

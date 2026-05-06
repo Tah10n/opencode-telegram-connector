@@ -1,5 +1,6 @@
 import { classifyBoundaryError } from "../boundary-errors.js"
 import { escapeHtml } from "../telegram/formatter.js"
+import { t as translate } from "../i18n/index.js"
 import { permissionNoteIdempotencyPrefix, permissionReplyIdempotencyPrefix, promptIdentity, questionReplyIdempotencyPrefix, questionRejectIdempotencyKey } from "./idempotency.js"
 
 function defaultTypeSummary() {
@@ -60,6 +61,7 @@ function buildWizardFromSnapshot(snapshot, { request } = {}) {
 export function createPromptRecovery(runtime) {
   const {
     store,
+    config,
     ocByAlias,
     prompted,
     questionWizards,
@@ -300,10 +302,11 @@ export function createPromptRecovery(runtime) {
         const wizard = buildWizardFromSnapshot({ ...snapshot, ctx }, { request: liveQuestion || snapshot.request })
         questionWizards.set(wizardKey(wizard.projectAlias, wizard.id, wizard.sessionID), wizard)
         try {
+          const locale = wizard.ctx?.locale || config?.i18n?.defaultLocale || "en"
           await sendBlocksToThread(wizard.ctx, [
             {
               type: "text",
-              html: `<b>Question request resumed</b>\n<code>${escapeHtml(wizard.id)}</code>\n\n${escapeHtml(`Project: ${wizard.projectAlias}`)}`,
+              html: `<b>${escapeHtml(translate(locale, "prompts.questionRequestResumed"))}</b>\n<code>${escapeHtml(wizard.id)}</code>\n\n${escapeHtml(translate(locale, "prompts.project", { project: wizard.projectAlias }))}`,
             },
           ])
           await sendCurrentQuestionStep(wizard)

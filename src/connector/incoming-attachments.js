@@ -1,5 +1,6 @@
 import { humanBytes, sanitizeFilename } from "./attachment-utils.js"
 import { DEFAULT_LIMITS } from "../limits.js"
+import { t as translate } from "../i18n/index.js"
 
 export const USER_ATTACHMENT_LIMITS = Object.freeze({
   confirmBytes: DEFAULT_LIMITS.userAttachmentConfirmBytes,
@@ -171,41 +172,47 @@ export function formatAttachmentPrompt({ prefix = "", caption = "", documentInfo
   ].join("\n")
 }
 
-export function attachmentConfirmationText(documentInfo, { limits = USER_ATTACHMENT_LIMITS } = {}) {
+export function attachmentConfirmationText(documentInfo, { limits = USER_ATTACHMENT_LIMITS, locale = "en" } = {}) {
   return [
-    "Confirm sending this file to OpenCode:",
-    `File: ${documentInfo?.safeName || "attachment.txt"}`,
-    `Size: ${humanBytes(documentInfo?.fileSize)}`,
-    `Large-file confirmation threshold: ${humanBytes(limits.confirmBytes)}`,
+    translate(locale, "attachments.confirmationTitle"),
+    translate(locale, "attachments.file", { file: documentInfo?.safeName || "attachment.txt" }),
+    translate(locale, "attachments.size", { size: humanBytes(documentInfo?.fileSize) }),
+    translate(locale, "attachments.confirmationThreshold", { size: humanBytes(limits.confirmBytes) }),
     "",
-    "The file contents will be included in the prompt for this thread's bound session.",
+    translate(locale, "attachments.confirmationBody"),
   ].join("\n")
 }
 
-export function unsupportedAttachmentText(documentInfo, { limits = USER_ATTACHMENT_LIMITS } = {}) {
+export function unsupportedAttachmentText(documentInfo, { limits = USER_ATTACHMENT_LIMITS, locale = "en" } = {}) {
   if (documentInfo?.reason === "too_large") {
-    return `Attachment '${documentInfo.safeName}' is too large (${humanBytes(documentInfo.fileSize)}). Maximum supported text/code/log file size is ${humanBytes(limits.maxBytes)}.`
+    return translate(locale, "attachments.unsupportedTooLarge", {
+      file: documentInfo.safeName,
+      size: humanBytes(documentInfo.fileSize),
+      maxSize: humanBytes(limits.maxBytes),
+    })
   }
   return [
-    `Attachment '${documentInfo?.safeName || "attachment"}' is not supported.`,
-    "Supported attachments: UTF-8 text, code, log, diff/patch, JSON/YAML/TOML/XML/CSV, and shell/PowerShell scripts.",
-    `Maximum size: ${humanBytes(limits.maxBytes)}. Large files from ${humanBytes(limits.confirmBytes)} require confirmation.`,
+    translate(locale, "attachments.unsupportedTitle", { file: documentInfo?.safeName || "attachment" }),
+    translate(locale, "attachments.unsupportedSupported"),
+    translate(locale, "attachments.unsupportedMax", { maxSize: humanBytes(limits.maxBytes), confirmSize: humanBytes(limits.confirmBytes) }),
   ].join("\n")
 }
 
-export function unsupportedMediaText(kind, { limits = USER_ATTACHMENT_LIMITS } = {}) {
+export function unsupportedMediaText(kind, { limits = USER_ATTACHMENT_LIMITS, locale = "en" } = {}) {
   return [
-    `${kind ? `Telegram ${kind} messages are` : "This Telegram media message is"} not supported as an OpenCode prompt attachment.`,
-    "Send a UTF-8 text/code/log file as a Telegram document instead.",
-    `Maximum supported file size: ${humanBytes(limits.maxBytes)}.`,
+    kind ? translate(locale, "attachments.unsupportedMedia", { kind }) : translate(locale, "attachments.unsupportedMediaGeneric"),
+    translate(locale, "attachments.unsupportedMediaHint"),
+    translate(locale, "attachments.unsupportedMediaMax", { maxSize: humanBytes(limits.maxBytes) }),
   ].join("\n")
 }
 
-export function attachmentSentText(documentInfo, binding) {
-  const scope = binding?.projectAlias && binding?.sessionId ? ` to ${binding.projectAlias}/${binding.sessionId}` : ""
-  return `Attachment sent${scope}: ${documentInfo?.safeName || "attachment.txt"}`
+export function attachmentSentText(documentInfo, binding, { locale = "en" } = {}) {
+  const scope = binding?.projectAlias && binding?.sessionId
+    ? translate(locale, "attachments.scope", { project: binding.projectAlias, session: binding.sessionId })
+    : ""
+  return translate(locale, "attachments.sent", { scope, file: documentInfo?.safeName || "attachment.txt" })
 }
 
-export function attachmentDownloadFailedText(documentInfo) {
-  return `Attachment '${documentInfo?.safeName || "attachment"}' could not be downloaded from Telegram. Please try again.`
+export function attachmentDownloadFailedText(documentInfo, { locale = "en" } = {}) {
+  return translate(locale, "attachments.downloadFailed", { file: documentInfo?.safeName || "attachment" })
 }
