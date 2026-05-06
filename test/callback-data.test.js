@@ -68,6 +68,41 @@ test("callback codec fuzzes documented legacy prefixes", () => {
   }
 })
 
+test("callback codec fuzzes unsupported pipe prefixes as invalid", () => {
+  const rng = createFuzzRng("callback-unsupported-prefixes")
+  const supported = new Set(LEGACY_CALLBACK_PREFIXES)
+  for (let i = 0; i < ITERATIONS; i++) {
+    let prefix = randomString(rng, { minLength: 1, maxLength: 12, alphabet: "abcdefghijklmnopqrstuvwxyz0123456789_-" })
+    if (supported.has(prefix)) prefix = `x-${prefix}`
+    assert.equal(decodeCallbackData(`${prefix}|${randomString(rng, { minLength: 0, maxLength: 24 })}`), null)
+  }
+})
+
+test("callback packer fuzzes generated parts through injected packer", () => {
+  const rng = createFuzzRng("callback-packer-roundtrip")
+  const packedPayloads = []
+  const pack = callbackPacker({
+    pack: (payload) => {
+      packedPayloads.push(payload)
+      return `packed:${payload}`
+    },
+  })
+
+  for (let i = 0; i < ITERATIONS; i++) {
+    const parts = Array.from({ length: randomInt(rng, 1, 6) }, () => pick(rng, [
+      null,
+      undefined,
+      randomInt(rng, -100, 100),
+      randomString(rng, { minLength: 0, maxLength: 32 }),
+    ]))
+    const result = pack(parts)
+    const payload = packedPayloads.at(-1)
+
+    assert.equal(result, `packed:${payload}`)
+    assert.deepEqual(decodeCallbackData(payload), parts.map((part) => (part == null ? "" : String(part))))
+  }
+})
+
 test("callback codec keeps malformed JSON arrays invalid", () => {
   for (const payload of ["[", "[]", "[1,", "[null] trailing", "[\"ok\""]) assert.equal(decodeCallbackData(payload), null)
 })

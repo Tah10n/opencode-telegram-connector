@@ -145,6 +145,59 @@ function randomConnectorShape(rng) {
   return raw
 }
 
+function randomValidConnectorConfig(rng) {
+  const cwd = `cwd-${safeName(rng)}`
+  const stateFile = `state-${safeName(rng)}.json`
+  const alias = safeName(rng, "project")
+  const projectDirectory = `repo-${safeName(rng)}`
+  const port = randomInt(rng, 1024, 65000)
+  const defaultLocale = pick(rng, ["en", "ru"])
+  const healthPort = randomInt(rng, 0, 65535)
+  return {
+    raw: {
+      cwd,
+      stateFile,
+      defaultProject: alias,
+      tgPrefix: safeValue(rng, { maxLength: 8 }),
+      echoFilterMode: pick(rng, ["recent", "prefix"]),
+      mirrorTuiUserMessages: chance(rng),
+      allowInsecureHttp: chance(rng),
+      activeTurnStaleMs: randomInt(rng, 1, 300000),
+      healthServer: { enabled: chance(rng), host: "127.0.0.1", port: healthPort },
+      opencodeWatchdog: {
+        failureThreshold: randomInt(rng, 1, 10),
+        windowMs: randomInt(rng, 1000, 300000),
+        cooldownMs: randomInt(rng, 0, 300000),
+      },
+      i18n: {
+        defaultLocale,
+        supportedLocales: ["en", "ru"],
+        autoDetectTelegramLanguage: chance(rng),
+        botCommandLocales: [defaultLocale],
+      },
+      limits: {
+        userAttachmentConfirmBytes: randomInt(rng, 1, 4096),
+        userAttachmentMaxBytes: randomInt(rng, 4096, 65536),
+      },
+      telegram: {
+        botToken: `token-${safeName(rng)}`,
+        allowedUserId: randomInt(rng, 1, 999999999),
+      },
+      projects: {
+        [alias]: {
+          directory: projectDirectory,
+          port,
+          autoStart: true,
+          serverLaunchMode: pick(rng, ["background", "window"]),
+          openTuiOnAutoStart: chance(rng),
+          openAttachOnNewMode: pick(rng, ["same-window", "new-window"]),
+        },
+      },
+    },
+    expected: { cwd, stateFile, alias, projectDirectory, port, healthPort, defaultLocale },
+  }
+}
+
 test("parseDotEnv fuzzes bounded random text without non-Error throws", () => {
   const rng = createFuzzRng("parse-dotenv-random-text")
   for (let i = 0; i < ITERATIONS; i++) {
@@ -169,6 +222,15 @@ test("parseDotEnv generated assignments parse predictably", () => {
     }
     lines.push("ignored-without-equals")
     assert.deepEqual(parseDotEnv(lines.join("\n")), expected)
+  }
+})
+
+test("parseDotEnv generated quoted assignments preserve hashes and spaces", () => {
+  const rng = createFuzzRng("parse-dotenv-quoted-hashes")
+  for (let i = 0; i < ITERATIONS; i++) {
+    const key = safeName(rng, "ENV").toUpperCase().replaceAll("-", "_")
+    const value = `${safeValue(rng, { minLength: 1, maxLength: 8 }).trim()} # ${safeValue(rng, { minLength: 1, maxLength: 8 }).trim()}`
+    assert.deepEqual(parseDotEnv(`${key}="${value}" # comment`), { [key]: value })
   }
 })
 
@@ -216,5 +278,24 @@ test("normalizeConnectorConfig generated object shapes normalize or reject with 
     assert.equal(result.value.configFilePath, CONFIG_FILE)
     assert.equal(typeof result.value.config, "object")
     assert.ok(path.isAbsolute(result.value.config.cwd))
+  }
+})
+
+test("normalizeConnectorConfig generated valid configs normalize paths and nested config predictably", () => {
+  const rng = createFuzzRng("connector-valid")
+  for (let i = 0; i < ITERATIONS; i++) {
+    const { raw, expected } = randomValidConnectorConfig(rng)
+    const normalized = normalizeConnectorConfig(raw, { configFilePath: CONFIG_FILE })
+    const runtimeBaseDir = path.resolve(BASE_DIR, expected.cwd)
+
+    assert.equal(normalized.baseDir, BASE_DIR)
+    assert.equal(normalized.config.cwd, runtimeBaseDir)
+    assert.equal(normalized.config.stateFile, path.resolve(runtimeBaseDir, expected.stateFile))
+    assert.equal(normalized.config.defaultProject, expected.alias)
+    assert.equal(normalized.config.healthServer.port, expected.healthPort)
+    assert.equal(normalized.config.i18n.defaultLocale, expected.defaultLocale)
+    assert.equal(normalized.config.projects[expected.alias].baseUrl, `http://127.0.0.1:${expected.port}`)
+    assert.equal(normalized.config.projects[expected.alias].directory, path.resolve(runtimeBaseDir, expected.projectDirectory))
+    assert.equal(normalized.config.projects[expected.alias].autoStart, true)
   }
 })
