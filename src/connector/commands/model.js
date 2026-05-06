@@ -12,6 +12,13 @@ import { t as translate } from "../../i18n/index.js"
 import { callbackToast } from "../callback-toast.js"
 import { callbackPacker } from "./shared.js"
 
+const MODEL_SOURCE_LABEL_KEYS = {
+  "thread-custom": "model.sourceLabels.threadCustom",
+  "thread-project-default": "model.sourceLabels.threadProjectDefault",
+  "session-history": "model.sourceLabels.sessionHistory",
+  "project-default": "model.sourceLabels.projectDefault",
+}
+
 export function createModelCommandHandlers(deps) {
   const {
     store,
@@ -97,27 +104,42 @@ export function createModelCommandHandlers(deps) {
     }
   }
 
-  function appendEffectiveModelLines(lines, effectiveState) {
+  function localizedModelSourceLabel(source, locale = "en") {
+    const key = MODEL_SOURCE_LABEL_KEYS[source]
+    if (!key) return modelSourceLabel(source)
+    const label = t(locale, key)
+    return label && label !== key ? label : modelSourceLabel(source)
+  }
+
+  function appendEffectiveModelLines(lines, effectiveState, locale = "en") {
     if (!effectiveState?.label) return lines
-    lines.push(`Model: ${effectiveState.label}`)
+    lines.push(`${t(locale, "common.model")}: ${effectiveState.label}`)
     if (effectiveState.source && effectiveState.source !== "unknown") {
-      lines.push(`Source: ${modelSourceLabel(effectiveState.source)}`)
+      lines.push(t(locale, "model.source", { source: localizedModelSourceLabel(effectiveState.source, locale) }))
     }
     return lines
   }
 
-  async function buildSessionSwitchText(projectAlias, sessionId, { ctxKey } = {}) {
-    const lines = [`Changed: this thread now uses session ${sessionId}.`, `Project: ${projectAlias}`, `Session: ${sessionId}`]
-    if (ctxKey) lines.push(`Feed: ${feedModeLabel(getFeedMode(ctxKey))}`)
+  async function buildSessionSwitchText(projectAlias, sessionId, { ctxKey, locale = "en" } = {}) {
+    const lines = [
+      t(locale, "sessions.changedSession", { session: sessionId }),
+      t(locale, "model.project", { project: projectAlias }),
+      t(locale, "model.session", { session: sessionId }),
+    ]
+    if (ctxKey) lines.push(t(locale, "sessions.feed", { mode: feedModeLabel(getFeedMode(ctxKey), locale) }))
     const effectiveState = await resolveEffectiveModelState(ctxKey, { projectAlias, sessionId })
-    return appendEffectiveModelLines(lines, effectiveState).join("\n")
+    return appendEffectiveModelLines(lines, effectiveState, locale).join("\n")
   }
 
-  async function buildNewSessionText(projectAlias, sessionId, { ctxKey } = {}) {
-    const lines = [`Changed: this thread now uses new session ${sessionId}.`, `Project: ${projectAlias}`, `Session: ${sessionId}`]
-    if (ctxKey) lines.push(`Feed: ${feedModeLabel(getFeedMode(ctxKey))}`)
+  async function buildNewSessionText(projectAlias, sessionId, { ctxKey, locale = "en" } = {}) {
+    const lines = [
+      t(locale, "sessions.changedNewSession", { session: sessionId }),
+      t(locale, "model.project", { project: projectAlias }),
+      t(locale, "model.session", { session: sessionId }),
+    ]
+    if (ctxKey) lines.push(t(locale, "sessions.feed", { mode: feedModeLabel(getFeedMode(ctxKey), locale) }))
     const effectiveState = await resolveEffectiveModelState(ctxKey, { projectAlias, sessionId })
-    return appendEffectiveModelLines(lines, effectiveState).join("\n")
+    return appendEffectiveModelLines(lines, effectiveState, locale).join("\n")
   }
 
   async function setThreadModelPreference(ctxMeta, binding, nextPreference) {

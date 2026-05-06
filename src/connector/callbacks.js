@@ -521,7 +521,7 @@ export function createCallbackHandlers(runtime) {
           editMessageId: msg?.message_id,
         }).catch(async (err) => {
           runtime.logger?.error?.("Failed to refresh sessions list:", err?.message || String(err))
-          await sendToThread(ctxMeta, await buildSessionSwitchText(projectAlias, safeTargetSessionId, { ctxKey: ctxMeta.ctxKey })).catch(ignoreError)
+          await sendToThread(ctxMeta, await buildSessionSwitchText(projectAlias, safeTargetSessionId, { ctxKey: ctxMeta.ctxKey, locale: ctxMeta.locale })).catch(ignoreError)
         })
         return
       }

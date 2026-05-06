@@ -187,14 +187,14 @@ export function createSessionCommandHandlers(deps) {
       const startupSid = await resolveValidStartupSession(alias, oc)
       if (startupSid) {
         const bindResult = await bindCtxToSession(ctxMeta, alias, startupSid)
-        await sendToThread(ctxMeta, appendMoveConflict([t(ctxMeta, "sessions.boundStartup", { project: alias, session: startupSid })], bindResult).join("\n"))
+        await sendToThread(ctxMeta, appendMoveConflict([t(ctxMeta, "sessions.boundStartup", { project: alias, session: startupSid })], bindResult, ctxMeta.locale).join("\n"))
       } else {
         const created = await oc.createSession(createSessionOptions(alias))
         const createdId = requireSessionIdFromBackend(created?.id, "created session id")
         logger.info(`[${alias}] created session for bind:`, createdId)
         startupSessionByProject[alias] = createdId
         const bindResult = await bindCtxToSession(ctxMeta, alias, createdId)
-        await sendToThread(ctxMeta, appendMoveConflict([t(ctxMeta, "sessions.boundNew", { project: alias, session: createdId })], bindResult).join("\n"))
+        await sendToThread(ctxMeta, appendMoveConflict([t(ctxMeta, "sessions.boundNew", { project: alias, session: createdId })], bindResult, ctxMeta.locale).join("\n"))
       }
     } catch (err) {
       await sendToThread(ctxMeta, formatProjectUnavailable(alias, err, { locale: ctxMeta.locale })).catch(() => {})
@@ -246,7 +246,7 @@ export function createSessionCommandHandlers(deps) {
         const bindResult = await bindCtxToSession(ctxMeta, binding.projectAlias, createdId)
         primeTuiActiveSessionFollow?.(binding.projectAlias, ctxMeta, binding.sessionId, { pendingTargetSessionId: createdId })
 
-        const lines = [await buildNewSessionText(binding.projectAlias, createdId, { ctxKey: ctxMeta.ctxKey })]
+        const lines = [await buildNewSessionText(binding.projectAlias, createdId, { ctxKey: ctxMeta.ctxKey, locale: ctxMeta.locale })]
         if (sameWindowSwitchFailed) {
           lines.push(
             `Note: Could not switch the existing TUI automatically in same-window mode. Telegram is already using the new session; switch or reattach the TUI manually if needed.`,
@@ -259,10 +259,13 @@ export function createSessionCommandHandlers(deps) {
             `Note: This opencode server does not expose active TUI session tracking; Telegram is already using the new session, but future TUI-only switches will not be followed automatically.`,
           )
         }
-        await sendToThread(ctxMeta, appendMoveConflict(lines, bindResult).join("\n"))
+        await sendToThread(ctxMeta, appendMoveConflict(lines, bindResult, ctxMeta.locale).join("\n"))
       } else {
         const bindResult = await bindCtxToSession(ctxMeta, binding.projectAlias, createdId)
-        await sendToThread(ctxMeta, appendMoveConflict([await buildNewSessionText(binding.projectAlias, createdId, { ctxKey: ctxMeta.ctxKey })], bindResult).join("\n"))
+        await sendToThread(
+          ctxMeta,
+          appendMoveConflict([await buildNewSessionText(binding.projectAlias, createdId, { ctxKey: ctxMeta.ctxKey, locale: ctxMeta.locale })], bindResult, ctxMeta.locale).join("\n"),
+        )
       }
 
       if (attachOnNewMode === "new-window") {
@@ -374,7 +377,10 @@ export function createSessionCommandHandlers(deps) {
       }
       await oc.getSession(targetSessionId)
       const bindResult = await bindCtxToSession(ctxMeta, binding.projectAlias, targetSessionId)
-      await sendToThread(ctxMeta, appendMoveConflict([await buildSessionSwitchText(binding.projectAlias, targetSessionId, { ctxKey: ctxMeta.ctxKey })], bindResult).join("\n"))
+      await sendToThread(
+        ctxMeta,
+        appendMoveConflict([await buildSessionSwitchText(binding.projectAlias, targetSessionId, { ctxKey: ctxMeta.ctxKey, locale: ctxMeta.locale })], bindResult, ctxMeta.locale).join("\n"),
+      )
     } catch (err) {
       await sendToThread(ctxMeta, formatProjectUnavailable(binding.projectAlias, err, { locale: ctxMeta.locale })).catch(() => {})
     }

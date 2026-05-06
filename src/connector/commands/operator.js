@@ -262,6 +262,7 @@ export function createOperatorCommandHandlers(deps) {
           ...runtimeLines,
         ],
         effectiveState,
+        ctxMeta.locale,
       ).join("\n"),
       replyMarkup,
     )

@@ -340,13 +340,16 @@ export function createCommandHandlers(runtime) {
     return deleted
   }
 
-  function moveConflictNote(result) {
+  function moveConflictNote(result, locale = "en") {
     if (!result?.movedFromRoute) return ""
-    return `Note: this session was already bound to chat ${result.movedFromRoute.chatId} / ${formatThreadLabel(result.movedFromRoute.threadIdOr0)} and was moved to this thread.`
+    return t(locale, "sessions.moveConflictNote", {
+      chat: result.movedFromRoute.chatId,
+      thread: formatThreadLabel(result.movedFromRoute.threadIdOr0),
+    })
   }
 
-  function appendMoveConflict(lines, result) {
-    const note = moveConflictNote(result)
+  function appendMoveConflict(lines, result, locale = "en") {
+    const note = moveConflictNote(result, locale)
     if (note) lines.push(note)
     return lines
   }

@@ -173,6 +173,12 @@ export default {
     noVariant: "Без variant",
     back: "Назад",
     projectDefaultButton: "Дефолт проекта",
+    sourceLabels: {
+      threadCustom: "Пользовательское переопределение треда",
+      threadProjectDefault: "Дефолт проекта для треда",
+      sessionHistory: "Наследуется из истории сессии",
+      projectDefault: "Наследуется из дефолта проекта",
+    },
   },
   prompts: {
     question: "Вопрос {current}/{total}",
@@ -246,6 +252,7 @@ export default {
     moveConflictNote: "Заметка: эта сессия уже была привязана к chat {chat} / {thread} и была перенесена в этот тред.",
     changedSession: "Изменено: этот тред теперь использует сессию {session}.",
     changedNewSession: "Изменено: этот тред теперь использует новую сессию {session}.",
+    feed: "Feed: {mode}",
   },
   callbacks: {
     closed: "Закрыто",

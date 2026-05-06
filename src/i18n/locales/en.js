@@ -173,6 +173,12 @@ export default {
     noVariant: "No variant",
     back: "Back",
     projectDefaultButton: "Project default",
+    sourceLabels: {
+      threadCustom: "Thread custom override",
+      threadProjectDefault: "Thread project default override",
+      sessionHistory: "Inherited from session history",
+      projectDefault: "Inherited from project default",
+    },
   },
   prompts: {
     question: "Question {current}/{total}",
@@ -246,6 +252,7 @@ export default {
     moveConflictNote: "Note: this session was already bound to chat {chat} / {thread} and was moved to this thread.",
     changedSession: "Changed: this thread now uses session {session}.",
     changedNewSession: "Changed: this thread now uses new session {session}.",
+    feed: "Feed: {mode}",
   },
   callbacks: {
     closed: "Closed",
