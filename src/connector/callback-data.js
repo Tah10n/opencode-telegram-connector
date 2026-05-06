@@ -1,6 +1,18 @@
+export const LEGACY_CALLBACK_PREFIXES = Object.freeze(["rt", "s", "srv", "b", "feed", "m", "cf", "att", "p", "q", "lang"])
+
+const LEGACY_CALLBACK_PREFIX_SET = new Set(LEGACY_CALLBACK_PREFIXES)
+
 function normalizeCallbackParts(parts) {
   if (!Array.isArray(parts)) return []
   return parts.map((part) => (part == null ? "" : String(part)))
+}
+
+export function legacyCallbackPrefix(data) {
+  if (typeof data !== "string" || data.length === 0 || data.startsWith("[")) return ""
+  const separator = data.indexOf("|")
+  if (separator <= 0) return ""
+  const prefix = data.slice(0, separator)
+  return LEGACY_CALLBACK_PREFIX_SET.has(prefix) ? prefix : ""
 }
 
 export function encodeCallback(parts) {
@@ -18,7 +30,7 @@ export function decodeCallbackData(data) {
       return null
     }
   }
-  return data.split("|")
+  return legacyCallbackPrefix(data) ? data.split("|") : null
 }
 
 export function packCallbackParts(cb, parts) {

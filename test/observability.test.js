@@ -28,6 +28,7 @@ test("createRuntimeObservability records compact privacy-safe counters", () => {
   observability.recordTelegramFailure({ projectAlias: "demo", operation: "sendMessage" })
   observability.recordTelegramFailure({ projectAlias: "demo", operation: "editMessageText" })
   observability.recordAttachmentFallback("demo", "assistant-long-output")
+  observability.recordLegacyCallbackFallback("demo")
 
   const projectText = observability.buildStatusLines("demo").join("\n")
   const runtimeText = observability.buildRuntimeStatusLines().join("\n")
@@ -36,6 +37,7 @@ test("createRuntimeObservability records compact privacy-safe counters", () => {
     assert.match(text, /Messages: assistant=1 skipped=1 attachmentFallbacks=1/)
     assert.match(text, /Prompts: delivered=1 answered=1/)
     assert.match(text, /Telegram delivery: sendFailures=1 editFailures=1/)
+    assert.match(text, /legacyFallback=1|Legacy callbacks: fallback=1/)
     assert.doesNotMatch(text, /chat|session|state\.json|token/i)
   }
 })

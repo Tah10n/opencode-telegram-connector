@@ -26,7 +26,7 @@ function createProjectState() {
     },
     promptRecovery: { restored: 0, stale: 0, retryable: 0, fatal: 0 },
     promptCleanup: { stale: 0 },
-    callbacks: { stale: 0, retryable: 0, fatal: 0 },
+    callbacks: { stale: 0, retryable: 0, fatal: 0, legacyFallback: 0 },
     messages: { assistantMirrored: 0, noisySkipped: 0 },
     prompts: { delivered: 0, answered: 0 },
     telegram: { sendFailures: 0, editFailures: 0 },
@@ -50,6 +50,7 @@ function createGlobalState() {
     prompts: { delivered: 0, answered: 0 },
     telegram: { sendFailures: 0, editFailures: 0 },
     attachments: { fallbacks: 0 },
+    callbacks: { legacyFallback: 0 },
   }
 }
 
@@ -170,6 +171,10 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
     bucket[outcome] += 1
   }
 
+  function recordLegacyCallbackFallback(projectAlias) {
+    increment("callbacks", "legacyFallback", { projectAlias })
+  }
+
   function recordUpdateRetry() {
     globalState.updates.retryable += 1
   }
@@ -226,6 +231,8 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
       ...formatCounterLines(project),
     ]
 
+    if (project.callbacks.legacyFallback > 0) lines.push(`Legacy callbacks: fallback=${project.callbacks.legacyFallback}`)
+
     if (project.promptCleanup.stale > 0) {
       lines.push(`Prompt cleanup: stale=${project.promptCleanup.stale}`)
     }
@@ -264,6 +271,7 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
       formatLoopLine("Prompt poll", globalState.loops.promptPoll, { includeFallback: true }),
       formatLoopLine("Shutdown", globalState.loops.shutdown),
       `Updates: retryable=${globalState.updates.retryable} skipped=${globalState.updates.skipped}`,
+      `Callbacks: legacyFallback=${globalState.callbacks.legacyFallback}`,
       ...formatCounterLines(globalState),
     ]
   }
@@ -325,6 +333,7 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
     recordPromptRecovery,
     recordPromptCleanup,
     recordCallbackOutcome,
+    recordLegacyCallbackFallback,
     recordUpdateRetry,
     recordUpdateSkip,
     recordAssistantMirrored,

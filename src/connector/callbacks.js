@@ -10,7 +10,7 @@ import {
   questionRejectIdempotencyKey,
   questionReplyIdempotencyPrefix,
 } from "./idempotency.js"
-import { callbackPacker, decodeCallbackData } from "./callback-data.js"
+import { callbackPacker, decodeCallbackData, legacyCallbackPrefix } from "./callback-data.js"
 import { localeDisplayName, matchSupportedLocale, t as translate } from "../i18n/index.js"
 import { languageSettingsView, supportedLocaleSummary } from "./language-ui.js"
 import { getRequestContext } from "../runtime/request-context.js"
@@ -67,6 +67,7 @@ export function createCallbackHandlers(runtime) {
     startServerKeyboard,
     platform,
     recordCallbackOutcome,
+    recordLegacyCallbackFallback,
     recordPromptAnswered,
     resolveBoundRoute,
     requestRuntimeShutdown,
@@ -77,6 +78,8 @@ export function createCallbackHandlers(runtime) {
     config,
   } = runtime
   const packCallbackData = callbackPacker(cb)
+  const legacyCallbackWarningAt = new Map()
+  const legacyCallbackWarningIntervalMs = 5 * 60 * 1000
 
   async function answerCallbackQuery(callbackQueryId, text) {
     const locale = getRequestContext()?.locale || config?.i18n?.defaultLocale || "en"
@@ -314,6 +317,23 @@ export function createCallbackHandlers(runtime) {
     return typeof requestRuntimeShutdown === "function"
   }
 
+  function recordLegacyCallback(prefix, projectAlias) {
+    if (!prefix) return
+    try {
+      recordLegacyCallbackFallback?.(projectAlias)
+      const now = Date.now()
+      const lastWarnedAt = legacyCallbackWarningAt.get(prefix) || 0
+      if (now - lastWarnedAt < legacyCallbackWarningIntervalMs) return
+      legacyCallbackWarningAt.set(prefix, now)
+      runtime.logger?.warn?.("Legacy callback payload format used", {
+        callbackPrefix: prefix,
+        operation: "callback legacy fallback",
+      })
+    } catch (err) {
+      runtime.logger?.error?.("Legacy callback fallback recorder failed:", err?.message || String(err))
+    }
+  }
+
   function requestRuntimeShutdownSoon(action) {
     const run = () =>
       Promise.resolve(requestRuntimeShutdown({ action })).catch((err) => {
@@ -352,6 +372,7 @@ export function createCallbackHandlers(runtime) {
       return
     }
 
+    const legacyPrefix = legacyCallbackPrefix(data)
     const parts = decodeCallbackData(data)
     if (!parts?.length || !parts[0]) {
       await answerCallbackQuery(callbackQuery.id, "Invalid")
@@ -359,6 +380,7 @@ export function createCallbackHandlers(runtime) {
     }
     const kind = parts[0]
     const callbackProjectAlias = projects?.[parts[1]] ? parts[1] : store.getBinding(ctxMeta.ctxKey)?.projectAlias || null
+    recordLegacyCallback(legacyPrefix, callbackProjectAlias)
 
     try {
       if (kind === "lang") {
