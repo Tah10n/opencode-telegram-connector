@@ -241,8 +241,12 @@ export function createCommandHandlers(runtime) {
     ])
   }
 
-  function closeOnlyKeyboard() {
-    return makeInlineKeyboard([[{ text: "Close", callback_data: packCallback("s", "close") }]])
+  function localeForCtx(ctxMeta = null) {
+    return ctxMeta?.locale || config.i18n?.defaultLocale || "en"
+  }
+
+  function closeOnlyKeyboard(ctxMeta = null) {
+    return makeInlineKeyboard([[{ text: translate(localeForCtx(ctxMeta), "common.close"), callback_data: packCallback("s", "close") }]])
   }
 
   async function maybeBlockStaleActiveTurn(ctxMeta, binding) {
@@ -263,7 +267,7 @@ export function createCommandHandlers(runtime) {
       return false
     }
     if (status?.state !== "stale") return false
-    await sendToThread(ctxMeta, formatStaleActiveTurnNotice(status, binding), closeOnlyKeyboard())
+    await sendToThread(ctxMeta, formatStaleActiveTurnNotice(status, binding), closeOnlyKeyboard(ctxMeta))
     return true
   }
 
@@ -452,7 +456,7 @@ export function createCommandHandlers(runtime) {
         await sendToThread(
           ctxMeta,
           t(ctxMeta, "language.unsupported", { locale: arg, supported: supportedLocaleSummary({ config, displayLocale: ctxMeta.locale }) }),
-          closeOnlyKeyboard(),
+          closeOnlyKeyboard(ctxMeta),
         )
         return
       }
@@ -525,24 +529,24 @@ export function createCommandHandlers(runtime) {
     if (awaitingQ) {
       const bindingStatus = await promptContinuationBindingStatus(ctxMeta.ctxKey, awaitingQ.projectAlias, awaitingQ.sessionID)
       if (bindingStatus === "retryable") {
-        await sendToThread(ctxMeta, "Question answer is temporarily unavailable. Send the answer again or /cancel.").catch(() => {})
+        await sendToThread(ctxMeta, t(ctxMeta, "commands.questionRetry")).catch(() => {})
         return
       }
       if (bindingStatus !== "current") {
         setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
-        await sendToThread(ctxMeta, "Question is no longer active.").catch(() => {})
+        await sendToThread(ctxMeta, t(ctxMeta, "prompts.questionInactive")).catch(() => {})
         await markMessageHandled("customAnswerStale", { projectAlias: awaitingQ.projectAlias })
         return
       }
       if (!hasText) {
-        await sendToThread(ctxMeta, "This question expects a text answer. Send text or /cancel.", closeOnlyKeyboard())
+        await sendToThread(ctxMeta, t(ctxMeta, "commands.questionTextExpected"), closeOnlyKeyboard(ctxMeta))
         await markMessageHandled("questionNonText", { projectAlias: awaitingQ.projectAlias })
         return
       }
       const wizard = getWizard(awaitingQ.projectAlias, awaitingQ.requestId, awaitingQ.sessionID)
       if (!wizard || wizard.index !== awaitingQ.qIndex) {
         setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
-        await sendToThread(ctxMeta, "Question is no longer active.")
+        await sendToThread(ctxMeta, t(ctxMeta, "prompts.questionInactive"))
         await markMessageHandled("customAnswerStale", { projectAlias: awaitingQ.projectAlias })
         return
       }
@@ -556,7 +560,7 @@ export function createCommandHandlers(runtime) {
           idempotencyEntries: [messageIdempotencyEntry("replyQuestion", { projectAlias: awaitingQ.projectAlias, sessionId: wizard.sessionID })],
         })
         if (result?.outcome === "retryable") {
-          await sendToThread(ctxMeta, "Question answer is temporarily unavailable. Send the answer again or /cancel.").catch(() => {})
+          await sendToThread(ctxMeta, t(ctxMeta, "commands.questionRetry")).catch(() => {})
           return
         }
       } else {
@@ -575,18 +579,18 @@ export function createCommandHandlers(runtime) {
     if (awaiting) {
       const bindingStatus = await promptContinuationBindingStatus(ctxMeta.ctxKey, awaiting.projectAlias, awaiting.sessionID)
       if (bindingStatus === "retryable") {
-        await sendToThread(ctxMeta, "Permission reply is temporarily unavailable. Send the note again or /cancel.").catch(() => {})
+        await sendToThread(ctxMeta, t(ctxMeta, "commands.permissionRetry")).catch(() => {})
         return
       }
       if (bindingStatus !== "current") {
         store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId, awaiting.sessionID)
         setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
-        await sendToThread(ctxMeta, "Permission request is no longer active.").catch(() => {})
+        await sendToThread(ctxMeta, t(ctxMeta, "commands.permissionInactive")).catch(() => {})
         await markMessageHandled("permissionNoteStale", { projectAlias: awaiting.projectAlias })
         return
       }
       if (!hasText) {
-        await sendToThread(ctxMeta, "This permission flow expects a text rejection note. Send text or /cancel.", closeOnlyKeyboard())
+        await sendToThread(ctxMeta, t(ctxMeta, "commands.permissionTextExpected"), closeOnlyKeyboard(ctxMeta))
         await markMessageHandled("permissionNoteNonText", { projectAlias: awaiting.projectAlias })
         return
       }
@@ -596,7 +600,7 @@ export function createCommandHandlers(runtime) {
         store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId, awaiting.sessionID)
         setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
         await markMessageHandled("replyPermissionNote", { projectAlias: awaiting.projectAlias })
-        await sendToThread(ctxMeta, "Rejection note already sent.").catch(() => {})
+        await sendToThread(ctxMeta, t(ctxMeta, "commands.rejectionNoteAlreadySent")).catch(() => {})
         return
       }
       try {
@@ -629,11 +633,11 @@ export function createCommandHandlers(runtime) {
           store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId, awaiting.sessionID)
           setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
           await flushDurableState("persist stale permission note state")
-          await sendToThread(ctxMeta, "Permission request is no longer active.").catch(() => {})
+          await sendToThread(ctxMeta, t(ctxMeta, "commands.permissionInactive")).catch(() => {})
           return
         }
         if (isRetryableBoundaryError(err, { source: "opencode", pathname: `/permission/${awaiting.permissionId}/reply`, method: "POST" })) {
-          await sendToThread(ctxMeta, "Permission reply is temporarily unavailable. Send the note again or /cancel.").catch(() => {})
+          await sendToThread(ctxMeta, t(ctxMeta, "commands.permissionRetry")).catch(() => {})
           return
         }
         throw err
@@ -665,14 +669,14 @@ export function createCommandHandlers(runtime) {
       store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId, awaiting.sessionID)
       setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
       await flushDurableState("persist permission note state")
-      await sendToThread(ctxMeta, "Rejection note sent.").catch(() => {})
+      await sendToThread(ctxMeta, t(ctxMeta, "commands.rejectionNoteSent")).catch(() => {})
       return
     }
 
     const awaitingBind = bindAliasAwaiting.get(ctxMeta.ctxKey)
     if (awaitingBind) {
       if (!hasText) {
-        await sendToThread(ctxMeta, "This bind flow expects a project alias as text. Send an alias or /cancel.", closeOnlyKeyboard())
+        await sendToThread(ctxMeta, t(ctxMeta, "commands.bindTextExpected"), closeOnlyKeyboard(ctxMeta))
         await markMessageHandled("bindAliasNonText")
         return
       }
@@ -689,7 +693,7 @@ export function createCommandHandlers(runtime) {
       } else {
         const alias = String(text).trim().split(/\s+/)[0]
         if (!alias) {
-          await sendToThread(ctxMeta, "Send project alias (e.g. 'myproj') or /cancel.")
+          await sendToThread(ctxMeta, t(ctxMeta, "commands.bindAliasPrompt"))
           return
         }
         bindAliasAwaiting.delete(ctxMeta.ctxKey)
@@ -726,7 +730,7 @@ export function createCommandHandlers(runtime) {
       if (cmd === "/bind") {
         if (!argv?.[0]) {
           bindAliasAwaiting.set(ctxMeta.ctxKey, { startedAt: Date.now() })
-          await sendToThread(ctxMeta, `${unboundGuidanceText(ctxMeta, "Send a project alias for this thread, or tap a button below.")}\nYou can /cancel.`, unboundGuidanceKeyboard(ctxMeta))
+          await sendToThread(ctxMeta, `${unboundGuidanceText(ctxMeta, t(ctxMeta, "commands.unbound.bindPromptReason"))}\n${t(ctxMeta, "commands.unbound.bindPromptCancel")}`, unboundGuidanceKeyboard(ctxMeta))
           await markMessageHandled("bindPrompt")
           return
         }
@@ -818,7 +822,7 @@ export function createCommandHandlers(runtime) {
     }
 
     if (mediaKind) {
-      await sendToThread(ctxMeta, unsupportedMediaText(mediaKind, { limits: userAttachmentLimits }), closeOnlyKeyboard())
+      await sendToThread(ctxMeta, unsupportedMediaText(mediaKind, { limits: userAttachmentLimits, locale: ctxMeta.locale }), closeOnlyKeyboard(ctxMeta))
       await markMessageHandled("unsupportedMedia", { projectAlias: binding.projectAlias, sessionId: binding.sessionId, action: mediaKind })
       return
     }

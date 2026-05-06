@@ -8,6 +8,7 @@ import {
   normalizeVariant,
   pickMostRecentSessionModelInfo,
 } from "../../model-selection.js"
+import { t as translate } from "../../i18n/index.js"
 import { callbackPacker } from "./shared.js"
 
 export function createModelCommandHandlers(deps) {
@@ -24,6 +25,7 @@ export function createModelCommandHandlers(deps) {
     getFeedMode,
     feedModeLabel,
     cb,
+    t = (ctxOrLocale, key, params) => translate(typeof ctxOrLocale === "string" ? ctxOrLocale : ctxOrLocale?.locale, key, params),
   } = deps
   const packCallback = callbackPacker(cb)
 
@@ -126,14 +128,14 @@ export function createModelCommandHandlers(deps) {
         return {
           ok: false,
           callbackText: "No project default",
-          message: "Project default model is not configured for this project.",
+          message: t(ctxMeta, "modelCommands.noProjectDefaultMessage"),
         }
       }
       setModelPreference(ctxMeta.ctxKey, preference)
       return {
         ok: true,
         callbackText: "Model: project default",
-        noticeText: "Changed: this thread now uses the project default model override.",
+        noticeText: t(ctxMeta, "modelCommands.noticeProjectDefault"),
       }
     }
 
@@ -142,7 +144,7 @@ export function createModelCommandHandlers(deps) {
       return {
         ok: true,
         callbackText: preference.variant ? `Model: ${formatModelLabel(preference.model, preference.variant)}` : `Model: ${formatModelLabel(preference.model)}`,
-        noticeText: `Changed: this thread now uses ${formatModelLabel(preference.model, preference.variant)}.`,
+        noticeText: t(ctxMeta, "modelCommands.noticeCustom", { model: formatModelLabel(preference.model, preference.variant) }),
       }
     }
 
@@ -150,14 +152,14 @@ export function createModelCommandHandlers(deps) {
     return {
       ok: true,
       callbackText: "Model: inherit",
-      noticeText: "Changed: this thread now inherits its model from session/project defaults.",
+      noticeText: t(ctxMeta, "modelCommands.noticeInherit"),
     }
   }
 
   async function renderModelSettings(ctxMeta, { binding, editMessageId, selectedProviderId, selectedModelKey, noticeText = "" } = {}) {
     const currentBinding = binding || store.getBinding(ctxMeta.ctxKey)
     if (!currentBinding) {
-      await sendToThread(ctxMeta, unboundGuidanceText(ctxMeta, "Model settings need a bound thread."), unboundGuidanceKeyboard(ctxMeta))
+      await sendToThread(ctxMeta, unboundGuidanceText(ctxMeta, t(ctxMeta, "commands.unbound.modelSettingsNeedsBound")), unboundGuidanceKeyboard(ctxMeta))
       return
     }
 
@@ -217,7 +219,7 @@ export function createModelCommandHandlers(deps) {
   async function handleModelCommand(ctxMeta, argv) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await sendToThread(ctxMeta, unboundGuidanceText(ctxMeta, "Model changes need a bound thread."), unboundGuidanceKeyboard(ctxMeta))
+      await sendToThread(ctxMeta, unboundGuidanceText(ctxMeta, t(ctxMeta, "commands.unbound.modelChangesNeedsBound")), unboundGuidanceKeyboard(ctxMeta))
       return
     }
 
@@ -248,11 +250,11 @@ export function createModelCommandHandlers(deps) {
     const model = normalizeModelReference(modelArg)
     const reservedVariant = ["reset", "inherit", "default", "project-default", "project_default"].includes(String(variantArg || "").toLowerCase())
     if (reservedVariant) {
-      await sendToThread(ctxMeta, "Usage: /model\n/model default\n/model reset\n/model <provider/model> [variant]")
+      await sendToThread(ctxMeta, t(ctxMeta, "modelCommands.usage"))
       return
     }
     if (!model) {
-      await sendToThread(ctxMeta, "Usage: /model\n/model default\n/model reset\n/model <provider/model> [variant]")
+      await sendToThread(ctxMeta, t(ctxMeta, "modelCommands.usage"))
       return
     }
 

@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { createCallbackHandlers } from "../src/connector/callbacks.js"
+import { createCallbackHandlers, localizeCallbackToast } from "../src/connector/callbacks.js"
 import { makeBoundaryError } from "../src/boundary-errors.js"
 import { redactCmdlineSecrets } from "../src/url-utils.js"
 import { encodeCallback } from "../src/connector/callback-data.js"
@@ -8,6 +8,24 @@ import { encodeCallback } from "../src/connector/callback-data.js"
 function callbackData(...parts) {
   return encodeCallback(parts)
 }
+
+test("localizeCallbackToast covers attachment and dynamic callback statuses", () => {
+  for (const text of [
+    "Wrong thread",
+    "Expired",
+    "Agent busy",
+    "Already sending",
+    "Already sent",
+    "Too large",
+    "Try again",
+    "Download failed",
+    "Sent",
+  ]) {
+    assert.notEqual(localizeCallbackToast(text, "ru"), text)
+  }
+  assert.equal(localizeCallbackToast("Model: openai/gpt-5", "ru"), "Модель: openai/gpt-5")
+  assert.equal(localizeCallbackToast("Feed: Verbose", "ru"), "Feed: Verbose")
+})
 
 function makeCallback(data, overrides = {}) {
   const threadIdOr0 = overrides.threadIdOr0 ?? 7

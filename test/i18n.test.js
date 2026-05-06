@@ -1,6 +1,11 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { botCommandsForLocale, localeDisplayName, matchSupportedLocale, normalizeI18nConfig, normalizeLocale, t } from "../src/i18n/index.js"
+import { botCommandsForLocale, CATALOGS, localeDisplayName, matchSupportedLocale, normalizeI18nConfig, normalizeLocale, t } from "../src/i18n/index.js"
+
+function flattenKeys(value, prefix = "") {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [prefix]
+  return Object.entries(value).flatMap(([key, child]) => flattenKeys(child, prefix ? `${prefix}.${key}` : key))
+}
 
 test("i18n normalizes Telegram locale codes and falls back to default", () => {
   assert.equal(matchSupportedLocale("ru-RU"), "ru")
@@ -33,4 +38,10 @@ test("i18n builds localized Telegram command menus", () => {
   assert.ok(en.some((entry) => entry.command === "language" && entry.description === "Choose bot language"))
   assert.ok(ru.some((entry) => entry.command === "language" && entry.description === "Выбрать язык бота"))
   assert.equal(en.length, ru.length)
+})
+
+test("i18n locale catalogs expose the same keys", () => {
+  const enKeys = flattenKeys(CATALOGS.en).sort()
+  const ruKeys = flattenKeys(CATALOGS.ru).sort()
+  assert.deepEqual(ruKeys, enKeys)
 })

@@ -230,10 +230,19 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   async function publishBotCommandMenus() {
     const i18nConfig = config.i18n
     const defaultLocale = i18nConfig.defaultLocale
-    await tg.setMyCommands(botCommandsForLocale(defaultLocale))
+    async function publishLocale(locale, options = {}) {
+      try {
+        await tg.setMyCommands(botCommandsForLocale(locale), options)
+      } catch (err) {
+        const scope = options.language_code ? `locale ${options.language_code}` : `default locale ${locale}`
+        logger.error(`Failed to set bot commands for ${scope}:`, err?.message || String(err))
+      }
+    }
+
+    await publishLocale(defaultLocale)
     for (const locale of i18nConfig.botCommandLocales || []) {
       if (locale === defaultLocale) continue
-      await tg.setMyCommands(botCommandsForLocale(locale), { language_code: locale })
+      await publishLocale(locale, { language_code: locale })
     }
   }
 

@@ -210,7 +210,7 @@ export function createOperatorCommandHandlers(deps) {
   async function handleAbort(ctxMeta) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Abort needs a bound thread."), unboundGuidanceKeyboard(ctxMeta))
+      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, t(ctxMeta, "commands.unbound.abortNeedsBound")), unboundGuidanceKeyboard(ctxMeta))
       return
     }
     const oc = ocByAlias[binding.projectAlias]
@@ -230,7 +230,7 @@ export function createOperatorCommandHandlers(deps) {
   async function handleWhere(ctxMeta) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Status needs a bound thread."), unboundGuidanceKeyboard(ctxMeta))
+      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, t(ctxMeta, "commands.unbound.statusNeedsBound")), unboundGuidanceKeyboard(ctxMeta))
       return
     }
     const health = await resolveBindingHealth(ctxMeta.ctxKey, binding)
@@ -316,7 +316,7 @@ export function createOperatorCommandHandlers(deps) {
   async function handleSendLast(ctxMeta) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Sending the last assistant reply needs a bound thread."), unboundGuidanceKeyboard(ctxMeta))
+      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, t(ctxMeta, "commands.unbound.sendLastNeedsBound")), unboundGuidanceKeyboard(ctxMeta))
       return
     }
     const oc = ocByAlias[binding.projectAlias]

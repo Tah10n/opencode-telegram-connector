@@ -45,6 +45,17 @@ export function createPromptHandlers(runtime) {
     return normalizeLocale(config?.i18n?.defaultLocale, config?.i18n)
   }
 
+  function refreshCtxLocale(ctxMeta) {
+    if (!ctxMeta?.ctxKey) return ctxMeta
+    return { ...ctxMeta, locale: localeForCtx(ctxMeta.ctxKey) }
+  }
+
+  function refreshWizardCtxLocale(wizard) {
+    if (!wizard?.ctx?.ctxKey) return wizard?.ctx?.locale || normalizeLocale(config?.i18n?.defaultLocale, config?.i18n)
+    wizard.ctx = refreshCtxLocale(wizard.ctx)
+    return wizard.ctx.locale
+  }
+
   const wizardKey = (projectAlias, requestId, sessionID = "") => promptKey(projectAlias, requestId, sessionID)
   const initialPendingPrompts = JSON.parse(JSON.stringify(store.getPendingPrompts?.() || store.get?.().pendingPrompts || {}))
   const getWizard = (projectAlias, requestId, sessionID = "") => {
@@ -215,6 +226,7 @@ export function createPromptHandlers(runtime) {
     target.answers = source.answers
     target.selectedByIndex = source.selectedByIndex
     target.messageIdByIndex = source.messageIdByIndex
+    target.ctx = source.ctx
   }
 
   function renderQuestionStep(projectAlias, req, stepIndex, selectedLabels, locale = "en") {
@@ -268,7 +280,7 @@ export function createPromptHandlers(runtime) {
     const req = wizard.request
     if (!req?.questions?.[idx]) return
     const selectedSet = new Set(wizard.selectedByIndex?.[idx] || [])
-    const rendered = renderQuestionStep(wizard.projectAlias, req, idx, selectedSet, wizard.ctx?.locale || "en")
+    const rendered = renderQuestionStep(wizard.projectAlias, req, idx, selectedSet, refreshWizardCtxLocale(wizard))
     const { chatId, threadIdOr0 } = wizard.ctx
 
     if (editMessageId) {
@@ -317,12 +329,12 @@ export function createPromptHandlers(runtime) {
   }
 
   async function sendPermissionPrompt(projectAlias, props, ctxMeta) {
-    const rendered = renderPermissionPrompt(projectAlias, props, ctxMeta?.locale || "en")
+    const rendered = renderPermissionPrompt(projectAlias, props, ctxMeta?.locale || config?.i18n?.defaultLocale || "en")
     await sendBlocksToThread(ctxMeta, rendered.blocks, rendered.replyMarkup)
   }
 
   async function sendRejectNotePrompt(ctxMeta, projectAlias, permissionId, { resumed = false, sessionID = "" } = {}) {
-    const locale = ctxMeta?.locale || "en"
+    const locale = ctxMeta?.locale || config?.i18n?.defaultLocale || "en"
     const prefix = resumed ? translate(locale, "prompts.resumedPrefix") : ""
     await sendToThread(
       ctxMeta,
@@ -332,7 +344,7 @@ export function createPromptHandlers(runtime) {
   }
 
   async function sendQuestionCustomAnswerPrompt(ctxMeta, projectAlias, questionId, qIndex, label, { resumed = false, sessionID = "" } = {}) {
-    const locale = ctxMeta?.locale || "en"
+    const locale = ctxMeta?.locale || config?.i18n?.defaultLocale || "en"
     const prefix = resumed ? translate(locale, "prompts.resumedPrefix") : ""
     await sendToThread(
       ctxMeta,
@@ -362,7 +374,8 @@ export function createPromptHandlers(runtime) {
         })
         await markIdempotencyEntries(idempotencyEntries)
         await clearQuestionWizardStateDurably(wizard, "persist stale question reply state", { rollbackIdempotencyEntries: idempotencyEntries })
-        await sendToThread(wizard.ctx, translate(wizard.ctx?.locale || "en", "prompts.questionInactive")).catch(() => {})
+        const locale = refreshWizardCtxLocale(wizard)
+        await sendToThread(wizard.ctx, translate(locale, "prompts.questionInactive")).catch(() => {})
         return { outcome: "stale", stale: true }
       }
       if (isRetryableBoundaryError(err, { source: "opencode", pathname: `/question/${wizard.request.id}/reply`, method: "POST" })) {
@@ -380,7 +393,8 @@ export function createPromptHandlers(runtime) {
     await markIdempotencyEntries(idempotencyEntries)
     recordPromptAnswered?.(wizard.projectAlias, "question", "ok")
     await clearQuestionWizardStateDurably(wizard, "persist question reply state", { rollbackIdempotencyEntries: idempotencyEntries })
-    await sendToThread(wizard.ctx, `Answered: ${wizard.request.id}`).catch(() => {})
+    const locale = refreshWizardCtxLocale(wizard)
+    await sendToThread(wizard.ctx, translate(locale, "prompts.answered", { requestId: wizard.request.id })).catch(() => {})
     return { outcome: "ok", stale: false }
   }
 
@@ -481,8 +495,9 @@ export function createPromptHandlers(runtime) {
 
     try {
       await flushDurableState("persist question prompt recovery state")
+      const locale = refreshWizardCtxLocale(wizard)
       await sendBlocksToThread(ctx, [
-        { type: "text", html: `<b>Question request</b>\n<code>${escapeHtml(props.id)}</code>\n\n${escapeHtml(`Project: ${projectAlias}`)}` },
+        { type: "text", html: `<b>${escapeHtml(translate(locale, "prompts.questionRequest"))}</b>\n<code>${escapeHtml(props.id)}</code>\n\n${escapeHtml(translate(locale, "prompts.project", { project: projectAlias }))}` },
       ])
       await sendCurrentQuestionStep(wizard)
       recordPromptDelivered?.(projectAlias, "question")

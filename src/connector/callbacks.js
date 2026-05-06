@@ -15,7 +15,7 @@ import { localeDisplayName, matchSupportedLocale, t as translate } from "../i18n
 import { languageSettingsView, supportedLocaleSummary } from "./language-ui.js"
 import { getRequestContext } from "../runtime/request-context.js"
 
-const CALLBACK_TOAST_KEYS = Object.freeze({
+export const CALLBACK_TOAST_KEYS = Object.freeze({
   Closed: "closed",
   Invalid: "invalid",
   "Private chat only": "privateChatOnly",
@@ -60,11 +60,30 @@ const CALLBACK_TOAST_KEYS = Object.freeze({
   Selected: "selected",
   Done: "done",
   Unsupported: "unsupported",
+  "Wrong thread": "wrongThread",
+  Expired: "expired",
+  "Agent busy": "agentBusy",
+  "Already sending": "alreadySending",
+  "Already sent": "alreadySent",
+  "Too large": "tooLarge",
+  "Try again": "tryAgain",
+  "Download failed": "downloadFailed",
+  Sent: "sent",
+  "No project default": "noProjectDefault",
+  Rejected: "rejected",
+  "Not found": "notFound",
+  "Out of date": "outOfDate",
+  "Custom disabled": "customDisabled",
+  "Send answer": "sendAnswer",
 })
 
-function localizeCallbackToast(text, locale) {
+export function localizeCallbackToast(text, locale) {
+  if (typeof text !== "string") return text
   const key = CALLBACK_TOAST_KEYS[text]
-  return key ? translate(locale, `callbacks.${key}`) : text
+  if (key) return translate(locale, `callbacks.${key}`)
+  if (text.startsWith("Model: ")) return translate(locale, "callbacks.modelValue", { value: text.slice("Model: ".length) })
+  if (text.startsWith("Feed: ")) return translate(locale, "callbacks.feedValue", { value: text.slice("Feed: ".length) })
+  return text
 }
 
 async function defaultBuildSessionSwitchText(_projectAlias, sessionId) {
@@ -128,7 +147,7 @@ export function createCallbackHandlers(runtime) {
   const packCallbackData = callbackPacker(cb)
 
   async function answerCallbackQuery(callbackQueryId, text) {
-    const locale = getRequestContext()?.locale || "en"
+    const locale = getRequestContext()?.locale || config?.i18n?.defaultLocale || "en"
     await tg.answerCallbackQuery(callbackQueryId, typeof text === "string" ? localizeCallbackToast(text, locale) : text).catch(ignoreError)
   }
 
@@ -333,30 +352,30 @@ export function createCallbackHandlers(runtime) {
     return `chat ${parsed.chatId} / ${formatThreadLabel?.(parsed.threadIdOr0) || `thread ${parsed.threadIdOr0}`}`
   }
 
-  function unbindConfirmationKeyboard(ctxKey, binding) {
+  function unbindConfirmationKeyboard(ctxKey, binding, locale = "en") {
     return makeInlineKeyboard([
-      [{ text: "Remove this thread binding", callback_data: packCallbackData("b", "unbind", ctxKey, binding.projectAlias, binding.sessionId) }],
-      [{ text: "Close", callback_data: packCallbackData("b", "close") }],
+      [{ text: t(locale, "operator.removeBinding"), callback_data: packCallbackData("b", "unbind", ctxKey, binding.projectAlias, binding.sessionId) }],
+      [{ text: t(locale, "common.close"), callback_data: packCallbackData("b", "close") }],
     ])
   }
 
-  function runtimeCloseKeyboard() {
-    return makeInlineKeyboard([[{ text: "Close", callback_data: packCallbackData("rt", "close") }]])
+  function runtimeCloseKeyboard(locale = "en") {
+    return makeInlineKeyboard([[{ text: t(locale, "common.close"), callback_data: packCallbackData("rt", "close") }]])
   }
 
-  function runtimeConfirmationKeyboard(action) {
-    const label = action === "restart" ? "Confirm restart" : "Confirm stop"
+  function runtimeConfirmationKeyboard(action, locale = "en") {
+    const label = action === "restart" ? t(locale, "callbacks.confirmRestart") : t(locale, "callbacks.confirmStop")
     return makeInlineKeyboard([
       [{ text: label, callback_data: packCallbackData("rt", action) }],
-      [{ text: "Cancel", callback_data: packCallbackData("rt", "cancel") }],
+      [{ text: t(locale, "common.cancel"), callback_data: packCallbackData("rt", "cancel") }],
     ])
   }
 
-  function runtimeConfirmationText(action) {
+  function runtimeConfirmationText(action, ctxMeta) {
     if (action === "restart") {
-      return "Restart connector?\n\nThis will stop the current process and exit with code 1 so your supervisor can start it again."
+      return t(ctxMeta, "callbacks.runtimeConfirmRestart")
     }
-    return "Stop connector?\n\nThis will stop Telegram polling, OpenCode streams, flush state, and exit."
+    return t(ctxMeta, "callbacks.runtimeConfirmStop")
   }
 
   function canRequestRuntimeShutdown() {
@@ -470,7 +489,7 @@ export function createCallbackHandlers(runtime) {
           await answerCallbackQuery(callbackQuery.id, targetAction === "restart" ? "Confirm restart" : "Confirm stop")
           if (msg?.message_id && typeof tg.editMessageText === "function") {
             await tg
-              .editMessageText(ctxMeta.chatId, msg.message_id, runtimeConfirmationText(targetAction), runtimeConfirmationKeyboard(targetAction))
+              .editMessageText(ctxMeta.chatId, msg.message_id, runtimeConfirmationText(targetAction, ctxMeta), runtimeConfirmationKeyboard(targetAction, ctxMeta.locale))
               .catch(ignoreError)
           }
           return
@@ -479,7 +498,7 @@ export function createCallbackHandlers(runtime) {
           if (!canRequestRuntimeShutdown()) {
             await answerCallbackQuery(callbackQuery.id, "Unavailable")
             if (msg?.message_id && typeof tg.editMessageText === "function") {
-              await tg.editMessageText(ctxMeta.chatId, msg.message_id, "Runtime shutdown control is unavailable for this launcher.", runtimeCloseKeyboard()).catch(ignoreError)
+              await tg.editMessageText(ctxMeta.chatId, msg.message_id, t(ctxMeta, "callbacks.runtimeShutdownUnavailable"), runtimeCloseKeyboard(ctxMeta.locale)).catch(ignoreError)
             }
             return
           }
@@ -523,7 +542,7 @@ export function createCallbackHandlers(runtime) {
           await answerCallbackQuery(callbackQuery.id, "Creating…")
           await handleNewCommand(ctxMeta, "").then(() => flushStoreIfAvailable()).catch(async (err) => {
             runtime.logger?.error?.("Failed to create session from callback:", err?.message || String(err))
-            await sendToThread(ctxMeta, "Action failed. Please try /new.").catch(ignoreError)
+            await sendToThread(ctxMeta, t(ctxMeta, "callbacks.actionFailedTryNew")).catch(ignoreError)
           })
           return
         }
@@ -628,7 +647,7 @@ export function createCallbackHandlers(runtime) {
           await answerCallbackQuery(callbackQuery.id, "Checking…")
           try {
             await validateProject(projectAlias)
-            await sendToThread(ctxMeta, `Project '${projectAlias}' health check: online.`).catch(ignoreError)
+            await sendToThread(ctxMeta, t(ctxMeta, "callbacks.healthOnline", { project: projectAlias })).catch(ignoreError)
           } catch (err) {
             const replyMarkup = canAutoStartProject?.(projectAlias, { platform }) ? startServerKeyboard?.(projectAlias) : null
             await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err, { locale: ctxMeta.locale }), replyMarkup).catch(ignoreError)
@@ -683,7 +702,7 @@ export function createCallbackHandlers(runtime) {
 
         if (action === "keep") {
           await answerCallbackQuery(callbackQuery.id, "Kept")
-          await sendToThread(ctxMeta, `Kept binding for ${describeTargetCtx(targetCtxKey)} unchanged.`).catch(ignoreError)
+          await sendToThread(ctxMeta, t(ctxMeta, "callbacks.bindingKept", { scope: describeTargetCtx(targetCtxKey) })).catch(ignoreError)
           return
         }
         if (action === "confirm-unbind") {
@@ -691,13 +710,13 @@ export function createCallbackHandlers(runtime) {
           await sendToThread(
             ctxMeta,
             [
-              "Confirm unbind for this thread:",
-              `Scope: ${describeTargetCtx(targetCtxKey)}`,
-              `Project: ${binding.projectAlias}`,
-              `Session: ${binding.sessionId}`,
-              "This only removes the Telegram binding; it does not delete the opencode session.",
+              t(ctxMeta, "operator.confirmUnbind"),
+              t(ctxMeta, "operator.scope", { scope: describeTargetCtx(targetCtxKey) }),
+              t(ctxMeta, "operator.project", { project: binding.projectAlias }),
+              t(ctxMeta, "operator.session", { session: binding.sessionId }),
+              t(ctxMeta, "operator.unbindNote"),
             ].join("\n"),
-            unbindConfirmationKeyboard(targetCtxKey, binding),
+            unbindConfirmationKeyboard(targetCtxKey, binding, ctxMeta.locale),
           ).catch(ignoreError)
           return
         }
@@ -709,13 +728,13 @@ export function createCallbackHandlers(runtime) {
             await sendToThread(
               ctxMeta,
               [
-                "Confirm unbind for this thread:",
-                `Scope: ${describeTargetCtx(targetCtxKey)}`,
-                `Project: ${binding.projectAlias}`,
-                `Session: ${binding.sessionId}`,
-                "This only removes the Telegram binding; it does not delete the opencode session.",
+                t(ctxMeta, "operator.confirmUnbind"),
+                t(ctxMeta, "operator.scope", { scope: describeTargetCtx(targetCtxKey) }),
+                t(ctxMeta, "operator.project", { project: binding.projectAlias }),
+                t(ctxMeta, "operator.session", { session: binding.sessionId }),
+                t(ctxMeta, "operator.unbindNote"),
               ].join("\n"),
-              unbindConfirmationKeyboard(targetCtxKey, binding),
+              unbindConfirmationKeyboard(targetCtxKey, binding, ctxMeta.locale),
             ).catch(ignoreError)
             await deleteInteractiveMessage(ctxMeta, msg?.message_id)
             return
@@ -723,13 +742,13 @@ export function createCallbackHandlers(runtime) {
           if (binding.projectAlias !== expectedProjectAlias || binding.sessionId !== expectedSessionId) {
             await answerCallbackQuery(callbackQuery.id, "Binding changed")
             await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-            await sendToThread(ctxMeta, `Binding changed for ${describeTargetCtx(targetCtxKey)}. Open /status or /bindings and confirm again.`).catch(ignoreError)
+            await sendToThread(ctxMeta, t(ctxMeta, "callbacks.bindingChangedForScope", { scope: describeTargetCtx(targetCtxKey) })).catch(ignoreError)
             return
           }
           const ok = await commitStateMutation(() => store.unbind(targetCtxKey), { shouldCommit: (result) => !!result })
           await answerCallbackQuery(callbackQuery.id, ok ? "Unbound" : "Not bound")
           await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-          await sendToThread(ctxMeta, ok ? `Changed: binding removed.\nRemoved binding for ${describeTargetCtx(targetCtxKey)}.` : "Binding was already absent.").catch(ignoreError)
+          await sendToThread(ctxMeta, ok ? t(ctxMeta, "callbacks.bindingRemoved", { scope: describeTargetCtx(targetCtxKey) }) : t(ctxMeta, "callbacks.bindingAbsent")).catch(ignoreError)
           return
         }
         if (action === "rebind" || action === "new") {
@@ -751,12 +770,20 @@ export function createCallbackHandlers(runtime) {
             const targetMeta = { ...targetCtx, ctxKey: targetCtxKey, chatType: ctxMeta.chatType }
             await commitStateMutation(() => bindCtxToSession(targetMeta, projectAlias, safeNextSessionId))
             await answerCallbackQuery(callbackQuery.id, action === "rebind" ? "Rebound" : "Created")
-            await sendToThread(ctxMeta, `${action === "rebind" ? "Rebound" : "Created and bound"} ${describeTargetCtx(targetCtxKey)} to ${projectAlias} / ${safeNextSessionId}.`).catch(ignoreError)
+            await sendToThread(
+              ctxMeta,
+              t(ctxMeta, "callbacks.bindingChangedToSession", {
+                action: action === "rebind" ? t(ctxMeta, "callbacks.rebound") : t(ctxMeta, "callbacks.createdAndBound"),
+                scope: describeTargetCtx(targetCtxKey),
+                project: projectAlias,
+                session: safeNextSessionId,
+              }),
+            ).catch(ignoreError)
           } catch (err) {
             if (isStateDurabilityError(err)) {
               if (action === "new") {
                 await answerCallbackQuery(callbackQuery.id, "Action failed")
-                await sendToThread(ctxMeta, "Created a new opencode session, but failed to persist the Telegram binding. Open /sessions and choose the session again after fixing state storage.").catch(ignoreError)
+                await sendToThread(ctxMeta, t(ctxMeta, "callbacks.newSessionPersistFailed")).catch(ignoreError)
                 return
               }
               throw err
@@ -789,7 +816,7 @@ export function createCallbackHandlers(runtime) {
         const mode = normalizeFeedMode(rawMode)
         await commitStateMutation(() => store.setFeedMode(ctxMeta.ctxKey, mode))
         await answerCallbackQuery(callbackQuery.id, `Feed: ${feedModeLabel(mode)}`)
-        await renderFeedSettings(ctxMeta, { editMessageId: msg?.message_id, noticeText: `Changed: this thread feed is now ${feedModeLabel(mode)}.` }).catch(ignoreError)
+        await renderFeedSettings(ctxMeta, { editMessageId: msg?.message_id, noticeText: t(ctxMeta, "callbacks.feedChanged", { mode: feedModeLabel(mode, ctxMeta.locale) }) }).catch(ignoreError)
         return
       }
 
@@ -988,7 +1015,7 @@ export function createCallbackHandlers(runtime) {
             if (isRetryableBoundaryError(err, { source: "opencode", pathname: `/permission/${permissionId}/reply`, method: "POST" })) {
               recordCallbackOutcome?.(projectAlias, "retryable")
               await answerCallbackQuery(callbackQuery.id, "Temporarily unavailable")
-              await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(ignoreError)
+              await sendToThread(ctxMeta, t(ctxMeta, "callbacks.actionTemporarilyUnavailable")).catch(ignoreError)
               return
             }
             throw err
@@ -1098,7 +1125,7 @@ export function createCallbackHandlers(runtime) {
             if (isRetryableBoundaryError(err, { source: "opencode", pathname: `/question/${questionId}/reject`, method: "POST" })) {
               recordCallbackOutcome?.(projectAlias, "retryable")
               await answerCallbackQuery(callbackQuery.id, "Temporarily unavailable")
-              await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(ignoreError)
+              await sendToThread(ctxMeta, t(ctxMeta, "callbacks.actionTemporarilyUnavailable")).catch(ignoreError)
               return
             }
             throw err
@@ -1193,7 +1220,7 @@ export function createCallbackHandlers(runtime) {
               result?.outcome === "stale" ? "No longer active" : result?.outcome === "retryable" ? "Temporarily unavailable" : "Selected",
             )
             if (result?.outcome === "retryable") {
-              await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(ignoreError)
+              await sendToThread(ctxMeta, t(ctxMeta, "callbacks.actionTemporarilyUnavailable")).catch(ignoreError)
             } else {
               await deleteInteractiveMessage(ctxMeta, msg?.message_id)
             }
@@ -1250,7 +1277,7 @@ export function createCallbackHandlers(runtime) {
               result?.outcome === "stale" ? "No longer active" : result?.outcome === "retryable" ? "Temporarily unavailable" : "Done",
             )
             if (result?.outcome === "retryable") {
-              await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(ignoreError)
+              await sendToThread(ctxMeta, t(ctxMeta, "callbacks.actionTemporarilyUnavailable")).catch(ignoreError)
             } else {
               await deleteInteractiveMessage(ctxMeta, msg?.message_id)
             }
@@ -1286,12 +1313,12 @@ export function createCallbackHandlers(runtime) {
       if (classification.retryable) {
         recordCallbackOutcome?.(callbackProjectAlias, "retryable")
         await answerCallbackQuery(callbackQuery.id, "Temporarily unavailable")
-        await sendToThread(ctxMeta, "Action is temporarily unavailable. Please try again.").catch(ignoreError)
+        await sendToThread(ctxMeta, t(ctxMeta, "callbacks.actionTemporarilyUnavailable")).catch(ignoreError)
         return
       }
       recordCallbackOutcome?.(callbackProjectAlias, "fatal")
       await answerCallbackQuery(callbackQuery.id, "Action failed")
-      await sendToThread(ctxMeta, "Action failed. Please try again.").catch(ignoreError)
+      await sendToThread(ctxMeta, t(ctxMeta, "callbacks.actionFailedTryAgain")).catch(ignoreError)
     }
   }
 

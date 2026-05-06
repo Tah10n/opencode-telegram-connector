@@ -480,7 +480,7 @@ export function createMirroringHandlers(runtime) {
   }
 
   async function renderFeedSettings(ctxMeta, { editMessageId, noticeText = "" } = {}) {
-    const locale = ctxMeta?.locale || "en"
+    const locale = ctxMeta?.locale || config?.i18n?.defaultLocale || "en"
     const settingsText = renderFeedSettingsText(ctxMeta.ctxKey, locale)
     const text = noticeText ? `${noticeText}\n\n${settingsText}` : settingsText
     const replyMarkup = feedKeyboard(ctxMeta.ctxKey, locale)

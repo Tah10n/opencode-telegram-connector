@@ -175,6 +175,43 @@ test("handleQuestionAsked falls back when the stored locale is no longer support
   assert.equal(replyMarkup.inline_keyboard.at(-1)[0].text, "Reject")
 })
 
+test("sendCurrentQuestionStep refreshes wizard locale before rendering", async () => {
+  let locale = "en"
+  const { calls, handlers } = makePromptRuntime({
+    config: { i18n: { defaultLocale: "en", supportedLocales: ["en", "ru"], autoDetectTelegramLanguage: true } },
+    store: {
+      getLocaleRecord(ctxKey) {
+        assert.equal(ctxKey, "100:7")
+        return { locale, source: "manual" }
+      },
+    },
+  })
+  const wizard = {
+    projectAlias: "demo",
+    id: "q_locale_refresh",
+    sessionID: "ses_1",
+    request: {
+      id: "q_locale_refresh",
+      sessionID: "ses_1",
+      questions: [{ question: "Pick one?", custom: false, options: [{ label: "A" }] }],
+    },
+    index: 0,
+    answers: [[]],
+    selectedByIndex: {},
+    messageIdByIndex: {},
+    ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7", locale: "en" },
+  }
+
+  locale = "ru"
+  await handlers.sendCurrentQuestionStep(wizard)
+
+  assert.equal(wizard.ctx.locale, "ru")
+  assert.equal(calls.sendMessage.length, 1)
+  const [, html, replyMarkup] = calls.sendMessage[0]
+  assert.match(html, /Варианты:/)
+  assert.equal(replyMarkup.inline_keyboard.at(-1)[0].text, "Отклонить")
+})
+
 test("handlePermissionAsked retries after Telegram prompt delivery fails", async () => {
   let fail = true
   const delivered = []

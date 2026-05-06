@@ -106,7 +106,7 @@ function makeCallbackUpdate(updateId, data, { userId = 42, chatId = 100, chatTyp
   }
 }
 
-function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, sendMessageImpl, sendDocumentImpl, editMessageTextImpl } = {}) {
+function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, setMyCommandsImpl, sendMessageImpl, sendDocumentImpl, editMessageTextImpl } = {}) {
   let nextMessageId = 1000
   const updates = []
   const sentMessages = []
@@ -150,6 +150,7 @@ function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, sendMessag
     },
     async setMyCommands(commands, options = {}) {
       setMyCommandsCalls.push({ commands, options })
+      if (setMyCommandsImpl) return setMyCommandsImpl({ commands, options, callIndex: setMyCommandsCalls.length })
       return true
     },
     async getUpdates(input) {
@@ -468,6 +469,27 @@ test("startConnector publishes localized Telegram command menus", async () => {
     assert.ok(harness.tg.setMyCommandsCalls[0].commands.some((entry) => entry.command === "language" && entry.description === "Choose bot language"))
     assert.equal(harness.tg.setMyCommandsCalls[1].options.language_code, "ru")
     assert.ok(harness.tg.setMyCommandsCalls[1].commands.some((entry) => entry.command === "language" && entry.description === "Выбрать язык бота"))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector continues publishing bot command locales after one locale fails", async () => {
+  const harness = await createHarness({
+    configPatch: { i18n: { defaultLocale: "en", supportedLocales: ["en", "ru"], botCommandLocales: ["en", "ru"] } },
+    tgOptions: {
+      setMyCommandsImpl: ({ options }) => {
+        if (!options.language_code) throw new Error("telegram rejected default menu")
+        return true
+      },
+    },
+  })
+
+  try {
+    await waitFor(() => harness.tg.setMyCommandsCalls.length >= 2)
+
+    assert.equal(harness.tg.setMyCommandsCalls[0].options.language_code, undefined)
+    assert.equal(harness.tg.setMyCommandsCalls[1].options.language_code, "ru")
   } finally {
     await harness.connector.stop()
   }

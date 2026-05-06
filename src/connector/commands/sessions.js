@@ -204,7 +204,7 @@ export function createSessionCommandHandlers(deps) {
   async function handleNewCommand(ctxMeta, title) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Creating a session needs a bound thread."), unboundGuidanceKeyboard(ctxMeta))
+      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, t(ctxMeta, "commands.unbound.createSessionNeedsBound")), unboundGuidanceKeyboard(ctxMeta))
       return
     }
     const oc = ocByAlias[binding.projectAlias]
@@ -298,7 +298,7 @@ export function createSessionCommandHandlers(deps) {
     }
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Switching sessions needs a bound thread."), unboundGuidanceKeyboard(ctxMeta))
+      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, t(ctxMeta, "commands.unbound.switchSessionNeedsBound")), unboundGuidanceKeyboard(ctxMeta))
       return
     }
     const oc = ocByAlias[binding.projectAlias]
@@ -383,7 +383,7 @@ export function createSessionCommandHandlers(deps) {
   async function handleSessions(ctxMeta) {
     const binding = store.getBinding(ctxMeta.ctxKey)
     if (!binding) {
-      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, "Session list needs a bound thread."), unboundGuidanceKeyboard(ctxMeta))
+      await safeInformThread(ctxMeta, unboundGuidanceText(ctxMeta, t(ctxMeta, "commands.unbound.sessionListNeedsBound")), unboundGuidanceKeyboard(ctxMeta))
       return
     }
     try {
