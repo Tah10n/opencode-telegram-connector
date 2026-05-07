@@ -22,7 +22,7 @@ export function createCorrelationId(prefix = "req", parts = []) {
   const safeParts = (Array.isArray(parts) ? parts : [parts])
     .map((part) => normalizeCorrelationId(part))
     .filter(Boolean)
-  const suffix = crypto.randomBytes(6).toString("base64url")
+  const suffix = crypto.randomBytes(6).toString("base64url").replace(/-/g, "_")
   const base = [safePrefix, ...safeParts].join("-")
   const maxBaseLength = MAX_CORRELATION_ID_LENGTH - suffix.length - 1
   const truncatedBase = base.length > maxBaseLength ? base.slice(0, maxBaseLength).replace(/-+$/g, "") : base

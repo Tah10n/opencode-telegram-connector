@@ -10,7 +10,7 @@ function isPlainObject(v) {
 
 function parseConfigBool(name, value) {
   if (typeof value === "boolean") return value
-  if (typeof value === "number") return value !== 0
+  if (typeof value === "number" && Number.isFinite(value) && (value === 0 || value === 1)) return value === 1
   if (typeof value === "string") {
     const normalized = value.trim().toLowerCase()
     if (["1", "true", "yes", "y", "on"].includes(normalized)) return true

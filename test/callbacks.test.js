@@ -251,6 +251,32 @@ test("createCallbackHandlers rejects unknown callback kinds", async () => {
   assert.deepEqual(callbackAnswers, [{ callbackQueryId: "cb_1", text: "Invalid" }])
 })
 
+test("createCallbackHandlers records legacy callback fallback without raw payloads", async () => {
+  const warnings = []
+  const legacyFallbackProjects = []
+  const { runtime, callbackAnswers } = makeRuntime({
+    recordLegacyCallbackFallback: (projectAlias) => legacyFallbackProjects.push(projectAlias),
+    logger: {
+      error: () => {},
+      warn: (message, fields) => warnings.push({ message, fields }),
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("rt|cancel", { chatType: "private", threadIdOr0: 0 }))
+  await handlers.handleTelegramCallback(makeCallback("rt|cancel", { id: "cb_2", chatType: "private", threadIdOr0: 0 }))
+
+  assert.deepEqual(callbackAnswers, [
+    { callbackQueryId: "cb_1", text: "Cancelled" },
+    { callbackQueryId: "cb_2", text: "Cancelled" },
+  ])
+  assert.deepEqual(legacyFallbackProjects, [null, null])
+  assert.equal(warnings.length, 1)
+  assert.equal(warnings[0].message, "Legacy callback payload format used")
+  assert.deepEqual(warnings[0].fields, { callbackPrefix: "rt", operation: "callback legacy fallback" })
+  assert.doesNotMatch(JSON.stringify(warnings), /cancel|100:7|session|project/i)
+})
+
 test("createCallbackHandlers asks for confirmation before runtime stop", async () => {
   const editCalls = []
   const { runtime, callbackAnswers } = makeRuntime({

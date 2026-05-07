@@ -329,6 +329,8 @@ test("buildRuntimeConfig rejects invalid echo filter mode", async (t) => {
 test("buildRuntimeConfig rejects invalid connector.config runtime knobs", async () => {
   const cases = [
     ["activeTurnStaleMs: 0", /Config field 'activeTurnStaleMs' must be a positive integer/],
+    ["allowInsecureHttp: 2", /Config field 'allowInsecureHttp' must be a boolean/],
+    ["allowInsecureHttp: Number('false')", /Config field 'allowInsecureHttp' must be a boolean/],
     ["opencodeWatchdog: 1", /Config field 'opencodeWatchdog' must be an object/],
     ["opencodeWatchdog: { failureThreshold: 'many' }", /Config field 'opencodeWatchdog\.failureThreshold' must be a positive integer/],
     ["opencodeWatchdog: { cooldownMs: -1 }", /Config field 'opencodeWatchdog\.cooldownMs' must be a non-negative integer/],

@@ -1365,6 +1365,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     cb,
     logger,
     recordCallbackOutcome: runtimeObservability.recordCallbackOutcome,
+    recordLegacyCallbackFallback: runtimeObservability.recordLegacyCallbackFallback,
     recordPromptAnswered: runtimeObservability.recordPromptAnswered,
     questionWizards,
     ctxMetaFromMessage,
