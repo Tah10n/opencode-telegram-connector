@@ -154,6 +154,29 @@ test("callback data guard rejects pipe-joined cb.pack payload variables", async 
   )
 })
 
+test("callback data guard rejects raw pipe-delimited cb.pack literals", async () => {
+  const dir = await makeTempDir()
+  await fs.writeFile(path.join(dir, "bad.js"), "const packed = cb.pack(\"s|demo|ses\")\nString(packed)\n", "utf8")
+
+  await assert.rejects(
+    execFileAsync(process.execPath, [verifyScript, dir]),
+    (err) => {
+      assert.match(err.stderr, /raw callback payload literal/)
+      assert.match(err.stderr, /bad\.js:1/)
+      return true
+    },
+  )
+})
+
+test("callback data guard allows encoded cb.pack arguments with pipe-bearing parts", async () => {
+  const dir = await makeTempDir()
+  await fs.writeFile(path.join(dir, "good.js"), "const packed = cb.pack(encodeCallback([\"m|not-raw\"]))\nString(packed)\n", "utf8")
+
+  const result = await execFileAsync(process.execPath, [verifyScript, dir])
+
+  assert.match(result.stdout, /Callback data guard passed/)
+})
+
 test("callback data guard rejects formatted pipe-joined callback variables", async () => {
   const dir = await makeTempDir()
   await fs.writeFile(path.join(dir, "bad.js"), "const data = [\"s\", projectAlias, sessionId].join(\"|\")\nconst button = {\n  callback_data:\n    data,\n}\n", "utf8")

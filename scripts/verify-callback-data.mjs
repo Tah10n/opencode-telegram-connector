@@ -114,11 +114,18 @@ function payloadHasPipeLiteral(expression) {
 }
 
 function isEncodedCallbackExpression(expression) {
-  return /^\s*(?:packCallback|encodeCallback|pack|cb\.pack|runtime\.cb\.pack)\s*\(/.test(expression)
+  return /^\s*(?:packCallback|encodeCallback|pack)\s*\(/.test(expression) ||
+    /^\s*(?:cb|runtime\.cb)\.pack\s*\(\s*(?:packCallback|encodeCallback|pack)\s*\(/.test(expression)
+}
+
+function isEncodedLowLevelPackArgument(expression) {
+  return /^\s*(?:packCallback|encodeCallback|pack)\s*\(/.test(expression)
 }
 
 function isEncodedCallbackPayload(payload) {
-  return payload.kind === "cb.pack" || (payload.kind === "callback_data" && isEncodedCallbackExpression(payload.expression))
+  return payload.kind === "cb.pack"
+    ? isEncodedLowLevelPackArgument(payload.expression)
+    : payload.kind === "callback_data" && isEncodedCallbackExpression(payload.expression)
 }
 
 function lineColumnAtOffset(text, offset) {
