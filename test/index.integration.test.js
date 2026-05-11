@@ -27,9 +27,16 @@ async function makeTempDir() {
   return dir
 }
 
-function withSseEventMeta(evt, meta) {
+function withSseEventMeta(evt, meta = {}) {
+  const rawEventPath = String(meta.eventPath || "/global/event").trim()
+  const eventPath = rawEventPath.startsWith("/") ? rawEventPath : `/${rawEventPath}`
   Object.defineProperty(evt, OPENCODE_SSE_EVENT_META, {
-    value: Object.freeze({ ...(meta || {}) }),
+    value: Object.freeze({
+      directory: typeof meta.directory === "string" && meta.directory.trim() ? meta.directory.trim() : null,
+      eventPath,
+      wrapped: meta.wrapped ?? true,
+      requiresDirectoryRouting: meta.requiresDirectoryRouting ?? (eventPath.replace(/\/+$/g, "") === "/global/event"),
+    }),
     enumerable: false,
   })
   return evt
@@ -779,7 +786,7 @@ test("startConnector mirrors assistant SSE output and /sendlast replays the late
   }
 })
 
-test("startConnector ignores global SSE events from another project directory", async () => {
+test("startConnector ignores global SSE events with missing or mismatched project directory", async () => {
   const completedAt = new Date(Date.now() + 60_000).toISOString()
   const demoDir = path.join(os.tmpdir(), `telegram-connector-demo-${crypto.randomUUID()}`)
   const otherDir = path.join(os.tmpdir(), `telegram-connector-other-${crypto.randomUUID()}`)
@@ -797,6 +804,10 @@ test("startConnector ignores global SSE events from another project directory", 
       },
     },
     messagesById: {
+      msg_missing_directory: {
+        info: { id: "msg_missing_directory", role: "assistant", time: { created: completedAt, completed: completedAt } },
+        parts: [{ type: "text", text: "Unscoped global reply" }],
+      },
       msg_foreign: {
         info: { id: "msg_foreign", role: "assistant", time: { created: completedAt, completed: completedAt } },
         parts: [{ type: "text", text: "Foreign reply" }],
@@ -809,6 +820,24 @@ test("startConnector ignores global SSE events from another project directory", 
   })
 
   try {
+    await harness.emitSse(
+      "demo",
+      withSseEventMeta(
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "ses_1",
+            info: { id: "msg_missing_directory", role: "assistant", time: { completed: completedAt } },
+          },
+        },
+        { directory: null },
+      ),
+    )
+    await delay(350)
+
+    assert.equal(harness.ocCalls.getMessage.length, 0)
+    assert.equal(harness.tg.sentHtmlBlocks.length, 0)
+
     await harness.emitSse(
       "demo",
       withSseEventMeta(
@@ -844,6 +873,95 @@ test("startConnector ignores global SSE events from another project directory", 
     await waitFor(() => harness.tg.sentHtmlBlocks.length === 1)
     assert.equal(harness.tg.sentHtmlBlocks[0].blocks[0].html, "Local reply")
     assert.deepEqual(harness.ocCalls.getMessage, [{ sessionId: "ses_1", messageId: "msg_local" }])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector accepts legacy SSE /event events without directory metadata", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 202,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    messagesById: {
+      msg_legacy: {
+        info: { id: "msg_legacy", role: "assistant", time: { created: completedAt, completed: completedAt } },
+        parts: [{ type: "text", text: "Legacy reply" }],
+      },
+    },
+  })
+
+  try {
+    await harness.emitSse(
+      "demo",
+      withSseEventMeta(
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "ses_1",
+            info: { id: "msg_legacy", role: "assistant", time: { completed: completedAt } },
+          },
+        },
+        { eventPath: "/event", wrapped: false, requiresDirectoryRouting: false },
+      ),
+    )
+
+    await waitFor(() => harness.tg.sentHtmlBlocks.length === 1)
+    assert.equal(harness.tg.sentHtmlBlocks[0].blocks[0].html, "Legacy reply")
+    assert.deepEqual(harness.ocCalls.getMessage, [{ sessionId: "ses_1", messageId: "msg_legacy" }])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector drops default global SSE events when project directory is not configured", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const harness = await createHarness({
+    projectPatch: {
+      directory: undefined,
+    },
+    statePatch: {
+      updateOffset: 202,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    messagesById: {
+      msg_unscoped_project: {
+        info: { id: "msg_unscoped_project", role: "assistant", time: { created: completedAt, completed: completedAt } },
+        parts: [{ type: "text", text: "Should not mirror" }],
+      },
+    },
+  })
+
+  try {
+    await harness.emitSse(
+      "demo",
+      withSseEventMeta(
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "ses_1",
+            info: { id: "msg_unscoped_project", role: "assistant", time: { completed: completedAt } },
+          },
+        },
+        { directory: "/srv/workspaces/team-project" },
+      ),
+    )
+    await delay(350)
+
+    assert.equal(harness.ocCalls.getMessage.length, 0)
+    assert.equal(harness.tg.sentHtmlBlocks.length, 0)
   } finally {
     await harness.connector.stop()
   }

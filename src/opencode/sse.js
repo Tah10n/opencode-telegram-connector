@@ -13,6 +13,37 @@ import { createCorrelationId, runWithRequestContext } from "../runtime/request-c
 const DEFAULT_EVENT_PATH = "/global/event"
 export const OPENCODE_SSE_EVENT_META = Symbol.for("telegram-opencode-connector.opencodeSseEventMeta")
 
+function canonicalEventPath(value) {
+  const raw = String(value || "").trim()
+  const withLeadingSlash = raw ? (raw.startsWith("/") ? raw : `/${raw}`) : DEFAULT_EVENT_PATH
+  return withLeadingSlash.length > 1 ? withLeadingSlash.replace(/\/+$/g, "") : withLeadingSlash
+}
+
+function directoryMetadata(value) {
+  if (typeof value !== "string") return null
+  const directory = value.trim()
+  return directory ? directory : null
+}
+
+function makeSseEventMeta({ directory, eventPath, wrapped }) {
+  return Object.freeze({
+    directory: directoryMetadata(directory),
+    eventPath,
+    wrapped,
+    requiresDirectoryRouting: canonicalEventPath(eventPath) === DEFAULT_EVENT_PATH,
+  })
+}
+
+function defineSseEventMeta(evt, meta) {
+  if (!evt || typeof evt !== "object" || Array.isArray(evt)) return evt
+  Object.defineProperty(evt, OPENCODE_SSE_EVENT_META, {
+    value: meta,
+    enumerable: false,
+    configurable: false,
+  })
+  return evt
+}
+
 function sseEventContext(projectAlias, evt) {
   const props = evt?.properties || {}
   const part = props?.part || {}
@@ -43,20 +74,13 @@ function readPathEnv(name, fallback) {
   return raw.startsWith("/") ? raw : `/${raw}`
 }
 
-function normalizeSseEvent(evt) {
+function normalizeSseEvent(evt, eventPath) {
+  const directory = evt?.directory
   if (evt?.payload && typeof evt.payload === "object" && !Array.isArray(evt.payload)) {
     const payload = evt.payload
-    const directory = typeof evt.directory === "string" && evt.directory.trim() ? evt.directory.trim() : ""
-    if (directory) {
-      Object.defineProperty(payload, OPENCODE_SSE_EVENT_META, {
-        value: Object.freeze({ directory }),
-        enumerable: false,
-        configurable: false,
-      })
-    }
-    return payload
+    return defineSseEventMeta(payload, makeSseEventMeta({ directory, eventPath, wrapped: true }))
   }
-  return evt
+  return defineSseEventMeta(evt, makeSseEventMeta({ directory, eventPath, wrapped: false }))
 }
 
 export function getOpenCodeSseEventMeta(evt) {
@@ -225,7 +249,7 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
             if (!payload) continue
             let evt
             try {
-              evt = normalizeSseEvent(JSON.parse(payload))
+              evt = normalizeSseEvent(JSON.parse(payload), EVENT_PATH)
             } catch {
               continue
             }

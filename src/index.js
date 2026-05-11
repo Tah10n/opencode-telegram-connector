@@ -1411,11 +1411,18 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     return process.platform === "win32" ? normalized.toLowerCase() : normalized
   }
 
-  function sseEventMatchesProjectDirectory(projectAlias, evt) {
-    const eventDirectory = getOpenCodeSseEventMeta(evt)?.directory
+  function sseEventDirectoryRoutingDecision(projectAlias, evt) {
+    const meta = getOpenCodeSseEventMeta(evt)
+    const eventDirectory = meta?.directory
     const projectDirectory = projects?.[projectAlias]?.directory
-    if (!eventDirectory || !projectDirectory) return true
-    return normalizeDirectoryForComparison(eventDirectory) === normalizeDirectoryForComparison(projectDirectory)
+    if (meta?.requiresDirectoryRouting) {
+      if (!eventDirectory) return { matches: false, reason: "global_directory_missing" }
+      if (!projectDirectory) return { matches: false, reason: "project_directory_missing" }
+    }
+    if (eventDirectory && projectDirectory && normalizeDirectoryForComparison(eventDirectory) !== normalizeDirectoryForComparison(projectDirectory)) {
+      return { matches: false, reason: "directory_mismatch" }
+    }
+    return { matches: true, reason: "matched" }
   }
 
   function sseEventPathFallback() {
@@ -1440,8 +1447,9 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       const type = evt?.type
       const props = evt?.properties || {}
 
-      if (!sseEventMatchesProjectDirectory(projectAlias, evt)) {
-        logSseDebug(projectAlias, props.sessionID || props.sessionId, "drop=directory_mismatch")
+      const directoryRouting = sseEventDirectoryRoutingDecision(projectAlias, evt)
+      if (!directoryRouting.matches) {
+        logSseDebug(projectAlias, props.sessionID || props.sessionId, `drop=${directoryRouting.reason}`)
         return false
       }
 
