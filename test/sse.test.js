@@ -92,6 +92,42 @@ test("startOpenCodeSseLoop forwards parsed SSE events and connects once", async 
   assert.equal(errorCalls, 0)
 })
 
+test("startOpenCodeSseLoop unwraps opencode global event payloads", async (t) => {
+  useFetchStub(t, async () =>
+    makeSseResponse([
+      'data: {"payload":{"id":"evt_1","type":"message.updated","properties":{"sessionID":"ses_1","info":{"id":"msg_1"}}}}\n',
+      "\n",
+    ]),
+  )
+
+  const ocClient = {
+    baseUrl: "http://127.0.0.1:4312",
+    headers: () => ({}),
+    health: async () => ({ ok: true }),
+  }
+
+  let loop
+  const evt = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Timed out waiting for wrapped SSE event")), 500)
+    loop = startOpenCodeSseLoop({
+      projectAlias: "demo",
+      ocClient,
+      logger: makeLogger(),
+      onEvent: async ({ evt }) => {
+        loop.stop()
+        clearTimeout(timeout)
+        resolve(evt)
+      },
+    })
+  })
+
+  assert.deepEqual(evt, {
+    id: "evt_1",
+    type: "message.updated",
+    properties: { sessionID: "ses_1", info: { id: "msg_1" } },
+  })
+})
+
 test("startOpenCodeSseLoop sends correlation header and scopes event context", async (t) => {
   const headersSeen = []
   useFetchStub(t, async (_url, init) => {
@@ -201,6 +237,38 @@ test("startOpenCodeSseLoop rejects one SSE line over the configured limit", asyn
 })
 
 test("startOpenCodeSseLoop appends event path after a base path", async (t) => {
+  const fetchUrls = []
+  useFetchStub(t, async (url) => {
+    fetchUrls.push(String(url))
+    return makeSseResponse(['data: {"id":"evt_1","type":"message"}\n', "\n"])
+  })
+
+  const ocClient = {
+    baseUrl: "https://example.com/api",
+    headers: () => ({}),
+    health: async () => ({ ok: true }),
+  }
+
+  let loop
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Timed out waiting for SSE event")), 500)
+    loop = startOpenCodeSseLoop({
+      projectAlias: "demo",
+      ocClient,
+      logger: makeLogger(),
+      onEvent: async () => {
+        loop.stop()
+        clearTimeout(timeout)
+        resolve()
+      },
+    })
+  })
+
+  assert.deepEqual(fetchUrls, ["https://example.com/api/global/event"])
+})
+
+test("startOpenCodeSseLoop allows overriding the SSE event path", async (t) => {
+  swapEnv(t, { OPENCODE_SSE_EVENT_PATH: "/event" })
   const fetchUrls = []
   useFetchStub(t, async (url) => {
     fetchUrls.push(String(url))
