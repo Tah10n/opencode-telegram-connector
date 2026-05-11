@@ -8,5 +8,5 @@
     "strict": true,
     "target": "ES2022"
   },
-  "files": ["src/connector/callback-data.js"]
+  "files": ["src/connector/callback-data.js", "src/opencode/ids.js"]
 }
