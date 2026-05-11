@@ -385,7 +385,8 @@ test("package scripts keep syntax check, cover starter config, and add setup che
   const callbackGuardScript = await fs.readFile(new URL("../scripts/verify-callback-data.mjs", import.meta.url), "utf8")
 
   assert.equal(pkg.private, true)
-  assert.equal(pkg.scripts.check, "node scripts/check-syntax.mjs && node scripts/verify-callback-data.mjs")
+  assert.equal(pkg.scripts.check, "node scripts/check-syntax.mjs && node scripts/verify-callback-data.mjs && npm run check:types")
+  assert.equal(pkg.scripts["check:types"], "tsc -p tsconfig.check.json")
   assert.ok(pkg.files.includes("scripts/verify-callback-data.mjs"))
   assert.match(syntaxCheckScript, /connector\.config\.example\.mjs/)
   assert.match(callbackGuardScript, /raw callback payload literal/)
