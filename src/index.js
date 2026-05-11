@@ -1,5 +1,4 @@
 import { setTimeout as delay } from "node:timers/promises"
-import path from "node:path"
 import crypto from "node:crypto"
 import { createCallbackHandlers } from "./connector/callbacks.js"
 import { createCommandHandlers } from "./connector/commands.js"
@@ -28,6 +27,7 @@ import { DEFAULT_FEED_MODE, StateStore, normalizeFeedMode, resolveDefaultStatePa
 import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "./session-list.js"
 import { sanitizeBaseUrlForDisplay } from "./url-utils.js"
 import { normalizeLimits } from "./limits.js"
+import { directoriesMatch } from "./directory-paths.js"
 import { createParentSessionCache, LruMap, LruSet } from "./util/lru.js"
 import { botCommandsForLocale, matchSupportedLocale, normalizeI18nConfig, normalizeLocale, t } from "./i18n/index.js"
 
@@ -1405,13 +1405,6 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     }
   }
 
-  function normalizeDirectoryForComparison(value) {
-    const raw = String(value || "").trim()
-    if (!raw) return ""
-    const normalized = path.resolve(raw).replace(/\\/g, "/").replace(/\/+$/g, "")
-    return process.platform === "win32" ? normalized.toLowerCase() : normalized
-  }
-
   function sseEventDirectoryRoutingDecision(projectAlias, evt) {
     const meta = getOpenCodeSseEventMeta(evt)
     const eventDirectory = meta?.directory
@@ -1420,7 +1413,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       if (!eventDirectory) return { matches: false, reason: "global_directory_missing" }
       if (!projectDirectory) return { matches: false, reason: "project_directory_missing" }
     }
-    if (eventDirectory && projectDirectory && normalizeDirectoryForComparison(eventDirectory) !== normalizeDirectoryForComparison(projectDirectory)) {
+    if (eventDirectory && projectDirectory && !directoriesMatch(eventDirectory, projectDirectory)) {
       return { matches: false, reason: "directory_mismatch" }
     }
     return { matches: true, reason: "matched" }

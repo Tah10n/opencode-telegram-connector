@@ -1,5 +1,6 @@
 import fs from "node:fs/promises"
 import path from "node:path"
+import { normalizeConfiguredDirectory } from "../directory-paths.js"
 import { normalizeEndpointBaseUrl } from "../url-utils.js"
 
 function isPlainObject(v) {
@@ -62,8 +63,7 @@ export function normalizeProjectsConfig(raw, { baseDir, sourceLabel } = {}) {
   for (const [alias, cfg] of Object.entries(raw)) {
     validateProjectAlias(alias)
     if (!isPlainObject(cfg)) throw new Error(`Project '${alias}' must be an object`)
-    const directoryRaw = cfg.directory != null ? String(cfg.directory).trim() : ""
-    const directory = directoryRaw ? path.resolve(resolvedBaseDir, directoryRaw) : undefined
+    const directory = normalizeConfiguredDirectory(cfg.directory, { baseDir: resolvedBaseDir })
 
     const port = cfg.port != null && cfg.port !== "" ? Number(cfg.port) : undefined
     if (port != null && !Number.isInteger(port)) throw new Error(`Project '${alias}' invalid port`)

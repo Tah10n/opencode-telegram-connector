@@ -290,7 +290,7 @@ Prefer the `limits` object in `connector.config.mjs`; env fallbacks are availabl
 ### Per-project fields
 
 - `baseUrl` or `port` (`baseUrl` must use `http://` or `https://`)
-- `directory` (required for `autoStart`; also required for default `/global/event` SSE mirroring so global events can be scoped safely. `setup:check` fails when this is missing under the default SSE path. If an older opencode build cannot provide matching directory metadata, use `OPENCODE_SSE_EVENT_PATH=/event`.)
+- `directory` (required for `autoStart`; also required for default `/global/event` SSE mirroring so global events can be scoped safely. Matching is path-flavor aware: POSIX-looking paths such as `/srv/App` stay case-sensitive even when the connector runs on Windows, while Windows drive/UNC paths are compared case-insensitively. `setup:check` fails when this is missing under the default SSE path. If an older opencode build cannot provide matching directory metadata, use `OPENCODE_SSE_EVENT_PATH=/event`.)
 - `autoStart` (boolean; strings such as `"true"` are rejected)
 - `serverLaunchMode`: `background` or `window`
 - `openTuiOnAutoStart` (boolean; strings such as `"false"` are rejected)
@@ -582,7 +582,7 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 - Telegram HTML messages are split with tag/entity awareness to avoid malformed chunks.
 - OpenCode path IDs are URL-encoded at the HTTP boundary; user-entered binding/session IDs are validated before being persisted and cannot contain whitespace, colons, pipes (`|`), or URL path/query separators.
 - Parent-session routing uses a bounded cache for long-running processes.
-- OpenCode event mirroring uses `/global/event` by default and requires matching directory metadata before mirroring a global event. Use `OPENCODE_SSE_EVENT_PATH=/event` only when running an older opencode build that does not expose `/global/event` or its directory metadata.
+- OpenCode event mirroring uses `/global/event` by default and requires matching directory metadata before mirroring a global event. Directory matching follows the path flavor rather than the connector host OS: `/srv/App` and `/srv/app` are distinct POSIX project paths, including from a Windows connector, while `C:/Repo/App` and `c:\\repo\\app` match as Windows paths. Use `OPENCODE_SSE_EVENT_PATH=/event` only when running an older opencode build that does not expose `/global/event` or its directory metadata.
 - Basic Auth over non-loopback `http://` is blocked unless `OPENCODE_ALLOW_INSECURE_HTTP=1` is set.
 
 ## Useful local commands

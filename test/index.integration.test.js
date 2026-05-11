@@ -884,6 +884,122 @@ test("startConnector ignores global SSE events with missing or mismatched projec
   }
 })
 
+test("startConnector keeps remote POSIX SSE directory routing case-sensitive on Windows", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const harness = await createHarness({
+    platform: "win32",
+    projectPatch: {
+      directory: "/srv/App",
+    },
+    statePatch: {
+      updateOffset: 202,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    messagesById: {
+      msg_foreign_case: {
+        info: { id: "msg_foreign_case", role: "assistant", time: { created: completedAt, completed: completedAt } },
+        parts: [{ type: "text", text: "Wrong-case POSIX reply" }],
+      },
+      msg_local_case: {
+        info: { id: "msg_local_case", role: "assistant", time: { created: completedAt, completed: completedAt } },
+        parts: [{ type: "text", text: "Exact-case POSIX reply" }],
+      },
+    },
+  })
+
+  try {
+    await harness.emitSse(
+      "demo",
+      withSseEventMeta(
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "ses_1",
+            info: { id: "msg_foreign_case", role: "assistant", time: { completed: completedAt } },
+          },
+        },
+        { directory: "/srv/app" },
+      ),
+    )
+    await delay(350)
+
+    assert.equal(harness.ocCalls.getMessage.length, 0)
+    assert.equal(harness.tg.sentHtmlBlocks.length, 0)
+
+    await harness.emitSse(
+      "demo",
+      withSseEventMeta(
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "ses_1",
+            info: { id: "msg_local_case", role: "assistant", time: { completed: completedAt } },
+          },
+        },
+        { directory: "/srv/App" },
+      ),
+    )
+
+    await waitFor(() => harness.tg.sentHtmlBlocks.length === 1)
+    assert.equal(harness.tg.sentHtmlBlocks[0].blocks[0].html, "Exact-case POSIX reply")
+    assert.deepEqual(harness.ocCalls.getMessage, [{ sessionId: "ses_1", messageId: "msg_local_case" }])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector keeps Windows SSE directory routing case-insensitive", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const harness = await createHarness({
+    platform: "win32",
+    projectPatch: {
+      directory: "C:/Repo/App",
+    },
+    statePatch: {
+      updateOffset: 202,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    messagesById: {
+      msg_windows_case: {
+        info: { id: "msg_windows_case", role: "assistant", time: { created: completedAt, completed: completedAt } },
+        parts: [{ type: "text", text: "Windows-case reply" }],
+      },
+    },
+  })
+
+  try {
+    await harness.emitSse(
+      "demo",
+      withSseEventMeta(
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "ses_1",
+            info: { id: "msg_windows_case", role: "assistant", time: { completed: completedAt } },
+          },
+        },
+        { directory: "c:\\repo\\app" },
+      ),
+    )
+
+    await waitFor(() => harness.tg.sentHtmlBlocks.length === 1)
+    assert.equal(harness.tg.sentHtmlBlocks[0].blocks[0].html, "Windows-case reply")
+    assert.deepEqual(harness.ocCalls.getMessage, [{ sessionId: "ses_1", messageId: "msg_windows_case" }])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
 test("startConnector accepts legacy SSE /event events without directory metadata", async () => {
   const completedAt = new Date(Date.now() + 60_000).toISOString()
   const harness = await createHarness({
