@@ -56,6 +56,10 @@ export default {
     remoteTeam: {
       displayName: "Remote shared server",
       baseUrl: "https://opencode.example.com",
+      // Required by the default /global/event SSE stream so events can be
+      // scoped safely. Omit only when using OPENCODE_SSE_EVENT_PATH=/event
+      // for an older opencode build.
+      directory: "/srv/workspaces/team-project",
       usernameEnv: "REMOTE_OPENCODE_USERNAME",
       passwordEnv: "REMOTE_OPENCODE_PASSWORD",
     },

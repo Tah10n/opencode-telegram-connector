@@ -2,7 +2,14 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { setTimeout as delay } from "node:timers/promises"
 import { ReadableStream } from "node:stream/web"
-import { startOpenCodeSseLoop } from "../src/opencode/sse.js"
+import {
+  canonicalOpenCodeSseEventPath,
+  effectiveOpenCodeSseEventPath,
+  getOpenCodeSseEventMeta,
+  getOpenCodeSseProjectRoutingIssue,
+  openCodeSseEventPathRequiresDirectoryRouting,
+  startOpenCodeSseLoop,
+} from "../src/opencode/sse.js"
 import { OpenCodeClient, OPENCODE_CORRELATION_HEADER } from "../src/opencode/client.js"
 import { classifyBoundaryError } from "../src/boundary-errors.js"
 import { getRequestContext } from "../src/runtime/request-context.js"
@@ -48,7 +55,21 @@ function makeSseResponse(chunks) {
   })
 }
 
+test("OpenCode SSE path helpers centralize directory routing requirements", () => {
+  assert.equal(canonicalOpenCodeSseEventPath("global/event/"), "/global/event")
+  assert.equal(effectiveOpenCodeSseEventPath({}), "/global/event")
+  assert.equal(effectiveOpenCodeSseEventPath({ OPENCODE_SSE_EVENT_PATH: "event/" }), "/event")
+  assert.equal(openCodeSseEventPathRequiresDirectoryRouting("/global/event/"), true)
+  assert.equal(openCodeSseEventPathRequiresDirectoryRouting("/event"), false)
+  assert.deepEqual(getOpenCodeSseProjectRoutingIssue({}, { eventPath: "/global/event" }), {
+    reason: "project_directory_missing",
+    eventPath: "/global/event",
+  })
+  assert.equal(getOpenCodeSseProjectRoutingIssue({}, { eventPath: "/event" }), null)
+})
+
 test("startOpenCodeSseLoop forwards parsed SSE events and connects once", async (t) => {
+  swapEnv(t, { OPENCODE_SSE_EVENT_PATH: undefined })
   let fetchCalls = 0
   useFetchStub(t, async () => {
     fetchCalls += 1
@@ -76,6 +97,12 @@ test("startOpenCodeSseLoop forwards parsed SSE events and connects once", async 
       onEvent: async ({ projectAlias, evt }) => {
         assert.equal(projectAlias, "demo")
         assert.deepEqual(evt, { id: "evt_1", type: "message" })
+        assert.deepEqual(getOpenCodeSseEventMeta(evt), {
+          directory: null,
+          eventPath: "/global/event",
+          wrapped: false,
+          requiresDirectoryRouting: true,
+        })
         loop.stop()
         clearTimeout(timeout)
         resolve()
@@ -90,6 +117,126 @@ test("startOpenCodeSseLoop forwards parsed SSE events and connects once", async 
   assert.equal(fetchCalls, 1)
   assert.equal(connectCalls, 1)
   assert.equal(errorCalls, 0)
+})
+
+test("startOpenCodeSseLoop unwraps opencode global event payloads", async (t) => {
+  swapEnv(t, { OPENCODE_SSE_EVENT_PATH: undefined })
+  useFetchStub(t, async () =>
+    makeSseResponse([
+      'data: {"payload":{"id":"evt_1","type":"message.updated","properties":{"sessionID":"ses_1","info":{"id":"msg_1"}}}}\n',
+      "\n",
+    ]),
+  )
+
+  const ocClient = {
+    baseUrl: "http://127.0.0.1:4312",
+    headers: () => ({}),
+    health: async () => ({ ok: true }),
+  }
+
+  let loop
+  const evt = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Timed out waiting for wrapped SSE event")), 500)
+    loop = startOpenCodeSseLoop({
+      projectAlias: "demo",
+      ocClient,
+      logger: makeLogger(),
+      onEvent: async ({ evt }) => {
+        loop.stop()
+        clearTimeout(timeout)
+        resolve(evt)
+      },
+    })
+  })
+
+  assert.deepEqual(evt, {
+    id: "evt_1",
+    type: "message.updated",
+    properties: { sessionID: "ses_1", info: { id: "msg_1" } },
+  })
+  assert.deepEqual(getOpenCodeSseEventMeta(evt), {
+    directory: null,
+    eventPath: "/global/event",
+    wrapped: true,
+    requiresDirectoryRouting: true,
+  })
+})
+
+test("startOpenCodeSseLoop preserves opencode global event directory metadata", async (t) => {
+  swapEnv(t, { OPENCODE_SSE_EVENT_PATH: undefined })
+  useFetchStub(t, async () =>
+    makeSseResponse([
+      'data: {"directory":"C:/repo/demo","payload":{"id":"evt_1","type":"message.updated","properties":{"sessionID":"ses_1","info":{"id":"msg_1"}}}}\n',
+      "\n",
+    ]),
+  )
+
+  const ocClient = {
+    baseUrl: "http://127.0.0.1:4312",
+    headers: () => ({}),
+    health: async () => ({ ok: true }),
+  }
+
+  let loop
+  const evt = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Timed out waiting for wrapped SSE event")), 500)
+    loop = startOpenCodeSseLoop({
+      projectAlias: "demo",
+      ocClient,
+      logger: makeLogger(),
+      onEvent: async ({ evt }) => {
+        loop.stop()
+        clearTimeout(timeout)
+        resolve(evt)
+      },
+    })
+  })
+
+  assert.equal(evt.type, "message.updated")
+  assert.deepEqual(getOpenCodeSseEventMeta(evt), {
+    directory: "C:/repo/demo",
+    eventPath: "/global/event",
+    wrapped: true,
+    requiresDirectoryRouting: true,
+  })
+})
+
+test("startOpenCodeSseLoop treats blank global event directory metadata as missing", async (t) => {
+  swapEnv(t, { OPENCODE_SSE_EVENT_PATH: undefined })
+  useFetchStub(t, async () =>
+    makeSseResponse([
+      'data: {"directory":"   ","payload":{"id":"evt_1","type":"message.updated","properties":{"sessionID":"ses_1"}}}\n',
+      "\n",
+    ]),
+  )
+
+  const ocClient = {
+    baseUrl: "http://127.0.0.1:4312",
+    headers: () => ({}),
+    health: async () => ({ ok: true }),
+  }
+
+  let loop
+  const evt = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Timed out waiting for blank-directory SSE event")), 500)
+    loop = startOpenCodeSseLoop({
+      projectAlias: "demo",
+      ocClient,
+      logger: makeLogger(),
+      onEvent: async ({ evt }) => {
+        loop.stop()
+        clearTimeout(timeout)
+        resolve(evt)
+      },
+    })
+  })
+
+  assert.deepEqual(getOpenCodeSseEventMeta(evt), {
+    directory: null,
+    eventPath: "/global/event",
+    wrapped: true,
+    requiresDirectoryRouting: true,
+  })
 })
 
 test("startOpenCodeSseLoop sends correlation header and scopes event context", async (t) => {
@@ -201,6 +348,7 @@ test("startOpenCodeSseLoop rejects one SSE line over the configured limit", asyn
 })
 
 test("startOpenCodeSseLoop appends event path after a base path", async (t) => {
+  swapEnv(t, { OPENCODE_SSE_EVENT_PATH: undefined })
   const fetchUrls = []
   useFetchStub(t, async (url) => {
     fetchUrls.push(String(url))
@@ -228,7 +376,48 @@ test("startOpenCodeSseLoop appends event path after a base path", async (t) => {
     })
   })
 
+  assert.deepEqual(fetchUrls, ["https://example.com/api/global/event"])
+})
+
+test("startOpenCodeSseLoop allows overriding the SSE event path", async (t) => {
+  swapEnv(t, { OPENCODE_SSE_EVENT_PATH: "/event" })
+  const fetchUrls = []
+  let receivedEvent
+  useFetchStub(t, async (url) => {
+    fetchUrls.push(String(url))
+    return makeSseResponse(['data: {"payload":{"id":"evt_1","type":"message"}}\n', "\n"])
+  })
+
+  const ocClient = {
+    baseUrl: "https://example.com/api",
+    headers: () => ({}),
+    health: async () => ({ ok: true }),
+  }
+
+  let loop
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Timed out waiting for SSE event")), 500)
+    loop = startOpenCodeSseLoop({
+      projectAlias: "demo",
+      ocClient,
+      logger: makeLogger(),
+      onEvent: async ({ evt }) => {
+        receivedEvent = evt
+        loop.stop()
+        clearTimeout(timeout)
+        resolve()
+      },
+    })
+  })
+
   assert.deepEqual(fetchUrls, ["https://example.com/api/event"])
+  assert.deepEqual(receivedEvent, { id: "evt_1", type: "message" })
+  assert.deepEqual(getOpenCodeSseEventMeta(receivedEvent), {
+    directory: null,
+    eventPath: "/event",
+    wrapped: true,
+    requiresDirectoryRouting: false,
+  })
 })
 
 test("startOpenCodeSseLoop reports disconnects only after a failed health check", async (t) => {

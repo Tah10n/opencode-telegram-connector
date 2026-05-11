@@ -11,9 +11,16 @@ import { defaultState, StateStore } from "../src/state/store.js"
 import { questionReplyIdempotencyKey } from "../src/connector/idempotency.js"
 import { getRequestContext } from "../src/runtime/request-context.js"
 import { startHealthServer } from "../src/runtime/health-server.js"
+import { canonicalOpenCodeSseEventPath, openCodeSseEventPathRequiresDirectoryRouting, OPENCODE_SSE_EVENT_META } from "../src/opencode/sse.js"
 
-function makeLogger() {
-  return { info() {}, warn() {}, error() {}, debug() {} }
+function makeLogger(entries) {
+  const push = (level, args) => entries?.push({ level, args })
+  return {
+    info(...args) { push("info", args) },
+    warn(...args) { push("warn", args) },
+    error(...args) { push("error", args) },
+    debug(...args) { push("debug", args) },
+  }
 }
 
 function shortDelay(ms) {
@@ -24,6 +31,20 @@ async function makeTempDir() {
   const dir = path.join(os.tmpdir(), `telegram-connector-${crypto.randomUUID()}`)
   await fs.mkdir(dir, { recursive: true })
   return dir
+}
+
+function withSseEventMeta(evt, meta = {}) {
+  const eventPath = canonicalOpenCodeSseEventPath(meta.eventPath || "/global/event")
+  Object.defineProperty(evt, OPENCODE_SSE_EVENT_META, {
+    value: Object.freeze({
+      directory: typeof meta.directory === "string" && meta.directory.trim() ? meta.directory.trim() : null,
+      eventPath,
+      wrapped: meta.wrapped ?? true,
+      requiresDirectoryRouting: meta.requiresDirectoryRouting ?? openCodeSseEventPathRequiresDirectoryRouting(eventPath),
+    }),
+    enumerable: false,
+  })
+  return evt
 }
 
 function swapEnv(t, patch) {
@@ -351,6 +372,7 @@ async function createHarness({
   opencodeWatchdog,
   createStateStoreImpl,
   configPatch,
+  logger = makeLogger(),
 } = {}) {
   const dir = await makeTempDir()
   const stateFile = path.join(dir, "state.json")
@@ -404,7 +426,7 @@ async function createHarness({
 
   const connector = await startConnector({
     config,
-    logger: makeLogger(),
+    logger,
     deps: {
       createTelegramClient: () => tg,
       ...(createStateStoreImpl ? { createStateStore: createStateStoreImpl } : {}),
@@ -765,6 +787,349 @@ test("startConnector mirrors assistant SSE output and /sendlast replays the late
       { sessionId: "ses_1", messageId: "msg_assistant" },
       { sessionId: "ses_1", messageId: "msg_assistant" },
     ])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector ignores global SSE events with missing or mismatched project directory", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const demoDir = path.join(os.tmpdir(), `telegram-connector-demo-${crypto.randomUUID()}`)
+  const otherDir = path.join(os.tmpdir(), `telegram-connector-other-${crypto.randomUUID()}`)
+  const harness = await createHarness({
+    projectPatch: {
+      directory: demoDir,
+    },
+    statePatch: {
+      updateOffset: 202,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    messagesById: {
+      msg_missing_directory: {
+        info: { id: "msg_missing_directory", role: "assistant", time: { created: completedAt, completed: completedAt } },
+        parts: [{ type: "text", text: "Unscoped global reply" }],
+      },
+      msg_foreign: {
+        info: { id: "msg_foreign", role: "assistant", time: { created: completedAt, completed: completedAt } },
+        parts: [{ type: "text", text: "Foreign reply" }],
+      },
+      msg_local: {
+        info: { id: "msg_local", role: "assistant", time: { created: completedAt, completed: completedAt } },
+        parts: [{ type: "text", text: "Local reply" }],
+      },
+    },
+  })
+
+  try {
+    await harness.emitSse(
+      "demo",
+      withSseEventMeta(
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "ses_1",
+            info: { id: "msg_missing_directory", role: "assistant", time: { completed: completedAt } },
+          },
+        },
+        { directory: null },
+      ),
+    )
+    await delay(350)
+
+    assert.equal(harness.ocCalls.getMessage.length, 0)
+    assert.equal(harness.tg.sentHtmlBlocks.length, 0)
+
+    await harness.emitSse(
+      "demo",
+      withSseEventMeta(
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "ses_1",
+            info: { id: "msg_foreign", role: "assistant", time: { completed: completedAt } },
+          },
+        },
+        { directory: otherDir },
+      ),
+    )
+    await delay(350)
+
+    assert.equal(harness.ocCalls.getMessage.length, 0)
+    assert.equal(harness.tg.sentHtmlBlocks.length, 0)
+
+    await harness.emitSse(
+      "demo",
+      withSseEventMeta(
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "ses_1",
+            info: { id: "msg_local", role: "assistant", time: { completed: completedAt } },
+          },
+        },
+        { directory: demoDir },
+      ),
+    )
+
+    await waitFor(() => harness.tg.sentHtmlBlocks.length === 1)
+    assert.equal(harness.tg.sentHtmlBlocks[0].blocks[0].html, "Local reply")
+    assert.deepEqual(harness.ocCalls.getMessage, [{ sessionId: "ses_1", messageId: "msg_local" }])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector keeps remote POSIX SSE directory routing case-sensitive on Windows", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const harness = await createHarness({
+    platform: "win32",
+    projectPatch: {
+      directory: "/srv/App",
+    },
+    statePatch: {
+      updateOffset: 202,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    messagesById: {
+      msg_foreign_case: {
+        info: { id: "msg_foreign_case", role: "assistant", time: { created: completedAt, completed: completedAt } },
+        parts: [{ type: "text", text: "Wrong-case POSIX reply" }],
+      },
+      msg_local_case: {
+        info: { id: "msg_local_case", role: "assistant", time: { created: completedAt, completed: completedAt } },
+        parts: [{ type: "text", text: "Exact-case POSIX reply" }],
+      },
+    },
+  })
+
+  try {
+    await harness.emitSse(
+      "demo",
+      withSseEventMeta(
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "ses_1",
+            info: { id: "msg_foreign_case", role: "assistant", time: { completed: completedAt } },
+          },
+        },
+        { directory: "/srv/app" },
+      ),
+    )
+    await delay(350)
+
+    assert.equal(harness.ocCalls.getMessage.length, 0)
+    assert.equal(harness.tg.sentHtmlBlocks.length, 0)
+
+    await harness.emitSse(
+      "demo",
+      withSseEventMeta(
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "ses_1",
+            info: { id: "msg_local_case", role: "assistant", time: { completed: completedAt } },
+          },
+        },
+        { directory: "/srv/App" },
+      ),
+    )
+
+    await waitFor(() => harness.tg.sentHtmlBlocks.length === 1)
+    assert.equal(harness.tg.sentHtmlBlocks[0].blocks[0].html, "Exact-case POSIX reply")
+    assert.deepEqual(harness.ocCalls.getMessage, [{ sessionId: "ses_1", messageId: "msg_local_case" }])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector keeps Windows SSE directory routing case-insensitive", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const harness = await createHarness({
+    platform: "win32",
+    projectPatch: {
+      directory: "C:/Repo/App",
+    },
+    statePatch: {
+      updateOffset: 202,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    messagesById: {
+      msg_windows_case: {
+        info: { id: "msg_windows_case", role: "assistant", time: { created: completedAt, completed: completedAt } },
+        parts: [{ type: "text", text: "Windows-case reply" }],
+      },
+    },
+  })
+
+  try {
+    await harness.emitSse(
+      "demo",
+      withSseEventMeta(
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "ses_1",
+            info: { id: "msg_windows_case", role: "assistant", time: { completed: completedAt } },
+          },
+        },
+        { directory: "c:\\repo\\app" },
+      ),
+    )
+
+    await waitFor(() => harness.tg.sentHtmlBlocks.length === 1)
+    assert.equal(harness.tg.sentHtmlBlocks[0].blocks[0].html, "Windows-case reply")
+    assert.deepEqual(harness.ocCalls.getMessage, [{ sessionId: "ses_1", messageId: "msg_windows_case" }])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector accepts legacy SSE /event events without directory metadata", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 202,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    messagesById: {
+      msg_legacy: {
+        info: { id: "msg_legacy", role: "assistant", time: { created: completedAt, completed: completedAt } },
+        parts: [{ type: "text", text: "Legacy reply" }],
+      },
+    },
+  })
+
+  try {
+    await harness.emitSse(
+      "demo",
+      withSseEventMeta(
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "ses_1",
+            info: { id: "msg_legacy", role: "assistant", time: { completed: completedAt } },
+          },
+        },
+        { eventPath: "/event", wrapped: false, requiresDirectoryRouting: false },
+      ),
+    )
+
+    await waitFor(() => harness.tg.sentHtmlBlocks.length === 1)
+    assert.equal(harness.tg.sentHtmlBlocks[0].blocks[0].html, "Legacy reply")
+    assert.deepEqual(harness.ocCalls.getMessage, [{ sessionId: "ses_1", messageId: "msg_legacy" }])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector disables default global SSE without project directory but keeps prompt polling", async (t) => {
+  swapEnv(t, { OPENCODE_SSE_EVENT_PATH: undefined })
+  const permission = { id: "perm_missing_directory_poll", sessionID: "ses_1", permission: "shell", patterns: ["npm test"] }
+  let exposePermission = false
+  let sseStarts = 0
+  const loggerEntries = []
+  const harness = await createHarness({
+    projectPatch: {
+      directory: undefined,
+    },
+    statePatch: {
+      updateOffset: 202,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    ocOptions: {
+      listPermissionsImpl: async () => (exposePermission ? [permission] : []),
+      listQuestionsImpl: async () => [],
+    },
+    startSseLoopImpl: () => {
+      sseStarts += 1
+      return { stop() {} }
+    },
+    logger: makeLogger(loggerEntries),
+  })
+
+  try {
+    await waitFor(() => harness.ocCalls.listPermissions > 0)
+    await waitFor(() => loggerEntries.some((entry) =>
+      entry.level === "error" &&
+      entry.args[0] === "SSE disabled for project" &&
+      entry.args[1]?.projectAlias === "demo" &&
+      entry.args[1]?.reason === "project_directory_missing",
+    ))
+
+    const sseDisabledLogs = loggerEntries.filter((entry) =>
+      entry.level === "error" &&
+      entry.args[0] === "SSE disabled for project" &&
+      entry.args[1]?.projectAlias === "demo" &&
+      entry.args[1]?.reason === "project_directory_missing",
+    )
+    assert.equal(sseDisabledLogs.length, 1)
+    assert.equal(sseStarts, 0)
+    assert.equal(harness.hasSseHandler("demo"), false)
+
+    exposePermission = true
+    await waitFor(() => harness.tg.sentHtmlBlocks.some((entry) => entry.blocks.some((block) => /perm_missing_directory_poll/.test(block.html))))
+
+    harness.tg.enqueue(makeMessageUpdate(203, "/status"))
+    await waitFor(() => harness.tg.sentMessages.some((entry) => /SSE: unavailable \(missing directory\)/.test(entry.text)))
+    const status = harness.tg.sentMessages.at(-1)?.text || ""
+    assert.match(status, /SSE observed: retries=0 aborted=0 connected=never .*lastError=.*requires project 'directory'/)
+    assert.match(status, /Prompt poll observed: .*hits=1/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector allows legacy SSE /event without project directory", async (t) => {
+  swapEnv(t, { OPENCODE_SSE_EVENT_PATH: "/event" })
+  let sseStarts = 0
+  const harness = await createHarness({
+    projectPatch: {
+      directory: undefined,
+    },
+    statePatch: {
+      updateOffset: 202,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    startSseLoopImpl: () => {
+      sseStarts += 1
+      return { stop() {} }
+    },
+  })
+
+  try {
+    await waitFor(() => harness.hasSseHandler("demo"))
+    assert.equal(sseStarts, 1)
   } finally {
     await harness.connector.stop()
   }

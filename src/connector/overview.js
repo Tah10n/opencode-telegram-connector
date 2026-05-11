@@ -153,6 +153,11 @@ export function createOverviewHelpers({ projects, store, config, startInProgress
     projectSseState.set(projectAlias, "down")
   }
 
+  function markProjectSseUnavailable(projectAlias, reason = "unavailable") {
+    const suffix = String(reason || "").trim()
+    projectSseState.set(projectAlias, suffix ? `unavailable (${suffix})` : "unavailable")
+  }
+
   function getProjectSseStatus(projectAlias) {
     return projectSseState.get(projectAlias) || "unknown"
   }
@@ -215,6 +220,7 @@ export function createOverviewHelpers({ projects, store, config, startInProgress
     markProjectUp,
     markProjectSseConnected,
     markProjectSseDown,
+    markProjectSseUnavailable,
     getProjectSseStatus,
     _state: { projectLastUnavailableNoticeAt, projectIsDown, projectSseState },
   }

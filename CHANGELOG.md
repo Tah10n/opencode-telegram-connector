@@ -8,6 +8,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ## [Unreleased]
 
 ### Fixed
+- OpenCode SSE mirroring now uses the current `/global/event` stream by default, unwraps `payload`-wrapped events, drops unscoped global events fail-closed, and keeps `OPENCODE_SSE_EVENT_PATH=/event` as a compatibility override for older opencode builds.
+- `setup:check` and runtime startup now fail/degrade loudly when `/global/event` is used without a configured project `directory`, instead of silently dropping every global SSE event for that project.
+- `/global/event` directory matching is now path-flavor aware, so remote POSIX paths remain case-sensitive even when the connector runs on Windows while Windows drive/UNC paths still compare case-insensitively.
 - `connector.config.mjs` values for `activeTurnStaleMs` and `opencodeWatchdog` now reach runtime config and invalid values fail fast with clear errors.
 - Project `baseUrl` now rejects non-HTTP(S) schemes, and string `autoStart` / `openTuiOnAutoStart` values are no longer silently treated as `false`.
 - `/use` share links that resolve to unsafe session IDs now receive a clear refusal instead of implying share links bypass session ID safety rules.

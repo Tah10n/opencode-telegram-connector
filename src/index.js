@@ -12,7 +12,7 @@ import { TelegramClient, makeInlineKeyboard } from "./telegram/client.js"
 import { formatMarkdownToTelegramHtmlBlocks, escapeHtml } from "./telegram/formatter.js"
 import { ctxKeyFrom, threadIdOr0FromMessage } from "./telegram/routing.js"
 import { OpenCodeClient } from "./opencode/client.js"
-import { startOpenCodeSseLoop } from "./opencode/sse.js"
+import { effectiveOpenCodeSseEventPath, getOpenCodeSseEventMeta, getOpenCodeSseProjectRoutingIssue, startOpenCodeSseLoop } from "./opencode/sse.js"
 import { ensureStartupSession } from "./opencode/startup-session.js"
 import { ensureOpenCodeRunning, openAttachWindow, stopOpenCodeServeOnPort, stopOpenCodeUiOnPort } from "./opencode/launcher.js"
 import { extractPatchDiffText, extractPatchFiles, formatChangedFilesText } from "./message-display.js"
@@ -27,6 +27,7 @@ import { DEFAULT_FEED_MODE, StateStore, normalizeFeedMode, resolveDefaultStatePa
 import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "./session-list.js"
 import { sanitizeBaseUrlForDisplay } from "./url-utils.js"
 import { normalizeLimits } from "./limits.js"
+import { directoriesMatch } from "./directory-paths.js"
 import { createParentSessionCache, LruMap, LruSet } from "./util/lru.js"
 import { botCommandsForLocale, matchSupportedLocale, normalizeI18nConfig, normalizeLocale, t } from "./i18n/index.js"
 
@@ -649,6 +650,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     markProjectUp,
     markProjectSseConnected,
     markProjectSseDown,
+    markProjectSseUnavailable,
     getProjectSseStatus,
   } = overviewHelpers
 
@@ -1403,10 +1405,58 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     }
   }
 
+  function sseEventDirectoryRoutingDecision(projectAlias, evt) {
+    const meta = getOpenCodeSseEventMeta(evt)
+    const eventDirectory = meta?.directory
+    const projectDirectory = projects?.[projectAlias]?.directory
+    if (meta?.requiresDirectoryRouting) {
+      if (!eventDirectory) return { matches: false, reason: "global_directory_missing" }
+      if (!projectDirectory) return { matches: false, reason: "project_directory_missing" }
+    }
+    if (eventDirectory && projectDirectory && !directoriesMatch(eventDirectory, projectDirectory)) {
+      return { matches: false, reason: "directory_mismatch" }
+    }
+    return { matches: true, reason: "matched" }
+  }
+
+  function sseEventPathFallback() {
+    return effectiveOpenCodeSseEventPath()
+  }
+
+  function sseErrorContext(err) {
+    const method = err?.method || "GET"
+    const pathname = err?.pathname || sseEventPathFallback()
+    return {
+      source: "opencode",
+      operation: err?.operation || `${method} ${pathname}`,
+      method,
+      pathname,
+    }
+  }
+
+  function makeSseProjectRoutingError(projectAlias, issue) {
+    const pathname = issue?.eventPath || sseEventPathFallback()
+    return makeBoundaryError({
+      source: "opencode",
+      operation: `GET ${pathname}`,
+      method: "GET",
+      pathname,
+      kind: "configuration",
+      outcome: "fatal",
+      message: `SSE disabled for project '${projectAlias}': ${pathname} requires project 'directory' for safe routing. Add 'directory' to connector.config.mjs or set OPENCODE_SSE_EVENT_PATH=/event for legacy opencode builds.`,
+    })
+  }
+
   async function onSseEvent({ projectAlias, evt }) {
     return runWithRequestContext(sseRequestContextFields(projectAlias, evt), async () => {
       const type = evt?.type
       const props = evt?.properties || {}
+
+      const directoryRouting = sseEventDirectoryRoutingDecision(projectAlias, evt)
+      if (!directoryRouting.matches) {
+        logSseDebug(projectAlias, props.sessionID || props.sessionId, `drop=${directoryRouting.reason}`)
+        return false
+      }
 
       function isInitialBaselinePrompt(kind) {
         const identity = promptIdentity(props?.id, props?.sessionID)
@@ -1630,6 +1680,30 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       async () => {
         await waitForPromiseOrAbort(startInProgress.get(alias))
         if (abortController.signal.aborted) return null
+        const routingIssue = getOpenCodeSseProjectRoutingIssue(projects?.[alias])
+        if (routingIssue) {
+          const err = makeSseProjectRoutingError(alias, routingIssue)
+          markProjectSseUnavailable(alias, "missing directory")
+          recordLoopError("sse", err, {
+            projectAlias: alias,
+            source: "opencode",
+            operation: err.operation,
+            method: err.method,
+            pathname: err.pathname,
+          })
+          logger.error("SSE disabled for project", {
+            projectAlias: alias,
+            source: err.source,
+            operation: err.operation,
+            method: err.method,
+            pathname: err.pathname,
+            kind: err.kind,
+            outcome: err.outcome,
+            reason: routingIssue.reason,
+            error: err.message,
+          })
+          return null
+        }
         const handle = startSseLoop({
           projectAlias: alias,
           ocClient: ocByAlias[alias],
@@ -1642,33 +1716,23 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
           onEvent: onSseEvent,
           onError: ({ projectAlias, err }) => {
             markProjectSseDown(projectAlias)
-            const classification = classifyBoundaryError(err, {
-              source: "opencode",
-              operation: "GET /event",
-              method: "GET",
-              pathname: "/event",
-            })
+            const context = sseErrorContext(err)
+            const classification = classifyBoundaryError(err, context)
             if (classification.retryable) {
               logLoopIssue("sse", classification.error, {
                 projectAlias,
                 retryable: true,
-                source: "opencode",
-                operation: "GET /event",
-                method: "GET",
-                pathname: "/event",
+                ...context,
               })
               recordProjectHealthFailure(projectAlias, classification.error, {
-                operation: "GET /event",
-                method: "GET",
-                pathname: "/event",
+                operation: context.operation,
+                method: context.method,
+                pathname: context.pathname,
               })
             } else {
               logLoopIssue("sse", classification.error, {
                 projectAlias,
-                source: "opencode",
-                operation: "GET /event",
-                method: "GET",
-                pathname: "/event",
+                ...context,
               })
             }
             return notifyProjectUnavailable(projectAlias, err, { platform })

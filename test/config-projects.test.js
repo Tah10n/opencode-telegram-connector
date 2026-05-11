@@ -81,6 +81,30 @@ test("loadProjectsConfig reads basic auth from usernameEnv/passwordEnv", async (
   assert.equal(projects.demo.directory, path.resolve(path.join("workspace", "configs"), "../repo"))
 })
 
+test("loadProjectsConfig preserves foreign absolute project directories", async () => {
+  const projects = await loadProjectsConfig({
+    baseDir: path.join("workspace", "configs"),
+    projectsJson: JSON.stringify({
+      posixRemote: {
+        baseUrl: "https://opencode.example.com",
+        directory: "/srv/App",
+      },
+      windowsRemote: {
+        baseUrl: "https://win-opencode.example.com",
+        directory: "C:/Repo/App",
+      },
+      uncRemote: {
+        baseUrl: "https://unc-opencode.example.com",
+        directory: "//Server/Share/App",
+      },
+    }),
+  })
+
+  assert.equal(projects.posixRemote.directory, "/srv/App")
+  assert.equal(projects.windowsRemote.directory, "C:/Repo/App")
+  assert.equal(projects.uncRemote.directory, "//Server/Share/App")
+})
+
 test("loadProjectsConfig rejects baseUrl query strings and fragments", async () => {
   await assert.rejects(
     loadProjectsConfig({

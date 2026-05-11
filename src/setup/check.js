@@ -4,6 +4,7 @@ import path from "node:path"
 import { buildRuntimeConfig } from "../config/runtime.js"
 import { OpenCodeClient } from "../opencode/client.js"
 import { commandExistsOnPath, getLaunchSupport } from "../opencode/launcher.js"
+import { effectiveOpenCodeSseEventPath, getOpenCodeSseProjectRoutingIssue, openCodeSseEventPathRequiresDirectoryRouting } from "../opencode/sse.js"
 import { resolveDefaultStatePath } from "../state/store.js"
 import { TelegramClient } from "../telegram/client.js"
 import { redactSensitiveText, sanitizeBaseUrlForDisplay } from "../url-utils.js"
@@ -144,6 +145,17 @@ function describeAutoStart({ project, support, directoryStatus, commandAvailable
   return `${summary}${details.length ? `; ${details.join(", ")}` : ""}`
 }
 
+function describeSseRouting(project, { eventPath }) {
+  const issue = getOpenCodeSseProjectRoutingIssue(project, { eventPath })
+  if (issue) {
+    return `${issue.eventPath} requires project 'directory' for safe routing. Add 'directory' to connector.config.mjs or set OPENCODE_SSE_EVENT_PATH=/event for legacy opencode builds.`
+  }
+  if (openCodeSseEventPathRequiresDirectoryRouting(eventPath)) {
+    return `${eventPath} requires matching project directory metadata; configured directory ${project.directory}`
+  }
+  return `${eventPath} does not require project directory routing`
+}
+
 async function pathExists(fsImpl, targetPath) {
   try {
     await fsImpl.stat(targetPath)
@@ -276,9 +288,18 @@ export async function runSetupCheck({
   }
 
   addFinding(findings, "pass", "Projects", Object.keys(config.projects).join(", "))
+  const sseEventPath = effectiveOpenCodeSseEventPath()
 
   for (const [alias, project] of Object.entries(config.projects)) {
     addFinding(findings, "pass", `Project ${alias}`, describeProject(project))
+
+    const sseRoutingIssue = getOpenCodeSseProjectRoutingIssue(project, { eventPath: sseEventPath })
+    addFinding(
+      findings,
+      sseRoutingIssue ? "fail" : "pass",
+      `SSE routing ${alias}`,
+      describeSseRouting(project, { eventPath: sseEventPath }),
+    )
 
     const autoStartSupport = project.autoStart === true
       ? getLaunchSupportImpl({ project, platform })

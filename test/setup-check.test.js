@@ -30,6 +30,21 @@ function makeRuntime({ dir, stateFile, projects, allowInsecureHttp = false, load
   }
 }
 
+function swapEnv(t, patch) {
+  const previous = new Map()
+  for (const key of Object.keys(patch)) previous.set(key, process.env[key])
+  for (const [key, value] of Object.entries(patch)) {
+    if (value == null) delete process.env[key]
+    else process.env[key] = value
+  }
+  t.after(() => {
+    for (const [key, value] of previous.entries()) {
+      if (value == null) delete process.env[key]
+      else process.env[key] = value
+    }
+  })
+}
+
 test("runSetupCheck reports successful probes and cleans temp state files", async () => {
   const dir = await makeTempDir()
   const repoDir = path.join(dir, "repo")
@@ -75,7 +90,7 @@ test("runSetupCheck reports successful probes and cleans temp state files", asyn
   })
 
   assert.equal(report.exitCode, 0)
-  assert.deepEqual(report.counts, { pass: 9, warn: 0, fail: 0 })
+  assert.deepEqual(report.counts, { pass: 10, warn: 0, fail: 0 })
   assert.match(lines.join("\n"), /\[PASS\] Telegram API: getMe ok \(@demo_bot, id 7\)/)
   assert.doesNotMatch(lines.join("\n"), /5555555555:AABBCCDDEEFFaabbccddeeff12345678/)
 
@@ -235,6 +250,79 @@ test("runSetupCheck fails when autoStart needs opencode but command is missing",
   assert.equal(report.findings.find((finding) => finding.item === "Auto-start demo")?.status, "fail")
 })
 
+test("runSetupCheck fails default global SSE when project directory is missing", async (t) => {
+  swapEnv(t, { OPENCODE_SSE_EVENT_PATH: undefined })
+  const dir = await makeTempDir()
+  const stateFile = path.join(dir, ".data", "state.json")
+  const lines = []
+
+  const report = await runSetupCheck({
+    stdout: (line) => lines.push(line),
+    skipTelegramProbe: true,
+    skipOpenCodeProbe: true,
+    buildRuntimeConfigImpl: async () => makeRuntime({
+      dir,
+      stateFile,
+      projects: {
+        demo: {
+          baseUrl: "http://127.0.0.1:4312",
+          autoStart: false,
+          serverLaunchMode: "background",
+          openTuiOnAutoStart: true,
+          openAttachOnNewMode: "same-window",
+          username: "",
+          password: "",
+        },
+      },
+    }),
+    createOpenCodeClientImpl: () => ({
+      health: async () => ({ status: "ok" }),
+    }),
+  })
+
+  assert.equal(report.exitCode, 1)
+  const sseFinding = report.findings.find((finding) => finding.item === "SSE routing demo")
+  assert.equal(sseFinding?.status, "fail")
+  assert.match(sseFinding?.message || "", /\/global\/event requires project 'directory'/)
+  assert.match(sseFinding?.message || "", /OPENCODE_SSE_EVENT_PATH=\/event/)
+  assert.match(lines.join("\n"), /\[FAIL\] SSE routing demo:/)
+})
+
+test("runSetupCheck allows legacy SSE /event when project directory is missing", async (t) => {
+  swapEnv(t, { OPENCODE_SSE_EVENT_PATH: "/event" })
+  const dir = await makeTempDir()
+  const stateFile = path.join(dir, ".data", "state.json")
+
+  const report = await runSetupCheck({
+    stdout: () => {},
+    skipTelegramProbe: true,
+    skipOpenCodeProbe: true,
+    buildRuntimeConfigImpl: async () => makeRuntime({
+      dir,
+      stateFile,
+      projects: {
+        demo: {
+          baseUrl: "http://127.0.0.1:4312",
+          autoStart: false,
+          serverLaunchMode: "background",
+          openTuiOnAutoStart: true,
+          openAttachOnNewMode: "same-window",
+          username: "",
+          password: "",
+        },
+      },
+    }),
+    createOpenCodeClientImpl: () => ({
+      health: async () => ({ status: "ok" }),
+    }),
+  })
+
+  assert.equal(report.exitCode, 0)
+  const sseFinding = report.findings.find((finding) => finding.item === "SSE routing demo")
+  assert.equal(sseFinding?.status, "pass")
+  assert.match(sseFinding?.message || "", /\/event does not require project directory routing/)
+})
+
 test("runSetupCheck reports Basic Auth safety failures without leaking credentials", async () => {
   const dir = await makeTempDir()
   const stateFile = path.join(dir, ".data", "state.json")
@@ -250,6 +338,7 @@ test("runSetupCheck reports Basic Auth safety failures without leaking credentia
       projects: {
         demo: {
           baseUrl: "http://example.com:4312",
+          directory: dir,
           autoStart: false,
           serverLaunchMode: "background",
           openTuiOnAutoStart: true,
@@ -279,6 +368,7 @@ test("runSetupCheck reports OpenCode and state probe failures", async () => {
       projects: {
         demo: {
           baseUrl: "http://127.0.0.1:4312",
+          directory: dir,
           autoStart: false,
           serverLaunchMode: "background",
           openTuiOnAutoStart: true,
@@ -327,6 +417,7 @@ test("runSetupCheck fails when state file path is an existing directory", async 
       projects: {
         demo: {
           baseUrl: "http://127.0.0.1:4312",
+          directory: dir,
           autoStart: false,
           serverLaunchMode: "background",
           openTuiOnAutoStart: true,
@@ -360,6 +451,7 @@ test("runSetupCheck fails on shipped Telegram placeholders", async () => {
         projects: {
           demo: {
             baseUrl: "http://127.0.0.1:4312",
+            directory: dir,
             autoStart: false,
             serverLaunchMode: "background",
             openTuiOnAutoStart: true,
@@ -385,7 +477,8 @@ test("package scripts keep syntax check, cover starter config, and add setup che
   const callbackGuardScript = await fs.readFile(new URL("../scripts/verify-callback-data.mjs", import.meta.url), "utf8")
 
   assert.equal(pkg.private, true)
-  assert.equal(pkg.scripts.check, "node scripts/check-syntax.mjs && node scripts/verify-callback-data.mjs")
+  assert.equal(pkg.scripts.check, "node scripts/check-syntax.mjs && node scripts/verify-callback-data.mjs && npm run check:types")
+  assert.equal(pkg.scripts["check:types"], "tsc -p tsconfig.check.json")
   assert.ok(pkg.files.includes("scripts/verify-callback-data.mjs"))
   assert.match(syntaxCheckScript, /connector\.config\.example\.mjs/)
   assert.match(callbackGuardScript, /raw callback payload literal/)

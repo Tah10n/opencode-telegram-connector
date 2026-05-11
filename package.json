@@ -35,11 +35,15 @@
   },
   "scripts": {
     "start": "node src/cli.js",
-    "check": "node scripts/check-syntax.mjs && node scripts/verify-callback-data.mjs",
+    "check": "node scripts/check-syntax.mjs && node scripts/verify-callback-data.mjs && npm run check:types",
+    "check:types": "tsc -p tsconfig.check.json",
     "setup:check": "node src/cli.js check",
     "lint": "npm run check",
     "test": "node --test",
     "test:platform": "node --test test/launcher.test.js test/overview.test.js test/index.integration.test.js",
     "test:coverage": "node --test --experimental-test-coverage"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3"
   }
 }
