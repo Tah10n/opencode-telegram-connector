@@ -1,4 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises"
+import path from "node:path"
 import crypto from "node:crypto"
 import { createCallbackHandlers } from "./connector/callbacks.js"
 import { createCommandHandlers } from "./connector/commands.js"
@@ -12,7 +13,7 @@ import { TelegramClient, makeInlineKeyboard } from "./telegram/client.js"
 import { formatMarkdownToTelegramHtmlBlocks, escapeHtml } from "./telegram/formatter.js"
 import { ctxKeyFrom, threadIdOr0FromMessage } from "./telegram/routing.js"
 import { OpenCodeClient } from "./opencode/client.js"
-import { startOpenCodeSseLoop } from "./opencode/sse.js"
+import { getOpenCodeSseEventMeta, startOpenCodeSseLoop } from "./opencode/sse.js"
 import { ensureStartupSession } from "./opencode/startup-session.js"
 import { ensureOpenCodeRunning, openAttachWindow, stopOpenCodeServeOnPort, stopOpenCodeUiOnPort } from "./opencode/launcher.js"
 import { extractPatchDiffText, extractPatchFiles, formatChangedFilesText } from "./message-display.js"
@@ -1403,10 +1404,46 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     }
   }
 
+  function normalizeDirectoryForComparison(value) {
+    const raw = String(value || "").trim()
+    if (!raw) return ""
+    const normalized = path.resolve(raw).replace(/\\/g, "/").replace(/\/+$/g, "")
+    return process.platform === "win32" ? normalized.toLowerCase() : normalized
+  }
+
+  function sseEventMatchesProjectDirectory(projectAlias, evt) {
+    const eventDirectory = getOpenCodeSseEventMeta(evt)?.directory
+    const projectDirectory = projects?.[projectAlias]?.directory
+    if (!eventDirectory || !projectDirectory) return true
+    return normalizeDirectoryForComparison(eventDirectory) === normalizeDirectoryForComparison(projectDirectory)
+  }
+
+  function sseEventPathFallback() {
+    const raw = String(process.env.OPENCODE_SSE_EVENT_PATH || "").trim()
+    if (!raw) return "/global/event"
+    return raw.startsWith("/") ? raw : `/${raw}`
+  }
+
+  function sseErrorContext(err) {
+    const method = err?.method || "GET"
+    const pathname = err?.pathname || sseEventPathFallback()
+    return {
+      source: "opencode",
+      operation: err?.operation || `${method} ${pathname}`,
+      method,
+      pathname,
+    }
+  }
+
   async function onSseEvent({ projectAlias, evt }) {
     return runWithRequestContext(sseRequestContextFields(projectAlias, evt), async () => {
       const type = evt?.type
       const props = evt?.properties || {}
+
+      if (!sseEventMatchesProjectDirectory(projectAlias, evt)) {
+        logSseDebug(projectAlias, props.sessionID || props.sessionId, "drop=directory_mismatch")
+        return false
+      }
 
       function isInitialBaselinePrompt(kind) {
         const identity = promptIdentity(props?.id, props?.sessionID)
@@ -1642,33 +1679,23 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
           onEvent: onSseEvent,
           onError: ({ projectAlias, err }) => {
             markProjectSseDown(projectAlias)
-            const classification = classifyBoundaryError(err, {
-              source: "opencode",
-              operation: "GET /event",
-              method: "GET",
-              pathname: "/event",
-            })
+            const context = sseErrorContext(err)
+            const classification = classifyBoundaryError(err, context)
             if (classification.retryable) {
               logLoopIssue("sse", classification.error, {
                 projectAlias,
                 retryable: true,
-                source: "opencode",
-                operation: "GET /event",
-                method: "GET",
-                pathname: "/event",
+                ...context,
               })
               recordProjectHealthFailure(projectAlias, classification.error, {
-                operation: "GET /event",
-                method: "GET",
-                pathname: "/event",
+                operation: context.operation,
+                method: context.method,
+                pathname: context.pathname,
               })
             } else {
               logLoopIssue("sse", classification.error, {
                 projectAlias,
-                source: "opencode",
-                operation: "GET /event",
-                method: "GET",
-                pathname: "/event",
+                ...context,
               })
             }
             return notifyProjectUnavailable(projectAlias, err, { platform })

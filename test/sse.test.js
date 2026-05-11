@@ -2,7 +2,7 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { setTimeout as delay } from "node:timers/promises"
 import { ReadableStream } from "node:stream/web"
-import { startOpenCodeSseLoop } from "../src/opencode/sse.js"
+import { getOpenCodeSseEventMeta, startOpenCodeSseLoop } from "../src/opencode/sse.js"
 import { OpenCodeClient, OPENCODE_CORRELATION_HEADER } from "../src/opencode/client.js"
 import { classifyBoundaryError } from "../src/boundary-errors.js"
 import { getRequestContext } from "../src/runtime/request-context.js"
@@ -126,6 +126,40 @@ test("startOpenCodeSseLoop unwraps opencode global event payloads", async (t) =>
     type: "message.updated",
     properties: { sessionID: "ses_1", info: { id: "msg_1" } },
   })
+  assert.deepEqual(getOpenCodeSseEventMeta(evt), null)
+})
+
+test("startOpenCodeSseLoop preserves opencode global event directory metadata", async (t) => {
+  useFetchStub(t, async () =>
+    makeSseResponse([
+      'data: {"directory":"C:/repo/demo","payload":{"id":"evt_1","type":"message.updated","properties":{"sessionID":"ses_1","info":{"id":"msg_1"}}}}\n',
+      "\n",
+    ]),
+  )
+
+  const ocClient = {
+    baseUrl: "http://127.0.0.1:4312",
+    headers: () => ({}),
+    health: async () => ({ ok: true }),
+  }
+
+  let loop
+  const evt = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Timed out waiting for wrapped SSE event")), 500)
+    loop = startOpenCodeSseLoop({
+      projectAlias: "demo",
+      ocClient,
+      logger: makeLogger(),
+      onEvent: async ({ evt }) => {
+        loop.stop()
+        clearTimeout(timeout)
+        resolve(evt)
+      },
+    })
+  })
+
+  assert.equal(evt.type, "message.updated")
+  assert.deepEqual(getOpenCodeSseEventMeta(evt), { directory: "C:/repo/demo" })
 })
 
 test("startOpenCodeSseLoop sends correlation header and scopes event context", async (t) => {

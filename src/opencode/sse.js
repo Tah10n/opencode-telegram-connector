@@ -11,6 +11,7 @@ import { appendPathToBaseUrl } from "../url-utils.js"
 import { createCorrelationId, runWithRequestContext } from "../runtime/request-context.js"
 
 const DEFAULT_EVENT_PATH = "/global/event"
+export const OPENCODE_SSE_EVENT_META = Symbol.for("telegram-opencode-connector.opencodeSseEventMeta")
 
 function sseEventContext(projectAlias, evt) {
   const props = evt?.properties || {}
@@ -43,8 +44,23 @@ function readPathEnv(name, fallback) {
 }
 
 function normalizeSseEvent(evt) {
-  if (evt?.payload && typeof evt.payload === "object" && !Array.isArray(evt.payload)) return evt.payload
+  if (evt?.payload && typeof evt.payload === "object" && !Array.isArray(evt.payload)) {
+    const payload = evt.payload
+    const directory = typeof evt.directory === "string" && evt.directory.trim() ? evt.directory.trim() : ""
+    if (directory) {
+      Object.defineProperty(payload, OPENCODE_SSE_EVENT_META, {
+        value: Object.freeze({ directory }),
+        enumerable: false,
+        configurable: false,
+      })
+    }
+    return payload
+  }
   return evt
+}
+
+export function getOpenCodeSseEventMeta(evt) {
+  return evt?.[OPENCODE_SSE_EVENT_META] || null
 }
 
 function shouldPropagateHandlerError(err) {

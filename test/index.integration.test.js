@@ -11,6 +11,7 @@ import { defaultState, StateStore } from "../src/state/store.js"
 import { questionReplyIdempotencyKey } from "../src/connector/idempotency.js"
 import { getRequestContext } from "../src/runtime/request-context.js"
 import { startHealthServer } from "../src/runtime/health-server.js"
+import { OPENCODE_SSE_EVENT_META } from "../src/opencode/sse.js"
 
 function makeLogger() {
   return { info() {}, warn() {}, error() {}, debug() {} }
@@ -24,6 +25,14 @@ async function makeTempDir() {
   const dir = path.join(os.tmpdir(), `telegram-connector-${crypto.randomUUID()}`)
   await fs.mkdir(dir, { recursive: true })
   return dir
+}
+
+function withSseEventMeta(evt, meta) {
+  Object.defineProperty(evt, OPENCODE_SSE_EVENT_META, {
+    value: Object.freeze({ ...(meta || {}) }),
+    enumerable: false,
+  })
+  return evt
 }
 
 function swapEnv(t, patch) {
@@ -765,6 +774,76 @@ test("startConnector mirrors assistant SSE output and /sendlast replays the late
       { sessionId: "ses_1", messageId: "msg_assistant" },
       { sessionId: "ses_1", messageId: "msg_assistant" },
     ])
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector ignores global SSE events from another project directory", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const demoDir = path.join(os.tmpdir(), `telegram-connector-demo-${crypto.randomUUID()}`)
+  const otherDir = path.join(os.tmpdir(), `telegram-connector-other-${crypto.randomUUID()}`)
+  const harness = await createHarness({
+    projectPatch: {
+      directory: demoDir,
+    },
+    statePatch: {
+      updateOffset: 202,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    messagesById: {
+      msg_foreign: {
+        info: { id: "msg_foreign", role: "assistant", time: { created: completedAt, completed: completedAt } },
+        parts: [{ type: "text", text: "Foreign reply" }],
+      },
+      msg_local: {
+        info: { id: "msg_local", role: "assistant", time: { created: completedAt, completed: completedAt } },
+        parts: [{ type: "text", text: "Local reply" }],
+      },
+    },
+  })
+
+  try {
+    await harness.emitSse(
+      "demo",
+      withSseEventMeta(
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "ses_1",
+            info: { id: "msg_foreign", role: "assistant", time: { completed: completedAt } },
+          },
+        },
+        { directory: otherDir },
+      ),
+    )
+    await delay(350)
+
+    assert.equal(harness.ocCalls.getMessage.length, 0)
+    assert.equal(harness.tg.sentHtmlBlocks.length, 0)
+
+    await harness.emitSse(
+      "demo",
+      withSseEventMeta(
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "ses_1",
+            info: { id: "msg_local", role: "assistant", time: { completed: completedAt } },
+          },
+        },
+        { directory: demoDir },
+      ),
+    )
+
+    await waitFor(() => harness.tg.sentHtmlBlocks.length === 1)
+    assert.equal(harness.tg.sentHtmlBlocks[0].blocks[0].html, "Local reply")
+    assert.deepEqual(harness.ocCalls.getMessage, [{ sessionId: "ses_1", messageId: "msg_local" }])
   } finally {
     await harness.connector.stop()
   }
