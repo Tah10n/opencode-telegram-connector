@@ -312,8 +312,9 @@ Prefer the `limits` object in `connector.config.mjs`; env fallbacks are availabl
 - `DEBUG_SSE_ROUTING=<projectAlias>[:sessionId]` — enable verbose SSE routing logs.
 - `MIRROR_COMPACTION=1` — also mirror compaction messages.
 - `OPENCODE_SERVER_DEBUG=1` — start local `opencode serve` processes with debug logging.
+- `OPENCODE_SSE_EVENT_PATH` — override the opencode SSE endpoint. Defaults to `/global/event`; set `/event` only for older opencode builds that do not expose the global stream.
 - `OPENCODE_SSE_MAX_LINE_BYTES`, `OPENCODE_SSE_MAX_EVENT_BYTES`, `OPENCODE_SSE_MAX_EVENT_LINES` — tune SSE safety limits for unusually large upstream events.
-- `OPENCODE_SSE_CONNECT_TIMEOUT_MS` — timeout for an initial SSE `/event` connection that accepts TCP but never returns headers.
+- `OPENCODE_SSE_CONNECT_TIMEOUT_MS` — timeout for an initial SSE connection that accepts TCP but never returns headers.
 - `OPENCODE_SSE_HEALTHCHECK_MIN_INTERVAL_MS` — tune health-check throttling after SSE disconnects.
 - `OPENCODE_WATCHDOG_FAILURE_THRESHOLD`, `OPENCODE_WATCHDOG_WINDOW_MS`, `OPENCODE_WATCHDOG_COOLDOWN_MS` / `opencodeWatchdog.{failureThreshold,windowMs,cooldownMs}` — tune the autoStart watchdog that restarts a configured opencode server after repeated retryable health/SSE/prompt-poll failures.
   On Windows, watchdog restarts also close matching stale `opencode attach` UI windows before reopening the TUI for that project.
@@ -530,7 +531,7 @@ services:
 
 Use `on-failure` if you want `/runtime` Restart (`exit 1`) to relaunch and `/runtime` Stop (`exit 0`) to stay stopped. Use `unless-stopped` only if you want the container runtime to bring the connector back after any process exit.
 
-SSE disconnects reconnect with backoff when they are retryable. Fatal SSE protocol or size errors stop that project's SSE loop instead of reconnecting forever; prompt polling remains available as the fallback path for permission and question prompts while SSE is down.
+SSE disconnects reconnect with backoff when they are retryable. The connector listens to opencode's `/global/event` stream by default and accepts both wrapped `payload` events and legacy top-level event JSON. Fatal SSE protocol or size errors stop that project's SSE loop instead of reconnecting forever; prompt polling remains available as the fallback path for permission and question prompts while SSE is down.
 
 ### Runtime smoke checks
 
@@ -557,6 +558,7 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 | Windows TUI/attach window appears hung | Check logs for watchdog restarts or repeated retryable SSE/prompt-poll failures. A stale attach window can remain after a server restart. | Let the auto-start watchdog recover the project; it closes matching stale attach windows and opens a fresh one. If needed, close the old TUI window manually and use `/projects` → Start/Retry health. |
 | State file cannot be read, written, or validated | Startup or runtime logs report a state read/write/schema failure. The connector fails closed instead of silently resetting state. Schema errors include the malformed section path, and migration/invalid-state backups are written next to `state.json` when possible. | Fix permissions/path/corruption, repair the reported section, or restore a known-good `state.json.backup.*` file. Treat backups as sensitive; they contain the same bindings, offset, prompts, and idempotency history as `state.json`. |
 | Prompt send reports project unavailable | A retryable opencode `prompt_async` failure happened while forwarding a user message. | Restore the project; the Telegram update remains retryable and should be processed again after recovery. |
+| OpenCode works but assistant replies do not appear in Telegram | Check logs for rapid `SSE connected` / `SSE disconnected` loops. Current opencode builds expose the long-lived stream at `/global/event`; older connector versions listening to `/event` may only receive `server.connected` before the stream closes. | Restart the connector on a build that defaults to `/global/event`. If you run an older opencode build that lacks `/global/event`, set `OPENCODE_SSE_EVENT_PATH=/event` and restart. |
 | SSE stopped after protocol/size error | Logs show a fatal SSE protocol or size failure for one project. | Inspect upstream event size/protocol, fix the source, then restart the connector or recover the project; prompt polling still handles prompts while SSE is down. |
 | Group command ignored | The command may be addressed to another bot, for example `/start@OtherBot`. | Use `/command@<this bot username>` or an unsuffixed command that Telegram delivers to this bot. |
 | Duplicate prompts or callbacks | Check `/status` for prompt cleanup/recovery and callback outcome counters. Duplicates after restart should be skipped as already handled. | If duplicates continue, keep the connector single-instance and inspect logs around prompt polling/SSE reconnects. |
@@ -577,6 +579,7 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 - Telegram HTML messages are split with tag/entity awareness to avoid malformed chunks.
 - OpenCode path IDs are URL-encoded at the HTTP boundary; user-entered binding/session IDs are validated before being persisted and cannot contain whitespace, colons, pipes (`|`), or URL path/query separators.
 - Parent-session routing uses a bounded cache for long-running processes.
+- OpenCode event mirroring uses `/global/event` by default and accepts both `payload`-wrapped events and legacy top-level event JSON. Use `OPENCODE_SSE_EVENT_PATH=/event` only when running an older opencode build that does not expose `/global/event`.
 - Basic Auth over non-loopback `http://` is blocked unless `OPENCODE_ALLOW_INSECURE_HTTP=1` is set.
 
 ## Useful local commands
