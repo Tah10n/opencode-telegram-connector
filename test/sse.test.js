@@ -2,7 +2,14 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { setTimeout as delay } from "node:timers/promises"
 import { ReadableStream } from "node:stream/web"
-import { getOpenCodeSseEventMeta, startOpenCodeSseLoop } from "../src/opencode/sse.js"
+import {
+  canonicalOpenCodeSseEventPath,
+  effectiveOpenCodeSseEventPath,
+  getOpenCodeSseEventMeta,
+  getOpenCodeSseProjectRoutingIssue,
+  openCodeSseEventPathRequiresDirectoryRouting,
+  startOpenCodeSseLoop,
+} from "../src/opencode/sse.js"
 import { OpenCodeClient, OPENCODE_CORRELATION_HEADER } from "../src/opencode/client.js"
 import { classifyBoundaryError } from "../src/boundary-errors.js"
 import { getRequestContext } from "../src/runtime/request-context.js"
@@ -48,7 +55,21 @@ function makeSseResponse(chunks) {
   })
 }
 
+test("OpenCode SSE path helpers centralize directory routing requirements", () => {
+  assert.equal(canonicalOpenCodeSseEventPath("global/event/"), "/global/event")
+  assert.equal(effectiveOpenCodeSseEventPath({}), "/global/event")
+  assert.equal(effectiveOpenCodeSseEventPath({ OPENCODE_SSE_EVENT_PATH: "event/" }), "/event")
+  assert.equal(openCodeSseEventPathRequiresDirectoryRouting("/global/event/"), true)
+  assert.equal(openCodeSseEventPathRequiresDirectoryRouting("/event"), false)
+  assert.deepEqual(getOpenCodeSseProjectRoutingIssue({}, { eventPath: "/global/event" }), {
+    reason: "project_directory_missing",
+    eventPath: "/global/event",
+  })
+  assert.equal(getOpenCodeSseProjectRoutingIssue({}, { eventPath: "/event" }), null)
+})
+
 test("startOpenCodeSseLoop forwards parsed SSE events and connects once", async (t) => {
+  swapEnv(t, { OPENCODE_SSE_EVENT_PATH: undefined })
   let fetchCalls = 0
   useFetchStub(t, async () => {
     fetchCalls += 1
@@ -99,6 +120,7 @@ test("startOpenCodeSseLoop forwards parsed SSE events and connects once", async 
 })
 
 test("startOpenCodeSseLoop unwraps opencode global event payloads", async (t) => {
+  swapEnv(t, { OPENCODE_SSE_EVENT_PATH: undefined })
   useFetchStub(t, async () =>
     makeSseResponse([
       'data: {"payload":{"id":"evt_1","type":"message.updated","properties":{"sessionID":"ses_1","info":{"id":"msg_1"}}}}\n',
@@ -141,6 +163,7 @@ test("startOpenCodeSseLoop unwraps opencode global event payloads", async (t) =>
 })
 
 test("startOpenCodeSseLoop preserves opencode global event directory metadata", async (t) => {
+  swapEnv(t, { OPENCODE_SSE_EVENT_PATH: undefined })
   useFetchStub(t, async () =>
     makeSseResponse([
       'data: {"directory":"C:/repo/demo","payload":{"id":"evt_1","type":"message.updated","properties":{"sessionID":"ses_1","info":{"id":"msg_1"}}}}\n',
@@ -179,6 +202,7 @@ test("startOpenCodeSseLoop preserves opencode global event directory metadata", 
 })
 
 test("startOpenCodeSseLoop treats blank global event directory metadata as missing", async (t) => {
+  swapEnv(t, { OPENCODE_SSE_EVENT_PATH: undefined })
   useFetchStub(t, async () =>
     makeSseResponse([
       'data: {"directory":"   ","payload":{"id":"evt_1","type":"message.updated","properties":{"sessionID":"ses_1"}}}\n',
@@ -324,6 +348,7 @@ test("startOpenCodeSseLoop rejects one SSE line over the configured limit", asyn
 })
 
 test("startOpenCodeSseLoop appends event path after a base path", async (t) => {
+  swapEnv(t, { OPENCODE_SSE_EVENT_PATH: undefined })
   const fetchUrls = []
   useFetchStub(t, async (url) => {
     fetchUrls.push(String(url))

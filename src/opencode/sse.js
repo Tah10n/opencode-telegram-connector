@@ -10,13 +10,34 @@ import {
 import { appendPathToBaseUrl } from "../url-utils.js"
 import { createCorrelationId, runWithRequestContext } from "../runtime/request-context.js"
 
-const DEFAULT_EVENT_PATH = "/global/event"
+export const DEFAULT_OPENCODE_SSE_EVENT_PATH = "/global/event"
 export const OPENCODE_SSE_EVENT_META = Symbol.for("telegram-opencode-connector.opencodeSseEventMeta")
 
-function canonicalEventPath(value) {
+export function canonicalOpenCodeSseEventPath(value) {
   const raw = String(value || "").trim()
-  const withLeadingSlash = raw ? (raw.startsWith("/") ? raw : `/${raw}`) : DEFAULT_EVENT_PATH
+  const withLeadingSlash = raw ? (raw.startsWith("/") ? raw : `/${raw}`) : DEFAULT_OPENCODE_SSE_EVENT_PATH
   return withLeadingSlash.length > 1 ? withLeadingSlash.replace(/\/+$/g, "") : withLeadingSlash
+}
+
+export function effectiveOpenCodeSseEventPath(env = process.env) {
+  return canonicalOpenCodeSseEventPath(env?.OPENCODE_SSE_EVENT_PATH)
+}
+
+export function openCodeSseEventPathRequiresDirectoryRouting(eventPath = effectiveOpenCodeSseEventPath()) {
+  return canonicalOpenCodeSseEventPath(eventPath) === DEFAULT_OPENCODE_SSE_EVENT_PATH
+}
+
+function configuredDirectory(value) {
+  if (value == null) return ""
+  return String(value).trim()
+}
+
+export function getOpenCodeSseProjectRoutingIssue(project, { eventPath = effectiveOpenCodeSseEventPath() } = {}) {
+  const effectiveEventPath = canonicalOpenCodeSseEventPath(eventPath)
+  if (openCodeSseEventPathRequiresDirectoryRouting(effectiveEventPath) && !configuredDirectory(project?.directory)) {
+    return { reason: "project_directory_missing", eventPath: effectiveEventPath }
+  }
+  return null
 }
 
 function directoryMetadata(value) {
@@ -28,9 +49,9 @@ function directoryMetadata(value) {
 function makeSseEventMeta({ directory, eventPath, wrapped }) {
   return Object.freeze({
     directory: directoryMetadata(directory),
-    eventPath,
+    eventPath: canonicalOpenCodeSseEventPath(eventPath),
     wrapped,
-    requiresDirectoryRouting: canonicalEventPath(eventPath) === DEFAULT_EVENT_PATH,
+    requiresDirectoryRouting: openCodeSseEventPathRequiresDirectoryRouting(eventPath),
   })
 }
 
@@ -66,12 +87,6 @@ function readIntEnv(name, fallback) {
   if (raw == null || raw === "") return fallback
   const n = Number(raw)
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback
-}
-
-function readPathEnv(name, fallback) {
-  const raw = String(process.env?.[name] || "").trim()
-  if (!raw) return fallback
-  return raw.startsWith("/") ? raw : `/${raw}`
 }
 
 function normalizeSseEvent(evt, eventPath) {
@@ -136,7 +151,7 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
 
   const HEALTH_CHECK_MIN_INTERVAL_MS = readIntEnv("OPENCODE_SSE_HEALTHCHECK_MIN_INTERVAL_MS", 15_000)
   const CONNECT_TIMEOUT_MS = readIntEnv("OPENCODE_SSE_CONNECT_TIMEOUT_MS", 15_000)
-  const EVENT_PATH = readPathEnv("OPENCODE_SSE_EVENT_PATH", DEFAULT_EVENT_PATH)
+  const EVENT_PATH = effectiveOpenCodeSseEventPath()
   const EVENT_OPERATION = `GET ${EVENT_PATH}`
   let lastHealthCheckAt = 0
 

@@ -13,7 +13,7 @@ import { TelegramClient, makeInlineKeyboard } from "./telegram/client.js"
 import { formatMarkdownToTelegramHtmlBlocks, escapeHtml } from "./telegram/formatter.js"
 import { ctxKeyFrom, threadIdOr0FromMessage } from "./telegram/routing.js"
 import { OpenCodeClient } from "./opencode/client.js"
-import { getOpenCodeSseEventMeta, startOpenCodeSseLoop } from "./opencode/sse.js"
+import { effectiveOpenCodeSseEventPath, getOpenCodeSseEventMeta, getOpenCodeSseProjectRoutingIssue, startOpenCodeSseLoop } from "./opencode/sse.js"
 import { ensureStartupSession } from "./opencode/startup-session.js"
 import { ensureOpenCodeRunning, openAttachWindow, stopOpenCodeServeOnPort, stopOpenCodeUiOnPort } from "./opencode/launcher.js"
 import { extractPatchDiffText, extractPatchFiles, formatChangedFilesText } from "./message-display.js"
@@ -650,6 +650,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     markProjectUp,
     markProjectSseConnected,
     markProjectSseDown,
+    markProjectSseUnavailable,
     getProjectSseStatus,
   } = overviewHelpers
 
@@ -1426,9 +1427,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   }
 
   function sseEventPathFallback() {
-    const raw = String(process.env.OPENCODE_SSE_EVENT_PATH || "").trim()
-    if (!raw) return "/global/event"
-    return raw.startsWith("/") ? raw : `/${raw}`
+    return effectiveOpenCodeSseEventPath()
   }
 
   function sseErrorContext(err) {
@@ -1440,6 +1439,19 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       method,
       pathname,
     }
+  }
+
+  function makeSseProjectRoutingError(projectAlias, issue) {
+    const pathname = issue?.eventPath || sseEventPathFallback()
+    return makeBoundaryError({
+      source: "opencode",
+      operation: `GET ${pathname}`,
+      method: "GET",
+      pathname,
+      kind: "configuration",
+      outcome: "fatal",
+      message: `SSE disabled for project '${projectAlias}': ${pathname} requires project 'directory' for safe routing. Add 'directory' to connector.config.mjs or set OPENCODE_SSE_EVENT_PATH=/event for legacy opencode builds.`,
+    })
   }
 
   async function onSseEvent({ projectAlias, evt }) {
@@ -1675,6 +1687,30 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       async () => {
         await waitForPromiseOrAbort(startInProgress.get(alias))
         if (abortController.signal.aborted) return null
+        const routingIssue = getOpenCodeSseProjectRoutingIssue(projects?.[alias])
+        if (routingIssue) {
+          const err = makeSseProjectRoutingError(alias, routingIssue)
+          markProjectSseUnavailable(alias, "missing directory")
+          recordLoopError("sse", err, {
+            projectAlias: alias,
+            source: "opencode",
+            operation: err.operation,
+            method: err.method,
+            pathname: err.pathname,
+          })
+          logger.error("SSE disabled for project", {
+            projectAlias: alias,
+            source: err.source,
+            operation: err.operation,
+            method: err.method,
+            pathname: err.pathname,
+            kind: err.kind,
+            outcome: err.outcome,
+            reason: routingIssue.reason,
+            error: err.message,
+          })
+          return null
+        }
         const handle = startSseLoop({
           projectAlias: alias,
           ocClient: ocByAlias[alias],

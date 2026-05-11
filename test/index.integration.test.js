@@ -11,10 +11,16 @@ import { defaultState, StateStore } from "../src/state/store.js"
 import { questionReplyIdempotencyKey } from "../src/connector/idempotency.js"
 import { getRequestContext } from "../src/runtime/request-context.js"
 import { startHealthServer } from "../src/runtime/health-server.js"
-import { OPENCODE_SSE_EVENT_META } from "../src/opencode/sse.js"
+import { canonicalOpenCodeSseEventPath, openCodeSseEventPathRequiresDirectoryRouting, OPENCODE_SSE_EVENT_META } from "../src/opencode/sse.js"
 
-function makeLogger() {
-  return { info() {}, warn() {}, error() {}, debug() {} }
+function makeLogger(entries) {
+  const push = (level, args) => entries?.push({ level, args })
+  return {
+    info(...args) { push("info", args) },
+    warn(...args) { push("warn", args) },
+    error(...args) { push("error", args) },
+    debug(...args) { push("debug", args) },
+  }
 }
 
 function shortDelay(ms) {
@@ -28,14 +34,13 @@ async function makeTempDir() {
 }
 
 function withSseEventMeta(evt, meta = {}) {
-  const rawEventPath = String(meta.eventPath || "/global/event").trim()
-  const eventPath = rawEventPath.startsWith("/") ? rawEventPath : `/${rawEventPath}`
+  const eventPath = canonicalOpenCodeSseEventPath(meta.eventPath || "/global/event")
   Object.defineProperty(evt, OPENCODE_SSE_EVENT_META, {
     value: Object.freeze({
       directory: typeof meta.directory === "string" && meta.directory.trim() ? meta.directory.trim() : null,
       eventPath,
       wrapped: meta.wrapped ?? true,
-      requiresDirectoryRouting: meta.requiresDirectoryRouting ?? (eventPath.replace(/\/+$/g, "") === "/global/event"),
+      requiresDirectoryRouting: meta.requiresDirectoryRouting ?? openCodeSseEventPathRequiresDirectoryRouting(eventPath),
     }),
     enumerable: false,
   })
@@ -367,6 +372,7 @@ async function createHarness({
   opencodeWatchdog,
   createStateStoreImpl,
   configPatch,
+  logger = makeLogger(),
 } = {}) {
   const dir = await makeTempDir()
   const stateFile = path.join(dir, "state.json")
@@ -420,7 +426,7 @@ async function createHarness({
 
   const connector = await startConnector({
     config,
-    logger: makeLogger(),
+    logger,
     deps: {
       createTelegramClient: () => tg,
       ...(createStateStoreImpl ? { createStateStore: createStateStoreImpl } : {}),
@@ -921,8 +927,12 @@ test("startConnector accepts legacy SSE /event events without directory metadata
   }
 })
 
-test("startConnector drops default global SSE events when project directory is not configured", async () => {
-  const completedAt = new Date(Date.now() + 60_000).toISOString()
+test("startConnector disables default global SSE without project directory but keeps prompt polling", async (t) => {
+  swapEnv(t, { OPENCODE_SSE_EVENT_PATH: undefined })
+  const permission = { id: "perm_missing_directory_poll", sessionID: "ses_1", permission: "shell", patterns: ["npm test"] }
+  let exposePermission = false
+  let sseStarts = 0
+  const loggerEntries = []
   const harness = await createHarness({
     projectPatch: {
       directory: undefined,
@@ -936,32 +946,74 @@ test("startConnector drops default global SSE events when project directory is n
         "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
       },
     },
-    messagesById: {
-      msg_unscoped_project: {
-        info: { id: "msg_unscoped_project", role: "assistant", time: { created: completedAt, completed: completedAt } },
-        parts: [{ type: "text", text: "Should not mirror" }],
+    ocOptions: {
+      listPermissionsImpl: async () => (exposePermission ? [permission] : []),
+      listQuestionsImpl: async () => [],
+    },
+    startSseLoopImpl: () => {
+      sseStarts += 1
+      return { stop() {} }
+    },
+    logger: makeLogger(loggerEntries),
+  })
+
+  try {
+    await waitFor(() => harness.ocCalls.listPermissions > 0)
+    await waitFor(() => loggerEntries.some((entry) =>
+      entry.level === "error" &&
+      entry.args[0] === "SSE disabled for project" &&
+      entry.args[1]?.projectAlias === "demo" &&
+      entry.args[1]?.reason === "project_directory_missing",
+    ))
+
+    const sseDisabledLogs = loggerEntries.filter((entry) =>
+      entry.level === "error" &&
+      entry.args[0] === "SSE disabled for project" &&
+      entry.args[1]?.projectAlias === "demo" &&
+      entry.args[1]?.reason === "project_directory_missing",
+    )
+    assert.equal(sseDisabledLogs.length, 1)
+    assert.equal(sseStarts, 0)
+    assert.equal(harness.hasSseHandler("demo"), false)
+
+    exposePermission = true
+    await waitFor(() => harness.tg.sentHtmlBlocks.some((entry) => entry.blocks.some((block) => /perm_missing_directory_poll/.test(block.html))))
+
+    harness.tg.enqueue(makeMessageUpdate(203, "/status"))
+    await waitFor(() => harness.tg.sentMessages.some((entry) => /SSE: unavailable \(missing directory\)/.test(entry.text)))
+    const status = harness.tg.sentMessages.at(-1)?.text || ""
+    assert.match(status, /SSE observed: retries=0 aborted=0 connected=never .*lastError=.*requires project 'directory'/)
+    assert.match(status, /Prompt poll observed: .*hits=1/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector allows legacy SSE /event without project directory", async (t) => {
+  swapEnv(t, { OPENCODE_SSE_EVENT_PATH: "/event" })
+  let sseStarts = 0
+  const harness = await createHarness({
+    projectPatch: {
+      directory: undefined,
+    },
+    statePatch: {
+      updateOffset: 202,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
       },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+    },
+    startSseLoopImpl: () => {
+      sseStarts += 1
+      return { stop() {} }
     },
   })
 
   try {
-    await harness.emitSse(
-      "demo",
-      withSseEventMeta(
-        {
-          type: "message.updated",
-          properties: {
-            sessionID: "ses_1",
-            info: { id: "msg_unscoped_project", role: "assistant", time: { completed: completedAt } },
-          },
-        },
-        { directory: "/srv/workspaces/team-project" },
-      ),
-    )
-    await delay(350)
-
-    assert.equal(harness.ocCalls.getMessage.length, 0)
-    assert.equal(harness.tg.sentHtmlBlocks.length, 0)
+    await waitFor(() => harness.hasSseHandler("demo"))
+    assert.equal(sseStarts, 1)
   } finally {
     await harness.connector.stop()
   }
