@@ -1,24 +1,40 @@
 import crypto from "node:crypto"
 import { makeInlineKeyboard } from "../telegram/client.js"
-import { formatUnifiedDiffHtml } from "../telegram/diff-formatter.js"
-import { escapeHtml, formatMarkdownToTelegramHtmlBlocks } from "../telegram/formatter.js"
+import { formatMarkdownToTelegramHtmlBlocks } from "../telegram/formatter.js"
 import { ctxKeyFrom } from "../telegram/routing.js"
-import {
-  extractPatchDiffText,
-  extractPatchFileEntries,
-  extractPatchFiles,
-  extractSummaryFileDiffEntries,
-  formatChangedFilesText,
-  formatFileDiffEntriesPatch,
-} from "../message-display.js"
+import { extractPatchFileEntries } from "../message-display.js"
 import { DEFAULT_FEED_MODE, normalizeFeedMode, sessionKey } from "../state/store.js"
-import { ATTACHMENT_NOTICES, attachmentCaption, sanitizeFilenamePart, scopedAttachmentFilename } from "./attachment-utils.js"
+import { ATTACHMENT_NOTICES, attachmentCaption, sanitizeFilenamePart } from "./attachment-utils.js"
 import { NOISY_SKIP_REASONS } from "./noisy-skip-reasons.js"
-import { redactSensitiveText } from "../url-utils.js"
 import { classifyBoundaryError, isRetryableBoundaryError } from "../boundary-errors.js"
 import { bindRequestContext } from "../runtime/request-context.js"
 import { callbackPacker } from "./callback-data.js"
 import { t as translate } from "../i18n/index.js"
+import {
+  agentStopErrorDedupeKey,
+  assistantAttachmentName as formatAssistantAttachmentName,
+  buildAssistantStreamPreviewHtml as formatAssistantStreamPreviewHtml,
+  extractTextParts,
+  formatAgentStopErrorNotice,
+  hashTextForEcho,
+  shouldSendAssistantAsAttachment as isAssistantAttachmentSized,
+} from "./mirroring/assistant-format.js"
+import {
+  agentActionForwardKey,
+  fallbackAgentActionPartId,
+  formatAgentActionText,
+  normalizeAgentActionStatus,
+  partEventTimeInfo,
+} from "./mirroring/agent-action-format.js"
+import {
+  changedFilesAttachmentName as formatChangedFilesAttachmentName,
+  extractChangedFilesSummary as formatChangedFilesSummary,
+  formatChangedFileDiffList,
+  loadChangedFilesDiffData,
+  renderChangedFilesDiffHtml,
+  renderSelectedFileDiffHtml,
+} from "./mirroring/changed-files-format.js"
+import { formatUserMirrorBlocks } from "./mirroring/user-format.js"
 
 export function createMirroringHandlers(runtime) {
   const {
@@ -282,106 +298,12 @@ export function createMirroringHandlers(runtime) {
     }
   }
 
-  function hashTextForEcho(text) {
-    const t = String(text ?? "")
-    return crypto.createHash("sha1").update(t, "utf8").digest("hex") + ":" + String(t.length)
-  }
-
-  function agentStopErrorDedupeKey({ messageId = "", partId = "", details = "" } = {}) {
-    const msg = String(messageId || "").trim()
-    if (msg) return msg
-    const part = String(partId || "").trim()
-    if (part) return `part:${part}:${hashTextForEcho(details || "agent-stop-error")}`
-    return `error:${hashTextForEcho(details || "agent-stop-error")}`
-  }
-
   function agentStopErrorDebounceKey(projectAlias, sessionId, dedupeKey) {
     return `agent-stop-error:${sessionKey(projectAlias, sessionId)}:${dedupeKey}`
   }
 
   function isAgentStopErrorDebounce(entry) {
     return String(entry?.kind || "").startsWith("agent-stop-error")
-  }
-
-  const AGENT_STOP_ERROR_TEXT_KEYS = ["message", "error", "errorMessage", "error_description", "reason", "description", "detail", "details", "body", "data", "response", "cause", "errors"]
-  const AGENT_STOP_ERROR_METADATA_KEYS = ["name", "type", "code", "status", "statusCode", "kind", "outcome", "providerID", "providerId", "modelID", "modelId"]
-
-  function safeReadAgentStopErrorField(value, key) {
-    try {
-      return value?.[key]
-    } catch {
-      return undefined
-    }
-  }
-
-  function primitiveAgentStopErrorText(value) {
-    if (typeof value === "string") return value
-    if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value)
-    return ""
-  }
-
-  function agentStopErrorMetadata(value) {
-    const parts = []
-    for (const key of AGENT_STOP_ERROR_METADATA_KEYS) {
-      const entry = safeReadAgentStopErrorField(value, key)
-      const text = primitiveAgentStopErrorText(entry).trim()
-      if (text) parts.push(`${key}=${text}`)
-    }
-    return parts.join(" ")
-  }
-
-  function readableAgentStopErrorText(value, seen = new WeakSet()) {
-    if (typeof value === "string") return value
-    if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value)
-    if (!value || typeof value !== "object") return ""
-    if (seen.has(value)) return "[Circular]"
-    seen.add(value)
-
-    if (value instanceof Error || safeReadAgentStopErrorField(value, "isBoundaryError") === true) {
-      return [agentStopErrorMetadata(value), primitiveAgentStopErrorText(safeReadAgentStopErrorField(value, "message")).trim()].filter(Boolean).join("\n")
-    }
-
-    if (Array.isArray(value)) {
-      const entries = []
-      let sample = []
-      try {
-        sample = value.slice(0, 3)
-      } catch {
-        sample = []
-      }
-      for (const entry of sample) {
-        const text = readableAgentStopErrorText(entry, seen).trim()
-        if (text && text !== "[Circular]") entries.push(text)
-      }
-      return entries.join("\n")
-    }
-
-    const metadata = agentStopErrorMetadata(value)
-    for (const key of AGENT_STOP_ERROR_TEXT_KEYS) {
-      const entry = safeReadAgentStopErrorField(value, key)
-      if (entry == null) continue
-      const text = readableAgentStopErrorText(entry, seen).trim()
-      if (text && text !== "[Circular]") return [metadata, text].filter(Boolean).join("\n")
-    }
-
-    return metadata
-  }
-
-  function redactAgentStopErrorText(value) {
-    return redactSensitiveText(readableAgentStopErrorText(value))
-      .replace(/(^|[^A-Za-z0-9_-])(["']?)(set[-_]?cookie|cookie|authorization)\2(\s*[:=]\s*)[^\n\r]+/gi, "$1$2$3$2$4***")
-      .replace(/(^|[^A-Za-z0-9_-])(["']?)([A-Za-z0-9_-]*(?:token|password|passwd|secret|api[_-]?key|auth|authorization|cookie|set[-_]?cookie|session|credential)[A-Za-z0-9_-]*)\2(\s*[:=]\s*)("[^"\n\r]*"|'[^'\n\r]*'|[^,;\n\r]+)/gi, "$1$2$3$2$4***")
-      .trim()
-  }
-
-  function formatAgentStopErrorNotice({ reason = "Agent stopped due to error.", details = "" } = {}) {
-    const lines = ["⚠️ Agent stopped due to error."]
-    const reasonText = redactAgentStopErrorText(reason)
-    if (reasonText) lines.push("", reasonText)
-    let detailsText = redactAgentStopErrorText(details)
-    if (detailsText.length > 2000) detailsText = `${detailsText.slice(0, 1999)}…`
-    if (detailsText) lines.push("", detailsText)
-    return lines.join("\n")
   }
 
   function cancelPendingAgentStopError(projectAlias, sessionId, messageId) {
@@ -492,7 +414,7 @@ export function createMirroringHandlers(runtime) {
   }
 
   function changedFilesAttachmentName(projectAlias, sessionId, messageId, { label = "changed-files", extension = ".patch", fileName = "" } = {}) {
-    return scopedAttachmentFilename({ projectAlias, sessionId, messageId, label, fileName, extension })
+    return formatChangedFilesAttachmentName(projectAlias, sessionId, messageId, { label, fileName, extension })
   }
 
   function changedFilesSummaryKeyboard(projectAlias, sessionId, messageId, msg) {
@@ -537,123 +459,8 @@ export function createMirroringHandlers(runtime) {
     return makeInlineKeyboard([[{ text: "Close", callback_data: packCallback("cf", "close") }]])
   }
 
-  function extractTextParts(message) {
-    if (!message || !Array.isArray(message.parts)) return ""
-    const parts = message.parts.filter((p) => p && p.type === "text" && typeof p.text === "string" && !p.ignored)
-    return parts.map((p) => p.text).join("")
-  }
-
   function extractChangedFilesSummary(projectAlias, msg) {
-    const files = extractPatchFiles(msg)
-    if (!files.length) return ""
-    return formatChangedFilesText(files, { baseDir: projects?.[projectAlias]?.directory, limit: CHANGED_FILES_LIMIT })
-  }
-
-  function normalizeAgentActionStatus(status) {
-    const normalized = String(status || "").trim().toLowerCase()
-    if (normalized === "running" || normalized === "completed" || normalized === "error") return normalized
-    return ""
-  }
-
-  function compactAgentActionText(value, { fallback = "", max = 180 } = {}) {
-    let text = redactSensitiveText(String(value ?? ""))
-      .replace(/\b(token|password|passwd|secret|api[_-]?key|authorization)\s*[:=]\s*\S+/gi, "$1=***")
-      .replace(/\s+/g, " ")
-      .trim()
-    if (!text) text = fallback
-    if (!text) return ""
-    if (text.length > max) text = `${text.slice(0, Math.max(0, max - 1))}…`
-    return text
-  }
-
-  function formatToolName(tool) {
-    const raw = String(tool || "").trim()
-    if (!raw) return "tool"
-    return raw.replace(/[_-]+/g, " ")
-  }
-
-  function agentActionStatusLabel(status) {
-    if (status === "running") return "Running"
-    if (status === "completed") return "Done"
-    return "Failed"
-  }
-
-  function agentActionIcon(status) {
-    if (status === "running") return "🛠"
-    if (status === "completed") return "✅"
-    return "⚠️"
-  }
-
-  function formatAgentActionText(part) {
-    if (part?.type !== "tool") return ""
-    const status = normalizeAgentActionStatus(part?.state?.status)
-    if (!status) return ""
-
-    const toolName = compactAgentActionText(part.tool, { fallback: "tool", max: 80 })
-    const title = compactAgentActionText(part?.state?.title || part?.metadata?.title || part?.state?.metadata?.title, {
-      fallback: formatToolName(toolName),
-      max: 180,
-    })
-    const lines = [`${agentActionIcon(status)} Agent action`, `${agentActionStatusLabel(status)}: ${title}`]
-    if (toolName && toolName.toLowerCase() !== title.toLowerCase()) lines.push(`Tool: ${toolName}`)
-    if (status === "error") {
-      const errorText = compactAgentActionText(part?.state?.error, { max: 240 })
-      if (errorText) lines.push(`Error: ${errorText}`)
-    }
-    return lines.join("\n")
-  }
-
-  function stableHash(value) {
-    let text = ""
-    try {
-      text = JSON.stringify(value ?? null)
-    } catch {
-      text = String(value ?? "")
-    }
-    return crypto.createHash("sha1").update(text, "utf8").digest("hex").slice(0, 12)
-  }
-
-  function fallbackAgentActionPartId(part, props) {
-    const state = part?.state || {}
-    const stateTime = state.time || {}
-    const identity = [part?.tool || "tool", stateTime.start ?? "", state.raw ?? "", state.input ?? null]
-    if (!stateTime.start && !state.raw && state.input == null) identity.push(state.title ?? part?.metadata?.title ?? state.metadata?.title ?? part?.time ?? "")
-    return `tool:${stableHash(identity)}`
-  }
-
-  function agentActionForwardKey(messageId, partId, status) {
-    return `${messageId}:${partId}:${status}`
-  }
-
-  function partEventTimeInfo(part, props) {
-    const stateTime = part?.state?.time || {}
-    const created = stateTime.start ?? props?.time ?? part?.time
-    const completed = stateTime.end ?? (part?.state?.status === "completed" || part?.state?.status === "error" ? props?.time : undefined)
-    return { time: { created, updated: props?.time, completed } }
-  }
-
-  async function loadChangedFilesDiffData(oc, sessionId, msg) {
-    const inlineDiffText = extractPatchDiffText(msg)
-    const inlineFileEntries = extractPatchFileEntries(msg).filter((entry) => entry.diff)
-    if (inlineDiffText || inlineFileEntries.length) return { diffText: inlineDiffText, fileEntries: inlineFileEntries }
-
-    const parentId = typeof msg?.info?.parentID === "string" ? msg.info.parentID.trim() : ""
-    if (!parentId || typeof oc?.getMessage !== "function") return { diffText: "", fileEntries: [] }
-
-    const parentMsg = await oc.getMessage(sessionId, parentId).catch(() => null)
-    const fileEntries = extractSummaryFileDiffEntries(parentMsg).filter((entry) => entry.diff)
-    return {
-      diffText: formatFileDiffEntriesPatch(fileEntries),
-      fileEntries,
-    }
-  }
-
-  function renderChangedFilesDiffHtml(diffText) {
-    return formatUnifiedDiffHtml(diffText, { title: "Changed files diff" })
-  }
-
-  function renderSelectedFileDiffHtml(entry) {
-    return formatUnifiedDiffHtml(entry?.diff || "", { title: `Changed file diff: ${entry?.file || "file"}` })
+    return formatChangedFilesSummary(projectAlias, msg, { projects, limit: CHANGED_FILES_LIMIT })
   }
 
   async function deliverChangedFilesSummary(ctxMeta, projectAlias, sessionId, messageId, msg, { replaceMessageId } = {}) {
@@ -752,10 +559,7 @@ export function createMirroringHandlers(runtime) {
         await tg.editMessageText(ctxMeta.chatId, editMessageId, "Selected file diffs are unavailable for this update.", changedFilesSummaryKeyboard(projectAlias, sessionId, messageId, msg))
         return
       }
-      const shown = fileEntries.slice(0, CHANGED_FILES_LIMIT)
-      const lines = ["Changed file diffs:", ...shown.map((entry, index) => `${index + 1}. ${entry.file}`)]
-      if (fileEntries.length > shown.length) lines.push(`…and ${fileEntries.length - shown.length} more.`)
-      await tg.editMessageText(ctxMeta.chatId, editMessageId, lines.join("\n"), changedFilesListKeyboard(projectAlias, sessionId, messageId, fileEntries))
+      await tg.editMessageText(ctxMeta.chatId, editMessageId, formatChangedFileDiffList(fileEntries, { limit: CHANGED_FILES_LIMIT }), changedFilesListKeyboard(projectAlias, sessionId, messageId, fileEntries))
       return
     }
 
@@ -866,7 +670,7 @@ export function createMirroringHandlers(runtime) {
   }
 
   function shouldSendAssistantAsAttachment(text) {
-    return typeof text === "string" && text.length >= TEXT_ATTACHMENT_THRESHOLD
+    return isAssistantAttachmentSized(text, TEXT_ATTACHMENT_THRESHOLD)
   }
 
   function recordNoisySkip(projectAlias, reason) {
@@ -874,23 +678,11 @@ export function createMirroringHandlers(runtime) {
   }
 
   function assistantAttachmentName(projectAlias, sessionId, messageId) {
-    return scopedAttachmentFilename({ projectAlias, sessionId, messageId, label: "assistant", extension: ".txt" })
+    return formatAssistantAttachmentName(projectAlias, sessionId, messageId)
   }
 
   function buildAssistantStreamPreviewHtml(text) {
-    const body = String(text || "").trim()
-    if (!body) return ""
-    const maxLen = Math.min(STREAM_PREVIEW_MAX_CHARS, 3900)
-    let escaped = ""
-    for (const ch of body) {
-      const next = escapeHtml(ch)
-      if (escaped.length + next.length > maxLen) {
-        escaped = `${escaped.slice(0, Math.max(0, maxLen - 1))}…`
-        break
-      }
-      escaped += next
-    }
-    return escaped
+    return formatAssistantStreamPreviewHtml(text, { maxChars: STREAM_PREVIEW_MAX_CHARS })
   }
 
   async function pauseWithSignal(ms, signal) {
@@ -1424,10 +1216,7 @@ export function createMirroringHandlers(runtime) {
         recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.USER_MIRROR_DISABLED)
         return
       }
-      const blocks = formatMarkdownToTelegramHtmlBlocks(text)
-      if (blocks.length > 0) {
-        blocks[0] = { ...blocks[0], html: `<i>User:</i>\n${blocks[0].html}` }
-      }
+      const blocks = formatUserMirrorBlocks(text)
       await tg.sendHtmlBlocks(route.chatId, blocks, null, { message_thread_id: route.threadIdOr0 || undefined })
       sets.user.add(info.id)
       logSseDebug(projectAlias, sessionId, `send=user msg=${info.id} thread=${route.threadIdOr0 || 0}`)
