@@ -1,8 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises"
-import crypto from "node:crypto"
 import { createCallbackHandlers } from "./connector/callbacks.js"
 import { createCommandHandlers } from "./connector/commands.js"
-import { promptIdentity, telegramUpdateIdempotencyKey } from "./connector/idempotency.js"
+import { promptIdentity } from "./connector/idempotency.js"
 import { createMirroringHandlers } from "./connector/mirroring.js"
 import { createOverviewHelpers } from "./connector/overview.js"
 import { createPromptHandlers } from "./connector/prompts.js"
@@ -23,6 +22,19 @@ import { startHealthServer } from "./runtime/health-server.js"
 import { collectLoggerRedactionOptions, createConnectorLogger } from "./runtime/logger.js"
 import { createRuntimeObservability } from "./runtime/observability.js"
 import { createCorrelationId, getRequestContext, runWithRequestContext, withRequestContextFields } from "./runtime/request-context.js"
+import {
+  clampString,
+  compareNumbers,
+  extractTextParts,
+  isCommand,
+  makeCallbackStore,
+  normalizeEpochMs,
+  normalizeOpenCodeWatchdogOptions,
+  parseCommand,
+  parseSseDebugFilter,
+} from "./runtime/connector-bootstrap.js"
+import { createConnectorLifecycleTools } from "./runtime/connector-lifecycle.js"
+import { createTelegramUpdateLoop } from "./runtime/telegram-loop.js"
 import { DEFAULT_FEED_MODE, StateStore, normalizeFeedMode, resolveDefaultStatePath, sessionKey } from "./state/store.js"
 import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "./session-list.js"
 import { sanitizeBaseUrlForDisplay } from "./url-utils.js"
@@ -30,103 +42,6 @@ import { normalizeLimits } from "./limits.js"
 import { directoriesMatch } from "./directory-paths.js"
 import { createParentSessionCache, LruMap, LruSet } from "./util/lru.js"
 import { botCommandsForLocale, matchSupportedLocale, normalizeI18nConfig, normalizeLocale, t } from "./i18n/index.js"
-
-function parseSseDebugFilter(rawValue) {
-  const raw = String(rawValue || "").trim()
-  if (!raw) return null
-  const [projectAlias, sessionId] = raw.split(":", 2)
-  return {
-    projectAlias: projectAlias ? projectAlias.trim() : "",
-    sessionId: sessionId ? sessionId.trim() : "",
-  }
-}
-
-function makeCallbackStore() {
-  const store = new LruMap(4000)
-  const token = () => crypto.randomBytes(8).toString("base64url")
-  const pack = (data) => {
-    if (Buffer.byteLength(data, "utf8") <= 64) return data
-    let t = ""
-    for (let i = 0; i < 10; i++) {
-      t = token()
-      if (store.get(t) == null) break
-    }
-    store.set(t, data)
-    return `cb|${t}`
-  }
-  const unpack = (data) => {
-    if (typeof data !== "string") return null
-    if (!data.startsWith("cb|")) return data
-    const t = data.slice(3)
-    return store.get(t) ?? null
-  }
-  return { pack, unpack }
-}
-
-function clampString(s, max) {
-  const str = String(s ?? "")
-  if (str.length <= max) return str
-  return str.slice(0, Math.max(0, max - 1)) + "…"
-}
-
-function compareNumbers(a, b) {
-  return a === b ? 0 : a < b ? -1 : 1
-}
-
-function isCommand(text) {
-  return typeof text === "string" && text.trim().startsWith("/")
-}
-
-function parseCommand(text, { botUsername } = {}) {
-  const trimmed = text.trim()
-  const [cmd, ...rest] = trimmed.split(/\s+/)
-  // Telegram may send commands as /cmd@BotName in groups.
-  const [commandName, targetBot] = String(cmd || "").split("@", 2)
-  const normalizedTargetBot = String(targetBot || "").trim().toLowerCase()
-  const normalizedBotUsername = String(botUsername || "").trim().toLowerCase()
-  if (normalizedTargetBot && normalizedBotUsername && normalizedTargetBot !== normalizedBotUsername) {
-    return { cmd: null, args: rest.join(" ").trim(), argv: rest, targetBot: normalizedTargetBot, isForThisBot: false }
-  }
-  if (normalizedTargetBot && !normalizedBotUsername) {
-    return { cmd: null, args: rest.join(" ").trim(), argv: rest, targetBot: normalizedTargetBot, isForThisBot: false }
-  }
-  const normalizedCmd = String(commandName || "")
-    .toLowerCase()
-  return { cmd: normalizedCmd, args: rest.join(" ").trim(), argv: rest, targetBot: normalizedTargetBot, isForThisBot: true }
-}
-
-function normalizeEpochMs(value) {
-  if (typeof value === "number" && Number.isFinite(value)) return value < 1e12 ? value * 1000 : value
-  if (typeof value === "string") {
-    const t = Date.parse(value)
-    return Number.isFinite(t) ? t : null
-  }
-  return null
-}
-
-function readPositiveNumber(value, fallback) {
-  const n = Number(value)
-  return Number.isFinite(n) && n > 0 ? n : fallback
-}
-
-function readNonNegativeNumber(value, fallback) {
-  const n = Number(value)
-  return Number.isFinite(n) && n >= 0 ? n : fallback
-}
-
-function normalizeOpenCodeWatchdogOptions(options = {}) {
-  return {
-    failureThreshold: Math.max(1, Math.floor(readPositiveNumber(options.failureThreshold ?? process.env.OPENCODE_WATCHDOG_FAILURE_THRESHOLD, 6))),
-    windowMs: Math.max(1, Math.floor(readPositiveNumber(options.windowMs ?? process.env.OPENCODE_WATCHDOG_WINDOW_MS, 120_000))),
-    cooldownMs: Math.max(0, Math.floor(readNonNegativeNumber(options.cooldownMs ?? process.env.OPENCODE_WATCHDOG_COOLDOWN_MS, 60_000))),
-  }
-}
-
-function extractTextParts(message) {
-  if (!message || !Array.isArray(message.parts)) return ""
-  const parts = message.parts.filter((p) => p && p.type === "text" && typeof p.text === "string" && !p.ignored)
-  return parts.map((p) => p.text).join("")
-}
 
 export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   if (!config?.telegram?.botToken) throw new Error("config.telegram.botToken is required")
@@ -261,6 +176,23 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   }
   const lifecycle = createLifecycleManager()
   const abortController = new AbortController()
+  const {
+    trackManagedPromise,
+    trackManagedHandle,
+    recordLoopError,
+    logLoopIssue,
+    recordLoopAbort,
+    startManagedTask,
+    sleepWithAbort,
+    waitForPromiseOrAbort,
+  } = createConnectorLifecycleTools({
+    lifecycle,
+    abortController,
+    logger,
+    onFatalError,
+    runtimeObservability,
+    sleep,
+  })
 
   function runtimeHealthSnapshot() {
     return runtimeObservability.buildHealthSnapshot({
@@ -711,139 +643,6 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     recordPromptCleanup: runtimeObservability.recordPromptCleanup,
     resolveBoundRoute,
   })
-
-  let fatalRuntimeErrorReported = false
-
-  function trackManagedPromise(name, promise, { kind = "task", metadata, stop } = {}) {
-    lifecycle.registerPromise(name, promise, { kind, metadata, stop })
-    return promise
-  }
-
-  function trackManagedHandle(name, handle, { kind = "task", metadata } = {}) {
-    return lifecycle.registerHandle(name, handle, { kind, metadata })
-  }
-
-  function recordLoopError(loopName, err, { projectAlias, source = projectAlias ? "opencode" : "runtime", operation, method, pathname } = {}) {
-    const normalized = normalizeBoundaryError(err, {
-      source,
-      operation,
-      method,
-      pathname,
-    })
-    runtimeObservability.recordLoopError(loopName, { projectAlias, err: normalized })
-    return normalized
-  }
-
-  function logLoopIssue(loopName, err, { projectAlias, retryable = false, source = projectAlias ? "opencode" : "runtime", operation, method, pathname } = {}) {
-    const normalized = normalizeBoundaryError(err, {
-      source,
-      operation,
-      method,
-      pathname,
-    })
-    if (retryable) {
-      runtimeObservability.recordLoopRetry(loopName, { projectAlias, err: normalized })
-      logger.warn("Loop retryable error", {
-        loop: loopName,
-        projectAlias,
-        source: normalized.source,
-        operation: normalized.operation,
-        method: normalized.method,
-        pathname: normalized.pathname,
-        outcome: normalized.outcome,
-        kind: normalized.kind,
-        status: normalized.status,
-        code: normalized.code,
-        retryable: true,
-        error: normalized.message,
-      })
-    } else {
-      runtimeObservability.recordLoopError(loopName, { projectAlias, err: normalized })
-      logger.error("Loop error", {
-        loop: loopName,
-        projectAlias,
-        source: normalized.source,
-        operation: normalized.operation,
-        method: normalized.method,
-        pathname: normalized.pathname,
-        outcome: normalized.outcome,
-        kind: normalized.kind,
-        status: normalized.status,
-        code: normalized.code,
-        retryable: false,
-        error: normalized.message,
-      })
-    }
-    return normalized
-  }
-
-  function recordLoopAbort(loopName, { projectAlias, reason } = {}) {
-    runtimeObservability.recordLoopAbort(loopName, { projectAlias, reason })
-    logger.info("Loop aborted", { loop: loopName, projectAlias, operation: "abort loop", reason: reason || "stopped" })
-  }
-
-  function reportFatalRuntimeError(err, { name, projectAlias } = {}) {
-    if (fatalRuntimeErrorReported || abortController.signal.aborted) return
-    fatalRuntimeErrorReported = true
-    abortController.abort()
-    logger.error("Fatal runtime error", { name, projectAlias, source: err?.source || "runtime", operation: err?.operation, kind: err?.kind, outcome: err?.outcome, error: err?.message || String(err) })
-    onFatalError(err)
-  }
-
-  function startManagedTask(name, run, { kind = "task", metadata, fatalOnError = false } = {}) {
-    const promise = (async () => {
-      try {
-        return await run()
-      } catch (err) {
-        if (abortController.signal.aborted) return null
-        const normalized = logLoopIssue(name, err, {
-          projectAlias: metadata?.projectAlias,
-          source: metadata?.source || (metadata?.projectAlias ? "opencode" : "runtime"),
-          operation: metadata?.operation,
-          method: metadata?.method,
-          pathname: metadata?.pathname,
-        })
-        if (fatalOnError) {
-          reportFatalRuntimeError(normalized, {
-            name,
-            projectAlias: metadata?.projectAlias,
-          })
-          throw normalized
-        }
-        return null
-      }
-    })()
-    trackManagedPromise(name, promise, { kind, metadata })
-    return promise
-  }
-
-  async function sleepWithAbort(ms) {
-    if (abortController.signal.aborted) return
-    let onAbort = null
-    const abortPromise = new Promise((resolve) => {
-      onAbort = () => resolve()
-      abortController.signal.addEventListener("abort", onAbort, { once: true })
-    })
-    try {
-      await Promise.race([sleep(ms), abortPromise])
-    } finally {
-      if (onAbort) abortController.signal.removeEventListener("abort", onAbort)
-    }
-  }
-
-  async function waitForPromiseOrAbort(promise) {
-    if (!promise || abortController.signal.aborted) return
-    let onAbort = null
-    const abortPromise = new Promise((resolve) => {
-      onAbort = () => resolve()
-      abortController.signal.addEventListener("abort", onAbort, { once: true })
-    })
-    try {
-      await Promise.race([Promise.resolve(promise).catch(() => {}), abortPromise])
-    } finally {
-      if (onAbort) abortController.signal.removeEventListener("abort", onAbort)
-    }
-  }
 
   const wizardGcTimer = setInterval(() => {
     const t = Date.now()
@@ -1494,164 +1293,20 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     })
   }
 
-  async function drainTelegramBacklogIfNeeded() {
-    if (store.get().updateOffset != null) return
-    logger.info("Draining Telegram backlog (first run)…")
-    let offset = 0
-    let backoff = 1000
-    while (true) {
-      if (abortController.signal.aborted) {
-        recordLoopAbort("backlogDrain", { reason: "connector stop" })
-        return
-      }
-      let pollRetryAfterMs = null
-      const updates = await tg
-        .getUpdates({ offset, timeout: 0, limit: 100, allowed_updates: ["message", "callback_query"], signal: abortController.signal })
-        .catch((err) => {
-          if (abortController.signal.aborted) return null
-          const classification = classifyBoundaryError(err, {
-            source: "telegram",
-            operation: "getUpdates",
-            method: "POST",
-            pathname: "/getUpdates",
-          })
-          pollRetryAfterMs = classification.retryAfterMs
-          logLoopIssue("backlogDrain", classification.error, {
-            retryable: classification.retryable,
-            source: "telegram",
-            operation: "getUpdates",
-            method: "POST",
-            pathname: "/getUpdates",
-          })
-          return null
-        })
-
-      if (abortController.signal.aborted) {
-        recordLoopAbort("backlogDrain", { reason: "connector stop" })
-        return
-      }
-      if (!Array.isArray(updates)) {
-        await sleepWithAbort(pollRetryAfterMs || backoff)
-        backoff = Math.min(30_000, backoff * 2)
-        continue
-      }
-
-      runtimeObservability.recordLoopSuccess("backlogDrain")
-      backoff = 1000
-      if (updates.length === 0) break
-      offset = updates[updates.length - 1].update_id + 1
-      await sleepWithAbort(200)
-    }
-    store.setUpdateOffset(offset)
-    await flushCriticalState("persist Telegram backlog offset")
-    logger.info("Telegram backlog drained. Starting from offset:", offset)
-  }
-
-  async function telegramLoop() {
-    await drainTelegramBacklogIfNeeded()
-    let backoff = 1000
-    while (!abortController.signal.aborted) {
-      let pollRetryAfterMs = null
-      const offset = store.get().updateOffset ?? 0
-      const updates = await tg
-        .getUpdates({ offset, timeout: 30, limit: 100, allowed_updates: ["message", "callback_query"], signal: abortController.signal })
-        .catch((err) => {
-          if (abortController.signal.aborted) return null
-          const classification = classifyBoundaryError(err, {
-            source: "telegram",
-            operation: "getUpdates",
-            method: "POST",
-            pathname: "/getUpdates",
-          })
-          pollRetryAfterMs = classification.retryAfterMs
-          logLoopIssue("telegramPoll", classification.error, {
-            retryable: classification.retryable,
-            source: "telegram",
-            operation: "getUpdates",
-            method: "POST",
-            pathname: "/getUpdates",
-          })
-          return null
-        })
-      if (abortController.signal.aborted) {
-        recordLoopAbort("telegramPoll", { reason: "connector stop" })
-        break
-      }
-      if (!Array.isArray(updates)) {
-        // Avoid a tight loop on network/API errors.
-        await sleepWithAbort(pollRetryAfterMs || backoff)
-        backoff = Math.min(30_000, backoff * 2)
-        continue
-      }
-      runtimeObservability.recordLoopSuccess("telegramPoll")
-      if (updates.length === 0) {
-        backoff = 1000
-        continue
-      }
-      backoff = 1000
-      for (const u of updates) {
-        let shouldAdvanceOffset = false
-        let retryDelayMs = 1000
-        const updateKey = telegramUpdateIdempotencyKey(u?.update_id)
-        if (updateKey && store.hasIdempotencyKey?.(updateKey)) {
-          store.setUpdateOffset(u.update_id + 1)
-          await flushCriticalState("persist replayed Telegram update offset")
-          continue
-        }
-        await runTelegramUpdateContext(u, async () => {
-          try {
-            if (u.message) await handleTelegramMessage(u.message, { updateId: u.update_id })
-            if (u.callback_query) await handleTelegramCallback(u.callback_query, { updateId: u.update_id })
-            shouldAdvanceOffset = true
-          } catch (err) {
-            const classification = classifyBoundaryError(err)
-            if (classification.retryable) {
-              retryDelayMs = classification.retryAfterMs || retryDelayMs
-              runtimeObservability.recordUpdateRetry()
-              logger.warn("Retryable update handler error", {
-                source: "telegram",
-                operation: u.message ? "message" : u.callback_query ? "callback" : "unknown",
-                updateId: u.update_id,
-                outcome: classification.outcome,
-                kind: classification.kind,
-                status: classification.status,
-                code: classification.code,
-                retryable: true,
-                error: classification.error.message,
-              })
-            } else {
-              runtimeObservability.recordUpdateSkip()
-              logger.error("Skipping non-retryable update", {
-                source: "telegram",
-                operation: u.message ? "message" : u.callback_query ? "callback" : "unknown",
-                updateId: u.update_id,
-                outcome: classification.outcome,
-                kind: classification.kind,
-                status: classification.status,
-                code: classification.code,
-                retryable: false,
-                error: classification.error.message,
-              })
-              shouldAdvanceOffset = true
-            }
-          }
-        })
-
-        if (shouldAdvanceOffset) {
-          store.markIdempotencyKey?.(updateKey, {
-            kind: "telegram-update",
-            updateId: u.update_id,
-            operation: u.message ? "message" : u.callback_query ? "callback" : "unknown",
-          })
-          store.setUpdateOffset(u.update_id + 1)
-          await flushCriticalState("persist Telegram update checkpoint")
-        } else {
-          await sleepWithAbort(retryDelayMs)
-          break
-        }
-      }
-    }
-  }
+  const { telegramLoop } = createTelegramUpdateLoop({
+    store,
+    tg,
+    logger,
+    abortController,
+    logLoopIssue,
+    recordLoopAbort,
+    sleepWithAbort,
+    flushCriticalState,
+    runTelegramUpdateContext,
+    handleTelegramMessage,
+    handleTelegramCallback,
+    runtimeObservability,
+  })
 
   if (recoverPendingPromptsOnStartup) {
     try {
