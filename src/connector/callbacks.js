@@ -1,20 +1,16 @@
-import { normalizeFeedMode } from "../state/store.js"
-import { normalizeModelReference } from "../model-selection.js"
+import { classifyBoundaryError, makeBoundaryError } from "../boundary-errors.js"
 import { requireSafeOpenCodeId } from "../opencode/ids.js"
-import { classifyBoundaryError, isRetryableBoundaryError, isStaleBoundaryError, makeBoundaryError } from "../boundary-errors.js"
 import { makeInlineKeyboard } from "../telegram/client.js"
-import {
-  permissionNoteIdempotencyPrefix,
-  permissionReplyIdempotencyKey,
-  permissionReplyIdempotencyPrefix,
-  questionRejectIdempotencyKey,
-  questionReplyIdempotencyPrefix,
-} from "./idempotency.js"
 import { callbackPacker, decodeCallbackData, legacyCallbackPrefix } from "./callback-data.js"
 import { localeDisplayName, matchSupportedLocale, t as translate } from "../i18n/index.js"
 import { languageSettingsView, supportedLocaleSummary } from "./language-ui.js"
 import { getRequestContext } from "../runtime/request-context.js"
 import { CALLBACK_TOAST_KEYS, callbackToast, localizeCallbackToast } from "./callback-toast.js"
+import { handleFeedCallback } from "./callbacks/feed.js"
+import { handleModelCallback } from "./callbacks/model.js"
+import { handlePermissionCallback } from "./callbacks/permission.js"
+import { handleQuestionCallback } from "./callbacks/question.js"
+import { handleSessionCallback } from "./callbacks/session.js"
 
 export { CALLBACK_TOAST_KEYS, callbackToast, localizeCallbackToast }
 
@@ -202,29 +198,6 @@ export function createCallbackHandlers(runtime) {
     setAwaitingCustomAnswerState(ctxKey, null)
   }
 
-  function parsePermissionParts(parts) {
-    if (parts.length >= 5) return { projectAlias: parts[1], sessionID: parts[2] || "", permissionId: parts[3], action: parts[4], isOldShape: false }
-    return { projectAlias: parts[1], sessionID: "", permissionId: parts[2], action: parts[3], isOldShape: true }
-  }
-
-  function isIntegerToken(value) {
-    return typeof value === "string" && value.length > 0 && Number.isInteger(Number(value))
-  }
-
-  function matchesQuestionCallbackRest(rest) {
-    if (rest.length === 1) return rest[0] === "reject"
-    if (rest.length === 2) return isIntegerToken(rest[0]) && (rest[1] === "custom" || rest[1] === "cancel_custom" || rest[1] === "done")
-    if (rest.length === 3) return isIntegerToken(rest[0]) && (rest[1] === "o" || rest[1] === "t") && isIntegerToken(rest[2])
-    return false
-  }
-
-  function parseQuestionParts(parts) {
-    const oldShape = { projectAlias: parts[1], sessionID: "", questionId: parts[2], rest: parts.slice(3), isOldShape: true }
-    const newShape = { projectAlias: parts[1], sessionID: parts[2] || "", questionId: parts[3], rest: parts.slice(4), isOldShape: false }
-    if (matchesQuestionCallbackRest(newShape.rest) && !matchesQuestionCallbackRest(oldShape.rest)) return newShape
-    return oldShape
-  }
-
   function routeCtxKey(route) {
     if (route?.chatId == null) return ""
     return `${route.chatId}:${route.threadIdOr0 || 0}`
@@ -248,22 +221,6 @@ export function createCallbackHandlers(runtime) {
     recordCallbackOutcome?.(projectAlias, "stale")
     await answerCallbackQuery(callbackQuery.id, "No longer active")
     await deleteInteractiveMessage(ctxMeta, messageId)
-  }
-
-  function hasHandledPermission(projectAlias, sessionID, permissionId) {
-    if (typeof store?.hasIdempotencyKeyPrefix !== "function") return false
-    return store.hasIdempotencyKeyPrefix(permissionReplyIdempotencyPrefix(projectAlias, sessionID, permissionId)) ||
-      store.hasIdempotencyKeyPrefix(permissionNoteIdempotencyPrefix(projectAlias, sessionID, permissionId)) ||
-      store.hasIdempotencyKeyPrefix(permissionReplyIdempotencyPrefix(projectAlias, "", permissionId)) ||
-      store.hasIdempotencyKeyPrefix(permissionNoteIdempotencyPrefix(projectAlias, "", permissionId))
-  }
-
-  function hasHandledQuestion(projectAlias, sessionID, questionId) {
-    return (typeof store?.hasIdempotencyKeyPrefix === "function" &&
-        (store.hasIdempotencyKeyPrefix(questionReplyIdempotencyPrefix(projectAlias, sessionID, questionId)) ||
-          store.hasIdempotencyKeyPrefix(questionReplyIdempotencyPrefix(projectAlias, "", questionId)))) ||
-      store.hasIdempotencyKey?.(questionRejectIdempotencyKey(projectAlias, sessionID, questionId)) ||
-      store.hasIdempotencyKey?.(questionRejectIdempotencyKey(projectAlias, "", questionId))
   }
 
   function canUseProjectControl(ctxMeta, projectAlias) {
@@ -467,83 +424,25 @@ export function createCallbackHandlers(runtime) {
       }
 
       if (kind === "s") {
-        if (parts[1] === "close") {
-          await closeInteractiveMessage(callbackQuery.id, ctxMeta, msg?.message_id)
-          return
-        }
-        if (parts[1] === "refresh") {
-          const binding = store.getBinding(ctxMeta.ctxKey)
-          if (!binding) {
-            await answerCallbackQuery(callbackQuery.id, "Not bound")
-            return
-          }
-          await answerCallbackQuery(callbackQuery.id, "Sessions")
-          await renderSessionsList(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(async (err) => {
-            runtime.logger?.error?.("Failed to refresh sessions list:", err?.message || String(err))
-            await sendToThread(ctxMeta, formatProjectUnavailable(binding.projectAlias, err, { locale: ctxMeta.locale })).catch(ignoreError)
-          })
-          return
-        }
-        if (parts[1] === "new") {
-          if (typeof handleNewCommand !== "function") {
-            await answerCallbackQuery(callbackQuery.id, "Invalid")
-            return
-          }
-          if (!store.getBinding(ctxMeta.ctxKey)) {
-            await answerCallbackQuery(callbackQuery.id, "Not bound")
-            return
-          }
-          await answerCallbackQuery(callbackQuery.id, "Creating…")
-          await handleNewCommand(ctxMeta, "").then(() => flushStoreIfAvailable()).catch(async (err) => {
-            runtime.logger?.error?.("Failed to create session from callback:", err?.message || String(err))
-            await sendToThread(ctxMeta, t(ctxMeta, "callbacks.actionFailedTryNew")).catch(ignoreError)
-          })
-          return
-        }
-        const projectAlias = parts[1]
-        const targetSessionId = parts[2]
-        const oc = ocByAlias[projectAlias]
-        const binding = store.getBinding(ctxMeta.ctxKey)
-        if (!oc || !projectAlias || !targetSessionId) {
-          await answerCallbackQuery(callbackQuery.id, "Invalid")
-          return
-        }
-        if (!binding) {
-          await answerCallbackQuery(callbackQuery.id, "Not bound")
-          return
-        }
-        if (binding.projectAlias !== projectAlias) {
-          await answerCallbackQuery(callbackQuery.id, "Binding changed")
-          return
-        }
-        let safeTargetSessionId
-        try {
-          safeTargetSessionId = requireSafeOpenCodeId(targetSessionId, "session id")
-        } catch {
-          await answerCallbackQuery(callbackQuery.id, "Invalid")
-          return
-        }
-        if (binding.sessionId === safeTargetSessionId) {
-          await answerCallbackQuery(callbackQuery.id, "Already current")
-          return
-        }
-        try {
-          await oc.getSession(safeTargetSessionId)
-        } catch (err) {
-          await answerCallbackQuery(callbackQuery.id, "Unavailable")
-          await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err, { locale: ctxMeta.locale })).catch(ignoreError)
-          return
-        }
-
-        await commitStateMutation(() => bindCtxToSession(ctxMeta, projectAlias, safeTargetSessionId))
-
-        await answerCallbackQuery(callbackQuery.id, "Switched")
-        await renderSessionsList({ ...ctxMeta, chatId: msg?.chat?.id || ctxMeta.chatId }, {
-          binding: { projectAlias, sessionId: safeTargetSessionId },
-          editMessageId: msg?.message_id,
-        }).catch(async (err) => {
-          runtime.logger?.error?.("Failed to refresh sessions list:", err?.message || String(err))
-          await sendToThread(ctxMeta, await buildSessionSwitchText(projectAlias, safeTargetSessionId, { ctxKey: ctxMeta.ctxKey, locale: ctxMeta.locale })).catch(ignoreError)
+        await handleSessionCallback({
+          parts,
+          callbackQuery,
+          ctxMeta,
+          msg,
+          store,
+          ocByAlias,
+          answerCallbackQuery,
+          closeInteractiveMessage,
+          renderSessionsList,
+          sendToThread,
+          formatProjectUnavailable,
+          handleNewCommand,
+          commitStateMutation,
+          bindCtxToSession,
+          buildSessionSwitchText,
+          flushStoreIfAvailable,
+          t,
+          runtime,
         })
         return
       }
@@ -753,133 +652,35 @@ export function createCallbackHandlers(runtime) {
       }
 
       if (kind === "feed") {
-        const rawMode = parts[1]
-        if (rawMode === "close") {
-          await closeInteractiveMessage(callbackQuery.id, ctxMeta, msg?.message_id)
-          return
-        }
-        if (rawMode === "settings") {
-          await answerCallbackQuery(callbackQuery.id, "Feed")
-          await renderFeedSettings(ctxMeta, { editMessageId: msg?.message_id }).catch(ignoreError)
-          return
-        }
-        if (rawMode !== "main" && rawMode !== "main+changes" && rawMode !== "verbose") {
-          await answerCallbackQuery(callbackQuery.id, "Invalid")
-          return
-        }
-        const mode = normalizeFeedMode(rawMode)
-        await commitStateMutation(() => store.setFeedMode(ctxMeta.ctxKey, mode))
-        await answerCallbackQuery(callbackQuery.id, callbackToast("feedValue", { value: feedModeLabel(mode, ctxMeta.locale) }))
-        await renderFeedSettings(ctxMeta, { editMessageId: msg?.message_id, noticeText: t(ctxMeta, "callbacks.feedChanged", { mode: feedModeLabel(mode, ctxMeta.locale) }) }).catch(ignoreError)
+        await handleFeedCallback({
+          parts,
+          callbackQuery,
+          ctxMeta,
+          msg,
+          store,
+          answerCallbackQuery,
+          closeInteractiveMessage,
+          commitStateMutation,
+          renderFeedSettings,
+          feedModeLabel,
+          t,
+        })
         return
       }
 
       if (kind === "m") {
-        const action = parts[1]
-        if (action === "close") {
-          await closeInteractiveMessage(callbackQuery.id, ctxMeta, msg?.message_id)
-          return
-        }
-
-        const binding = store.getBinding(ctxMeta.ctxKey)
-        if (!binding) {
-          await answerCallbackQuery(callbackQuery.id, "Not bound")
-          return
-        }
-
-        if (action === "settings") {
-          await answerCallbackQuery(callbackQuery.id, "Model")
-          await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(ignoreError)
-          return
-        }
-
-        if (action === "root" || action === "back") {
-          await answerCallbackQuery(callbackQuery.id, "Back")
-          await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(ignoreError)
-          return
-        }
-
-        if (action === "provider") {
-          const providerId = parts[2]
-          if (!providerId) {
-            await answerCallbackQuery(callbackQuery.id, "Invalid")
-            return
-          }
-          await answerCallbackQuery(callbackQuery.id, "Pick model")
-          await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id, selectedProviderId: providerId }).catch(ignoreError)
-          return
-        }
-
-        if (action === "set") {
-          const nextMode = parts[2]
-          let setResult = null
-          if (nextMode === "inherit") {
-            setResult = await commitStateMutation(() => setThreadModelPreference(ctxMeta, binding, null), { shouldCommit: (result) => result?.ok !== false })
-            await answerCallbackQuery(callbackQuery.id, setResult?.callbackToast || setResult?.callbackText || callbackToast("modelInherit"))
-          } else if (nextMode === "project-default") {
-            setResult = await commitStateMutation(() => setThreadModelPreference(ctxMeta, binding, { mode: "project-default" }), { shouldCommit: (result) => result?.ok !== false })
-            if (!setResult?.ok) {
-              await answerCallbackQuery(callbackQuery.id, setResult?.callbackToast || setResult?.callbackText || "Unavailable")
-              await renderModelSettings(ctxMeta, { binding, editMessageId: msg?.message_id }).catch(ignoreError)
-              return
-            }
-            await answerCallbackQuery(callbackQuery.id, setResult.callbackToast || setResult.callbackText || callbackToast("modelProjectDefault"))
-          } else {
-            await answerCallbackQuery(callbackQuery.id, "Invalid")
-            return
-          }
-          await renderModelSettings(ctxMeta, {
-            binding,
-            editMessageId: msg?.message_id,
-            ...(setResult?.noticeText ? { noticeText: setResult.noticeText } : {}),
-          }).catch(ignoreError)
-          return
-        }
-
-        if (action === "pick" || action === "model") {
-          const modelKey = parts[2]
-          if (!modelKey) {
-            await answerCallbackQuery(callbackQuery.id, "Invalid")
-            return
-          }
-          const selectedModel = normalizeModelReference(modelKey)
-          if (!selectedModel) {
-            await answerCallbackQuery(callbackQuery.id, "Invalid")
-            return
-          }
-          await answerCallbackQuery(callbackQuery.id, "Pick variant")
-          await renderModelSettings(ctxMeta, {
-            binding,
-            editMessageId: msg?.message_id,
-            selectedProviderId: selectedModel.providerID,
-            selectedModelKey: modelKey,
-          }).catch(ignoreError)
-          return
-        }
-
-        if (action === "apply") {
-          const modelKey = parts[2]
-          const variantToken = parts[3]
-          if (!modelKey || variantToken == null) {
-            await answerCallbackQuery(callbackQuery.id, "Invalid")
-            return
-          }
-          if (!normalizeModelReference(modelKey)) {
-            await answerCallbackQuery(callbackQuery.id, "Invalid")
-            return
-          }
-          const variant = variantToken === "~" ? "" : variantToken
-          const result = await commitStateMutation(() => setThreadModelPreference(ctxMeta, binding, { mode: "custom", model: modelKey, variant }), { shouldCommit: (mutationResult) => mutationResult?.ok !== false })
-          await answerCallbackQuery(callbackQuery.id, result?.callbackToast || result?.callbackText || callbackToast("modelValue", { value: variant ? `${modelKey} ${variant}` : modelKey }))
-          await renderModelSettings(ctxMeta, {
-            binding,
-            editMessageId: msg?.message_id,
-            ...(result?.noticeText ? { noticeText: result.noticeText } : {}),
-          }).catch(ignoreError)
-          return
-        }
-
-        await answerCallbackQuery(callbackQuery.id, "Invalid")
+        await handleModelCallback({
+          parts,
+          callbackQuery,
+          ctxMeta,
+          msg,
+          store,
+          answerCallbackQuery,
+          closeInteractiveMessage,
+          commitStateMutation,
+          renderModelSettings,
+          setThreadModelPreference,
+        })
         return
       }
 
@@ -926,327 +727,62 @@ export function createCallbackHandlers(runtime) {
       }
 
       if (kind === "p") {
-        const { projectAlias, sessionID, permissionId, action, isOldShape } = parsePermissionParts(parts)
-        const oc = ocByAlias[projectAlias]
-        if (!oc) {
-          await answerCallbackQuery(callbackQuery.id, "Unknown project")
-          return
-        }
-        if (action === "once" || action === "always" || action === "reject") {
-          const pendingPermission = store.getPendingPermission?.(projectAlias, permissionId, sessionID) || null
-          const effectiveSessionID = sessionID || pendingPermission?.sessionID || ""
-          if (!(await isPromptBindingCurrent(ctxMeta.ctxKey, projectAlias, sessionID, { isOldShape, stateSessionID: pendingPermission?.sessionID || "" }))) {
-            cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, effectiveSessionID)
-            await answerStalePromptCallback(callbackQuery, ctxMeta, msg?.message_id, projectAlias)
-            return
-          }
-          const replyKey = permissionReplyIdempotencyKey(projectAlias, effectiveSessionID, permissionId, action)
-          if (hasIdempotencyKey(replyKey) || hasHandledPermission(projectAlias, effectiveSessionID, permissionId)) {
-            cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, effectiveSessionID)
-            await flushStoreIfAvailable()
-            await answerCallbackQuery(callbackQuery.id, "Already handled")
-            await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-            return
-          }
-          try {
-            await oc.replyPermission(permissionId, { reply: action })
-          } catch (err) {
-            if (isStaleBoundaryError(err, { source: "opencode", pathname: `/permission/${permissionId}/reply`, method: "POST" })) {
-              await markIdempotencyKey(replyKey, {
-                kind: "permission-reply",
-                projectAlias,
-                ctxKey: ctxMeta.ctxKey,
-                operation: "replyPermission",
-                action,
-              })
-              cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, effectiveSessionID)
-              await flushStoreIfAvailable()
-              recordCallbackOutcome?.(projectAlias, "stale")
-              await answerCallbackQuery(callbackQuery.id, "No longer active")
-              await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-              return
-            }
-            if (isRetryableBoundaryError(err, { source: "opencode", pathname: `/permission/${permissionId}/reply`, method: "POST" })) {
-              recordCallbackOutcome?.(projectAlias, "retryable")
-              await answerCallbackQuery(callbackQuery.id, "Temporarily unavailable")
-              await sendToThread(ctxMeta, t(ctxMeta, "callbacks.actionTemporarilyUnavailable")).catch(ignoreError)
-              return
-            }
-            throw err
-          }
-          await markIdempotencyKey(replyKey, {
-            kind: "permission-reply",
-            projectAlias,
-            ctxKey: ctxMeta.ctxKey,
-            operation: "replyPermission",
-            action,
-          })
-          recordPromptAnswered?.(projectAlias, "permission", "ok")
-          cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, effectiveSessionID)
-          await flushStoreIfAvailable()
-          await answerCallbackQuery(callbackQuery.id, "OK")
-          await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-          return
-        }
-        if (action === "reject_note") {
-          const pendingPermission = store.getPendingPermission?.(projectAlias, permissionId, sessionID) || null
-          const effectiveSessionID = sessionID || pendingPermission?.sessionID || ""
-          if (!(await isPromptBindingCurrent(ctxMeta.ctxKey, projectAlias, sessionID, { isOldShape, stateSessionID: pendingPermission?.sessionID || "" }))) {
-            cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, effectiveSessionID)
-            await answerStalePromptCallback(callbackQuery, ctxMeta, msg?.message_id, projectAlias)
-            return
-          }
-          if (hasHandledPermission(projectAlias, effectiveSessionID, permissionId)) {
-            cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, effectiveSessionID)
-            await flushStoreIfAvailable()
-            await answerCallbackQuery(callbackQuery.id, "Already handled")
-            await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-            return
-          }
-          setRejectNoteAwaitingState(ctxMeta.ctxKey, { projectAlias, permissionId, ...(effectiveSessionID ? { sessionID: effectiveSessionID } : {}) })
-          try {
-            await sendRejectNotePrompt(ctxMeta, projectAlias, permissionId, { sessionID: effectiveSessionID })
-          } catch (err) {
-            setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
-            runtime.logger?.error?.("Failed to start reject-note flow:", err?.message || String(err))
-            await answerCallbackQuery(callbackQuery.id, "Unavailable")
-            return
-          }
-          await flushStoreIfAvailable()
-          await answerCallbackQuery(callbackQuery.id, "Send note")
-          await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-          return
-        }
-        if (action === "cancel_note") {
-          const pendingPermission = store.getPendingPermission?.(projectAlias, permissionId, sessionID) || null
-          const effectiveSessionID = sessionID || pendingPermission?.sessionID || ""
-          if (!(await isPromptBindingCurrent(ctxMeta.ctxKey, projectAlias, sessionID, { isOldShape, stateSessionID: pendingPermission?.sessionID || "" }))) {
-            cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, effectiveSessionID)
-            await answerStalePromptCallback(callbackQuery, ctxMeta, msg?.message_id, projectAlias)
-            return
-          }
-          setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
-          await flushStoreIfAvailable()
-          await answerCallbackQuery(callbackQuery.id, "Cancelled")
-          await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-          return
-        }
-        await answerCallbackQuery(callbackQuery.id, "Invalid")
+        await handlePermissionCallback({
+          parts,
+          callbackQuery,
+          ctxMeta,
+          msg,
+          store,
+          ocByAlias,
+          answerCallbackQuery,
+          deleteInteractiveMessage,
+          flushStoreIfAvailable,
+          hasIdempotencyKey,
+          markIdempotencyKey,
+          cleanupPermissionState,
+          isPromptBindingCurrent,
+          answerStalePromptCallback,
+          setRejectNoteAwaitingState,
+          sendRejectNotePrompt,
+          sendToThread,
+          recordCallbackOutcome,
+          recordPromptAnswered,
+          t,
+          runtime,
+        })
         return
       }
 
       if (kind === "q") {
-        const { projectAlias, sessionID, questionId, rest, isOldShape } = parseQuestionParts(parts)
-        const oc = ocByAlias[projectAlias]
-        if (!oc) {
-          await answerCallbackQuery(callbackQuery.id, "Unknown project")
-          return
-        }
-
-        const wizard = getWizard(projectAlias, questionId, sessionID)
-        const effectiveSessionID = sessionID || wizard?.sessionID || ""
-        if (!(await isPromptBindingCurrent(ctxMeta.ctxKey, projectAlias, sessionID, { isOldShape, stateSessionID: wizard?.sessionID || "" }))) {
-          cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, effectiveSessionID)
-          await answerStalePromptCallback(callbackQuery, ctxMeta, msg?.message_id, projectAlias)
-          return
-        }
-        if (rest.length === 1 && rest[0] === "reject") {
-          const rejectKey = questionRejectIdempotencyKey(projectAlias, effectiveSessionID, questionId)
-          if (hasIdempotencyKey(rejectKey) || hasHandledQuestion(projectAlias, effectiveSessionID, questionId)) {
-            cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, effectiveSessionID)
-            await flushStoreIfAvailable()
-            await answerCallbackQuery(callbackQuery.id, "Already handled")
-            await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-            return
-          }
-          try {
-            await oc.rejectQuestion(questionId)
-          } catch (err) {
-            if (isStaleBoundaryError(err, { source: "opencode", pathname: `/question/${questionId}/reject`, method: "POST" })) {
-              await markIdempotencyKey(rejectKey, {
-                kind: "question-reject",
-                projectAlias,
-                ctxKey: ctxMeta.ctxKey,
-                operation: "rejectQuestion",
-              })
-              cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, effectiveSessionID)
-              await flushStoreIfAvailable()
-              recordCallbackOutcome?.(projectAlias, "stale")
-              await answerCallbackQuery(callbackQuery.id, "No longer active")
-              await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-              return
-            }
-            if (isRetryableBoundaryError(err, { source: "opencode", pathname: `/question/${questionId}/reject`, method: "POST" })) {
-              recordCallbackOutcome?.(projectAlias, "retryable")
-              await answerCallbackQuery(callbackQuery.id, "Temporarily unavailable")
-              await sendToThread(ctxMeta, t(ctxMeta, "callbacks.actionTemporarilyUnavailable")).catch(ignoreError)
-              return
-            }
-            throw err
-          }
-          await markIdempotencyKey(rejectKey, {
-            kind: "question-reject",
-            projectAlias,
-            ctxKey: ctxMeta.ctxKey,
-            operation: "rejectQuestion",
-          })
-          recordPromptAnswered?.(projectAlias, "question", "rejected")
-          cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, effectiveSessionID)
-          await flushStoreIfAvailable()
-          await answerCallbackQuery(callbackQuery.id, "Rejected")
-          await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-          return
-        }
-
-        if (!wizard) {
-          if (hasHandledQuestion(projectAlias, effectiveSessionID, questionId)) {
-            cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, effectiveSessionID)
-            await flushStoreIfAvailable()
-            await answerCallbackQuery(callbackQuery.id, "Already handled")
-            await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-            return
-          }
-          await answerCallbackQuery(callbackQuery.id, "Not found")
-          return
-        }
-        if (rest.length < 2) {
-          await answerCallbackQuery(callbackQuery.id, "Invalid")
-          return
-        }
-
-        const qIndex = Number(rest[0])
-        const action = rest[1]
-        const arg = rest[2]
-        if (!Number.isInteger(qIndex) || qIndex !== wizard.index) {
-          await answerCallbackQuery(callbackQuery.id, "Out of date")
-          return
-        }
-
-        const req = wizard.request
-        const q = req.questions[qIndex]
-        const multiple = q.multiple === true
-        const allowCustom = q.custom !== false
-        const messageId = callbackQuery.message?.message_id
-
-        if (action === "custom") {
-          if (!allowCustom) {
-            await answerCallbackQuery(callbackQuery.id, "Custom disabled")
-            return
-          }
-          setAwaitingCustomAnswerState(ctxMeta.ctxKey, { projectAlias, requestId: questionId, ...(effectiveSessionID ? { sessionID: effectiveSessionID } : {}), qIndex })
-          try {
-            await sendQuestionCustomAnswerPrompt(ctxMeta, projectAlias, questionId, qIndex, q.header || "question", { sessionID: effectiveSessionID })
-          } catch (err) {
-            setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
-            runtime.logger?.error?.("Failed to start custom-answer flow:", err?.message || String(err))
-            await answerCallbackQuery(callbackQuery.id, "Unavailable")
-            return
-          }
-          await flushStoreIfAvailable()
-          await answerCallbackQuery(callbackQuery.id, "Send answer")
-          await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-          return
-        }
-        if (action === "cancel_custom") {
-          setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
-          await flushStoreIfAvailable()
-          await answerCallbackQuery(callbackQuery.id, "Cancelled")
-          await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-          return
-        }
-        if (action === "o") {
-          const optIndex = Number(arg)
-          if (!Number.isInteger(optIndex) || !q.options?.[optIndex]) {
-            await answerCallbackQuery(callbackQuery.id, "Invalid")
-            return
-          }
-          const label = String(q.options[optIndex].label)
-          const previousWizard = cloneWizardState(wizard)
-          const nextWizard = cloneWizardState(wizard)
-          nextWizard.answers[qIndex] = [label]
-          const nextIndex = qIndex + 1
-          if (nextIndex >= req.questions.length) {
-            applyWizardState(wizard, nextWizard)
-            persistQuestionWizard(wizard)
-            const result = await finishQuestionWizard(wizard)
-            await answerCallbackQuery(
-              callbackQuery.id,
-              result?.outcome === "stale" ? "No longer active" : result?.outcome === "retryable" ? "Temporarily unavailable" : "Selected",
-            )
-            if (result?.outcome === "retryable") {
-              await sendToThread(ctxMeta, t(ctxMeta, "callbacks.actionTemporarilyUnavailable")).catch(ignoreError)
-            } else {
-              await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-            }
-            return
-          } else {
-            nextWizard.index = nextIndex
-            await runtime.sendCurrentQuestionStep(nextWizard)
-            applyWizardState(wizard, nextWizard)
-            await persistQuestionWizardDurably(wizard, previousWizard)
-            await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-          }
-          await answerCallbackQuery(callbackQuery.id, "Selected")
-          return
-        }
-        if (action === "t") {
-          if (!multiple) {
-            await answerCallbackQuery(callbackQuery.id, "Invalid")
-            return
-          }
-          const optIndex = Number(arg)
-          if (!Number.isInteger(optIndex) || !q.options?.[optIndex]) {
-            await answerCallbackQuery(callbackQuery.id, "Invalid")
-            return
-          }
-          const label = String(q.options[optIndex].label)
-          const current = new Set(wizard.selectedByIndex?.[qIndex] || [])
-          if (current.has(label)) current.delete(label)
-          else current.add(label)
-          const previousWizard = cloneWizardState(wizard)
-          const nextWizard = cloneWizardState(wizard)
-          nextWizard.selectedByIndex[qIndex] = Array.from(current)
-          if (messageId) await runtime.sendCurrentQuestionStep(nextWizard, { editMessageId: messageId })
-          applyWizardState(wizard, nextWizard)
-          await persistQuestionWizardDurably(wizard, previousWizard)
-          await answerCallbackQuery(callbackQuery.id)
-          return
-        }
-        if (action === "done") {
-          if (!multiple) {
-            await answerCallbackQuery(callbackQuery.id, "Invalid")
-            return
-          }
-          const selected = wizard.selectedByIndex?.[qIndex] || []
-          const previousWizard = cloneWizardState(wizard)
-          const nextWizard = cloneWizardState(wizard)
-          nextWizard.answers[qIndex] = selected
-          const nextIndex = qIndex + 1
-          if (nextIndex >= req.questions.length) {
-            applyWizardState(wizard, nextWizard)
-            persistQuestionWizard(wizard)
-            const result = await finishQuestionWizard(wizard)
-            await answerCallbackQuery(
-              callbackQuery.id,
-              result?.outcome === "stale" ? "No longer active" : result?.outcome === "retryable" ? "Temporarily unavailable" : "Done",
-            )
-            if (result?.outcome === "retryable") {
-              await sendToThread(ctxMeta, t(ctxMeta, "callbacks.actionTemporarilyUnavailable")).catch(ignoreError)
-            } else {
-              await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-            }
-            return
-          } else {
-            nextWizard.index = nextIndex
-            await runtime.sendCurrentQuestionStep(nextWizard)
-            applyWizardState(wizard, nextWizard)
-            await persistQuestionWizardDurably(wizard, previousWizard)
-            await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-          }
-          await answerCallbackQuery(callbackQuery.id, "Done")
-          return
-        }
-        await answerCallbackQuery(callbackQuery.id, "Unsupported")
+        await handleQuestionCallback({
+          parts,
+          callbackQuery,
+          ctxMeta,
+          msg,
+          store,
+          ocByAlias,
+          answerCallbackQuery,
+          deleteInteractiveMessage,
+          flushStoreIfAvailable,
+          hasIdempotencyKey,
+          markIdempotencyKey,
+          cleanupQuestionState,
+          isPromptBindingCurrent,
+          answerStalePromptCallback,
+          getWizard,
+          setAwaitingCustomAnswerState,
+          sendQuestionCustomAnswerPrompt,
+          cloneWizardState,
+          applyWizardState,
+          persistQuestionWizard,
+          persistQuestionWizardDurably,
+          finishQuestionWizard,
+          sendToThread,
+          recordCallbackOutcome,
+          recordPromptAnswered,
+          t,
+          runtime,
+        })
         return
       }
 
