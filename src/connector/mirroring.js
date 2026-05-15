@@ -3,13 +3,12 @@ import { makeInlineKeyboard } from "../telegram/client.js"
 import { formatMarkdownToTelegramHtmlBlocks } from "../telegram/formatter.js"
 import { ctxKeyFrom } from "../telegram/routing.js"
 import { extractPatchFileEntries } from "../message-display.js"
-import { DEFAULT_FEED_MODE, normalizeFeedMode, sessionKey } from "../state/store.js"
+import { sessionKey } from "../state/store.js"
 import { ATTACHMENT_NOTICES, attachmentCaption, sanitizeFilenamePart } from "./attachment-utils.js"
 import { NOISY_SKIP_REASONS } from "./noisy-skip-reasons.js"
 import { classifyBoundaryError, isRetryableBoundaryError } from "../boundary-errors.js"
 import { bindRequestContext } from "../runtime/request-context.js"
 import { callbackPacker } from "./callback-data.js"
-import { t as translate } from "../i18n/index.js"
 import {
   agentStopErrorDedupeKey,
   assistantAttachmentName as formatAssistantAttachmentName,
@@ -34,6 +33,7 @@ import {
   renderChangedFilesDiffHtml,
   renderSelectedFileDiffHtml,
 } from "./mirroring/changed-files-format.js"
+import { createFeedUi } from "./mirroring/feed-ui.js"
 import { formatUserMirrorBlocks } from "./mirroring/user-format.js"
 
 export function createMirroringHandlers(runtime) {
@@ -357,61 +357,13 @@ export function createMirroringHandlers(runtime) {
     }
   }
 
-  function getFeedMode(ctxKey) {
-    return store.getFeedMode?.(ctxKey) || DEFAULT_FEED_MODE
-  }
-
-  function feedModeLabel(mode, locale = "en") {
-    const normalized = normalizeFeedMode(mode)
-    if (normalized === "main") return translate(locale, "feed.main")
-    if (normalized === "verbose") return translate(locale, "feed.verbose")
-    return translate(locale, "feed.mainChanges")
-  }
-
-  function shouldMirrorToFeed(ctxKey, kind) {
-    const mode = getFeedMode(ctxKey)
-    if (kind === "internal") return false
-    if (mode === "main") return kind === "assistant-final"
-    if (mode === "main+changes") return kind === "assistant-final" || kind === "changed-files"
-    return kind === "assistant-final" || kind === "assistant-stream" || kind === "changed-files" || kind === "agent-action"
-  }
-
-  function renderFeedSettingsText(ctxKey, locale = "en") {
-    const mode = getFeedMode(ctxKey)
-    return [
-      translate(locale, "feed.title", { mode: feedModeLabel(mode, locale) }),
-      "",
-      translate(locale, "feed.mainDescription"),
-      translate(locale, "feed.mainChangesDescription"),
-      translate(locale, "feed.verboseDescription"),
-      translate(locale, "feed.tuiMirror"),
-      "",
-      translate(locale, "feed.compactionHidden"),
-    ].join("\n")
-  }
-
-  function feedKeyboard(ctxKey, locale = "en") {
-    const current = getFeedMode(ctxKey)
-    const button = (mode, label) => ({ text: `${current === mode ? "✓ " : ""}${label}`, callback_data: packCallback("feed", mode) })
-    return makeInlineKeyboard([
-      [button("main", feedModeLabel("main", locale))],
-      [button("main+changes", feedModeLabel("main+changes", locale))],
-      [button("verbose", feedModeLabel("verbose", locale))],
-      [{ text: translate(locale, "common.close"), callback_data: packCallback("feed", "close") }],
-    ])
-  }
-
-  async function renderFeedSettings(ctxMeta, { editMessageId, noticeText = "" } = {}) {
-    const locale = ctxMeta?.locale || config?.i18n?.defaultLocale || "en"
-    const settingsText = renderFeedSettingsText(ctxMeta.ctxKey, locale)
-    const text = noticeText ? `${noticeText}\n\n${settingsText}` : settingsText
-    const replyMarkup = feedKeyboard(ctxMeta.ctxKey, locale)
-    if (editMessageId) {
-      await tg.editMessageText(ctxMeta.chatId, editMessageId, text, replyMarkup)
-      return
-    }
-    await sendToThread(ctxMeta, text, replyMarkup)
-  }
+  const { getFeedMode, feedModeLabel, shouldMirrorToFeed, renderFeedSettingsText, feedKeyboard, renderFeedSettings } = createFeedUi({
+    store,
+    config,
+    tg,
+    sendToThread,
+    packCallback,
+  })
 
   function changedFilesAttachmentName(projectAlias, sessionId, messageId, { label = "changed-files", extension = ".patch", fileName = "" } = {}) {
     return formatChangedFilesAttachmentName(projectAlias, sessionId, messageId, { label, fileName, extension })
