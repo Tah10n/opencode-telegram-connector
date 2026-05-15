@@ -15,6 +15,7 @@
     "src",
     "scripts/check-syntax.mjs",
     "scripts/verify-callback-data.mjs",
+    "scripts/verify-architecture.mjs",
     "index.mjs",
     "README.md",
     "LICENSE",
