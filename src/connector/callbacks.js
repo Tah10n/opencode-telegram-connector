@@ -1,11 +1,10 @@
 import { classifyBoundaryError, makeBoundaryError } from "../boundary-errors.js"
-import { requireSafeOpenCodeId } from "../opencode/ids.js"
-import { makeInlineKeyboard } from "../telegram/client.js"
 import { callbackPacker, decodeCallbackData, legacyCallbackPrefix } from "./callback-data.js"
 import { t as translate } from "../i18n/index.js"
 import { getRequestContext } from "../runtime/request-context.js"
 import { CALLBACK_TOAST_KEYS, callbackToast, localizeCallbackToast } from "./callback-toast.js"
 import { handleAttachmentCallback } from "./callbacks/attachment.js"
+import { handleBindingCallback } from "./callbacks/binding.js"
 import { handleChangedFilesCallback } from "./callbacks/changed-files.js"
 import { handleFeedCallback } from "./callbacks/feed.js"
 import { handleLanguageCallback } from "./callbacks/language.js"
@@ -227,23 +226,6 @@ export function createCallbackHandlers(runtime) {
     await deleteInteractiveMessage(ctxMeta, messageId)
   }
 
-  function canUseBindingAction(ctxMeta, targetCtxKey) {
-    return ctxMeta?.chatType === "private" || ctxMeta?.ctxKey === targetCtxKey
-  }
-
-  function describeTargetCtx(ctxKey) {
-    const parsed = parseCtxKey?.(ctxKey)
-    if (!parsed) return ctxKey
-    return `chat ${parsed.chatId} / ${formatThreadLabel?.(parsed.threadIdOr0) || `thread ${parsed.threadIdOr0}`}`
-  }
-
-  function unbindConfirmationKeyboard(ctxKey, binding, locale = "en") {
-    return makeInlineKeyboard([
-      [{ text: t(locale, "operator.removeBinding"), callback_data: packCallbackData("b", "unbind", ctxKey, binding.projectAlias, binding.sessionId) }],
-      [{ text: t(locale, "common.close"), callback_data: packCallbackData("b", "close") }],
-    ])
-  }
-
   function recordLegacyCallback(prefix, projectAlias) {
     if (!prefix) return
     try {
@@ -375,134 +357,30 @@ export function createCallbackHandlers(runtime) {
       }
 
       if (kind === "b") {
-        const action = parts[1]
-        if (action === "close") {
-          await closeInteractiveMessage(callbackQuery.id, ctxMeta, msg?.message_id)
-          return
-        }
-        if (action === "repair") {
-          if (ctxMeta?.chatType !== "private") {
-            await answerCallbackQuery(callbackQuery.id, "Private chat only")
-            return
-          }
-          const summary = store.repairBindingIndex?.() || { changed: false }
-          if (summary.changed) await flushStoreIfAvailable()
-          await answerCallbackQuery(callbackQuery.id, summary.changed ? "Repaired" : "Already clean")
-          if (typeof handleBindings === "function") await handleBindings(ctxMeta).catch(ignoreError)
-          return
-        }
-
-        const targetCtxKey = parts[2]
-        const targetCtx = parseCtxKey?.(targetCtxKey)
-        if (!targetCtxKey || !targetCtx) {
-          await answerCallbackQuery(callbackQuery.id, "Invalid")
-          return
-        }
-        if (!canUseBindingAction(ctxMeta, targetCtxKey)) {
-          await answerCallbackQuery(callbackQuery.id, "Private chat only")
-          return
-        }
-        const binding = store.getBinding(targetCtxKey)
-        if (!binding) {
-          await answerCallbackQuery(callbackQuery.id, "Not bound")
-          return
-        }
-
-        if (action === "keep") {
-          await answerCallbackQuery(callbackQuery.id, "Kept")
-          await sendToThread(ctxMeta, t(ctxMeta, "callbacks.bindingKept", { scope: describeTargetCtx(targetCtxKey) })).catch(ignoreError)
-          return
-        }
-        if (action === "confirm-unbind") {
-          await answerCallbackQuery(callbackQuery.id, "Confirm")
-          await sendToThread(
-            ctxMeta,
-            [
-              t(ctxMeta, "operator.confirmUnbind"),
-              t(ctxMeta, "operator.scope", { scope: describeTargetCtx(targetCtxKey) }),
-              t(ctxMeta, "operator.project", { project: binding.projectAlias }),
-              t(ctxMeta, "operator.session", { session: binding.sessionId }),
-              t(ctxMeta, "operator.unbindNote"),
-            ].join("\n"),
-            unbindConfirmationKeyboard(targetCtxKey, binding, ctxMeta.locale),
-          ).catch(ignoreError)
-          return
-        }
-        if (action === "unbind") {
-          const expectedProjectAlias = parts[3] || ""
-          const expectedSessionId = parts[4] || ""
-          if (!expectedProjectAlias || !expectedSessionId) {
-            await answerCallbackQuery(callbackQuery.id, "Confirm")
-            await sendToThread(
-              ctxMeta,
-              [
-                t(ctxMeta, "operator.confirmUnbind"),
-                t(ctxMeta, "operator.scope", { scope: describeTargetCtx(targetCtxKey) }),
-                t(ctxMeta, "operator.project", { project: binding.projectAlias }),
-                t(ctxMeta, "operator.session", { session: binding.sessionId }),
-                t(ctxMeta, "operator.unbindNote"),
-              ].join("\n"),
-              unbindConfirmationKeyboard(targetCtxKey, binding, ctxMeta.locale),
-            ).catch(ignoreError)
-            await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-            return
-          }
-          if (binding.projectAlias !== expectedProjectAlias || binding.sessionId !== expectedSessionId) {
-            await answerCallbackQuery(callbackQuery.id, "Binding changed")
-            await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-            await sendToThread(ctxMeta, t(ctxMeta, "callbacks.bindingChangedForScope", { scope: describeTargetCtx(targetCtxKey) })).catch(ignoreError)
-            return
-          }
-          const ok = await commitStateMutation(() => store.unbind(targetCtxKey), { shouldCommit: (result) => !!result })
-          await answerCallbackQuery(callbackQuery.id, ok ? "Unbound" : "Not bound")
-          await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-          await sendToThread(ctxMeta, ok ? t(ctxMeta, "callbacks.bindingRemoved", { scope: describeTargetCtx(targetCtxKey) }) : t(ctxMeta, "callbacks.bindingAbsent")).catch(ignoreError)
-          return
-        }
-        if (action === "rebind" || action === "new") {
-          const projectAlias = binding.projectAlias
-          const oc = ocByAlias[projectAlias]
-          if (!projectAlias || !projects?.[projectAlias] || !oc) {
-            await answerCallbackQuery(callbackQuery.id, "Unknown project")
-            return
-          }
-          try {
-            const nextSessionId = action === "rebind"
-              ? await getStartupSession(projectAlias, { waitForStart: false, forceRefresh: true })
-              : (await oc.createSession(projects?.[projectAlias]?.directory ? { directory: projects[projectAlias].directory } : {}))?.id
-            if (!nextSessionId) {
-              await answerCallbackQuery(callbackQuery.id, "Unavailable")
-              return
-            }
-            const safeNextSessionId = requireSafeOpenCodeId(nextSessionId, "session id")
-            const targetMeta = { ...targetCtx, ctxKey: targetCtxKey, chatType: ctxMeta.chatType }
-            await commitStateMutation(() => bindCtxToSession(targetMeta, projectAlias, safeNextSessionId))
-            await answerCallbackQuery(callbackQuery.id, action === "rebind" ? "Rebound" : "Created")
-            await sendToThread(
-              ctxMeta,
-              t(ctxMeta, "callbacks.bindingChangedToSession", {
-                action: action === "rebind" ? t(ctxMeta, "callbacks.rebound") : t(ctxMeta, "callbacks.createdAndBound"),
-                scope: describeTargetCtx(targetCtxKey),
-                project: projectAlias,
-                session: safeNextSessionId,
-              }),
-            ).catch(ignoreError)
-          } catch (err) {
-            if (isStateDurabilityError(err)) {
-              if (action === "new") {
-                await answerCallbackQuery(callbackQuery.id, "Action failed")
-                await sendToThread(ctxMeta, t(ctxMeta, "callbacks.newSessionPersistFailed")).catch(ignoreError)
-                return
-              }
-              throw err
-            }
-            await answerCallbackQuery(callbackQuery.id, "Unavailable")
-            await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err, { locale: ctxMeta.locale })).catch(ignoreError)
-          }
-          return
-        }
-
-        await answerCallbackQuery(callbackQuery.id, "Invalid")
+        await handleBindingCallback({
+          parts,
+          callbackQuery,
+          ctxMeta,
+          msg,
+          store,
+          projects,
+          ocByAlias,
+          parseCtxKey,
+          formatThreadLabel,
+          answerCallbackQuery,
+          closeInteractiveMessage,
+          deleteInteractiveMessage,
+          handleBindings,
+          flushStoreIfAvailable,
+          sendToThread,
+          commitStateMutation,
+          getStartupSession,
+          bindCtxToSession,
+          packCallbackData,
+          t,
+          formatProjectUnavailable,
+          isStateDurabilityError,
+        })
         return
       }
 
