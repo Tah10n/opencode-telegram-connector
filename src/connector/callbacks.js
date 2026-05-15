@@ -1,7 +1,6 @@
-import { classifyBoundaryError, makeBoundaryError } from "../boundary-errors.js"
+import { classifyBoundaryError } from "../boundary-errors.js"
 import { callbackPacker, decodeCallbackData, legacyCallbackPrefix } from "./callback-data.js"
 import { t as translate } from "../i18n/index.js"
-import { getRequestContext } from "../runtime/request-context.js"
 import { CALLBACK_TOAST_KEYS, callbackToast, localizeCallbackToast } from "./callback-toast.js"
 import { handleAttachmentCallback } from "./callbacks/attachment.js"
 import { handleBindingCallback } from "./callbacks/binding.js"
@@ -13,15 +12,15 @@ import { handlePermissionCallback } from "./callbacks/permission.js"
 import { handleProjectCallback } from "./callbacks/project.js"
 import { handleQuestionCallback } from "./callbacks/question.js"
 import { handleRuntimeCallback } from "./callbacks/runtime.js"
+import {
+  createCallbackSharedContext,
+  createLegacyCallbackRecorder,
+  defaultBuildSessionSwitchText,
+  ignoreCallbackError as ignoreError,
+} from "./callbacks/shared.js"
 import { handleSessionCallback } from "./callbacks/session.js"
 
 export { CALLBACK_TOAST_KEYS, callbackToast, localizeCallbackToast }
-
-async function defaultBuildSessionSwitchText(_projectAlias, sessionId) {
-  return `Switched to session: ${sessionId}`
-}
-
-function ignoreError() {}
 
 export function createCallbackHandlers(runtime) {
   const {
@@ -77,171 +76,39 @@ export function createCallbackHandlers(runtime) {
     config,
   } = runtime
   const packCallbackData = callbackPacker(cb)
-  const legacyCallbackWarningAt = new Map()
-  const legacyCallbackWarningIntervalMs = 5 * 60 * 1000
-
-  async function answerCallbackQuery(callbackQueryId, text) {
-    const locale = getRequestContext()?.locale || config?.i18n?.defaultLocale || "en"
-    await tg.answerCallbackQuery(callbackQueryId, localizeCallbackToast(text, locale)).catch(ignoreError)
-  }
-
-  async function deleteInteractiveMessage(ctxMeta, messageId) {
-    if (!messageId) return
-    if (typeof tg.deleteMessage === "function") {
-      await tg.deleteMessage(ctxMeta.chatId, messageId).catch(ignoreError)
-      return
-    }
-    if (typeof tg.editMessageReplyMarkup === "function") {
-      await tg.editMessageReplyMarkup(ctxMeta.chatId, messageId, null).catch(ignoreError)
-    }
-  }
-
-  async function closeInteractiveMessage(callbackQueryId, ctxMeta, messageId) {
-    await answerCallbackQuery(callbackQueryId, "Closed")
-    await deleteInteractiveMessage(ctxMeta, messageId)
-  }
-
-  function hasIdempotencyKey(key) {
-    return !!key && typeof store?.hasIdempotencyKey === "function" && store.hasIdempotencyKey(key)
-  }
-
-  async function markIdempotencyKey(key, metadata = {}) {
-    if (!key) return false
-    if (typeof store?.markIdempotencyKey === "function") {
-      return store.markIdempotencyKey(key, metadata)
-    }
-    if (typeof store?.markIdempotencyKeyAndFlush === "function") {
-      try {
-        return await store.markIdempotencyKeyAndFlush(key, metadata)
-      } catch (err) {
-        throw makeStateDurabilityError(err, "persist callback idempotency")
-      }
-    }
-    return false
-  }
-
-  function makeStateDurabilityError(err, operation) {
-    return makeBoundaryError({
-      source: "state",
-      operation,
-      kind: "durability",
-      outcome: "retryable",
-      message: `${operation} failed: ${err?.message || String(err)}`,
-      cause: err,
-    })
-  }
-
-  function isStateDurabilityError(err) {
-    return err?.isBoundaryError === true && err.source === "state" && err.kind === "durability"
-  }
-
-  async function flushStoreIfAvailable() {
-    if (typeof store?.flush !== "function") return
-    try {
-      await store.flush()
-    } catch (err) {
-      throw makeStateDurabilityError(err, "persist callback state")
-    }
-  }
-
-  async function persistQuestionWizardDurably(wizard, previousWizard) {
-    persistQuestionWizard(wizard)
-    try {
-      await flushStoreIfAvailable()
-    } catch (err) {
-      if (previousWizard) {
-        try {
-          applyWizardState(wizard, previousWizard)
-          persistQuestionWizard(wizard)
-        } catch (rollbackErr) {
-          runtime.logger?.error?.("Failed to roll back question wizard state:", rollbackErr?.message || String(rollbackErr))
-        }
-      }
-      throw err
-    }
-  }
-
-  function cloneStoreStateSnapshot() {
-    if (typeof store?.get !== "function") return null
-    const current = store.get()
-    if (!current || typeof current !== "object") return null
-    return JSON.parse(JSON.stringify(current))
-  }
-
-  function restoreStoreStateSnapshot(snapshot) {
-    if (!snapshot || typeof store?.get !== "function") return
-    const current = store.get()
-    if (!current || typeof current !== "object") return
-    for (const key of Object.keys(current)) delete current[key]
-    Object.assign(current, JSON.parse(JSON.stringify(snapshot)))
-  }
-
-  async function commitStateMutation(mutate, { shouldCommit = () => true } = {}) {
-    const snapshot = cloneStoreStateSnapshot()
-    try {
-      const result = await mutate()
-      if (shouldCommit(result)) await flushStoreIfAvailable()
-      return result
-    } catch (err) {
-      restoreStoreStateSnapshot(snapshot)
-      throw err
-    }
-  }
-
-  function cleanupPermissionState(ctxKey, projectAlias, permissionId, sessionID = "") {
-    store.deletePendingPermission(projectAlias, permissionId, sessionID)
-    setRejectNoteAwaitingState(ctxKey, null)
-  }
-
-  function cleanupQuestionState(ctxKey, projectAlias, questionId, sessionID = "") {
-    if (sessionID) runtime.questionWizards.delete(`${projectAlias}:${sessionID}:${questionId}`)
-    runtime.questionWizards.delete(`${projectAlias}:${questionId}`)
-    if (sessionID) clearPersistedQuestionWizard(projectAlias, questionId, sessionID)
-    clearPersistedQuestionWizard(projectAlias, questionId, "")
-    setAwaitingCustomAnswerState(ctxKey, null)
-  }
-
-  function routeCtxKey(route) {
-    if (route?.chatId == null) return ""
-    return `${route.chatId}:${route.threadIdOr0 || 0}`
-  }
-
-  async function isPromptBindingCurrent(ctxKey, projectAlias, callbackSessionID = "", { isOldShape = false, stateSessionID = "" } = {}) {
-    if (typeof store?.getBinding !== "function") return true
-    const binding = store.getBinding(ctxKey)
-    if (!binding) return false
-    if (binding.projectAlias !== projectAlias) return false
-    const expectedSessionID = callbackSessionID || stateSessionID || ""
-    if (isOldShape && !expectedSessionID) return false
-    if (!expectedSessionID || binding.sessionId === expectedSessionID) return true
-    if (typeof resolveBoundRoute !== "function") return false
-    const resolved = await resolveBoundRoute(projectAlias, expectedSessionID)
-    return binding.sessionId === resolved?.boundSessionId && routeCtxKey(resolved?.route) === ctxKey
-  }
-
-  async function answerStalePromptCallback(callbackQuery, ctxMeta, messageId, projectAlias) {
-    await flushStoreIfAvailable()
-    recordCallbackOutcome?.(projectAlias, "stale")
-    await answerCallbackQuery(callbackQuery.id, "No longer active")
-    await deleteInteractiveMessage(ctxMeta, messageId)
-  }
-
-  function recordLegacyCallback(prefix, projectAlias) {
-    if (!prefix) return
-    try {
-      recordLegacyCallbackFallback?.(projectAlias)
-      const now = Date.now()
-      const lastWarnedAt = legacyCallbackWarningAt.get(prefix) || 0
-      if (now - lastWarnedAt < legacyCallbackWarningIntervalMs) return
-      legacyCallbackWarningAt.set(prefix, now)
-      runtime.logger?.warn?.("Legacy callback payload format used", {
-        callbackPrefix: prefix,
-        operation: "callback legacy fallback",
-      })
-    } catch (err) {
-      runtime.logger?.error?.("Legacy callback fallback recorder failed:", err?.message || String(err))
-    }
-  }
+  const {
+    answerCallbackQuery,
+    deleteInteractiveMessage,
+    closeInteractiveMessage,
+    hasIdempotencyKey,
+    markIdempotencyKey,
+    isStateDurabilityError,
+    flushStoreIfAvailable,
+    persistQuestionWizardDurably,
+    commitStateMutation,
+    cleanupPermissionState,
+    cleanupQuestionState,
+    isPromptBindingCurrent,
+    answerStalePromptCallback,
+  } = createCallbackSharedContext({
+    tg,
+    store,
+    config,
+    ctxMetaWithLocale,
+    t,
+    runtime,
+    recordCallbackOutcome,
+    resolveBoundRoute,
+    applyWizardState,
+    persistQuestionWizard,
+    clearPersistedQuestionWizard,
+    setRejectNoteAwaitingState,
+    setAwaitingCustomAnswerState,
+  })
+  const recordLegacyCallback = createLegacyCallbackRecorder({
+    recordLegacyCallbackFallback,
+    logger: runtime.logger,
+  })
 
   async function handleTelegramCallback(callbackQuery) {
     if (!isAllowedUser(callbackQuery?.from)) return
