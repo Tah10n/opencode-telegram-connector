@@ -35,7 +35,8 @@
   },
   "scripts": {
     "start": "node src/cli.js",
-    "check": "node scripts/check-syntax.mjs && node scripts/verify-callback-data.mjs && npm run check:types",
+    "check": "node scripts/check-syntax.mjs && node scripts/verify-callback-data.mjs && npm run check:architecture && npm run check:types",
+    "check:architecture": "node scripts/verify-architecture.mjs",
     "check:types": "tsc -p tsconfig.check.json",
     "setup:check": "node src/cli.js check",
     "lint": "npm run check",
