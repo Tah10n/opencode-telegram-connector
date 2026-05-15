@@ -11,7 +11,7 @@ import { TelegramClient, makeInlineKeyboard } from "./telegram/client.js"
 import { formatMarkdownToTelegramHtmlBlocks, escapeHtml } from "./telegram/formatter.js"
 import { ctxKeyFrom, threadIdOr0FromMessage } from "./telegram/routing.js"
 import { OpenCodeClient } from "./opencode/client.js"
-import { effectiveOpenCodeSseEventPath, getOpenCodeSseEventMeta, getOpenCodeSseProjectRoutingIssue, startOpenCodeSseLoop } from "./opencode/sse.js"
+import { getOpenCodeSseProjectRoutingIssue, startOpenCodeSseLoop } from "./opencode/sse.js"
 import { ensureStartupSession } from "./opencode/startup-session.js"
 import { ensureOpenCodeRunning, openAttachWindow, stopOpenCodeServeOnPort, stopOpenCodeUiOnPort } from "./opencode/launcher.js"
 import { extractPatchDiffText, extractPatchFiles, formatChangedFilesText } from "./message-display.js"
@@ -21,7 +21,7 @@ import { createLifecycleManager } from "./runtime/lifecycle.js"
 import { startHealthServer } from "./runtime/health-server.js"
 import { collectLoggerRedactionOptions, createConnectorLogger } from "./runtime/logger.js"
 import { createRuntimeObservability } from "./runtime/observability.js"
-import { createCorrelationId, getRequestContext, runWithRequestContext, withRequestContextFields } from "./runtime/request-context.js"
+import { createCorrelationId, runWithRequestContext, withRequestContextFields } from "./runtime/request-context.js"
 import {
   clampString,
   compareNumbers,
@@ -34,12 +34,17 @@ import {
   parseSseDebugFilter,
 } from "./runtime/connector-bootstrap.js"
 import { createConnectorLifecycleTools } from "./runtime/connector-lifecycle.js"
+import {
+  makeSseProjectRoutingError,
+  sseErrorContext,
+  sseEventDirectoryRoutingDecision,
+  sseRequestContextFields,
+} from "./runtime/sse-runtime.js"
 import { createTelegramUpdateLoop } from "./runtime/telegram-loop.js"
 import { DEFAULT_FEED_MODE, StateStore, normalizeFeedMode, resolveDefaultStatePath, sessionKey } from "./state/store.js"
 import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "./session-list.js"
 import { sanitizeBaseUrlForDisplay } from "./url-utils.js"
 import { normalizeLimits } from "./limits.js"
-import { directoriesMatch } from "./directory-paths.js"
 import { createParentSessionCache, LruMap, LruSet } from "./util/lru.js"
 import { botCommandsForLocale, matchSupportedLocale, normalizeI18nConfig, normalizeLocale, t } from "./i18n/index.js"
 
@@ -1187,71 +1192,12 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   })
   const { handleTelegramCallback } = callbackHandlers
 
-  function sseRequestContextFields(projectAlias, evt) {
-    const props = evt?.properties || {}
-    const part = props?.part || {}
-    const info = props?.info || {}
-    const sessionId = props.sessionID || props.sessionId || part.sessionID || part.sessionId || ""
-    const messageId = info.id || props.messageID || props.messageId || part.messageID || part.messageId || ""
-    return {
-      source: "opencode",
-      operation: "handle SSE event",
-      projectAlias,
-      eventType: evt?.type || "unknown",
-      ...(sessionId ? { sessionId } : {}),
-      ...(messageId ? { messageId } : {}),
-      ...(getRequestContext().correlationId ? {} : { correlationId: createCorrelationId("sse", [projectAlias, evt?.type || "event"]) }),
-    }
-  }
-
-  function sseEventDirectoryRoutingDecision(projectAlias, evt) {
-    const meta = getOpenCodeSseEventMeta(evt)
-    const eventDirectory = meta?.directory
-    const projectDirectory = projects?.[projectAlias]?.directory
-    if (meta?.requiresDirectoryRouting) {
-      if (!eventDirectory) return { matches: false, reason: "global_directory_missing" }
-      if (!projectDirectory) return { matches: false, reason: "project_directory_missing" }
-    }
-    if (eventDirectory && projectDirectory && !directoriesMatch(eventDirectory, projectDirectory)) {
-      return { matches: false, reason: "directory_mismatch" }
-    }
-    return { matches: true, reason: "matched" }
-  }
-
-  function sseEventPathFallback() {
-    return effectiveOpenCodeSseEventPath()
-  }
-
-  function sseErrorContext(err) {
-    const method = err?.method || "GET"
-    const pathname = err?.pathname || sseEventPathFallback()
-    return {
-      source: "opencode",
-      operation: err?.operation || `${method} ${pathname}`,
-      method,
-      pathname,
-    }
-  }
-
-  function makeSseProjectRoutingError(projectAlias, issue) {
-    const pathname = issue?.eventPath || sseEventPathFallback()
-    return makeBoundaryError({
-      source: "opencode",
-      operation: `GET ${pathname}`,
-      method: "GET",
-      pathname,
-      kind: "configuration",
-      outcome: "fatal",
-      message: `SSE disabled for project '${projectAlias}': ${pathname} requires project 'directory' for safe routing. Add 'directory' to connector.config.mjs or set OPENCODE_SSE_EVENT_PATH=/event for legacy opencode builds.`,
-    })
-  }
-
   async function onSseEvent({ projectAlias, evt }) {
     return runWithRequestContext(sseRequestContextFields(projectAlias, evt), async () => {
       const type = evt?.type
       const props = evt?.properties || {}
 
-      const directoryRouting = sseEventDirectoryRoutingDecision(projectAlias, evt)
+      const directoryRouting = sseEventDirectoryRoutingDecision(projects, projectAlias, evt)
       if (!directoryRouting.matches) {
         logSseDebug(projectAlias, props.sessionID || props.sessionId, `drop=${directoryRouting.reason}`)
         return false
