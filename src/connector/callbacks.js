@@ -6,6 +6,8 @@ import { localeDisplayName, matchSupportedLocale, t as translate } from "../i18n
 import { languageSettingsView, supportedLocaleSummary } from "./language-ui.js"
 import { getRequestContext } from "../runtime/request-context.js"
 import { CALLBACK_TOAST_KEYS, callbackToast, localizeCallbackToast } from "./callback-toast.js"
+import { handleAttachmentCallback } from "./callbacks/attachment.js"
+import { handleChangedFilesCallback } from "./callbacks/changed-files.js"
 import { handleFeedCallback } from "./callbacks/feed.js"
 import { handleModelCallback } from "./callbacks/model.js"
 import { handlePermissionCallback } from "./callbacks/permission.js"
@@ -685,44 +687,29 @@ export function createCallbackHandlers(runtime) {
       }
 
       if (kind === "cf") {
-        if (parts[1] === "close") {
-          await closeInteractiveMessage(callbackQuery.id, ctxMeta, msg?.message_id)
-          return
-        }
-        const projectAlias = parts[1]
-        const sessionId = parts[2]
-        const opencodeMessageId = parts[3]
-        const action = parts[4]
-        const validChangedFilesActions = new Set(["show", "back", "summary", "patch", "files", "file", "filepatch"])
-        if (!projectAlias || !sessionId || !opencodeMessageId || !validChangedFilesActions.has(action)) {
-          await answerCallbackQuery(callbackQuery.id, "Invalid")
-          return
-        }
-        await answerCallbackQuery(callbackQuery.id)
-        const viewOptions = { editMessageId: msg?.message_id }
-        if (parts[5] != null) viewOptions.actionArg = parts[5]
-        await renderChangedFilesView(ctxMeta, projectAlias, sessionId, opencodeMessageId, action, viewOptions)
+        await handleChangedFilesCallback({
+          parts,
+          callbackQuery,
+          ctxMeta,
+          msg,
+          answerCallbackQuery,
+          closeInteractiveMessage,
+          renderChangedFilesView,
+        })
         return
       }
 
       if (kind === "att") {
-        const action = parts[1]
-        const token = parts[2]
-        if (!token || (action !== "send" && action !== "cancel" && action !== "close")) {
-          await answerCallbackQuery(callbackQuery.id, "Invalid")
-          return
-        }
-        if (action === "close") {
-          await runtime.handleAttachmentConfirmation?.(ctxMeta, action, token, { editMessageId: msg?.message_id })
-          await closeInteractiveMessage(callbackQuery.id, ctxMeta, msg?.message_id)
-          return
-        }
-        if (action === "send") await answerCallbackQuery(callbackQuery.id, "Sending…")
-        const result = await runtime.handleAttachmentConfirmation?.(ctxMeta, action, token, { editMessageId: msg?.message_id })
-        if (action !== "send") await answerCallbackQuery(callbackQuery.id, result?.callbackText || (action === "cancel" ? "Cancelled" : "Closed"))
-        if (result?.callbackText === "Sent" || result?.callbackText === "Cancelled" || result?.callbackText === "Already sent") {
-          await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-        }
+        await handleAttachmentCallback({
+          parts,
+          callbackQuery,
+          ctxMeta,
+          msg,
+          runtime,
+          answerCallbackQuery,
+          closeInteractiveMessage,
+          deleteInteractiveMessage,
+        })
         return
       }
 
