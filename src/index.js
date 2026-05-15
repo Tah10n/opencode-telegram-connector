@@ -6,10 +6,9 @@ import { createMirroringHandlers } from "./connector/mirroring.js"
 import { createOverviewHelpers } from "./connector/overview.js"
 import { createPromptHandlers } from "./connector/prompts.js"
 import { createPromptRecovery } from "./connector/prompt-recovery.js"
-import { classifyBoundaryError, makeBoundaryError, normalizeBoundaryError } from "./boundary-errors.js"
-import { TelegramClient, makeInlineKeyboard } from "./telegram/client.js"
-import { formatMarkdownToTelegramHtmlBlocks, escapeHtml } from "./telegram/formatter.js"
-import { ctxKeyFrom, threadIdOr0FromMessage } from "./telegram/routing.js"
+import { classifyBoundaryError, makeBoundaryError } from "./boundary-errors.js"
+import { TelegramClient } from "./telegram/client.js"
+import { ctxKeyFrom } from "./telegram/routing.js"
 import { OpenCodeClient } from "./opencode/client.js"
 import { getOpenCodeSseProjectRoutingIssue, startOpenCodeSseLoop } from "./opencode/sse.js"
 import { ensureStartupSession } from "./opencode/startup-session.js"
@@ -21,7 +20,7 @@ import { createLifecycleManager } from "./runtime/lifecycle.js"
 import { startHealthServer } from "./runtime/health-server.js"
 import { collectLoggerRedactionOptions, createConnectorLogger } from "./runtime/logger.js"
 import { createRuntimeObservability } from "./runtime/observability.js"
-import { createCorrelationId, runWithRequestContext, withRequestContextFields } from "./runtime/request-context.js"
+import { runWithRequestContext, withRequestContextFields } from "./runtime/request-context.js"
 import {
   clampString,
   compareNumbers,
@@ -41,12 +40,13 @@ import {
   sseRequestContextFields,
 } from "./runtime/sse-runtime.js"
 import { createTelegramUpdateLoop } from "./runtime/telegram-loop.js"
+import { createTelegramContextTools } from "./runtime/telegram-context.js"
 import { DEFAULT_FEED_MODE, StateStore, normalizeFeedMode, resolveDefaultStatePath, sessionKey } from "./state/store.js"
 import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "./session-list.js"
 import { sanitizeBaseUrlForDisplay } from "./url-utils.js"
 import { normalizeLimits } from "./limits.js"
 import { createParentSessionCache, LruMap, LruSet } from "./util/lru.js"
-import { botCommandsForLocale, matchSupportedLocale, normalizeI18nConfig, normalizeLocale, t } from "./i18n/index.js"
+import { botCommandsForLocale, normalizeI18nConfig } from "./i18n/index.js"
 
 export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   if (!config?.telegram?.botToken) throw new Error("config.telegram.botToken is required")
@@ -568,6 +568,20 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const questionWizards = new Map() // key `${projectAlias}:${requestId}` -> wizard
 
   const bindAliasAwaiting = new Map() // key ctxKey -> { startedAt }
+
+  const {
+    ctxMetaWithLocale,
+    rememberTelegramLocale,
+    localize,
+    ctxMetaFromMessage,
+    requestContextForCtxMeta,
+    runTelegramUpdateContext,
+    isAllowedUser,
+    sendToThread,
+    sendBlocksToThread,
+    parseCtxKey,
+    formatThreadLabel,
+  } = createTelegramContextTools({ config, store, tg })
   const overviewHelpers = createOverviewHelpers({
     projects,
     store,
@@ -717,142 +731,6 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     flushPendingAssistantDeliveries: drainPendingAssistantDeliveries,
   } = mirroringHandlers
   flushPendingAssistantDeliveries = drainPendingAssistantDeliveries
-
-  function detectedLocaleFromTelegram(from) {
-    if (config.i18n?.autoDetectTelegramLanguage === false) return ""
-    return matchSupportedLocale(from?.language_code, config.i18n?.supportedLocales)
-  }
-
-  function effectiveLocaleForContext(ctxKey, detectedLocale = "") {
-    const storedRecord = store.getLocaleRecord?.(ctxKey)
-    if (storedRecord?.locale && (storedRecord.source === "manual" || config.i18n?.autoDetectTelegramLanguage !== false)) {
-      return normalizeLocale(storedRecord.locale, config.i18n)
-    }
-    if (detectedLocale) return normalizeLocale(detectedLocale, config.i18n)
-    return config.i18n?.defaultLocale || "en"
-  }
-
-  function ctxMetaWithLocale(ctxMeta) {
-    if (!ctxMeta) return ctxMeta
-    const chatId = ctxMeta.chatId
-    const threadIdOr0 = ctxMeta.threadIdOr0 || 0
-    const ctxKey = ctxMeta.ctxKey || ctxKeyFrom(chatId, threadIdOr0)
-    return {
-      ...ctxMeta,
-      threadIdOr0,
-      ctxKey,
-      locale: effectiveLocaleForContext(ctxKey, ctxMeta.detectedLocale || ctxMeta.locale),
-    }
-  }
-
-  function rememberTelegramLocale(ctxMeta) {
-    if (!ctxMeta?.ctxKey || !ctxMeta.detectedLocale) return ctxMetaWithLocale(ctxMeta)
-    store.noteTelegramLocale?.(ctxMeta.ctxKey, ctxMeta.detectedLocale)
-    return ctxMetaWithLocale(ctxMeta)
-  }
-
-  function localize(ctxMetaOrLocale, key, params) {
-    const locale = typeof ctxMetaOrLocale === "string" ? ctxMetaOrLocale : ctxMetaWithLocale(ctxMetaOrLocale)?.locale
-    return t(locale || config.i18n?.defaultLocale || "en", key, params)
-  }
-
-  function ctxMetaFromMessage(msg, from = msg?.from) {
-    const chatId = msg?.chat?.id
-    const chatType = msg?.chat?.type
-    const threadIdOr0 = threadIdOr0FromMessage(msg)
-    const ctxKey = ctxKeyFrom(chatId, threadIdOr0)
-    const detectedLocale = detectedLocaleFromTelegram(from || msg?.from)
-    return ctxMetaWithLocale({ chatId, chatType, threadIdOr0, ctxKey, detectedLocale })
-  }
-
-  function requestContextForCtxMeta(ctxMeta, binding) {
-    if (!ctxMeta) return {}
-    return {
-      chatId: ctxMeta.chatId,
-      chatType: ctxMeta.chatType,
-      threadIdOr0: ctxMeta.threadIdOr0,
-      ctxKey: ctxMeta.ctxKey,
-      ...(ctxMeta.locale ? { locale: ctxMeta.locale } : {}),
-      ...(binding?.projectAlias ? { projectAlias: binding.projectAlias } : {}),
-      ...(binding?.sessionId ? { sessionId: binding.sessionId } : {}),
-    }
-  }
-
-  function telegramUpdateContext(update) {
-    const eventType = update?.message ? "message" : update?.callback_query ? "callback" : "unknown"
-    const msg = update?.message || update?.callback_query?.message || null
-    const from = update?.message?.from || update?.callback_query?.from || null
-    const ctxMeta = msg ? ctxMetaFromMessage(msg, from) : null
-    const binding = ctxMeta?.ctxKey ? store.getBinding(ctxMeta.ctxKey) : null
-    return {
-      correlationId: createCorrelationId("tg", [update?.update_id, eventType]),
-      source: "telegram",
-      operation: eventType,
-      updateId: update?.update_id,
-      eventType,
-      ...requestContextForCtxMeta(ctxMeta, binding),
-    }
-  }
-
-  function runTelegramUpdateContext(update, fn) {
-    return runWithRequestContext(telegramUpdateContext(update), fn)
-  }
-
-  function isAllowedUser(from) {
-    const allowedUserId = config.telegram.allowedUserId
-    return from && typeof from.id === "number" && from.id === allowedUserId
-  }
-
-  async function sendToThread(ctxMeta, text, replyMarkup, options = {}) {
-    ctxMeta = ctxMetaWithLocale(ctxMeta)
-    if (!ctxMeta?.chatId) return
-    return withRequestContextFields(requestContextForCtxMeta(ctxMeta, store.getBinding(ctxMeta.ctxKey)), async () => {
-      try {
-        await tg.sendMessage(ctxMeta.chatId, text, replyMarkup, {
-          ...options,
-          message_thread_id: ctxMeta.threadIdOr0 || undefined,
-        })
-      } catch (err) {
-        throw normalizeBoundaryError(err, {
-          source: "telegram",
-          operation: "sendMessage",
-          method: "POST",
-          pathname: "/sendMessage",
-          ...(err?.isBoundaryError === true ? {} : { outcome: "retryable" }),
-        })
-      }
-    })
-  }
-
-  async function sendBlocksToThread(ctxMeta, blocks, replyMarkup) {
-    ctxMeta = ctxMetaWithLocale(ctxMeta)
-    if (!ctxMeta?.chatId) return
-    return withRequestContextFields(requestContextForCtxMeta(ctxMeta, store.getBinding(ctxMeta.ctxKey)), async () => {
-      try {
-        await tg.sendHtmlBlocks(ctxMeta.chatId, blocks, replyMarkup, {
-          message_thread_id: ctxMeta.threadIdOr0 || undefined,
-        })
-      } catch (err) {
-        throw normalizeBoundaryError(err, {
-          source: "telegram",
-          operation: "sendHtmlBlocks",
-          method: "POST",
-          pathname: "/sendMessage",
-          ...(err?.isBoundaryError === true ? {} : { outcome: "retryable" }),
-        })
-      }
-    })
-  }
-
-  function parseCtxKey(key) {
-    const m = String(key).match(/^(-?\d+):(\d+)$/)
-    if (!m) return null
-    return { chatId: Number(m[1]), threadIdOr0: Number(m[2]), ctxKey: key }
-  }
-
-  function formatThreadLabel(threadIdOr0) {
-    return threadIdOr0 ? `topic ${threadIdOr0}` : "main"
-  }
 
   async function deliverPendingRuntimeOnlineNotice() {
     const notice = store.getPendingRuntimeOnlineNotice?.()
