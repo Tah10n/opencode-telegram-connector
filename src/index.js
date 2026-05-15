@@ -32,16 +32,17 @@ import {
   parseCommand,
   parseSseDebugFilter,
 } from "./runtime/connector-bootstrap.js"
-import { createConnectorLifecycleTools } from "./runtime/connector-lifecycle.js"
+import {
+  createRuntimeFoundation,
+  createRuntimeTelegramLoop,
+  createRuntimeTuiSync,
+} from "./runtime/service-wiring.js"
 import {
   makeSseProjectRoutingError,
   sseErrorContext,
   sseEventDirectoryRoutingDecision,
   sseRequestContextFields,
 } from "./runtime/sse-runtime.js"
-import { createTelegramUpdateLoop } from "./runtime/telegram-loop.js"
-import { createTelegramContextTools } from "./runtime/telegram-context.js"
-import { createTuiSessionSyncTools } from "./runtime/tui-session-sync.js"
 import { DEFAULT_FEED_MODE, StateStore, normalizeFeedMode, resolveDefaultStatePath } from "./state/store.js"
 import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "./session-list.js"
 import { sanitizeBaseUrlForDisplay } from "./url-utils.js"
@@ -182,6 +183,17 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   }
   const lifecycle = createLifecycleManager()
   const abortController = new AbortController()
+  const runtimeFoundation = createRuntimeFoundation({
+    lifecycle,
+    abortController,
+    logger,
+    onFatalError,
+    runtimeObservability,
+    sleep,
+    config,
+    store,
+    tg,
+  })
   const {
     trackManagedPromise,
     trackManagedHandle,
@@ -191,14 +203,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     startManagedTask,
     sleepWithAbort,
     waitForPromiseOrAbort,
-  } = createConnectorLifecycleTools({
-    lifecycle,
-    abortController,
-    logger,
-    onFatalError,
-    runtimeObservability,
-    sleep,
-  })
+  } = runtimeFoundation.lifecycle
 
   function runtimeHealthSnapshot() {
     return runtimeObservability.buildHealthSnapshot({
@@ -580,7 +585,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     sendBlocksToThread,
     parseCtxKey,
     formatThreadLabel,
-  } = createTelegramContextTools({ config, store, tg })
+  } = runtimeFoundation.telegramContext
   const overviewHelpers = createOverviewHelpers({
     projects,
     store,
@@ -774,7 +779,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     })
   }
 
-  const { primeTuiActiveSessionFollow, syncProjectTuiActiveSession } = createTuiSessionSyncTools({
+  const { primeTuiActiveSessionFollow, syncProjectTuiActiveSession } = createRuntimeTuiSync({
     store,
     ocByAlias,
     abortSignal: abortController.signal,
@@ -951,7 +956,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     })
   }
 
-  const { telegramLoop } = createTelegramUpdateLoop({
+  const { telegramLoop } = createRuntimeTelegramLoop({
     store,
     tg,
     logger,
