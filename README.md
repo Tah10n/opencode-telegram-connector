@@ -590,6 +590,7 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 ```sh
 npm run setup:check
 npm run check
+npm run check:architecture
 npm test
 npm run test:coverage
 ```
