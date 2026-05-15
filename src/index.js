@@ -1,18 +1,16 @@
 import { setTimeout as delay } from "node:timers/promises"
-import crypto from "node:crypto"
 import { createCallbackHandlers } from "./connector/callbacks.js"
 import { createCommandHandlers } from "./connector/commands.js"
-import { promptIdentity, telegramUpdateIdempotencyKey } from "./connector/idempotency.js"
+import { promptIdentity } from "./connector/idempotency.js"
 import { createMirroringHandlers } from "./connector/mirroring.js"
 import { createOverviewHelpers } from "./connector/overview.js"
 import { createPromptHandlers } from "./connector/prompts.js"
 import { createPromptRecovery } from "./connector/prompt-recovery.js"
-import { classifyBoundaryError, makeBoundaryError, normalizeBoundaryError } from "./boundary-errors.js"
-import { TelegramClient, makeInlineKeyboard } from "./telegram/client.js"
-import { formatMarkdownToTelegramHtmlBlocks, escapeHtml } from "./telegram/formatter.js"
-import { ctxKeyFrom, threadIdOr0FromMessage } from "./telegram/routing.js"
+import { classifyBoundaryError, makeBoundaryError } from "./boundary-errors.js"
+import { TelegramClient } from "./telegram/client.js"
+import { ctxKeyFrom } from "./telegram/routing.js"
 import { OpenCodeClient } from "./opencode/client.js"
-import { effectiveOpenCodeSseEventPath, getOpenCodeSseEventMeta, getOpenCodeSseProjectRoutingIssue, startOpenCodeSseLoop } from "./opencode/sse.js"
+import { getOpenCodeSseProjectRoutingIssue, startOpenCodeSseLoop } from "./opencode/sse.js"
 import { ensureStartupSession } from "./opencode/startup-session.js"
 import { ensureOpenCodeRunning, openAttachWindow, stopOpenCodeServeOnPort, stopOpenCodeUiOnPort } from "./opencode/launcher.js"
 import { extractPatchDiffText, extractPatchFiles, formatChangedFilesText } from "./message-display.js"
@@ -22,111 +20,35 @@ import { createLifecycleManager } from "./runtime/lifecycle.js"
 import { startHealthServer } from "./runtime/health-server.js"
 import { collectLoggerRedactionOptions, createConnectorLogger } from "./runtime/logger.js"
 import { createRuntimeObservability } from "./runtime/observability.js"
-import { createCorrelationId, getRequestContext, runWithRequestContext, withRequestContextFields } from "./runtime/request-context.js"
-import { DEFAULT_FEED_MODE, StateStore, normalizeFeedMode, resolveDefaultStatePath, sessionKey } from "./state/store.js"
+import { runWithRequestContext, withRequestContextFields } from "./runtime/request-context.js"
+import {
+  clampString,
+  compareNumbers,
+  extractTextParts,
+  isCommand,
+  makeCallbackStore,
+  normalizeEpochMs,
+  normalizeOpenCodeWatchdogOptions,
+  parseCommand,
+  parseSseDebugFilter,
+} from "./runtime/connector-bootstrap.js"
+import {
+  createRuntimeFoundation,
+  createRuntimeTelegramLoop,
+  createRuntimeTuiSync,
+} from "./runtime/service-wiring.js"
+import {
+  makeSseProjectRoutingError,
+  sseErrorContext,
+  sseEventDirectoryRoutingDecision,
+  sseRequestContextFields,
+} from "./runtime/sse-runtime.js"
+import { DEFAULT_FEED_MODE, StateStore, normalizeFeedMode, resolveDefaultStatePath } from "./state/store.js"
 import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "./session-list.js"
 import { sanitizeBaseUrlForDisplay } from "./url-utils.js"
 import { normalizeLimits } from "./limits.js"
-import { directoriesMatch } from "./directory-paths.js"
 import { createParentSessionCache, LruMap, LruSet } from "./util/lru.js"
-import { botCommandsForLocale, matchSupportedLocale, normalizeI18nConfig, normalizeLocale, t } from "./i18n/index.js"
-
-function parseSseDebugFilter(rawValue) {
-  const raw = String(rawValue || "").trim()
-  if (!raw) return null
-  const [projectAlias, sessionId] = raw.split(":", 2)
-  return {
-    projectAlias: projectAlias ? projectAlias.trim() : "",
-    sessionId: sessionId ? sessionId.trim() : "",
-  }
-}
-
-function makeCallbackStore() {
-  const store = new LruMap(4000)
-  const token = () => crypto.randomBytes(8).toString("base64url")
-  const pack = (data) => {
-    if (Buffer.byteLength(data, "utf8") <= 64) return data
-    let t = ""
-    for (let i = 0; i < 10; i++) {
-      t = token()
-      if (store.get(t) == null) break
-    }
-    store.set(t, data)
-    return `cb|${t}`
-  }
-  const unpack = (data) => {
-    if (typeof data !== "string") return null
-    if (!data.startsWith("cb|")) return data
-    const t = data.slice(3)
-    return store.get(t) ?? null
-  }
-  return { pack, unpack }
-}
-
-function clampString(s, max) {
-  const str = String(s ?? "")
-  if (str.length <= max) return str
-  return str.slice(0, Math.max(0, max - 1)) + "…"
-}
-
-function compareNumbers(a, b) {
-  return a === b ? 0 : a < b ? -1 : 1
-}
-
-function isCommand(text) {
-  return typeof text === "string" && text.trim().startsWith("/")
-}
-
-function parseCommand(text, { botUsername } = {}) {
-  const trimmed = text.trim()
-  const [cmd, ...rest] = trimmed.split(/\s+/)
-  // Telegram may send commands as /cmd@BotName in groups.
-  const [commandName, targetBot] = String(cmd || "").split("@", 2)
-  const normalizedTargetBot = String(targetBot || "").trim().toLowerCase()
-  const normalizedBotUsername = String(botUsername || "").trim().toLowerCase()
-  if (normalizedTargetBot && normalizedBotUsername && normalizedTargetBot !== normalizedBotUsername) {
-    return { cmd: null, args: rest.join(" ").trim(), argv: rest, targetBot: normalizedTargetBot, isForThisBot: false }
-  }
-  if (normalizedTargetBot && !normalizedBotUsername) {
-    return { cmd: null, args: rest.join(" ").trim(), argv: rest, targetBot: normalizedTargetBot, isForThisBot: false }
-  }
-  const normalizedCmd = String(commandName || "")
-    .toLowerCase()
-  return { cmd: normalizedCmd, args: rest.join(" ").trim(), argv: rest, targetBot: normalizedTargetBot, isForThisBot: true }
-}
-
-function normalizeEpochMs(value) {
-  if (typeof value === "number" && Number.isFinite(value)) return value < 1e12 ? value * 1000 : value
-  if (typeof value === "string") {
-    const t = Date.parse(value)
-    return Number.isFinite(t) ? t : null
-  }
-  return null
-}
-
-function readPositiveNumber(value, fallback) {
-  const n = Number(value)
-  return Number.isFinite(n) && n > 0 ? n : fallback
-}
-
-function readNonNegativeNumber(value, fallback) {
-  const n = Number(value)
-  return Number.isFinite(n) && n >= 0 ? n : fallback
-}
-
-function normalizeOpenCodeWatchdogOptions(options = {}) {
-  return {
-    failureThreshold: Math.max(1, Math.floor(readPositiveNumber(options.failureThreshold ?? process.env.OPENCODE_WATCHDOG_FAILURE_THRESHOLD, 6))),
-    windowMs: Math.max(1, Math.floor(readPositiveNumber(options.windowMs ?? process.env.OPENCODE_WATCHDOG_WINDOW_MS, 120_000))),
-    cooldownMs: Math.max(0, Math.floor(readNonNegativeNumber(options.cooldownMs ?? process.env.OPENCODE_WATCHDOG_COOLDOWN_MS, 60_000))),
-  }
-}
-
-function extractTextParts(message) {
-  if (!message || !Array.isArray(message.parts)) return ""
-  const parts = message.parts.filter((p) => p && p.type === "text" && typeof p.text === "string" && !p.ignored)
-  return parts.map((p) => p.text).join("")
-}
+import { botCommandsForLocale, normalizeI18nConfig } from "./i18n/index.js"
 
 export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   if (!config?.telegram?.botToken) throw new Error("config.telegram.botToken is required")
@@ -261,6 +183,27 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   }
   const lifecycle = createLifecycleManager()
   const abortController = new AbortController()
+  const runtimeFoundation = createRuntimeFoundation({
+    lifecycle,
+    abortController,
+    logger,
+    onFatalError,
+    runtimeObservability,
+    sleep,
+    config,
+    store,
+    tg,
+  })
+  const {
+    trackManagedPromise,
+    trackManagedHandle,
+    recordLoopError,
+    logLoopIssue,
+    recordLoopAbort,
+    startManagedTask,
+    sleepWithAbort,
+    waitForPromiseOrAbort,
+  } = runtimeFoundation.lifecycle
 
   function runtimeHealthSnapshot() {
     return runtimeObservability.buildHealthSnapshot({
@@ -611,8 +554,6 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const recentTgPromptsBySession = new LruMap(2000) // sessionKey -> LruSet(hash)
   const lastAssistantBySession = new LruMap(2000) // sessionKey -> { messageId, sessionId, text }
   const parentSessionBySession = createParentSessionCache(5000) // key `${projectAlias}:${sessionId}` -> parent session id or null
-  const tuiActiveSessionStateByProject = new Map() // alias -> { currentSessionId, followCtxKey }
-  const tuiActiveSessionUnsupportedProjects = new Set() // alias values where /tui/active-session is unavailable
   let flushPendingAssistantDeliveries = async () => {
     for (const entry of assistantDebounce.values()) clearTimeout(entry?.timer || entry)
     assistantDebounce.clear()
@@ -631,6 +572,20 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const questionWizards = new Map() // key `${projectAlias}:${requestId}` -> wizard
 
   const bindAliasAwaiting = new Map() // key ctxKey -> { startedAt }
+
+  const {
+    ctxMetaWithLocale,
+    rememberTelegramLocale,
+    localize,
+    ctxMetaFromMessage,
+    requestContextForCtxMeta,
+    runTelegramUpdateContext,
+    isAllowedUser,
+    sendToThread,
+    sendBlocksToThread,
+    parseCtxKey,
+    formatThreadLabel,
+  } = runtimeFoundation.telegramContext
   const overviewHelpers = createOverviewHelpers({
     projects,
     store,
@@ -712,139 +667,6 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     resolveBoundRoute,
   })
 
-  let fatalRuntimeErrorReported = false
-
-  function trackManagedPromise(name, promise, { kind = "task", metadata, stop } = {}) {
-    lifecycle.registerPromise(name, promise, { kind, metadata, stop })
-    return promise
-  }
-
-  function trackManagedHandle(name, handle, { kind = "task", metadata } = {}) {
-    return lifecycle.registerHandle(name, handle, { kind, metadata })
-  }
-
-  function recordLoopError(loopName, err, { projectAlias, source = projectAlias ? "opencode" : "runtime", operation, method, pathname } = {}) {
-    const normalized = normalizeBoundaryError(err, {
-      source,
-      operation,
-      method,
-      pathname,
-    })
-    runtimeObservability.recordLoopError(loopName, { projectAlias, err: normalized })
-    return normalized
-  }
-
-  function logLoopIssue(loopName, err, { projectAlias, retryable = false, source = projectAlias ? "opencode" : "runtime", operation, method, pathname } = {}) {
-    const normalized = normalizeBoundaryError(err, {
-      source,
-      operation,
-      method,
-      pathname,
-    })
-    if (retryable) {
-      runtimeObservability.recordLoopRetry(loopName, { projectAlias, err: normalized })
-      logger.warn("Loop retryable error", {
-        loop: loopName,
-        projectAlias,
-        source: normalized.source,
-        operation: normalized.operation,
-        method: normalized.method,
-        pathname: normalized.pathname,
-        outcome: normalized.outcome,
-        kind: normalized.kind,
-        status: normalized.status,
-        code: normalized.code,
-        retryable: true,
-        error: normalized.message,
-      })
-    } else {
-      runtimeObservability.recordLoopError(loopName, { projectAlias, err: normalized })
-      logger.error("Loop error", {
-        loop: loopName,
-        projectAlias,
-        source: normalized.source,
-        operation: normalized.operation,
-        method: normalized.method,
-        pathname: normalized.pathname,
-        outcome: normalized.outcome,
-        kind: normalized.kind,
-        status: normalized.status,
-        code: normalized.code,
-        retryable: false,
-        error: normalized.message,
-      })
-    }
-    return normalized
-  }
-
-  function recordLoopAbort(loopName, { projectAlias, reason } = {}) {
-    runtimeObservability.recordLoopAbort(loopName, { projectAlias, reason })
-    logger.info("Loop aborted", { loop: loopName, projectAlias, operation: "abort loop", reason: reason || "stopped" })
-  }
-
-  function reportFatalRuntimeError(err, { name, projectAlias } = {}) {
-    if (fatalRuntimeErrorReported || abortController.signal.aborted) return
-    fatalRuntimeErrorReported = true
-    abortController.abort()
-    logger.error("Fatal runtime error", { name, projectAlias, source: err?.source || "runtime", operation: err?.operation, kind: err?.kind, outcome: err?.outcome, error: err?.message || String(err) })
-    onFatalError(err)
-  }
-
-  function startManagedTask(name, run, { kind = "task", metadata, fatalOnError = false } = {}) {
-    const promise = (async () => {
-      try {
-        return await run()
-      } catch (err) {
-        if (abortController.signal.aborted) return null
-        const normalized = logLoopIssue(name, err, {
-          projectAlias: metadata?.projectAlias,
-          source: metadata?.source || (metadata?.projectAlias ? "opencode" : "runtime"),
-          operation: metadata?.operation,
-          method: metadata?.method,
-          pathname: metadata?.pathname,
-        })
-        if (fatalOnError) {
-          reportFatalRuntimeError(normalized, {
-            name,
-            projectAlias: metadata?.projectAlias,
-          })
-          throw normalized
-        }
-        return null
-      }
-    })()
-    trackManagedPromise(name, promise, { kind, metadata })
-    return promise
-  }
-
-  async function sleepWithAbort(ms) {
-    if (abortController.signal.aborted) return
-    let onAbort = null
-    const abortPromise = new Promise((resolve) => {
-      onAbort = () => resolve()
-      abortController.signal.addEventListener("abort", onAbort, { once: true })
-    })
-    try {
-      await Promise.race([sleep(ms), abortPromise])
-    } finally {
-      if (onAbort) abortController.signal.removeEventListener("abort", onAbort)
-    }
-  }
-
-  async function waitForPromiseOrAbort(promise) {
-    if (!promise || abortController.signal.aborted) return
-    let onAbort = null
-    const abortPromise = new Promise((resolve) => {
-      onAbort = () => resolve()
-      abortController.signal.addEventListener("abort", onAbort, { once: true })
-    })
-    try {
-      await Promise.race([Promise.resolve(promise).catch(() => {}), abortPromise])
-    } finally {
-      if (onAbort) abortController.signal.removeEventListener("abort", onAbort)
-    }
-  }
-
   const wizardGcTimer = setInterval(() => {
     const t = Date.now()
     for (const [k, w] of questionWizards.entries()) {
@@ -914,142 +736,6 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   } = mirroringHandlers
   flushPendingAssistantDeliveries = drainPendingAssistantDeliveries
 
-  function detectedLocaleFromTelegram(from) {
-    if (config.i18n?.autoDetectTelegramLanguage === false) return ""
-    return matchSupportedLocale(from?.language_code, config.i18n?.supportedLocales)
-  }
-
-  function effectiveLocaleForContext(ctxKey, detectedLocale = "") {
-    const storedRecord = store.getLocaleRecord?.(ctxKey)
-    if (storedRecord?.locale && (storedRecord.source === "manual" || config.i18n?.autoDetectTelegramLanguage !== false)) {
-      return normalizeLocale(storedRecord.locale, config.i18n)
-    }
-    if (detectedLocale) return normalizeLocale(detectedLocale, config.i18n)
-    return config.i18n?.defaultLocale || "en"
-  }
-
-  function ctxMetaWithLocale(ctxMeta) {
-    if (!ctxMeta) return ctxMeta
-    const chatId = ctxMeta.chatId
-    const threadIdOr0 = ctxMeta.threadIdOr0 || 0
-    const ctxKey = ctxMeta.ctxKey || ctxKeyFrom(chatId, threadIdOr0)
-    return {
-      ...ctxMeta,
-      threadIdOr0,
-      ctxKey,
-      locale: effectiveLocaleForContext(ctxKey, ctxMeta.detectedLocale || ctxMeta.locale),
-    }
-  }
-
-  function rememberTelegramLocale(ctxMeta) {
-    if (!ctxMeta?.ctxKey || !ctxMeta.detectedLocale) return ctxMetaWithLocale(ctxMeta)
-    store.noteTelegramLocale?.(ctxMeta.ctxKey, ctxMeta.detectedLocale)
-    return ctxMetaWithLocale(ctxMeta)
-  }
-
-  function localize(ctxMetaOrLocale, key, params) {
-    const locale = typeof ctxMetaOrLocale === "string" ? ctxMetaOrLocale : ctxMetaWithLocale(ctxMetaOrLocale)?.locale
-    return t(locale || config.i18n?.defaultLocale || "en", key, params)
-  }
-
-  function ctxMetaFromMessage(msg, from = msg?.from) {
-    const chatId = msg?.chat?.id
-    const chatType = msg?.chat?.type
-    const threadIdOr0 = threadIdOr0FromMessage(msg)
-    const ctxKey = ctxKeyFrom(chatId, threadIdOr0)
-    const detectedLocale = detectedLocaleFromTelegram(from || msg?.from)
-    return ctxMetaWithLocale({ chatId, chatType, threadIdOr0, ctxKey, detectedLocale })
-  }
-
-  function requestContextForCtxMeta(ctxMeta, binding) {
-    if (!ctxMeta) return {}
-    return {
-      chatId: ctxMeta.chatId,
-      chatType: ctxMeta.chatType,
-      threadIdOr0: ctxMeta.threadIdOr0,
-      ctxKey: ctxMeta.ctxKey,
-      ...(ctxMeta.locale ? { locale: ctxMeta.locale } : {}),
-      ...(binding?.projectAlias ? { projectAlias: binding.projectAlias } : {}),
-      ...(binding?.sessionId ? { sessionId: binding.sessionId } : {}),
-    }
-  }
-
-  function telegramUpdateContext(update) {
-    const eventType = update?.message ? "message" : update?.callback_query ? "callback" : "unknown"
-    const msg = update?.message || update?.callback_query?.message || null
-    const from = update?.message?.from || update?.callback_query?.from || null
-    const ctxMeta = msg ? ctxMetaFromMessage(msg, from) : null
-    const binding = ctxMeta?.ctxKey ? store.getBinding(ctxMeta.ctxKey) : null
-    return {
-      correlationId: createCorrelationId("tg", [update?.update_id, eventType]),
-      source: "telegram",
-      operation: eventType,
-      updateId: update?.update_id,
-      eventType,
-      ...requestContextForCtxMeta(ctxMeta, binding),
-    }
-  }
-
-  function runTelegramUpdateContext(update, fn) {
-    return runWithRequestContext(telegramUpdateContext(update), fn)
-  }
-
-  function isAllowedUser(from) {
-    const allowedUserId = config.telegram.allowedUserId
-    return from && typeof from.id === "number" && from.id === allowedUserId
-  }
-
-  async function sendToThread(ctxMeta, text, replyMarkup, options = {}) {
-    ctxMeta = ctxMetaWithLocale(ctxMeta)
-    if (!ctxMeta?.chatId) return
-    return withRequestContextFields(requestContextForCtxMeta(ctxMeta, store.getBinding(ctxMeta.ctxKey)), async () => {
-      try {
-        await tg.sendMessage(ctxMeta.chatId, text, replyMarkup, {
-          ...options,
-          message_thread_id: ctxMeta.threadIdOr0 || undefined,
-        })
-      } catch (err) {
-        throw normalizeBoundaryError(err, {
-          source: "telegram",
-          operation: "sendMessage",
-          method: "POST",
-          pathname: "/sendMessage",
-          ...(err?.isBoundaryError === true ? {} : { outcome: "retryable" }),
-        })
-      }
-    })
-  }
-
-  async function sendBlocksToThread(ctxMeta, blocks, replyMarkup) {
-    ctxMeta = ctxMetaWithLocale(ctxMeta)
-    if (!ctxMeta?.chatId) return
-    return withRequestContextFields(requestContextForCtxMeta(ctxMeta, store.getBinding(ctxMeta.ctxKey)), async () => {
-      try {
-        await tg.sendHtmlBlocks(ctxMeta.chatId, blocks, replyMarkup, {
-          message_thread_id: ctxMeta.threadIdOr0 || undefined,
-        })
-      } catch (err) {
-        throw normalizeBoundaryError(err, {
-          source: "telegram",
-          operation: "sendHtmlBlocks",
-          method: "POST",
-          pathname: "/sendMessage",
-          ...(err?.isBoundaryError === true ? {} : { outcome: "retryable" }),
-        })
-      }
-    })
-  }
-
-  function parseCtxKey(key) {
-    const m = String(key).match(/^(-?\d+):(\d+)$/)
-    if (!m) return null
-    return { chatId: Number(m[1]), threadIdOr0: Number(m[2]), ctxKey: key }
-  }
-
-  function formatThreadLabel(threadIdOr0) {
-    return threadIdOr0 ? `topic ${threadIdOr0}` : "main"
-  }
-
   async function deliverPendingRuntimeOnlineNotice() {
     const notice = store.getPendingRuntimeOnlineNotice?.()
     if (notice?.kind !== "restart" || !Number.isInteger(notice.chatId)) return
@@ -1093,181 +779,16 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     })
   }
 
-  function getBoundCtxForSession(projectAlias, sessionId) {
-    if (!projectAlias || !sessionId) return null
-    const route = store.get().sessionIndex?.[sessionKey(projectAlias, sessionId)]
-    if (!route) return null
-    const ctxKey = ctxKeyFrom(route.chatId, route.threadIdOr0)
-    const binding = store.getBinding(ctxKey)
-    if (binding?.projectAlias !== projectAlias || binding?.sessionId !== sessionId) return null
-    return ctxMetaWithLocale({ chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey })
-  }
-
-  function parseBoundCtxKey(ctxKey) {
-    const match = String(ctxKey || "").match(/^(-?\d+):(\d+)$/)
-    if (!match) return null
-    return ctxMetaWithLocale({ chatId: Number(match[1]), threadIdOr0: Number(match[2]), ctxKey: String(ctxKey) })
-  }
-
-  function primeTuiActiveSessionFollow(projectAlias, ctxMeta, sessionId, options = {}) {
-    if (!projectAlias || !ctxMeta?.ctxKey || !sessionId) return
-    const pendingTargetSessionId =
-      typeof options?.pendingTargetSessionId === "string" && options.pendingTargetSessionId.trim() ? options.pendingTargetSessionId.trim() : null
-    tuiActiveSessionStateByProject.set(projectAlias, {
-      currentSessionId: sessionId,
-      followCtxKey: ctxMeta.ctxKey,
-      ...(pendingTargetSessionId ? { pendingTargetSessionId } : {}),
-    })
-  }
-
-  async function syncProjectTuiActiveSession(projectAlias) {
-    if (tuiActiveSessionUnsupportedProjects.has(projectAlias)) return
-    const oc = ocByAlias[projectAlias]
-    if (!oc?.getActiveTuiSession) return
-
-    let activeSession = null
-    try {
-      activeSession = await oc.getActiveTuiSession({ timeoutMs: 2500, signal: abortController.signal })
-    } catch (err) {
-      const classification = classifyBoundaryError(err, {
-        source: "opencode",
-        operation: "GET /tui/active-session",
-        method: "GET",
-        pathname: "/tui/active-session",
-      })
-      if (classification.status === 404) {
-        tuiActiveSessionUnsupportedProjects.add(projectAlias)
-        logger.info(`[${projectAlias}] /tui/active-session is unavailable; disabling TUI session sync.`)
-      }
-      return
-    }
-
-    const activeSessionId = typeof activeSession?.id === "string" && activeSession.id.trim() ? activeSession.id.trim() : null
-    let previous = tuiActiveSessionStateByProject.get(projectAlias)
-    if (!previous) {
-      const activeCtx = activeSessionId ? getBoundCtxForSession(projectAlias, activeSessionId) : null
-      tuiActiveSessionStateByProject.set(projectAlias, {
-        currentSessionId: activeSessionId,
-        followCtxKey: activeCtx?.ctxKey || null,
-      })
-      return
-    }
-
-    const pendingTargetSessionId =
-      typeof previous.pendingTargetSessionId === "string" && previous.pendingTargetSessionId.trim() ? previous.pendingTargetSessionId.trim() : null
-    if (pendingTargetSessionId) {
-      const followCtxKey = previous.followCtxKey || getBoundCtxForSession(projectAlias, pendingTargetSessionId)?.ctxKey || null
-      const followBinding = followCtxKey ? store.getBinding(followCtxKey) : null
-      if (followBinding?.projectAlias === projectAlias && followBinding.sessionId === pendingTargetSessionId) {
-        if (activeSessionId === pendingTargetSessionId) {
-          tuiActiveSessionStateByProject.set(projectAlias, {
-            currentSessionId: activeSessionId,
-            followCtxKey,
-          })
-          logger.info(`[${projectAlias}] confirmed pending TUI switch to session: ${activeSessionId}`)
-          return
-        }
-        if (!activeSessionId || activeSessionId === previous.currentSessionId) {
-          tuiActiveSessionStateByProject.set(projectAlias, {
-            currentSessionId: previous.currentSessionId,
-            followCtxKey,
-            pendingTargetSessionId,
-          })
-          return
-        }
-      } else {
-        tuiActiveSessionStateByProject.set(projectAlias, {
-          currentSessionId: previous.currentSessionId,
-          followCtxKey: previous.followCtxKey || null,
-        })
-        previous = tuiActiveSessionStateByProject.get(projectAlias)
-      }
-    }
-
-    if (previous.currentSessionId === activeSessionId) {
-      if (!previous.followCtxKey && activeSessionId) {
-        const activeCtx = getBoundCtxForSession(projectAlias, activeSessionId)
-        if (activeCtx?.ctxKey) {
-          tuiActiveSessionStateByProject.set(projectAlias, {
-            currentSessionId: activeSessionId,
-            followCtxKey: activeCtx.ctxKey,
-          })
-        }
-      }
-      return
-    }
-
-    const followCtxKey = previous.followCtxKey || getBoundCtxForSession(projectAlias, previous.currentSessionId)?.ctxKey || null
-    if (!activeSessionId) {
-      tuiActiveSessionStateByProject.set(projectAlias, {
-        currentSessionId: null,
-        followCtxKey,
-      })
-      return
-    }
-
-    const targetCtx = getBoundCtxForSession(projectAlias, activeSessionId)
-    if (!followCtxKey) {
-      tuiActiveSessionStateByProject.set(projectAlias, {
-        currentSessionId: activeSessionId,
-        followCtxKey: targetCtx?.ctxKey || null,
-      })
-      return
-    }
-
-    const followBinding = store.getBinding(followCtxKey)
-    if (followBinding?.projectAlias !== projectAlias) {
-      tuiActiveSessionStateByProject.set(projectAlias, {
-        currentSessionId: activeSessionId,
-        followCtxKey: targetCtx?.ctxKey || null,
-      })
-      return
-    }
-
-    if (followBinding.sessionId === activeSessionId) {
-      tuiActiveSessionStateByProject.set(projectAlias, {
-        currentSessionId: activeSessionId,
-        followCtxKey,
-      })
-      return
-    }
-
-    const sourceCtx = parseBoundCtxKey(followCtxKey)
-    if (!sourceCtx) {
-      tuiActiveSessionStateByProject.set(projectAlias, {
-        currentSessionId: activeSessionId,
-        followCtxKey: targetCtx?.ctxKey || null,
-      })
-      return
-    }
-
-    if (targetCtx && targetCtx.ctxKey !== followCtxKey) {
-      tuiActiveSessionStateByProject.set(projectAlias, {
-        currentSessionId: activeSessionId,
-        followCtxKey,
-      })
-      logger.info(
-        `[${projectAlias}] active TUI session ${activeSessionId} is already bound to another Telegram context; skipping auto-switch from ${followBinding.sessionId}.`,
-      )
-      return
-    }
-
-    try {
-      await bindCtxToSession(sourceCtx, projectAlias, activeSessionId)
-      await flushCriticalState("persist TUI active session binding")
-    } catch (err) {
-      try {
-        store.setBinding(followCtxKey, followBinding, sourceCtx)
-      } catch {}
-      throw err
-    }
-    tuiActiveSessionStateByProject.set(projectAlias, {
-      currentSessionId: activeSessionId,
-      followCtxKey,
-    })
-    await sendToThread(sourceCtx, `TUI switched to session: ${activeSessionId}\nPrevious: ${followBinding.sessionId}`).catch(() => {})
-    logger.info(`[${projectAlias}] synced Telegram binding to active TUI session: ${followBinding.sessionId} -> ${activeSessionId}`)
-  }
+  const { primeTuiActiveSessionFollow, syncProjectTuiActiveSession } = createRuntimeTuiSync({
+    store,
+    ocByAlias,
+    abortSignal: abortController.signal,
+    logger,
+    ctxMetaWithLocale,
+    bindCtxToSession,
+    flushCriticalState,
+    sendToThread,
+  })
 
   async function resolveBoundRoute(projectAlias, sessionId) {
     const oc = ocByAlias[projectAlias]
@@ -1388,71 +909,12 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   })
   const { handleTelegramCallback } = callbackHandlers
 
-  function sseRequestContextFields(projectAlias, evt) {
-    const props = evt?.properties || {}
-    const part = props?.part || {}
-    const info = props?.info || {}
-    const sessionId = props.sessionID || props.sessionId || part.sessionID || part.sessionId || ""
-    const messageId = info.id || props.messageID || props.messageId || part.messageID || part.messageId || ""
-    return {
-      source: "opencode",
-      operation: "handle SSE event",
-      projectAlias,
-      eventType: evt?.type || "unknown",
-      ...(sessionId ? { sessionId } : {}),
-      ...(messageId ? { messageId } : {}),
-      ...(getRequestContext().correlationId ? {} : { correlationId: createCorrelationId("sse", [projectAlias, evt?.type || "event"]) }),
-    }
-  }
-
-  function sseEventDirectoryRoutingDecision(projectAlias, evt) {
-    const meta = getOpenCodeSseEventMeta(evt)
-    const eventDirectory = meta?.directory
-    const projectDirectory = projects?.[projectAlias]?.directory
-    if (meta?.requiresDirectoryRouting) {
-      if (!eventDirectory) return { matches: false, reason: "global_directory_missing" }
-      if (!projectDirectory) return { matches: false, reason: "project_directory_missing" }
-    }
-    if (eventDirectory && projectDirectory && !directoriesMatch(eventDirectory, projectDirectory)) {
-      return { matches: false, reason: "directory_mismatch" }
-    }
-    return { matches: true, reason: "matched" }
-  }
-
-  function sseEventPathFallback() {
-    return effectiveOpenCodeSseEventPath()
-  }
-
-  function sseErrorContext(err) {
-    const method = err?.method || "GET"
-    const pathname = err?.pathname || sseEventPathFallback()
-    return {
-      source: "opencode",
-      operation: err?.operation || `${method} ${pathname}`,
-      method,
-      pathname,
-    }
-  }
-
-  function makeSseProjectRoutingError(projectAlias, issue) {
-    const pathname = issue?.eventPath || sseEventPathFallback()
-    return makeBoundaryError({
-      source: "opencode",
-      operation: `GET ${pathname}`,
-      method: "GET",
-      pathname,
-      kind: "configuration",
-      outcome: "fatal",
-      message: `SSE disabled for project '${projectAlias}': ${pathname} requires project 'directory' for safe routing. Add 'directory' to connector.config.mjs or set OPENCODE_SSE_EVENT_PATH=/event for legacy opencode builds.`,
-    })
-  }
-
   async function onSseEvent({ projectAlias, evt }) {
     return runWithRequestContext(sseRequestContextFields(projectAlias, evt), async () => {
       const type = evt?.type
       const props = evt?.properties || {}
 
-      const directoryRouting = sseEventDirectoryRoutingDecision(projectAlias, evt)
+      const directoryRouting = sseEventDirectoryRoutingDecision(projects, projectAlias, evt)
       if (!directoryRouting.matches) {
         logSseDebug(projectAlias, props.sessionID || props.sessionId, `drop=${directoryRouting.reason}`)
         return false
@@ -1494,164 +956,20 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     })
   }
 
-  async function drainTelegramBacklogIfNeeded() {
-    if (store.get().updateOffset != null) return
-    logger.info("Draining Telegram backlog (first run)…")
-    let offset = 0
-    let backoff = 1000
-    while (true) {
-      if (abortController.signal.aborted) {
-        recordLoopAbort("backlogDrain", { reason: "connector stop" })
-        return
-      }
-      let pollRetryAfterMs = null
-      const updates = await tg
-        .getUpdates({ offset, timeout: 0, limit: 100, allowed_updates: ["message", "callback_query"], signal: abortController.signal })
-        .catch((err) => {
-          if (abortController.signal.aborted) return null
-          const classification = classifyBoundaryError(err, {
-            source: "telegram",
-            operation: "getUpdates",
-            method: "POST",
-            pathname: "/getUpdates",
-          })
-          pollRetryAfterMs = classification.retryAfterMs
-          logLoopIssue("backlogDrain", classification.error, {
-            retryable: classification.retryable,
-            source: "telegram",
-            operation: "getUpdates",
-            method: "POST",
-            pathname: "/getUpdates",
-          })
-          return null
-        })
-
-      if (abortController.signal.aborted) {
-        recordLoopAbort("backlogDrain", { reason: "connector stop" })
-        return
-      }
-      if (!Array.isArray(updates)) {
-        await sleepWithAbort(pollRetryAfterMs || backoff)
-        backoff = Math.min(30_000, backoff * 2)
-        continue
-      }
-
-      runtimeObservability.recordLoopSuccess("backlogDrain")
-      backoff = 1000
-      if (updates.length === 0) break
-      offset = updates[updates.length - 1].update_id + 1
-      await sleepWithAbort(200)
-    }
-    store.setUpdateOffset(offset)
-    await flushCriticalState("persist Telegram backlog offset")
-    logger.info("Telegram backlog drained. Starting from offset:", offset)
-  }
-
-  async function telegramLoop() {
-    await drainTelegramBacklogIfNeeded()
-    let backoff = 1000
-    while (!abortController.signal.aborted) {
-      let pollRetryAfterMs = null
-      const offset = store.get().updateOffset ?? 0
-      const updates = await tg
-        .getUpdates({ offset, timeout: 30, limit: 100, allowed_updates: ["message", "callback_query"], signal: abortController.signal })
-        .catch((err) => {
-          if (abortController.signal.aborted) return null
-          const classification = classifyBoundaryError(err, {
-            source: "telegram",
-            operation: "getUpdates",
-            method: "POST",
-            pathname: "/getUpdates",
-          })
-          pollRetryAfterMs = classification.retryAfterMs
-          logLoopIssue("telegramPoll", classification.error, {
-            retryable: classification.retryable,
-            source: "telegram",
-            operation: "getUpdates",
-            method: "POST",
-            pathname: "/getUpdates",
-          })
-          return null
-        })
-      if (abortController.signal.aborted) {
-        recordLoopAbort("telegramPoll", { reason: "connector stop" })
-        break
-      }
-      if (!Array.isArray(updates)) {
-        // Avoid a tight loop on network/API errors.
-        await sleepWithAbort(pollRetryAfterMs || backoff)
-        backoff = Math.min(30_000, backoff * 2)
-        continue
-      }
-      runtimeObservability.recordLoopSuccess("telegramPoll")
-      if (updates.length === 0) {
-        backoff = 1000
-        continue
-      }
-      backoff = 1000
-      for (const u of updates) {
-        let shouldAdvanceOffset = false
-        let retryDelayMs = 1000
-        const updateKey = telegramUpdateIdempotencyKey(u?.update_id)
-        if (updateKey && store.hasIdempotencyKey?.(updateKey)) {
-          store.setUpdateOffset(u.update_id + 1)
-          await flushCriticalState("persist replayed Telegram update offset")
-          continue
-        }
-        await runTelegramUpdateContext(u, async () => {
-          try {
-            if (u.message) await handleTelegramMessage(u.message, { updateId: u.update_id })
-            if (u.callback_query) await handleTelegramCallback(u.callback_query, { updateId: u.update_id })
-            shouldAdvanceOffset = true
-          } catch (err) {
-            const classification = classifyBoundaryError(err)
-            if (classification.retryable) {
-              retryDelayMs = classification.retryAfterMs || retryDelayMs
-              runtimeObservability.recordUpdateRetry()
-              logger.warn("Retryable update handler error", {
-                source: "telegram",
-                operation: u.message ? "message" : u.callback_query ? "callback" : "unknown",
-                updateId: u.update_id,
-                outcome: classification.outcome,
-                kind: classification.kind,
-                status: classification.status,
-                code: classification.code,
-                retryable: true,
-                error: classification.error.message,
-              })
-            } else {
-              runtimeObservability.recordUpdateSkip()
-              logger.error("Skipping non-retryable update", {
-                source: "telegram",
-                operation: u.message ? "message" : u.callback_query ? "callback" : "unknown",
-                updateId: u.update_id,
-                outcome: classification.outcome,
-                kind: classification.kind,
-                status: classification.status,
-                code: classification.code,
-                retryable: false,
-                error: classification.error.message,
-              })
-              shouldAdvanceOffset = true
-            }
-          }
-        })
-
-        if (shouldAdvanceOffset) {
-          store.markIdempotencyKey?.(updateKey, {
-            kind: "telegram-update",
-            updateId: u.update_id,
-            operation: u.message ? "message" : u.callback_query ? "callback" : "unknown",
-          })
-          store.setUpdateOffset(u.update_id + 1)
-          await flushCriticalState("persist Telegram update checkpoint")
-        } else {
-          await sleepWithAbort(retryDelayMs)
-          break
-        }
-      }
-    }
-  }
+  const { telegramLoop } = createRuntimeTelegramLoop({
+    store,
+    tg,
+    logger,
+    abortController,
+    logLoopIssue,
+    recordLoopAbort,
+    sleepWithAbort,
+    flushCriticalState,
+    runTelegramUpdateContext,
+    handleTelegramMessage,
+    handleTelegramCallback,
+    runtimeObservability,
+  })
 
   if (recoverPendingPromptsOnStartup) {
     try {

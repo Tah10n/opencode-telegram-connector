@@ -23,9 +23,12 @@ npm run test:coverage
 
 - `src/cli.js` — CLI entrypoint, env/config loading, and process startup
 - `src/config/*` — `.env`, `connector.config.mjs`, and legacy `projects.json` loading/normalization
-- `src/index.js` — high-level orchestration for Telegram polling, SSE wiring, state, and shutdown
-- `src/connector/*` — command handlers, callback handlers, mirroring, prompt recovery, and overview notifications
-- `src/opencode/*` — HTTP client, SSE loop, startup-session resolution, and auto-start helpers
+- `src/index.js` — top-level composition for Telegram polling, SSE wiring, state, and shutdown; keep detailed runtime assembly in `src/runtime/service-wiring.js`
+- `src/runtime/*` — lifecycle tools, Telegram polling loop, request context, observability, health checks, and runtime service wiring
+- `src/connector/callbacks.js` and `src/connector/callbacks/*` — callback dispatch, shared callback context, and prompt-specific permission/question flows
+- `src/connector/mirroring.js` and `src/connector/mirroring/*` — assistant, TUI user, changed-file, feed, and agent-action mirroring
+- `src/opencode/*` — HTTP client, SSE loop, startup-session resolution, and cross-platform auto-start helpers
+- `src/opencode/launcher.js` and `src/opencode/launcher/*` — platform launcher facade plus Windows/POSIX launcher internals
 - `src/telegram/*` — Telegram API client, formatting, and routing-key helpers
 - `src/state/*` — persisted runtime state and file storage
 
@@ -43,6 +46,7 @@ npm run test:coverage
 - Telegram HTML output must remain valid when split into multiple messages.
 - Keep SSE retryable disconnects and fatal protocol/size failures distinct. The default opencode event source is `/global/event`; preserve payload unwrapping, fail-closed directory metadata checks for global events, and the `OPENCODE_SSE_EVENT_PATH=/event` legacy override.
 - Encode dynamic OpenCode URL path segments and validate persisted/user-entered session IDs before routing.
+- `npm run check` includes `scripts/verify-architecture.mjs`. If a change intentionally moves a facade boundary or grows an entry file, update that guard in the same change and keep the new boundary explicit.
 
 ## Pull requests
 
