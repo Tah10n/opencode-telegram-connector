@@ -2,16 +2,17 @@ import { classifyBoundaryError, makeBoundaryError } from "../boundary-errors.js"
 import { requireSafeOpenCodeId } from "../opencode/ids.js"
 import { makeInlineKeyboard } from "../telegram/client.js"
 import { callbackPacker, decodeCallbackData, legacyCallbackPrefix } from "./callback-data.js"
-import { localeDisplayName, matchSupportedLocale, t as translate } from "../i18n/index.js"
-import { languageSettingsView, supportedLocaleSummary } from "./language-ui.js"
+import { t as translate } from "../i18n/index.js"
 import { getRequestContext } from "../runtime/request-context.js"
 import { CALLBACK_TOAST_KEYS, callbackToast, localizeCallbackToast } from "./callback-toast.js"
 import { handleAttachmentCallback } from "./callbacks/attachment.js"
 import { handleChangedFilesCallback } from "./callbacks/changed-files.js"
 import { handleFeedCallback } from "./callbacks/feed.js"
+import { handleLanguageCallback } from "./callbacks/language.js"
 import { handleModelCallback } from "./callbacks/model.js"
 import { handlePermissionCallback } from "./callbacks/permission.js"
 import { handleQuestionCallback } from "./callbacks/question.js"
+import { handleRuntimeCallback } from "./callbacks/runtime.js"
 import { handleSessionCallback } from "./callbacks/session.js"
 
 export { CALLBACK_TOAST_KEYS, callbackToast, localizeCallbackToast }
@@ -253,29 +254,6 @@ export function createCallbackHandlers(runtime) {
     ])
   }
 
-  function runtimeCloseKeyboard(locale = "en") {
-    return makeInlineKeyboard([[{ text: t(locale, "common.close"), callback_data: packCallbackData("rt", "close") }]])
-  }
-
-  function runtimeConfirmationKeyboard(action, locale = "en") {
-    const label = action === "restart" ? t(locale, "callbacks.confirmRestart") : t(locale, "callbacks.confirmStop")
-    return makeInlineKeyboard([
-      [{ text: label, callback_data: packCallbackData("rt", action) }],
-      [{ text: t(locale, "common.cancel"), callback_data: packCallbackData("rt", "cancel") }],
-    ])
-  }
-
-  function runtimeConfirmationText(action, ctxMeta) {
-    if (action === "restart") {
-      return t(ctxMeta, "callbacks.runtimeConfirmRestart")
-    }
-    return t(ctxMeta, "callbacks.runtimeConfirmStop")
-  }
-
-  function canRequestRuntimeShutdown() {
-    return typeof requestRuntimeShutdown === "function"
-  }
-
   function recordLegacyCallback(prefix, projectAlias) {
     if (!prefix) return
     try {
@@ -290,33 +268,6 @@ export function createCallbackHandlers(runtime) {
       })
     } catch (err) {
       runtime.logger?.error?.("Legacy callback fallback recorder failed:", err?.message || String(err))
-    }
-  }
-
-  function requestRuntimeShutdownSoon(action) {
-    const run = () =>
-      Promise.resolve(requestRuntimeShutdown({ action })).catch((err) => {
-        runtime.logger?.error?.("Runtime shutdown request failed:", err?.message || String(err))
-      })
-    try {
-      if (typeof scheduleRuntimeShutdown === "function") {
-        scheduleRuntimeShutdown(run)
-        return
-      }
-      const timer = setTimeout(run, 50)
-      timer.unref?.()
-    } catch (err) {
-      runtime.logger?.error?.("Failed to schedule runtime shutdown request:", err?.message || String(err))
-    }
-  }
-
-  async function persistRuntimeRestartNotice(ctxMeta) {
-    if (typeof store?.setPendingRuntimeOnlineNotice !== "function") return
-    try {
-      store.setPendingRuntimeOnlineNotice({ kind: "restart", chatId: ctxMeta.chatId, createdAt: Date.now() })
-      await flushStoreIfAvailable()
-    } catch (err) {
-      runtime.logger?.error?.("Failed to persist runtime restart notice:", err?.message || String(err))
     }
   }
 
@@ -343,85 +294,42 @@ export function createCallbackHandlers(runtime) {
 
     try {
       if (kind === "lang") {
-        const action = parts[1]
-        if (action === "close") {
-          await closeInteractiveMessage(callbackQuery.id, ctxMeta, msg?.message_id)
-          return
-        }
-        if (action === "reset") {
-          store.clearLocale?.(ctxMeta.ctxKey)
-          await flushStoreIfAvailable()
-          ctxMeta = ctxMetaWithLocale?.({ ...ctxMeta, locale: "" }) || { ...ctxMeta, locale: "" }
-          const view = languageSettingsView(ctxMeta, { store, config, packCallback: packCallbackData, t })
-          await answerCallbackQuery(callbackQuery.id, t(ctxMeta, "language.reset"))
-          if (msg?.message_id && typeof tg.editMessageText === "function") {
-            await tg.editMessageText(ctxMeta.chatId, msg.message_id, view.text, view.replyMarkup).catch(ignoreError)
-          }
-          return
-        }
-        if (action === "set") {
-          const locale = matchSupportedLocale(parts[2], config?.i18n?.supportedLocales)
-          if (!locale) {
-            await answerCallbackQuery(
-              callbackQuery.id,
-              t(ctxMeta, "language.unsupported", { locale: parts[2] || "", supported: supportedLocaleSummary({ config, displayLocale: ctxMeta.locale }) }),
-            )
-            return
-          }
-          store.setLocale?.(ctxMeta.ctxKey, locale, { source: "manual" })
-          await flushStoreIfAvailable()
-          ctxMeta = ctxMetaWithLocale?.(ctxMeta) || { ...ctxMeta, locale }
-          const view = languageSettingsView(ctxMeta, { store, config, packCallback: packCallbackData, t })
-          await answerCallbackQuery(callbackQuery.id, t(ctxMeta, "language.changed", { language: localeDisplayName(locale, locale) }))
-          if (msg?.message_id && typeof tg.editMessageText === "function") {
-            await tg.editMessageText(ctxMeta.chatId, msg.message_id, view.text, view.replyMarkup).catch(ignoreError)
-          }
-          return
-        }
-        await answerCallbackQuery(callbackQuery.id, "Invalid")
+        await handleLanguageCallback({
+          parts,
+          callbackQuery,
+          ctxMeta,
+          msg,
+          store,
+          config,
+          tg,
+          answerCallbackQuery,
+          closeInteractiveMessage,
+          flushStoreIfAvailable,
+          ctxMetaWithLocale,
+          packCallbackData,
+          t,
+        })
         return
       }
 
       if (kind === "rt") {
-        const action = parts[1]
-        if (ctxMeta?.chatType !== "private") {
-          await answerCallbackQuery(callbackQuery.id, "Private chat only")
-          return
-        }
-        if (action === "close") {
-          await closeInteractiveMessage(callbackQuery.id, ctxMeta, msg?.message_id)
-          return
-        }
-        if (action === "cancel") {
-          await answerCallbackQuery(callbackQuery.id, "Cancelled")
-          await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-          return
-        }
-        if (action === "confirm-stop" || action === "confirm-restart") {
-          const targetAction = action === "confirm-restart" ? "restart" : "stop"
-          await answerCallbackQuery(callbackQuery.id, targetAction === "restart" ? "Confirm restart" : "Confirm stop")
-          if (msg?.message_id && typeof tg.editMessageText === "function") {
-            await tg
-              .editMessageText(ctxMeta.chatId, msg.message_id, runtimeConfirmationText(targetAction, ctxMeta), runtimeConfirmationKeyboard(targetAction, ctxMeta.locale))
-              .catch(ignoreError)
-          }
-          return
-        }
-        if (action === "stop" || action === "restart") {
-          if (!canRequestRuntimeShutdown()) {
-            await answerCallbackQuery(callbackQuery.id, "Unavailable")
-            if (msg?.message_id && typeof tg.editMessageText === "function") {
-              await tg.editMessageText(ctxMeta.chatId, msg.message_id, t(ctxMeta, "callbacks.runtimeShutdownUnavailable"), runtimeCloseKeyboard(ctxMeta.locale)).catch(ignoreError)
-            }
-            return
-          }
-          await answerCallbackQuery(callbackQuery.id, action === "restart" ? "Restarting…" : "Stopping…")
-          await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-          if (action === "restart") await persistRuntimeRestartNotice(ctxMeta)
-          requestRuntimeShutdownSoon(action)
-          return
-        }
-        await answerCallbackQuery(callbackQuery.id, "Invalid")
+        await handleRuntimeCallback({
+          parts,
+          callbackQuery,
+          ctxMeta,
+          msg,
+          tg,
+          store,
+          runtime,
+          answerCallbackQuery,
+          closeInteractiveMessage,
+          deleteInteractiveMessage,
+          flushStoreIfAvailable,
+          requestRuntimeShutdown,
+          scheduleRuntimeShutdown,
+          packCallbackData,
+          t,
+        })
         return
       }
 
