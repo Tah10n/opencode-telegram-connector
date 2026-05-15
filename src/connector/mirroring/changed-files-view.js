@@ -1,6 +1,5 @@
-import { extractPatchFileEntries } from "../../message-display.js"
-import { makeInlineKeyboard } from "../../telegram/client.js"
-import { ATTACHMENT_NOTICES, attachmentCaption, sanitizeFilenamePart } from "../attachment-utils.js"
+import { ATTACHMENT_NOTICES, attachmentCaption } from "../attachment-utils.js"
+import { sendChangedFilesExport } from "./changed-files-export.js"
 import {
   changedFilesAttachmentName as formatChangedFilesAttachmentName,
   extractChangedFilesSummary as formatChangedFilesSummary,
@@ -9,6 +8,7 @@ import {
   renderChangedFilesDiffHtml,
   renderSelectedFileDiffHtml,
 } from "./changed-files-format.js"
+import { createChangedFilesKeyboards } from "./changed-files-keyboards.js"
 
 export function createChangedFilesView({
   store,
@@ -28,46 +28,21 @@ export function createChangedFilesView({
     return formatChangedFilesAttachmentName(projectAlias, sessionId, messageId, { label, fileName, extension })
   }
 
-  function changedFilesSummaryKeyboard(projectAlias, sessionId, messageId, msg) {
-    const fileEntries = extractPatchFileEntries(msg).filter((entry) => entry.diff)
-    const canLoadFileDiffs = fileEntries.length > 0 || !!msg?.info?.parentID
-    const rows = [
-      [{ text: "Show diff", callback_data: packCallback("cf", projectAlias, sessionId, messageId, "show") }],
-      [
-        { text: "Send summary", callback_data: packCallback("cf", projectAlias, sessionId, messageId, "summary") },
-        { text: "Full .patch", callback_data: packCallback("cf", projectAlias, sessionId, messageId, "patch") },
-      ],
-    ]
-    if (canLoadFileDiffs) rows.push([{ text: "File diffs", callback_data: packCallback("cf", projectAlias, sessionId, messageId, "files") }])
-    rows.push([{ text: "Close", callback_data: packCallback("cf", "close") }])
-    return makeInlineKeyboard(rows)
-  }
+  const {
+    changedFilesSummaryKeyboard,
+    changedFilesDiffKeyboard,
+    changedFilesListKeyboard,
+    changedFilesCloseKeyboard,
+  } = createChangedFilesKeyboards({ packCallback, changedFilesLimit })
 
-  function changedFilesDiffKeyboard(projectAlias, sessionId, messageId, { fileIndex = null } = {}) {
-    const rows = [[{ text: "Back", callback_data: packCallback("cf", projectAlias, sessionId, messageId, "back") }]]
-    if (Number.isInteger(fileIndex)) {
-      rows.push([{ text: "Send file .patch", callback_data: packCallback("cf", projectAlias, sessionId, messageId, "filepatch", fileIndex) }])
-    }
-    rows.push([{ text: "Full .patch", callback_data: packCallback("cf", projectAlias, sessionId, messageId, "patch") }])
-    rows.push([{ text: "Close", callback_data: packCallback("cf", "close") }])
-    return makeInlineKeyboard(rows)
-  }
-
-  function changedFilesListKeyboard(projectAlias, sessionId, messageId, entries) {
-    const rows = entries.slice(0, changedFilesLimit).map((entry, index) => [{
-      text: `${index + 1}. ${sanitizeFilenamePart(entry.file, "file")}`.slice(0, 64),
-      callback_data: packCallback("cf", projectAlias, sessionId, messageId, "file", index),
-    }])
-    rows.push([
-      { text: "Back", callback_data: packCallback("cf", projectAlias, sessionId, messageId, "back") },
-      { text: "Full .patch", callback_data: packCallback("cf", projectAlias, sessionId, messageId, "patch") },
-    ])
-    rows.push([{ text: "Close", callback_data: packCallback("cf", "close") }])
-    return makeInlineKeyboard(rows)
-  }
-
-  function changedFilesCloseKeyboard() {
-    return makeInlineKeyboard([[{ text: "Close", callback_data: packCallback("cf", "close") }]])
+  function sendExport(options) {
+    return sendChangedFilesExport({
+      claimChangedFilesExport,
+      markChangedFilesExportSent,
+      releaseChangedFilesExport,
+      tg,
+      ...options,
+    })
   }
 
   function extractChangedFilesSummary(projectAlias, msg) {
@@ -124,20 +99,16 @@ export function createChangedFilesView({
         await tg.editMessageText(ctxMeta.chatId, editMessageId, "Changed files summary is unavailable.", changedFilesSummaryKeyboard(projectAlias, sessionId, messageId, msg)).catch(() => {})
         return
       }
-      const claim = await claimChangedFilesExport(projectAlias, sessionId, messageId, action)
-      if (!claim.claimed) return
-      try {
-        await tg.sendDocument(
-          ctxMeta.chatId,
-          summary,
-          changedFilesAttachmentName(projectAlias, sessionId, messageId, { label: "changed-files-summary", extension: ".txt" }),
-          attachmentCaption("changed-files-summary", { projectAlias, sessionId }),
-          { message_thread_id: ctxMeta.threadIdOr0 || undefined },
-        )
-        await markChangedFilesExportSent(claim.key, { projectAlias, sessionId, action })
-      } finally {
-        releaseChangedFilesExport(claim.key)
-      }
+      await sendExport({
+        ctxMeta,
+        projectAlias,
+        sessionId,
+        messageId,
+        action,
+        content: summary,
+        filename: changedFilesAttachmentName(projectAlias, sessionId, messageId, { label: "changed-files-summary", extension: ".txt" }),
+        caption: attachmentCaption("changed-files-summary", { projectAlias, sessionId }),
+      })
       return
     }
 
@@ -148,20 +119,16 @@ export function createChangedFilesView({
         await tg.editMessageText(ctxMeta.chatId, editMessageId, "Diff unavailable for this update.", changedFilesDiffKeyboard(projectAlias, sessionId, messageId)).catch(() => {})
         return
       }
-      const claim = await claimChangedFilesExport(projectAlias, sessionId, messageId, action)
-      if (!claim.claimed) return
-      try {
-        await tg.sendDocument(
-          ctxMeta.chatId,
-          diffText,
-          changedFilesAttachmentName(projectAlias, sessionId, messageId, { label: "changed-files", extension: ".patch" }),
-          attachmentCaption("changed-files-patch", { projectAlias, sessionId }),
-          { message_thread_id: ctxMeta.threadIdOr0 || undefined },
-        )
-        await markChangedFilesExportSent(claim.key, { projectAlias, sessionId, action })
-      } finally {
-        releaseChangedFilesExport(claim.key)
-      }
+      await sendExport({
+        ctxMeta,
+        projectAlias,
+        sessionId,
+        messageId,
+        action,
+        content: diffText,
+        filename: changedFilesAttachmentName(projectAlias, sessionId, messageId, { label: "changed-files", extension: ".patch" }),
+        caption: attachmentCaption("changed-files-patch", { projectAlias, sessionId }),
+      })
       return
     }
 
@@ -182,20 +149,17 @@ export function createChangedFilesView({
         return
       }
       if (action === "filepatch") {
-        const claim = await claimChangedFilesExport(projectAlias, sessionId, messageId, action, String(fileIndex))
-        if (!claim.claimed) return
-        try {
-          await tg.sendDocument(
-            ctxMeta.chatId,
-            entry.diff,
-            changedFilesAttachmentName(projectAlias, sessionId, messageId, { label: "file-diff", extension: ".patch", fileName: entry.file }),
-            attachmentCaption("changed-files-patch", { projectAlias, sessionId, fileName: entry.file }),
-            { message_thread_id: ctxMeta.threadIdOr0 || undefined },
-          )
-          await markChangedFilesExportSent(claim.key, { projectAlias, sessionId, action })
-        } finally {
-          releaseChangedFilesExport(claim.key)
-        }
+        await sendExport({
+          ctxMeta,
+          projectAlias,
+          sessionId,
+          messageId,
+          action,
+          actionArg: String(fileIndex),
+          content: entry.diff,
+          filename: changedFilesAttachmentName(projectAlias, sessionId, messageId, { label: "file-diff", extension: ".patch", fileName: entry.file }),
+          caption: attachmentCaption("changed-files-patch", { projectAlias, sessionId, fileName: entry.file }),
+        })
         return
       }
 
@@ -207,21 +171,18 @@ export function createChangedFilesView({
           ATTACHMENT_NOTICES.diffTooLong,
           changedFilesDiffKeyboard(projectAlias, sessionId, messageId, { fileIndex }),
         )
-        const claim = await claimChangedFilesExport(projectAlias, sessionId, messageId, "file-large", String(fileIndex))
-        if (!claim.claimed) return
-        try {
-          await tg.sendDocument(
-            ctxMeta.chatId,
-            entry.diff,
-            changedFilesAttachmentName(projectAlias, sessionId, messageId, { label: "file-diff", extension: ".patch", fileName: entry.file }),
-            attachmentCaption("changed-files-patch", { projectAlias, sessionId, fileName: entry.file }),
-            { message_thread_id: ctxMeta.threadIdOr0 || undefined },
-          )
-          recordAttachmentFallback?.(projectAlias, "changed-file-diff-too-long")
-          await markChangedFilesExportSent(claim.key, { projectAlias, sessionId, action: "file-large" })
-        } finally {
-          releaseChangedFilesExport(claim.key)
-        }
+        await sendExport({
+          ctxMeta,
+          projectAlias,
+          sessionId,
+          messageId,
+          action: "file-large",
+          actionArg: String(fileIndex),
+          content: entry.diff,
+          filename: changedFilesAttachmentName(projectAlias, sessionId, messageId, { label: "file-diff", extension: ".patch", fileName: entry.file }),
+          caption: attachmentCaption("changed-files-patch", { projectAlias, sessionId, fileName: entry.file }),
+          onSent: () => recordAttachmentFallback?.(projectAlias, "changed-file-diff-too-long"),
+        })
         return
       }
 
@@ -250,21 +211,17 @@ export function createChangedFilesView({
         ATTACHMENT_NOTICES.diffTooLong,
         changedFilesDiffKeyboard(projectAlias, sessionId, messageId),
       )
-      const claim = await claimChangedFilesExport(projectAlias, sessionId, messageId, "show-large")
-      if (!claim.claimed) return
-      try {
-        await tg.sendDocument(
-          ctxMeta.chatId,
-          diffText,
-          changedFilesAttachmentName(projectAlias, sessionId, messageId, { label: "changed-files", extension: ".patch" }),
-          attachmentCaption("changed-files-patch", { projectAlias, sessionId }),
-          { message_thread_id: ctxMeta.threadIdOr0 || undefined },
-        )
-        recordAttachmentFallback?.(projectAlias, "changed-files-diff-too-long")
-        await markChangedFilesExportSent(claim.key, { projectAlias, sessionId, action: "show-large" })
-      } finally {
-        releaseChangedFilesExport(claim.key)
-      }
+      await sendExport({
+        ctxMeta,
+        projectAlias,
+        sessionId,
+        messageId,
+        action: "show-large",
+        content: diffText,
+        filename: changedFilesAttachmentName(projectAlias, sessionId, messageId, { label: "changed-files", extension: ".patch" }),
+        caption: attachmentCaption("changed-files-patch", { projectAlias, sessionId }),
+        onSent: () => recordAttachmentFallback?.(projectAlias, "changed-files-diff-too-long"),
+      })
       return
     }
 
