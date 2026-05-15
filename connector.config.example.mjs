@@ -40,6 +40,11 @@ export default {
     textAttachmentThreshold: 12_000,
   },
 
+  // Optional auto-start watchdog tuning. Env fallbacks are also supported:
+  // OPENCODE_WATCHDOG_FAILURE_THRESHOLD, OPENCODE_WATCHDOG_WINDOW_MS,
+  // and OPENCODE_WATCHDOG_COOLDOWN_MS.
+  // opencodeWatchdog: { failureThreshold: 6, windowMs: 120_000, cooldownMs: 60_000 },
+
   // Keep only the projects you plan to use, then run:
   // npm run setup:check
   projects: {
