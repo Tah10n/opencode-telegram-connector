@@ -194,7 +194,7 @@ When opencode asks for a permission decision or a question answer, the connector
 
 ### OpenCode permission profiles
 
-`/permissions` writes the project's OpenCode `permission` config to `opencode.json` by default, or to `permissionConfigPath` when configured. If `opencode.jsonc` already exists next to the project directory, the connector reads and updates that file as strict JSON-compatible JSONC. Existing files are backed up as `opencode.json.backup.*` or `opencode.jsonc.backup.*` before changes.
+`/permissions` writes the project's OpenCode `permission` config to `opencode.json` by default for local project directories, or to `permissionConfigPath` when configured. If `opencode.jsonc` already exists next to a local project directory, the connector reads and updates that file as strict JSON-compatible JSONC. For remote projects whose `directory` is only used for SSE routing, set an explicit local `permissionConfigPath` or disable `permissionControl`. Existing files are backed up as `opencode.json.backup.*` or `opencode.jsonc.backup.*` before changes.
 
 The built-in profiles are shaped after Codex-style modes:
 
@@ -317,7 +317,7 @@ Prefer the `limits` object in `connector.config.mjs`; env fallbacks are availabl
   - `new-window` opens a fresh `opencode attach --session ...` window for the new session.
 - `username` / `password` or `usernameEnv` / `passwordEnv`
 - `displayName`
-- `permissionConfigPath` (optional; defaults to `<directory>/opencode.json`, or existing `<directory>/opencode.jsonc`, for `/permissions`)
+- `permissionConfigPath` (optional; defaults to local `<directory>/opencode.json`, or existing local `<directory>/opencode.jsonc`, for `/permissions`)
 - `permissionControl` (optional boolean or `{ enabled, maxBackups }`; use `false` to disable Telegram-side permission switching for a project)
 
 ### CLI flags

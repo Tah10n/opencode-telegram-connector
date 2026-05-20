@@ -81,6 +81,33 @@ test("OpenCode permission config writer does not create a missing config on rese
   await assert.rejects(fs.readFile(path.join(dir, "opencode.json"), "utf8"), /ENOENT/)
 })
 
+test("OpenCode permission config does not infer local paths from foreign project directories", async () => {
+  const foreignDirectory = process.platform === "win32" ? "/srv/workspaces/app" : "C:/Workspaces/App"
+  const explicitConfigPath = path.join(await makeTempDir(), "opencode.remote.json")
+
+  assert.equal(await resolvePermissionConfigPath({ directory: foreignDirectory }), "")
+  assert.equal(await resolvePermissionConfigPath({ directory: foreignDirectory, permissionConfigPath: explicitConfigPath }), explicitConfigPath)
+  assert.equal((await readOpenCodePermissionConfig({ directory: foreignDirectory })).status, "unavailable")
+})
+
+test("OpenCode permission config reader reports invalid JSONC without overwriting it", async () => {
+  const dir = await makeTempDir()
+  const configPath = path.join(dir, "opencode.json")
+  await fs.writeFile(configPath, "{ invalid json", "utf8")
+
+  const readResult = await readOpenCodePermissionConfig({ directory: dir })
+
+  assert.equal(readResult.ok, false)
+  assert.equal(readResult.editable, false)
+  assert.equal(readResult.status, "invalid")
+  assert.match(readResult.error.message, /Failed to parse OpenCode config/)
+
+  const writeResult = await writeOpenCodePermissionProfile({ directory: dir }, "suggest")
+  assert.equal(writeResult.ok, false)
+  assert.equal(writeResult.status, "invalid")
+  assert.equal(await fs.readFile(configPath, "utf8"), "{ invalid json")
+})
+
 test("OpenCode permission config reader reports unavailable and disabled projects", async () => {
   assert.deepEqual(await readOpenCodePermissionConfig({ baseUrl: "http://127.0.0.1:4312" }), {
     ok: false,

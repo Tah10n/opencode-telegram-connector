@@ -37,6 +37,7 @@ function configStatusLabel(status, locale, t) {
     missing: "permissions.statusMissing",
     unavailable: "permissions.statusUnavailable",
     disabled: "permissions.statusDisabled",
+    invalid: "permissions.statusInvalid",
   }[status]
   return key ? t(locale, key) : status || "unknown"
 }
@@ -126,6 +127,7 @@ export function createPermissionCommandHandlers(deps) {
     if (!canWrite(ctxMeta)) lines.push(t(locale, "permissions.privateWriteOnly"))
     if (readResult?.status === "unavailable") lines.push(t(locale, "permissions.noConfigPath"))
     if (readResult?.status === "disabled") lines.push(t(locale, "permissions.disabled"))
+    if (readResult?.status === "invalid") lines.push(t(locale, "permissions.invalidConfig"))
     lines.push("", t(locale, "permissions.suggestDescription"))
     lines.push(t(locale, "permissions.autoEditDescription"))
     lines.push(t(locale, "permissions.fullAutoDescription"))

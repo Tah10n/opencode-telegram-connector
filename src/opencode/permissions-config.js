@@ -1,5 +1,6 @@
 import fs from "node:fs/promises"
 import path from "node:path"
+import { canonicalDirectoryPath } from "../directory-paths.js"
 import { createStateFileBackup, DEFAULT_STATE_BACKUP_MAX_FILES, writeJsonFileAtomic } from "../state/fileStore.js"
 import {
   detectPermissionProfile,
@@ -137,11 +138,19 @@ function permissionBackupMaxFiles(project) {
   return Number.isInteger(max) && max >= 0 ? max : DEFAULT_STATE_BACKUP_MAX_FILES
 }
 
+function isHostLocalDirectory(directory) {
+  const canonical = canonicalDirectoryPath(directory)
+  if (!canonical) return false
+  if (process.platform === "win32") return canonical.flavor === "windows-drive" || canonical.flavor === "windows-unc"
+  return canonical.flavor === "posix"
+}
+
 export async function resolvePermissionConfigPath(project, { fsImpl = fs } = {}) {
   const explicit = String(project?.permissionConfigPath || "").trim()
   if (explicit) return explicit
   const directory = String(project?.directory || "").trim()
   if (!directory) return ""
+  if (!isHostLocalDirectory(directory)) return ""
 
   const jsonPath = path.join(directory, "opencode.json")
   const jsoncPath = path.join(directory, "opencode.jsonc")
@@ -178,7 +187,22 @@ export async function readOpenCodePermissionConfig(project, { fsImpl = fs } = {}
     throw err
   }
 
-  const config = parseJsonc(text, filePath)
+  let config
+  try {
+    config = parseJsonc(text, filePath)
+  } catch (err) {
+    return {
+      ok: false,
+      editable: false,
+      exists: true,
+      status: "invalid",
+      filePath,
+      config: null,
+      permission: undefined,
+      profile: "custom",
+      error: err,
+    }
+  }
   const permission = config.permission
   return {
     ok: true,
