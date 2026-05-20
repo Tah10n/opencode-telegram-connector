@@ -174,6 +174,7 @@ In groups and forum topics, Telegram commands addressed to another bot are ignor
 
 - `/model`, `/model default`, `/model reset`, `/model <provider/model> [variant]` — show or change the model for the current thread.
 - `/feed` — choose mirrored updates for the current thread.
+- `/permissions`, `/permissions suggest`, `/permissions auto-edit`, `/permissions full-auto`, `/permissions reset` — show or change the OpenCode `permission` profile for the bound project. Profile changes are private-chat only; group/topic views are read-only. In a private chat, `/permissions <projectAlias> [profile]` can target a project without binding the chat first.
 - `/language`, `/language <en|ru>`, `/language reset` — show or change the bot UI language for the current thread.
 - `/status` — show the current binding, model, feed mode, whether the agent is running, SSE status, and base URL.
 - `/runtime` or `/health` — show compact connector runtime counters (**private chat only**): managed tasks, Telegram polling, backlog drain, update retry/skip counts, prompt polling, mirrored/skipped message counts, prompt delivery/answer counts, Telegram send/edit failures, attachment fallbacks, and shutdown state. The message includes **Restart**, **Stop**, and **Close** buttons. Restart and Stop always ask for confirmation first; after a supervised Restart, the bot sends a private-chat notice when the connector is online again.
@@ -190,6 +191,21 @@ In groups and forum topics, Telegram commands addressed to another bot are ignor
 ### Prompt requests
 
 When opencode asks for a permission decision or a question answer, the connector sends Telegram inline buttons in the bound thread. After a final action is accepted, the original prompt message is removed to keep the chat tidy. Multi-select question prompts stay visible while you toggle options and are removed only after you press **Done**.
+
+### OpenCode permission profiles
+
+`/permissions` writes the project's OpenCode `permission` config to `opencode.json` by default, or to `permissionConfigPath` when configured. If `opencode.jsonc` already exists next to the project directory, the connector reads and updates that file as strict JSON-compatible JSONC. Existing files are backed up as `opencode.json.backup.*` or `opencode.jsonc.backup.*` before changes.
+
+The built-in profiles are shaped after Codex-style modes:
+
+| Profile | Behavior |
+| --- | --- |
+| `suggest` | Read, list, glob, grep, LSP, and todo reads are allowed. Edits, shell commands, subagents, skills, todo writes, questions, network tools, external directories, and repeated identical tool loops ask first. |
+| `auto-edit` | `suggest` plus edits and todo writes are allowed. Shell commands, subagents, skills, questions, network tools, external directories, and repeated identical tool loops still ask first. |
+| `full-auto` | Reads/searches/edits/shell/subagents/skills are allowed. Web fetch/search/code search and external directories are denied; repeated identical tool loops ask first. |
+| `reset` | Removes the `permission` key and returns the project to OpenCode defaults. |
+
+OpenCode may need a restart for a running project to pick up file changes.
 
 ## Feed modes
 
@@ -301,6 +317,8 @@ Prefer the `limits` object in `connector.config.mjs`; env fallbacks are availabl
   - `new-window` opens a fresh `opencode attach --session ...` window for the new session.
 - `username` / `password` or `usernameEnv` / `passwordEnv`
 - `displayName`
+- `permissionConfigPath` (optional; defaults to `<directory>/opencode.json`, or existing `<directory>/opencode.jsonc`, for `/permissions`)
+- `permissionControl` (optional boolean or `{ enabled, maxBackups }`; use `false` to disable Telegram-side permission switching for a project)
 
 ### CLI flags
 
@@ -549,8 +567,9 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 7. If `healthServer.enabled` is on, confirm `/livez` returns `200` and `/readyz` returns `200` only after Telegram polling/state health are ready.
 8. In a group, confirm `/start@OtherBot` is ignored and `/start@<this bot username>` is handled.
 9. Answer an opencode permission or question prompt and confirm the handled prompt message is removed; for multi-select questions, confirm the message remains while toggling options and is removed after **Done**.
-10. If a normal Telegram prompt hits a retryable opencode failure, confirm it is retried and not marked handled until `prompt_async` succeeds.
-11. Send long formatted output and confirm Telegram chunks remain parseable HTML.
+10. In a private chat, use `/permissions <projectAlias> suggest`, confirm the OpenCode config backup/write, then reset with `/permissions <projectAlias> reset`.
+11. If a normal Telegram prompt hits a retryable opencode failure, confirm it is retried and not marked handled until `prompt_async` succeeds.
+12. Send long formatted output and confirm Telegram chunks remain parseable HTML.
 
 ## Troubleshooting matrix
 

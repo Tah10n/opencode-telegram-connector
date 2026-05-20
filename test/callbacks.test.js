@@ -20,6 +20,9 @@ test("localizeCallbackToast covers attachment and dynamic callback statuses", ()
     "Try again",
     "Download failed",
     "Sent",
+    "Permissions",
+    "Permissions changed",
+    "Permissions reset",
   ]) {
     assert.notEqual(localizeCallbackToast(text, "ru"), text)
   }
@@ -84,6 +87,7 @@ function makeRuntime(overrides = {}) {
   const feedCalls = []
   const changedFilesCalls = []
   const modelCalls = []
+  const permissionCalls = []
   const rejectStateCalls = []
   const customStateCalls = []
   const rejectedNotes = []
@@ -153,6 +157,18 @@ function makeRuntime(overrides = {}) {
     renderModelSettings: async (ctxMeta, options) => {
       modelCalls.push({ type: "render", ctxMeta, options })
     },
+    renderPermissionSettings: async (ctxMeta, options) => {
+      permissionCalls.push({ type: "render", ctxMeta, options })
+    },
+    renderPermissionDetails: async (ctxMeta, projectAlias, options) => {
+      permissionCalls.push({ type: "details", ctxMeta, projectAlias, options })
+    },
+    renderFullAutoConfirmation: async (ctxMeta, projectAlias, options) => {
+      permissionCalls.push({ type: "confirm", ctxMeta, projectAlias, options })
+    },
+    applyPermissionProfile: async (ctxMeta, projectAlias, profileId, options) => {
+      permissionCalls.push({ type: "apply", ctxMeta, projectAlias, profileId, options })
+    },
     setThreadModelPreference: async (ctxMeta, binding, value) => {
       if (!value || value.mode === "inherit") {
         modelCalls.push({ type: "clear", ctxKey: ctxMeta.ctxKey })
@@ -218,6 +234,7 @@ function makeRuntime(overrides = {}) {
     startCalls,
     feedCalls,
     modelCalls,
+    permissionCalls,
     changedFilesCalls,
     rejectStateCalls,
     customStateCalls,
@@ -761,6 +778,38 @@ test("createCallbackHandlers handles UX navigation callbacks", async () => {
   assert.equal(modelCalls.at(-1)?.type, "render")
   assert.equal(projectCalls.length, 1)
   assert.deepEqual(bindCommandCalls[0]?.argv, ["demo"])
+})
+
+test("createCallbackHandlers handles permissions control callbacks", async () => {
+  const { runtime, callbackAnswers, permissionCalls } = makeRuntime()
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("pc|project|demo", { chatType: "private", threadIdOr0: 0 }))
+  await handlers.handleTelegramCallback(makeCallback("pc|view|demo", { id: "cb_2", chatType: "private", threadIdOr0: 0 }))
+  await handlers.handleTelegramCallback(makeCallback("pc|set|demo|auto-edit", { id: "cb_3", chatType: "private", threadIdOr0: 0 }))
+  await handlers.handleTelegramCallback(makeCallback("pc|confirm|demo|full-auto", { id: "cb_4", chatType: "private", threadIdOr0: 0 }))
+
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Permissions", "Permissions", "Permissions changed", "Confirm"])
+  assert.deepEqual(permissionCalls, [
+    { type: "render", ctxMeta: { chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, options: { projectAlias: "demo", editMessageId: 900 } },
+    { type: "details", ctxMeta: { chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, projectAlias: "demo", options: { editMessageId: 900 } },
+    { type: "apply", ctxMeta: { chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, projectAlias: "demo", profileId: "auto-edit", options: { editMessageId: 900 } },
+    { type: "confirm", ctxMeta: { chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, projectAlias: "demo", options: { editMessageId: 900 } },
+  ])
+})
+
+test("createCallbackHandlers blocks permissions changes outside private chat", async () => {
+  const { runtime, callbackAnswers, permissionCalls } = makeRuntime()
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("pc|set|demo|auto-edit", { chatType: "supergroup", threadIdOr0: 7 }))
+  await handlers.handleTelegramCallback(makeCallback("pc|set|demo|full-auto", { id: "cb_2", chatType: "supergroup", threadIdOr0: 7 }))
+
+  assert.deepEqual(callbackAnswers, [
+    { callbackQueryId: "cb_1", text: "Private chat only" },
+    { callbackQueryId: "cb_2", text: "Private chat only" },
+  ])
+  assert.deepEqual(permissionCalls, [])
 })
 
 test("createCallbackHandlers reports unavailable project health with start action", async () => {

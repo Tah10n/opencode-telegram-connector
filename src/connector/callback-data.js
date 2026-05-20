@@ -1,6 +1,6 @@
 // @ts-check
 
-export const LEGACY_CALLBACK_PREFIXES = Object.freeze(["rt", "s", "srv", "b", "feed", "m", "cf", "att", "p", "q", "lang"])
+export const LEGACY_CALLBACK_PREFIXES = Object.freeze(["rt", "s", "srv", "b", "feed", "m", "pc", "cf", "att", "p", "q", "lang"])
 
 const LEGACY_CALLBACK_PREFIX_SET = new Set(LEGACY_CALLBACK_PREFIXES)
 

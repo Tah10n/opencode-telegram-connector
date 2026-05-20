@@ -7,6 +7,7 @@ import { createAttachmentHandlers } from "./commands/attachments.js"
 import { createLanguageCommandHandler } from "./commands/language.js"
 import { createModelCommandHandlers } from "./commands/model.js"
 import { createOperatorCommandHandlers } from "./commands/operator.js"
+import { createPermissionCommandHandlers } from "./commands/permissions.js"
 import { createSessionCommandHandlers } from "./commands/sessions.js"
 import { formatModelUiChoices, resolveModelProviderCatalog } from "./model-ui.js"
 import { unsupportedMediaKind, unsupportedMediaText } from "./incoming-attachments.js"
@@ -32,6 +33,7 @@ function helpText({ scopeLabel = "this thread", defaultProject = "", isBound = f
     t(locale, "commands.help.sessions"),
     t(locale, "commands.help.model"),
     t(locale, "commands.help.feed"),
+    t(locale, "commands.help.permissions"),
     t(locale, "commands.help.language"),
     t(locale, "commands.help.status"),
     t(locale, "commands.help.unbind"),
@@ -439,6 +441,25 @@ export function createCommandHandlers(runtime) {
     t,
   })
 
+  const {
+    applyPermissionProfile,
+    renderPermissionDetails,
+    renderPermissionSettings,
+    renderFullAutoConfirmation,
+    handlePermissionsCommand,
+  } = createPermissionCommandHandlers({
+    store,
+    projects,
+    sendToThread,
+    tg,
+    cb: runtime.cb,
+    unboundGuidanceText,
+    unboundGuidanceKeyboard,
+    readPermissionConfig: runtime.readPermissionConfig,
+    writePermissionProfile: runtime.writePermissionProfile,
+    t,
+  })
+
   async function handleFeed(ctxMeta, { editMessageId } = {}) {
     await renderFeedSettings(ctxMeta, { editMessageId })
   }
@@ -745,6 +766,11 @@ export function createCommandHandlers(runtime) {
         await markMessageHandled("feed")
         return
       }
+      if (cmd === "/permissions") {
+        await handlePermissionsCommand(ctxMeta, argv)
+        await markMessageHandled("permissions")
+        return
+      }
       if (cmd === "/language") {
         await handleLanguage(ctxMeta, argv)
         await markMessageHandled("language")
@@ -852,11 +878,15 @@ export function createCommandHandlers(runtime) {
   return {
     renderSessionsList,
     renderModelSettings,
+    renderPermissionDetails,
+    renderPermissionSettings,
+    renderFullAutoConfirmation,
     handleBindCommand,
     handleNewCommand,
     handleUseCommand,
     handleSessions,
     handleModelCommand,
+    handlePermissionsCommand,
     handleAbort,
     handleWhere,
     handleRuntime,
@@ -870,5 +900,6 @@ export function createCommandHandlers(runtime) {
     handleTelegramMessage,
     buildSessionSwitchText,
     setThreadModelPreference,
+    applyPermissionProfile,
   }
 }

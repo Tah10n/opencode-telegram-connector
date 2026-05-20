@@ -454,6 +454,119 @@ test("createCommandHandlers handleFeed delegates to feed renderer", async () => 
   assert.deepEqual(feedCalls, [{ ctxMeta: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, options: { editMessageId: 123 } }])
 })
 
+test("createCommandHandlers handlePermissions renders bound project read-only outside private chat", async () => {
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    readPermissionConfig: async () => ({
+      ok: true,
+      editable: true,
+      status: "ok",
+      filePath: "C:/repo/demo/opencode.json",
+      profile: "suggest",
+      permission: {},
+    }),
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" }, [])
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /OpenCode permissions:/)
+  assert.match(sent[0].text, /Project: demo/)
+  assert.match(sent[0].text, /Profile: Suggest/)
+  assert.match(sent[0].text, /read-only here/)
+  assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text), ["View current", "Close"])
+})
+
+test("createCommandHandlers handlePermissions applies non-dangerous profiles in private chat", async () => {
+  const writes = []
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    readPermissionConfig: async () => ({
+      ok: true,
+      editable: true,
+      status: "ok",
+      filePath: "C:/repo/demo/opencode.json",
+      profile: "auto-edit",
+      permission: {},
+    }),
+    writePermissionProfile: async (project, profileId) => {
+      writes.push({ project, profileId })
+      return { ok: true, profile: profileId, filePath: "C:/repo/demo/opencode.json" }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, ["auto-edit"])
+
+  assert.deepEqual(writes, [{ project: runtime.projects.demo, profileId: "auto-edit" }])
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Changed: permissions profile is now Auto Edit\./)
+  assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text), ["Suggest", "Auto Edit", "Full Auto", "OpenCode default", "View current", "Close"])
+})
+
+test("createCommandHandlers handlePermissions asks confirmation for full-auto", async () => {
+  const writes = []
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    writePermissionProfile: async (project, profileId) => {
+      writes.push({ project, profileId })
+      return { ok: true }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, ["full-auto"])
+
+  assert.deepEqual(writes, [])
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Confirm Full Auto permissions:/)
+  assert.deepEqual(callbackParts(sent[0].replyMarkup.inline_keyboard[0][0].callback_data), ["pc", "apply", "demo", "full-auto"])
+})
+
+test("createCommandHandlers handlePermissions shows project picker in unbound private chat", async () => {
+  const { runtime, sent } = makeRuntime({
+    projects: {
+      demo: { baseUrl: "http://127.0.0.1:4312" },
+      other: { baseUrl: "http://127.0.0.1:4313", displayName: "Other project" },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, [])
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Choose a project for permissions:/)
+  assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text), ["demo", "other (Other project)", "Close"])
+})
+
+test("createCommandHandlers handlePermissions does not target arbitrary projects from unbound groups", async () => {
+  let readCalls = 0
+  const { runtime, sent } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    readPermissionConfig: async () => {
+      readCalls += 1
+      return { ok: true, editable: true, status: "ok", profile: "suggest", permission: {} }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" }, ["demo"])
+
+  assert.equal(readCalls, 0)
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Permissions need a bound thread/)
+})
+
 test("createCommandHandlers handleBindings renders sorted bindings in private chat", async () => {
   const { runtime, sent } = makeRuntime({
     storeState: {

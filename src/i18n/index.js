@@ -15,6 +15,7 @@ export const BOT_COMMAND_NAMES = Object.freeze([
   "sessions",
   "model",
   "feed",
+  "permissions",
   "language",
   "status",
   "runtime",

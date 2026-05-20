@@ -105,6 +105,28 @@ test("loadProjectsConfig preserves foreign absolute project directories", async 
   assert.equal(projects.uncRemote.directory, "//Server/Share/App")
 })
 
+test("loadProjectsConfig resolves optional permission control config", async () => {
+  const projects = await loadProjectsConfig({
+    baseDir: path.join("workspace", "configs"),
+    projectsJson: JSON.stringify({
+      demo: {
+        baseUrl: "http://127.0.0.1:4312",
+        directory: "../repo",
+        permissionConfigPath: "./opencode.custom.json",
+        permissionControl: { enabled: true, maxBackups: 2 },
+      },
+      disabled: {
+        baseUrl: "http://127.0.0.1:4313",
+        permissionControl: false,
+      },
+    }),
+  })
+
+  assert.equal(projects.demo.permissionConfigPath, path.resolve(path.join("workspace", "configs"), "./opencode.custom.json"))
+  assert.deepEqual(projects.demo.permissionControl, { enabled: true, maxBackups: 2 })
+  assert.deepEqual(projects.disabled.permissionControl, { enabled: false })
+})
+
 test("loadProjectsConfig rejects baseUrl query strings and fragments", async () => {
   await assert.rejects(
     loadProjectsConfig({

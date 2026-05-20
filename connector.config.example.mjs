@@ -56,6 +56,10 @@ export default {
       serverLaunchMode: "background",
       openTuiOnAutoStart: true,
       openAttachOnNewMode: "new-window",
+      // Optional: /permissions edits this OpenCode config file.
+      // Defaults to <directory>/opencode.json, or existing opencode.jsonc.
+      // permissionConfigPath: "./project-a/opencode.json",
+      // permissionControl: { enabled: true, maxBackups: 5 },
     },
 
     remoteTeam: {

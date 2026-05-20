@@ -32,6 +32,25 @@ function readOptionalBoolean(value, { alias, fieldName, defaultValue }) {
   throw new Error(`Project '${alias}' ${fieldName} must be a boolean`)
 }
 
+function readOptionalNonNegativeInteger(value, { alias, fieldName, defaultValue }) {
+  if (value == null || value === "") return defaultValue
+  const n = Number(value)
+  if (!Number.isInteger(n) || n < 0) throw new Error(`Project '${alias}' ${fieldName} must be a non-negative integer`)
+  return n
+}
+
+function normalizeProjectPermissionControl(value, { alias }) {
+  if (typeof value === "boolean") return { enabled: value }
+  if (!isPlainObject(value)) throw new Error(`Project '${alias}' permissionControl must be a boolean or object`)
+  const out = {
+    enabled: readOptionalBoolean(value.enabled, { alias, fieldName: "permissionControl.enabled", defaultValue: true }),
+  }
+  if (value.maxBackups != null && value.maxBackups !== "") {
+    out.maxBackups = readOptionalNonNegativeInteger(value.maxBackups, { alias, fieldName: "permissionControl.maxBackups" })
+  }
+  return out
+}
+
 function validateProjectAlias(alias) {
   const trimmed = alias.trim()
   if (!trimmed) throw new Error("Project alias must not be empty")
@@ -103,7 +122,7 @@ export function normalizeProjectsConfig(raw, { baseDir, sourceLabel } = {}) {
     if (autoStart && !port) throw new Error(`Project '${alias}' autoStart requires 'port'`)
     const username = resolveAuthValue(cfg.username ?? "", cfg.usernameEnv)
     const password = resolveAuthValue(cfg.password ?? "", cfg.passwordEnv)
-    projects[alias] = {
+    const project = {
       baseUrl,
       directory,
       port,
@@ -115,6 +134,13 @@ export function normalizeProjectsConfig(raw, { baseDir, sourceLabel } = {}) {
       password: password ? String(password) : "",
       displayName: cfg.displayName ? String(cfg.displayName) : undefined,
     }
+    if (cfg.permissionConfigPath != null && cfg.permissionConfigPath !== "") {
+      project.permissionConfigPath = normalizeConfiguredDirectory(cfg.permissionConfigPath, { baseDir: resolvedBaseDir })
+    }
+    if (cfg.permissionControl != null) {
+      project.permissionControl = normalizeProjectPermissionControl(cfg.permissionControl, { alias })
+    }
+    projects[alias] = project
   }
   if (Object.keys(projects).length === 0) throw new Error(`${sourceLabel ? `${sourceLabel}: ` : ""}Projects config is empty`)
   return projects

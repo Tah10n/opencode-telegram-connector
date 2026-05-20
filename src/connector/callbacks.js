@@ -9,6 +9,7 @@ import { handleFeedCallback } from "./callbacks/feed.js"
 import { handleLanguageCallback } from "./callbacks/language.js"
 import { handleModelCallback } from "./callbacks/model.js"
 import { handlePermissionCallback } from "./callbacks/permission.js"
+import { handlePermissionsControlCallback } from "./callbacks/permissions-control.js"
 import { handleProjectCallback } from "./callbacks/project.js"
 import { handleQuestionCallback } from "./callbacks/question.js"
 import { handleRuntimeCallback } from "./callbacks/runtime.js"
@@ -40,6 +41,9 @@ export function createCallbackHandlers(runtime) {
     getStartupSession,
     renderFeedSettings,
     renderModelSettings,
+    renderPermissionDetails,
+    renderPermissionSettings,
+    renderFullAutoConfirmation,
     renderChangedFilesView,
     renderSessionsList,
     renderProjectSessions,
@@ -60,6 +64,7 @@ export function createCallbackHandlers(runtime) {
     finishQuestionWizard,
     buildSessionSwitchText = defaultBuildSessionSwitchText,
     setThreadModelPreference,
+    applyPermissionProfile,
     formatProjectUnavailable,
     canAutoStartProject,
     startServerKeyboard,
@@ -280,6 +285,22 @@ export function createCallbackHandlers(runtime) {
           commitStateMutation,
           renderModelSettings,
           setThreadModelPreference,
+        })
+        return
+      }
+
+      if (kind === "pc") {
+        await handlePermissionsControlCallback({
+          parts,
+          callbackQuery,
+          ctxMeta,
+          msg,
+          answerCallbackQuery,
+          closeInteractiveMessage,
+          renderPermissionSettings,
+          renderPermissionDetails,
+          renderFullAutoConfirmation,
+          applyPermissionProfile,
         })
         return
       }

@@ -31,6 +31,7 @@ export const CALLBACK_TOAST_KEYS = Object.freeze({
   "Action failed": "actionFailed",
   Feed: "feed",
   Model: "model",
+  Permissions: "permissions",
   Back: "back",
   "Pick model": "pickModel",
   "Model: inherit": "modelInherit",
@@ -60,6 +61,8 @@ export const CALLBACK_TOAST_KEYS = Object.freeze({
   "Out of date": "outOfDate",
   "Custom disabled": "customDisabled",
   "Send answer": "sendAnswer",
+  "Permissions changed": "permissionsChanged",
+  "Permissions reset": "permissionsReset",
 })
 
 const CALLBACK_TOAST_KIND = "callback-toast"
