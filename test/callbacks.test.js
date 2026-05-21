@@ -799,6 +799,23 @@ test("createCallbackHandlers handles permissions control callbacks", async () =>
   ])
 })
 
+test("createCallbackHandlers applies permissions reset callbacks in private chat", async () => {
+  const { runtime, callbackAnswers, permissionCalls } = makeRuntime({
+    applyPermissionProfile: async (ctxMeta, projectAlias, profileId, options) => {
+      permissionCalls.push({ type: "apply", ctxMeta, projectAlias, profileId, options })
+      return { ok: true }
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("pc|reset|demo", { chatType: "private", threadIdOr0: 0 }))
+
+  assert.deepEqual(callbackAnswers, [{ callbackQueryId: "cb_1", text: "Permissions reset" }])
+  assert.deepEqual(permissionCalls, [
+    { type: "apply", ctxMeta: { chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, projectAlias: "demo", profileId: "reset", options: { editMessageId: 900 } },
+  ])
+})
+
 test("createCallbackHandlers reports permission refresh failures after successful writes", async () => {
   const { runtime, callbackAnswers, permissionCalls } = makeRuntime({
     applyPermissionProfile: async (ctxMeta, projectAlias, profileId, options) => {

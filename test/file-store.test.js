@@ -147,6 +147,86 @@ test("writeJsonFileAtomic tolerates a missing target during Windows fallback rep
   assert.equal(files.size, 1)
 })
 
+test("writeJsonFileAtomic honors explicit file modes", async () => {
+  const filePath = "C:/tmp/state.json"
+  const files = new Map()
+  const modes = new Map()
+  const writeCalls = []
+  const chmodCalls = []
+  let tmpPath = null
+
+  const fsImpl = {
+    async mkdir() {},
+    async writeFile(targetPath, contents, options) {
+      files.set(targetPath, contents)
+      if (options && typeof options === "object" && "mode" in options) modes.set(targetPath, options.mode)
+      writeCalls.push({ targetPath, options })
+      if (targetPath !== filePath) tmpPath = targetPath
+    },
+    async chmod(targetPath, mode) {
+      modes.set(targetPath, mode)
+      chmodCalls.push({ targetPath, mode })
+    },
+    async rename(from, to) {
+      files.set(to, files.get(from))
+      modes.set(to, modes.get(from))
+      files.delete(from)
+      modes.delete(from)
+    },
+    async unlink(targetPath) {
+      files.delete(targetPath)
+      modes.delete(targetPath)
+    },
+  }
+
+  await writeJsonFileAtomic(filePath, { next: true }, { fsImpl, mode: 0o640 })
+
+  assert.deepEqual(writeCalls.map((call) => call.options), [{ encoding: "utf8", mode: 0o640 }])
+  assert.deepEqual(chmodCalls, [
+    { targetPath: tmpPath, mode: 0o640 },
+    { targetPath: filePath, mode: 0o640 },
+  ])
+  assert.equal(files.get(filePath), '{\n  "next": true\n}\n')
+  assert.equal(modes.get(filePath), 0o640)
+})
+
+test("writeJsonFileAtomic does not run Windows fallback when target chmod fails after rename", async () => {
+  const filePath = "C:/tmp/state.json"
+  const files = new Map([[filePath, '{"old":true}\n']])
+  const renameCalls = []
+  let tmpPath = null
+
+  const fsImpl = {
+    async mkdir() {},
+    async writeFile(targetPath, contents) {
+      files.set(targetPath, contents)
+      if (targetPath !== filePath) tmpPath = targetPath
+    },
+    async chmod(targetPath) {
+      if (targetPath === filePath) {
+        const err = new Error("target chmod denied")
+        err.code = "EACCES"
+        throw err
+      }
+    },
+    async rename(from, to) {
+      renameCalls.push({ from, to })
+      if (from !== tmpPath || to !== filePath) throw new Error(`Unexpected fallback rename: ${from} -> ${to}`)
+      files.set(to, files.get(from))
+      files.delete(from)
+    },
+    async unlink(targetPath) {
+      files.delete(targetPath)
+    },
+  }
+
+  await assert.rejects(() => writeJsonFileAtomic(filePath, { next: true }, { fsImpl, mode: 0o640 }), /target chmod denied/)
+
+  assert.deepEqual(renameCalls, [{ from: tmpPath, to: filePath }])
+  assert.equal(files.get(filePath), '{\n  "next": true\n}\n')
+  assert.equal(files.has(tmpPath), false)
+})
+
 test("readJsonFile returns null for missing files and surfaces parse errors", async () => {
   const dir = await makeTempDir()
   const missingPath = path.join(dir, "missing.json")
@@ -195,6 +275,49 @@ test("createStateFileBackup copies state files and rotates old backups", async (
   await assert.rejects(() => fs.readFile(backup1, "utf8"), /ENOENT/)
   const backups = (await fs.readdir(dir)).filter((name) => name.startsWith("state.json.backup."))
   assert.equal(backups.length, 2)
+})
+
+test("createStateFileBackup honors explicit file modes", async () => {
+  const filePath = "C:/tmp/state.json"
+  const files = new Map([[filePath, "{\"schemaVersion\":1}\n"]])
+  const modes = new Map()
+  const writeCalls = []
+  const chmodCalls = []
+
+  const fsImpl = {
+    async mkdir() {},
+    async readFile(targetPath) {
+      if (!files.has(targetPath)) {
+        const err = new Error("not found")
+        err.code = "ENOENT"
+        throw err
+      }
+      return files.get(targetPath)
+    },
+    async writeFile(targetPath, contents, options) {
+      files.set(targetPath, contents)
+      if (options && typeof options === "object" && "mode" in options) modes.set(targetPath, options.mode)
+      writeCalls.push({ targetPath, options })
+    },
+    async chmod(targetPath, mode) {
+      modes.set(targetPath, mode)
+      chmodCalls.push({ targetPath, mode })
+    },
+    async readdir() {
+      return []
+    },
+    async unlink(targetPath) {
+      files.delete(targetPath)
+      modes.delete(targetPath)
+    },
+  }
+
+  const backupPath = await createStateFileBackup(filePath, { fsImpl, mode: 0o600, now: new Date("2026-01-01T00:00:00.000Z") })
+
+  assert.deepEqual(writeCalls, [{ targetPath: backupPath, options: { mode: 0o600 } }])
+  assert.deepEqual(chmodCalls, [{ targetPath: backupPath, mode: 0o600 }])
+  assert.equal(files.get(backupPath), files.get(filePath))
+  assert.equal(modes.get(backupPath), 0o600)
 })
 
 test("rotateStateFileBackups can remove all backups when max is zero", async () => {

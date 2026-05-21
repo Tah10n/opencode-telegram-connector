@@ -11,6 +11,7 @@ import {
 } from "./permissions-profile.js"
 
 const DEFAULT_OPENCODE_CONFIG_SCHEMA = "https://opencode.ai/config.json"
+const NEW_PERMISSION_CONFIG_MODE = 0o600
 const ALLOWED_PERMISSION_CONFIG_FILENAMES = Object.freeze(new Set(["opencode.json", "opencode.jsonc"]))
 
 function hasCode(err, ...codes) {
@@ -57,6 +58,24 @@ async function fileState(fsImpl, filePath) {
 async function permissionConfigTargetState(fsImpl, filePath) {
   const state = await fileState(fsImpl, filePath)
   return state === "symlink" || state === "not-file" ? "unsafe" : state
+}
+
+function normalizedFileMode(mode) {
+  if (mode == null) return undefined
+  const numeric = Number(mode)
+  return Number.isInteger(numeric) && numeric >= 0 ? numeric & 0o777 : undefined
+}
+
+async function permissionConfigExistingFileMode(fsImpl, filePath) {
+  try {
+    const stat = typeof fsImpl?.lstat === "function" ? await fsImpl.lstat(filePath) : await fsImpl.stat(filePath)
+    if (typeof stat?.isSymbolicLink === "function" && stat.isSymbolicLink()) return { ok: false }
+    if (typeof stat?.isFile === "function" && !stat.isFile()) return { ok: false }
+    return { ok: true, mode: normalizedFileMode(stat?.mode) }
+  } catch (err) {
+    if (hasCode(err, "ENOENT", "ENOTDIR")) return { ok: false }
+    throw err
+  }
 }
 
 function stripJsonComments(text) {
@@ -257,12 +276,12 @@ export async function resolvePermissionConfigPath(project, { fsImpl = fs } = {})
 
   const jsonPath = path.join(directory, "opencode.json")
   const jsoncPath = path.join(directory, "opencode.jsonc")
-  const jsonState = await permissionConfigTargetState(fsImpl, jsonPath)
-  if (jsonState === "unsafe") return ""
-  if (jsonState === "file") return jsonPath
   const jsoncState = await permissionConfigTargetState(fsImpl, jsoncPath)
   if (jsoncState === "unsafe") return ""
   if (jsoncState === "file") return jsoncPath
+  const jsonState = await permissionConfigTargetState(fsImpl, jsonPath)
+  if (jsonState === "unsafe") return ""
+  if (jsonState === "file") return jsonPath
   return jsonPath
 }
 
@@ -373,6 +392,15 @@ export async function writeOpenCodePermissionProfile(project, profileId, { fsImp
     return { ok: false, editable: false, status: "unavailable", filePath: current.filePath, config: null, permission: undefined, profile: "custom" }
   }
 
+  let writeMode = NEW_PERMISSION_CONFIG_MODE
+  if (current.exists) {
+    const modeResult = await permissionConfigExistingFileMode(fsImpl, current.filePath)
+    if (!modeResult.ok) {
+      return { ok: false, editable: false, status: "unavailable", filePath: current.filePath, config: null, permission: undefined, profile: "custom" }
+    }
+    writeMode = modeResult.mode
+  }
+
   let backupPath = ""
   if (current.exists) {
     backupPath = await createStateFileBackup(current.filePath, {
@@ -381,10 +409,11 @@ export async function writeOpenCodePermissionProfile(project, profileId, { fsImp
       maxBackups: permissionBackupMaxFiles(project),
       fsImpl,
       now,
+      mode: writeMode,
     })
   }
 
-  await writeJsonFileAtomic(current.filePath, nextConfig, { fsImpl })
+  await writeJsonFileAtomic(current.filePath, nextConfig, { fsImpl, mode: writeMode })
   return {
     ok: true,
     status: "ok",

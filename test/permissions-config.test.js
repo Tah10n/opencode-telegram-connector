@@ -17,6 +17,96 @@ async function makeTempDir() {
   return dir
 }
 
+function enoent(filePath) {
+  const err = new Error(`not found: ${filePath}`)
+  err.code = "ENOENT"
+  return err
+}
+
+function makeFakePermissionConfigFs({ directories = [], files = {} } = {}) {
+  const normalize = (filePath) => path.normalize(filePath)
+  const dirs = new Set(directories.map(normalize))
+  const fileEntries = new Map(Object.entries(files).map(([filePath, entry]) => [
+    normalize(filePath),
+    { text: String(entry.text ?? ""), mode: entry.mode, mtimeMs: entry.mtimeMs ?? 0 },
+  ]))
+  const chmodCalls = []
+  let nextMtimeMs = 1
+
+  function statFor(filePath) {
+    const key = normalize(filePath)
+    if (dirs.has(key)) {
+      return { isDirectory: () => true, isFile: () => false, isSymbolicLink: () => false, mode: 0o755, mtimeMs: 0 }
+    }
+    const entry = fileEntries.get(key)
+    if (entry) {
+      return { isDirectory: () => false, isFile: () => true, isSymbolicLink: () => false, mode: entry.mode, mtimeMs: entry.mtimeMs }
+    }
+    throw enoent(filePath)
+  }
+
+  const fsImpl = {
+    async stat(filePath) {
+      return statFor(filePath)
+    },
+    async lstat(filePath) {
+      return statFor(filePath)
+    },
+    async realpath(filePath) {
+      return normalize(filePath)
+    },
+    async mkdir(dirPath) {
+      dirs.add(normalize(dirPath))
+    },
+    async readFile(filePath, encoding) {
+      const entry = fileEntries.get(normalize(filePath))
+      if (!entry) throw enoent(filePath)
+      return encoding ? entry.text : Buffer.from(entry.text, "utf8")
+    },
+    async writeFile(filePath, contents, options) {
+      const key = normalize(filePath)
+      const mode = options && typeof options === "object" && "mode" in options ? options.mode : 0o666
+      fileEntries.set(key, {
+        text: Buffer.isBuffer(contents) ? contents.toString("utf8") : String(contents),
+        mode,
+        mtimeMs: nextMtimeMs++,
+      })
+    },
+    async chmod(filePath, mode) {
+      const key = normalize(filePath)
+      const entry = fileEntries.get(key)
+      if (!entry) throw enoent(filePath)
+      entry.mode = mode
+      chmodCalls.push({ filePath: key, mode })
+    },
+    async rename(from, to) {
+      const fromKey = normalize(from)
+      const entry = fileEntries.get(fromKey)
+      if (!entry) throw enoent(from)
+      fileEntries.set(normalize(to), entry)
+      fileEntries.delete(fromKey)
+    },
+    async unlink(filePath) {
+      const key = normalize(filePath)
+      if (!fileEntries.delete(key)) throw enoent(filePath)
+    },
+    async readdir(dirPath) {
+      const dirKey = normalize(dirPath)
+      if (!dirs.has(dirKey)) throw enoent(dirPath)
+      return Array.from(fileEntries.keys())
+        .filter((filePath) => normalize(path.dirname(filePath)) === dirKey)
+        .map((filePath) => path.basename(filePath))
+    },
+  }
+
+  return {
+    fsImpl,
+    chmodCalls,
+    textOf: (filePath) => fileEntries.get(normalize(filePath))?.text,
+    modeOf: (filePath) => fileEntries.get(normalize(filePath))?.mode,
+  }
+}
+
 test("OpenCode permission config reader prefers existing opencode.jsonc and parses JSONC", async () => {
   const dir = await makeTempDir()
   const configPath = path.join(dir, "opencode.jsonc")
@@ -42,6 +132,30 @@ test("OpenCode permission config reader prefers existing opencode.jsonc and pars
   assert.equal(result.filePath, configPath)
   assert.deepEqual(result.permission, { "*": "ask", edit: "allow" })
   assert.equal(result.profile, "custom")
+})
+
+test("OpenCode permission config reader and writer prefer opencode.jsonc when both config files exist", async () => {
+  const dir = await makeTempDir()
+  const jsonPath = path.join(dir, "opencode.json")
+  const jsoncPath = path.join(dir, "opencode.jsonc")
+  const jsonText = JSON.stringify({ permission: profileToPermissionConfig("suggest"), jsonOnly: true }, null, 2)
+  await fs.writeFile(jsonPath, jsonText, "utf8")
+  await fs.writeFile(jsoncPath, JSON.stringify({ permission: profileToPermissionConfig("auto-edit"), jsoncOnly: true }, null, 2), "utf8")
+
+  assert.equal(await resolvePermissionConfigPath({ directory: dir }), jsoncPath)
+  const readResult = await readOpenCodePermissionConfig({ directory: dir })
+  assert.equal(readResult.filePath, jsoncPath)
+  assert.equal(readResult.profile, "auto-edit")
+
+  const writeResult = await writeOpenCodePermissionProfile({ directory: dir }, "full-auto", { now: new Date("2026-05-20T00:00:00.000Z") })
+
+  assert.equal(writeResult.ok, true)
+  assert.equal(writeResult.filePath, jsoncPath)
+  assert.equal(writeResult.profile, "full-auto")
+  assert.equal(await fs.readFile(jsonPath, "utf8"), jsonText)
+  assert.deepEqual(JSON.parse(await fs.readFile(jsoncPath, "utf8")).permission, profileToPermissionConfig("full-auto"))
+  assert.match(path.basename(writeResult.backupPath), /^opencode\.jsonc\.backup\./)
+  assert.deepEqual(JSON.parse(await fs.readFile(writeResult.backupPath, "utf8")).permission, profileToPermissionConfig("auto-edit"))
 })
 
 test("OpenCode permission config writer creates config when missing", async () => {
@@ -141,6 +255,43 @@ test("OpenCode permission config writer migrates legacy full-auto repo denials",
   assert.match(path.basename(result.backupPath), /^opencode\.json\.backup\./)
   assert.deepEqual(JSON.parse(await fs.readFile(configPath, "utf8")).permission, profileToPermissionConfig("full-auto"))
   assert.deepEqual(JSON.parse(await fs.readFile(result.backupPath, "utf8")).permission, legacyFullAuto)
+})
+
+test("OpenCode permission config writer preserves existing config mode for rewrites and backups", async () => {
+  const projectDir = process.platform === "win32" ? "C:/repo/project" : "/repo/project"
+  const configPath = path.join(projectDir, "opencode.json")
+  const { fsImpl, modeOf } = makeFakePermissionConfigFs({
+    directories: [projectDir],
+    files: {
+      [configPath]: {
+        text: JSON.stringify({ permission: profileToPermissionConfig("suggest"), custom: true }, null, 2),
+        mode: 0o640,
+      },
+    },
+  })
+
+  const result = await writeOpenCodePermissionProfile({ directory: projectDir }, "auto-edit", {
+    fsImpl,
+    now: new Date("2026-05-20T00:00:00.000Z"),
+  })
+
+  assert.equal(result.ok, true)
+  assert.equal(result.filePath, configPath)
+  assert.equal(modeOf(configPath), 0o640)
+  assert.equal(modeOf(result.backupPath), 0o640)
+})
+
+test("OpenCode permission config writer creates new configs with conservative mode", async () => {
+  const projectDir = process.platform === "win32" ? "C:/repo/project" : "/repo/project"
+  const configPath = path.join(projectDir, "opencode.json")
+  const { fsImpl, modeOf, textOf } = makeFakePermissionConfigFs({ directories: [projectDir] })
+
+  const result = await writeOpenCodePermissionProfile({ directory: projectDir }, "suggest", { fsImpl })
+
+  assert.equal(result.ok, true)
+  assert.equal(result.filePath, configPath)
+  assert.equal(modeOf(configPath), 0o600)
+  assert.deepEqual(JSON.parse(textOf(configPath)).permission, profileToPermissionConfig("suggest"))
 })
 
 test("OpenCode permission config writer skips reset when config is already default", async () => {

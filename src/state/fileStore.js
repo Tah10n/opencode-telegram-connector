@@ -31,6 +31,24 @@ function backupPrefix(filePath) {
   return `${path.basename(filePath)}.backup.`
 }
 
+function normalizedFileMode(mode) {
+  if (mode == null) return undefined
+  const numeric = Number(mode)
+  return Number.isInteger(numeric) && numeric >= 0 ? numeric & 0o777 : undefined
+}
+
+function writeFileOptionsForMode(mode, encoding) {
+  const normalized = normalizedFileMode(mode)
+  if (normalized == null) return encoding
+  return encoding ? { encoding, mode: normalized } : { mode: normalized }
+}
+
+async function chmodIfSupported(fsImpl, filePath, mode) {
+  const normalized = normalizedFileMode(mode)
+  if (normalized == null || typeof fsImpl?.chmod !== "function") return
+  await fsImpl.chmod(filePath, normalized)
+}
+
 function emergencyBackupPrefix(filePath) {
   return `${path.basename(filePath)}.bak.`
 }
@@ -133,7 +151,7 @@ export async function rotateStateFileBackups(filePath, { maxBackups = DEFAULT_ST
 
 export async function createStateFileBackup(
   filePath,
-  { reason = "state", schemaVersion, maxBackups = DEFAULT_STATE_BACKUP_MAX_FILES, fsImpl = fs, now = new Date() } = {},
+  { reason = "state", schemaVersion, maxBackups = DEFAULT_STATE_BACKUP_MAX_FILES, fsImpl = fs, now = new Date(), mode } = {},
 ) {
   const dir = path.dirname(filePath)
   await fsImpl.mkdir(dir, { recursive: true })
@@ -141,7 +159,8 @@ export async function createStateFileBackup(
   const suffix = [backupTimestamp(now), cleanBackupLabel(reason, "state"), versionLabel, crypto.randomBytes(4).toString("hex")].join(".")
   const backupPath = path.join(dir, `${backupPrefix(filePath)}${suffix}`)
   const contents = await fsImpl.readFile(filePath)
-  await fsImpl.writeFile(backupPath, contents)
+  await fsImpl.writeFile(backupPath, contents, writeFileOptionsForMode(mode))
+  await chmodIfSupported(fsImpl, backupPath, mode)
   await rotateStateFileBackups(filePath, { maxBackups, fsImpl })
   return backupPath
 }
@@ -188,19 +207,24 @@ export async function readJsonFile(filePath) {
   }
 }
 
-export async function writeJsonFileAtomic(filePath, data, { fsImpl = fs } = {}) {
+export async function writeJsonFileAtomic(filePath, data, { fsImpl = fs, mode } = {}) {
   await fsImpl.mkdir(path.dirname(filePath), { recursive: true })
   const tmp = `${filePath}.tmp.${process.pid}.${crypto.randomBytes(6).toString("hex")}`
-  await fsImpl.writeFile(tmp, JSON.stringify(data, null, 2) + "\n", "utf8")
+  await fsImpl.writeFile(tmp, JSON.stringify(data, null, 2) + "\n", writeFileOptionsForMode(mode, "utf8"))
   try {
-    await fsImpl.rename(tmp, filePath)
-  } catch (err) {
-    // Windows may not allow overwrite; preserve the current file before retrying.
-    if (hasCode(err, "EEXIST", "EPERM", "EACCES")) {
-      await replaceFileWithoutLosingExisting(fsImpl, tmp, filePath)
-      return
+    await chmodIfSupported(fsImpl, tmp, mode)
+    try {
+      await fsImpl.rename(tmp, filePath)
+    } catch (err) {
+      // Windows may not allow overwrite; preserve the current file before retrying.
+      if (hasCode(err, "EEXIST", "EPERM", "EACCES")) {
+        await replaceFileWithoutLosingExisting(fsImpl, tmp, filePath)
+        await chmodIfSupported(fsImpl, filePath, mode)
+        return
+      }
+      throw err
     }
-    throw err
+    await chmodIfSupported(fsImpl, filePath, mode)
   } finally {
     await unlinkIfExists(fsImpl, tmp).catch(() => {})
   }
