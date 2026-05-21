@@ -1,6 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import fs from "node:fs/promises"
+import { constants as fsConstants } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import crypto from "node:crypto"
@@ -266,6 +267,114 @@ test("writeJsonFileAtomic treats post-fallback target chmod as best effort", asy
 
   assert.equal(files.get(filePath), '{\n  "next": true\n}\n')
   assert.equal(files.has(tmpPath), false)
+})
+
+test("writeJsonFileAtomic overwrite false copyFile fallback does not overwrite concurrent targets", async () => {
+  const filePath = "C:/tmp/state.json"
+  const concurrent = '{"concurrent":true}\n'
+  const files = new Map()
+  const unlinkCalls = []
+  let tmpPath = null
+
+  const fsImpl = {
+    async mkdir() {},
+    async writeFile(targetPath, contents) {
+      files.set(targetPath, contents)
+      if (targetPath !== filePath) tmpPath = targetPath
+    },
+    async copyFile(from, to, mode) {
+      assert.equal(from, tmpPath)
+      assert.equal(to, filePath)
+      assert.equal(mode, fsConstants.COPYFILE_EXCL)
+      files.set(filePath, concurrent)
+      const err = new Error("target exists")
+      err.code = "EEXIST"
+      throw err
+    },
+    async stat() {
+      throw new Error("stat should not be called")
+    },
+    async rename() {
+      throw new Error("rename should not be called")
+    },
+    async unlink(targetPath) {
+      unlinkCalls.push(targetPath)
+      files.delete(targetPath)
+    },
+  }
+
+  await assert.rejects(() => writeJsonFileAtomic(filePath, { next: true }, { fsImpl, overwrite: false }), (err) => err.code === "EEXIST")
+
+  assert.equal(files.get(filePath), concurrent)
+  assert.equal(files.has(tmpPath), false)
+  assert.deepEqual(unlinkCalls, [tmpPath])
+})
+
+test("writeJsonFileAtomic overwrite false falls back to exclusive copy when hard links are unsupported", async () => {
+  const filePath = "C:/tmp/state.json"
+  const files = new Map()
+  let tmpPath = null
+  const linkError = new Error("hard links unsupported")
+  linkError.code = "ENOTSUP"
+
+  const fsImpl = {
+    async mkdir() {},
+    async writeFile(targetPath, contents) {
+      files.set(targetPath, contents)
+      if (targetPath !== filePath) tmpPath = targetPath
+    },
+    async link() {
+      throw linkError
+    },
+    async copyFile(from, to, mode) {
+      assert.equal(from, tmpPath)
+      assert.equal(to, filePath)
+      assert.equal(mode, fsConstants.COPYFILE_EXCL)
+      files.set(to, files.get(from))
+    },
+    async unlink(targetPath) {
+      files.delete(targetPath)
+    },
+  }
+
+  await writeJsonFileAtomic(filePath, { next: true }, { fsImpl, overwrite: false })
+
+  assert.equal(files.get(filePath), '{\n  "next": true\n}\n')
+  assert.equal(files.has(tmpPath), false)
+})
+
+test("writeJsonFileAtomic overwrite false fails closed without exclusive create primitives", async () => {
+  const filePath = "C:/tmp/state.json"
+  const files = new Map()
+  const unlinkCalls = []
+  let tmpPath = null
+
+  const fsImpl = {
+    async mkdir() {},
+    async writeFile(targetPath, contents) {
+      files.set(targetPath, contents)
+      if (targetPath !== filePath) tmpPath = targetPath
+    },
+    async stat() {
+      throw new Error("stat should not be called")
+    },
+    async rename() {
+      throw new Error("rename should not be called")
+    },
+    async unlink(targetPath) {
+      unlinkCalls.push(targetPath)
+      files.delete(targetPath)
+    },
+  }
+
+  await assert.rejects(
+    () => writeJsonFileAtomic(filePath, { next: true }, { fsImpl, overwrite: false }),
+    (err) => err.code === "ENOTSUP" && /does not support link or exclusive copyFile/.test(err.message),
+  )
+
+  assert.equal(files.has(filePath), false)
+  assert.equal(files.has(tmpPath), false)
+  assert.deepEqual(unlinkCalls, [tmpPath])
 })
 
 test("readJsonFile returns null for missing files and surfaces parse errors", async () => {

@@ -192,8 +192,10 @@ export default {
     confirmFullAutoButton: "Включить Full Auto",
     changed: "Изменено: профиль прав теперь {profile}.",
     resetChanged: "Изменено: permission config OpenCode сброшен к дефолту.",
+    noChangesNeeded: "Изменения прав не требуются.",
     writeUnavailable: "Permission config нельзя изменить для этого проекта.",
     refreshFailed: "Права изменены, но не удалось обновить это сообщение. Отправьте /permissions, чтобы перезагрузить вид.",
+    refreshNoChangesFailed: "Изменения прав не требуются, но не удалось обновить это сообщение. Отправьте /permissions, чтобы перезагрузить вид.",
     usage: "Использование: /permissions\n/permissions suggest\n/permissions auto-edit\n/permissions full-auto\n/permissions reset\n/permissions <projectAlias> [profile] (в личке)",
   },
   model: {
@@ -365,6 +367,7 @@ export default {
     permissionsChanged: "Права изменены",
     permissionsReset: "Права сброшены",
     permissionsRefreshFailed: "Права изменены; обновление не удалось",
+    permissionsNoChangeRefreshFailed: "Изменения прав не требуются; обновление не удалось",
     actionFailedTryNew: "Действие не удалось. Попробуйте /new.",
     actionTemporarilyUnavailable: "Действие временно недоступно. Попробуйте ещё раз.",
     actionFailedTryAgain: "Действие не удалось. Попробуйте ещё раз.",

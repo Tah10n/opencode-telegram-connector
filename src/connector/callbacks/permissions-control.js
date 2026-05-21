@@ -74,9 +74,11 @@ export async function handlePermissionsControlCallback({
       return true
     }
     const result = await applyPermissionProfile(ctxMeta, projectAlias, requestedProfile, { editMessageId: msg?.message_id })
-    const successToast = result?.renderOk === false
-      ? "permissionsRefreshFailed"
-      : requestedProfile === PERMISSION_RESET_ID ? "permissionsReset" : "permissionsChanged"
+    const successToast = result?.changed === false
+      ? result?.renderOk === false ? "permissionsNoChangeRefreshFailed" : "alreadyCurrent"
+      : result?.renderOk === false
+        ? "permissionsRefreshFailed"
+        : requestedProfile === PERMISSION_RESET_ID ? "permissionsReset" : "permissionsChanged"
     await answerCallbackQuery(callbackQuery.id, result?.ok === false ? "Unavailable" : callbackToast(successToast))
     return true
   }

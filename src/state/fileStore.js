@@ -1,4 +1,5 @@
 import fs from "node:fs/promises"
+import { constants as fsConstants } from "node:fs"
 import path from "node:path"
 import crypto from "node:crypto"
 
@@ -230,18 +231,24 @@ async function replaceFileWithoutLosingExisting(fsImpl, sourcePath, targetPath) 
 
 async function commitNewFileWithoutOverwrite(fsImpl, sourcePath, targetPath) {
   if (typeof fsImpl?.link === "function") {
-    await fsImpl.link(sourcePath, targetPath)
+    try {
+      await fsImpl.link(sourcePath, targetPath)
+      return
+    } catch (err) {
+      if (!hasCode(err, "ENOTSUP", "ENOSYS", "EOPNOTSUPP")) throw err
+    }
+  }
+  const exclusiveCopyFlag = fsImpl?.constants?.COPYFILE_EXCL ?? fsConstants?.COPYFILE_EXCL
+  if (typeof fsImpl?.copyFile === "function" && exclusiveCopyFlag != null) {
+    await fsImpl.copyFile(sourcePath, targetPath, exclusiveCopyFlag)
     return
   }
-  try {
-    await fsImpl.stat(targetPath)
-    const err = new Error(`Target already exists: ${targetPath}`)
-    err.code = "EEXIST"
-    throw err
-  } catch (err) {
-    if (!hasCode(err, "ENOENT")) throw err
-  }
-  await fsImpl.rename(sourcePath, targetPath)
+
+  const err = new Error(
+    `Cannot safely create '${targetPath}' without overwriting; fs implementation does not support link or exclusive copyFile.`,
+  )
+  err.code = "ENOTSUP"
+  throw err
 }
 
 export async function readJsonFile(filePath) {

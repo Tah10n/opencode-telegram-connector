@@ -4,6 +4,7 @@ import path from "node:path"
 import { buildRuntimeConfig } from "../config/runtime.js"
 import { OpenCodeClient } from "../opencode/client.js"
 import { commandExistsOnPath, getLaunchSupport } from "../opencode/launcher.js"
+import { resolvePermissionConfigPath } from "../opencode/permissions-config.js"
 import { effectiveOpenCodeSseEventPath, getOpenCodeSseProjectRoutingIssue, openCodeSseEventPathRequiresDirectoryRouting } from "../opencode/sse.js"
 import { resolveDefaultStatePath } from "../state/store.js"
 import { TelegramClient } from "../telegram/client.js"
@@ -156,6 +157,35 @@ function describeSseRouting(project, { eventPath }) {
   return `${eventPath} does not require project directory routing`
 }
 
+function permissionControlEnabled(project) {
+  return project?.permissionControl?.enabled !== false
+}
+
+function hasExplicitPermissionConfigPath(project) {
+  return String(project?.permissionConfigPath || "").trim() !== ""
+}
+
+function isExpectedPermissionConfigPathError(err) {
+  return ["EACCES", "EINVAL", "ELOOP", "ENAMETOOLONG", "ENOENT", "ENOTDIR", "EPERM"].includes(err?.code)
+}
+
+async function inspectExplicitPermissionConfigPath(project, { fsImpl, safeText }) {
+  try {
+    const resolvedPath = await resolvePermissionConfigPath(project, { fsImpl })
+    if (resolvedPath) return { ok: true, label: "explicit permissionConfigPath target is valid" }
+    return {
+      ok: false,
+      label: "explicit permissionConfigPath is not a valid local opencode.json/opencode.jsonc target",
+    }
+  } catch (err) {
+    const prefix = isExpectedPermissionConfigPathError(err)
+      ? "cannot access explicit permissionConfigPath"
+      : "could not validate explicit permissionConfigPath"
+    const code = err?.code ? ` (${safeText(err.code)})` : ""
+    return { ok: false, label: `${prefix}${code}` }
+  }
+}
+
 async function pathExists(fsImpl, targetPath) {
   try {
     await fsImpl.stat(targetPath)
@@ -300,6 +330,16 @@ export async function runSetupCheck({
       `SSE routing ${alias}`,
       describeSseRouting(project, { eventPath: sseEventPath }),
     )
+
+    if (permissionControlEnabled(project) && hasExplicitPermissionConfigPath(project)) {
+      const permissionConfigStatus = await inspectExplicitPermissionConfigPath(project, { fsImpl, safeText })
+      addFinding(
+        findings,
+        permissionConfigStatus.ok ? "pass" : "fail",
+        `Permission config ${alias}`,
+        permissionConfigStatus.label,
+      )
+    }
 
     const autoStartSupport = project.autoStart === true
       ? getLaunchSupportImpl({ project, platform })

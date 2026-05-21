@@ -323,6 +323,97 @@ test("runSetupCheck allows legacy SSE /event when project directory is missing",
   assert.match(sseFinding?.message || "", /\/event does not require project directory routing/)
 })
 
+test("runSetupCheck fails invalid explicit permission config paths", async () => {
+  const dir = await makeTempDir()
+  const repoDir = path.join(dir, "repo")
+  const stateFile = path.join(dir, ".data", "state.json")
+  const invalidPath = path.join(repoDir, "opencode.remote.json")
+  const missingParentPath = path.join(repoDir, "missing", "opencode.json")
+  const output = []
+  await fs.mkdir(repoDir, { recursive: true })
+
+  const report = await runSetupCheck({
+    stdout: (line) => output.push(line),
+    skipTelegramProbe: true,
+    skipOpenCodeProbe: true,
+    buildRuntimeConfigImpl: async () => makeRuntime({
+      dir,
+      stateFile,
+      projects: {
+        invalidName: {
+          baseUrl: "http://127.0.0.1:4312",
+          directory: repoDir,
+          permissionConfigPath: invalidPath,
+          autoStart: false,
+          serverLaunchMode: "background",
+          openTuiOnAutoStart: true,
+          openAttachOnNewMode: "same-window",
+          username: "",
+          password: "",
+        },
+        missingParent: {
+          baseUrl: "http://127.0.0.1:4313",
+          directory: repoDir,
+          permissionConfigPath: missingParentPath,
+          autoStart: false,
+          serverLaunchMode: "background",
+          openTuiOnAutoStart: true,
+          openAttachOnNewMode: "same-window",
+          username: "",
+          password: "",
+        },
+      },
+    }),
+  })
+
+  assert.equal(report.exitCode, 1)
+  assert.equal(report.findings.find((finding) => finding.item === "Permission config invalidName")?.status, "fail")
+  assert.match(report.findings.find((finding) => finding.item === "Permission config invalidName")?.message || "", /opencode\.jsonc/)
+  assert.equal(report.findings.find((finding) => finding.item === "Permission config missingParent")?.status, "fail")
+  const permissionConfigOutput = output.join("\n")
+  assert.doesNotMatch(permissionConfigOutput, new RegExp(invalidPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))
+  assert.doesNotMatch(permissionConfigOutput, new RegExp(missingParentPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))
+})
+
+test("runSetupCheck passes a valid explicit permission config path", async () => {
+  const dir = await makeTempDir()
+  const repoDir = path.join(dir, "repo")
+  const stateFile = path.join(dir, ".data", "state.json")
+  const permissionConfigPath = path.join(repoDir, "opencode.jsonc")
+  const output = []
+  await fs.mkdir(repoDir, { recursive: true })
+  await fs.writeFile(permissionConfigPath, "{}\n", "utf8")
+
+  const report = await runSetupCheck({
+    stdout: (line) => output.push(line),
+    skipTelegramProbe: true,
+    skipOpenCodeProbe: true,
+    buildRuntimeConfigImpl: async () => makeRuntime({
+      dir,
+      stateFile,
+      projects: {
+        demo: {
+          baseUrl: "http://127.0.0.1:4312",
+          directory: repoDir,
+          permissionConfigPath,
+          autoStart: false,
+          serverLaunchMode: "background",
+          openTuiOnAutoStart: true,
+          openAttachOnNewMode: "same-window",
+          username: "",
+          password: "",
+        },
+      },
+    }),
+  })
+
+  assert.equal(report.exitCode, 0)
+  const permissionConfigFinding = report.findings.find((finding) => finding.item === "Permission config demo")
+  assert.equal(permissionConfigFinding?.status, "pass")
+  assert.match(permissionConfigFinding?.message || "", /valid/)
+  assert.doesNotMatch(output.join("\n"), new RegExp(permissionConfigPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))
+})
+
 test("runSetupCheck reports Basic Auth safety failures without leaking credentials", async () => {
   const dir = await makeTempDir()
   const stateFile = path.join(dir, ".data", "state.json")

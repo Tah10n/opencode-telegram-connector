@@ -192,8 +192,10 @@ export default {
     confirmFullAutoButton: "Enable Full Auto",
     changed: "Changed: permissions profile is now {profile}.",
     resetChanged: "Changed: OpenCode permission config reset to default.",
+    noChangesNeeded: "No permission changes were needed.",
     writeUnavailable: "Permission config cannot be changed for this project.",
     refreshFailed: "Permissions changed, but I could not refresh this view. Send /permissions to reload it.",
+    refreshNoChangesFailed: "No permission changes were needed, but I could not refresh this view. Send /permissions to reload it.",
     usage: "Usage: /permissions\n/permissions suggest\n/permissions auto-edit\n/permissions full-auto\n/permissions reset\n/permissions <projectAlias> [profile] (private chat)",
   },
   model: {
@@ -365,6 +367,7 @@ export default {
     permissionsChanged: "Permissions changed",
     permissionsReset: "Permissions reset",
     permissionsRefreshFailed: "Permissions changed; refresh failed",
+    permissionsNoChangeRefreshFailed: "No permission changes were needed; refresh failed",
     actionFailedTryNew: "Action failed. Please try /new.",
     actionTemporarilyUnavailable: "Action is temporarily unavailable. Please try again.",
     actionFailedTryAgain: "Action failed. Please try again.",

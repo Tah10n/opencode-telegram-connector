@@ -619,6 +619,36 @@ test("createCommandHandlers handlePermissions applies non-dangerous profiles in 
   assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text), ["Suggest", "Auto Edit", "Full Auto", "OpenCode default", "View current", "Close"])
 })
 
+test("createCommandHandlers handlePermissions reports no-op profile writes without changed notice", async () => {
+  const writes = []
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    readPermissionConfig: async () => ({
+      ok: true,
+      editable: true,
+      status: "ok",
+      filePath: "C:/repo/demo/opencode.json",
+      profile: "auto-edit",
+      permission: {},
+    }),
+    writePermissionProfile: async (project, profileId) => {
+      writes.push({ project, profileId })
+      return { ok: true, changed: false, profile: profileId, filePath: "C:/repo/demo/opencode.json" }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, ["auto-edit"])
+
+  assert.deepEqual(writes, [{ project: runtime.projects.demo, profileId: "auto-edit" }])
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /No permission changes were needed\./)
+  assert.doesNotMatch(sent[0].text, /Changed: permissions profile is now/)
+})
+
 test("createCommandHandlers handlePermissions applies reset profile in private chat", async () => {
   const writes = []
   const { runtime, sent } = makeRuntime({
@@ -648,6 +678,36 @@ test("createCommandHandlers handlePermissions applies reset profile in private c
   assert.match(sent[0].text, /Changed: OpenCode permission config reset to default\./)
   assert.match(sent[0].text, /Profile: OpenCode default/)
   assert.match(sent[0].text, /Config: C:\/repo\/demo\/opencode\.json/)
+})
+
+test("createCommandHandlers handlePermissions reports no-op reset without reset-changed notice", async () => {
+  const writes = []
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    readPermissionConfig: async () => ({
+      ok: true,
+      editable: true,
+      status: "ok",
+      filePath: "C:/repo/demo/opencode.json",
+      profile: "opencode-default",
+      permission: undefined,
+    }),
+    writePermissionProfile: async (project, profileId) => {
+      writes.push({ project, profileId })
+      return { ok: true, changed: false, profile: "opencode-default", filePath: "C:/repo/demo/opencode.json" }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, ["reset"])
+
+  assert.deepEqual(writes, [{ project: runtime.projects.demo, profileId: "reset" }])
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /No permission changes were needed\./)
+  assert.doesNotMatch(sent[0].text, /Changed: OpenCode permission config reset to default\./)
 })
 
 test("createCommandHandlers applyPermissionProfile keeps successful write when post-write render fails", async () => {

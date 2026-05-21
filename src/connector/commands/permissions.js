@@ -246,14 +246,18 @@ export function createPermissionCommandHandlers(deps) {
     }
 
     const normalizedProfile = normalizePermissionProfileId(profileId, { includeReset: true })
-    const noticeText = normalizedProfile === PERMISSION_RESET_ID
-      ? t(ctxMeta, "permissions.resetChanged")
-      : t(ctxMeta, "permissions.changed", { profile: profileLabel(normalizedProfile, ctxMeta?.locale || "en", t) })
+    const isNoOp = result.changed === false
+    const noticeText = isNoOp
+      ? t(ctxMeta, "permissions.noChangesNeeded")
+      : normalizedProfile === PERMISSION_RESET_ID
+        ? t(ctxMeta, "permissions.resetChanged")
+        : t(ctxMeta, "permissions.changed", { profile: profileLabel(normalizedProfile, ctxMeta?.locale || "en", t) })
     try {
       await renderPermissionSettings(ctxMeta, { projectAlias, editMessageId, noticeText })
     } catch (err) {
       logger?.error?.("Failed to render permission settings after profile write:", projectAlias, err?.message || String(err))
-      await sendToThread(ctxMeta, t(ctxMeta, "permissions.refreshFailed")).catch((sendErr) => {
+      const refreshFailedText = isNoOp ? t(ctxMeta, "permissions.refreshNoChangesFailed") : t(ctxMeta, "permissions.refreshFailed")
+      await sendToThread(ctxMeta, refreshFailedText).catch((sendErr) => {
         logger?.error?.("Failed to send permission refresh failure notice:", projectAlias, sendErr?.message || String(sendErr))
       })
       return { ...result, renderOk: false }

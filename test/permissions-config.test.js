@@ -23,6 +23,12 @@ function enoent(filePath) {
   return err
 }
 
+function eexist(filePath) {
+  const err = new Error(`already exists: ${filePath}`)
+  err.code = "EEXIST"
+  return err
+}
+
 function makeFakePermissionConfigFs({ directories = [], files = {} } = {}) {
   const normalize = (filePath) => path.normalize(filePath)
   const dirs = new Set(directories.map(normalize))
@@ -78,6 +84,14 @@ function makeFakePermissionConfigFs({ directories = [], files = {} } = {}) {
       if (!entry) throw enoent(filePath)
       entry.mode = mode
       chmodCalls.push({ filePath: key, mode })
+    },
+    async copyFile(from, to, mode) {
+      const fromKey = normalize(from)
+      const toKey = normalize(to)
+      const entry = fileEntries.get(fromKey)
+      if (!entry) throw enoent(from)
+      if (mode && fileEntries.has(toKey)) throw eexist(to)
+      fileEntries.set(toKey, { ...entry, mtimeMs: nextMtimeMs++ })
     },
     async rename(from, to) {
       const fromKey = normalize(from)
@@ -772,6 +786,24 @@ test("OpenCode permission config writer does not overwrite concurrently created 
   assert.equal(result.status, "conflict")
   assert.equal(result.reason, "changed")
   assert.equal(fake.textOf(configPath), concurrent)
+})
+
+test("OpenCode permission config writer reports unavailable when exclusive create is unsupported", async () => {
+  const dir = path.join(await makeTempDir(), "project")
+  const configPath = path.join(dir, "opencode.json")
+  const fake = makeFakePermissionConfigFs({ directories: [dir] })
+  const fsImpl = {
+    ...fake.fsImpl,
+    copyFile: undefined,
+  }
+
+  const result = await writeOpenCodePermissionProfile({ directory: dir }, "auto-edit", { fsImpl })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.status, "unavailable")
+  assert.equal(result.reason, "unsupported-create")
+  assert.equal(result.filePath, configPath)
+  assert.equal(fake.textOf(configPath), undefined)
 })
 
 test("OpenCode permission config reader reports unavailable and disabled projects", async () => {

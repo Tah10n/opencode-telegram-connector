@@ -674,6 +674,7 @@ async function writeOpenCodePermissionProfileLocked(project, normalizedProfileId
     })
   } catch (err) {
     if (isAccessDenied(err)) return permissionResultUnavailable(current.filePath, "access-denied")
+    if (hasCode(err, "ENOTSUP", "ENOSYS", "EOPNOTSUPP")) return permissionResultUnavailable(current.filePath, "unsupported-create")
     if (hasCode(err, "EPARENTCHANGED", "EEXIST", "ENOENT", "ENOTDIR")) return permissionResultConflict(current.filePath)
     throw err
   }

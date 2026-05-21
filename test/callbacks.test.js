@@ -834,6 +834,25 @@ test("createCallbackHandlers applies permissions reset callbacks in private chat
   ])
 })
 
+test("createCallbackHandlers answers no-op permission callbacks without changed/reset toasts", async () => {
+  const { runtime, callbackAnswers, permissionCalls } = makeRuntime({
+    applyPermissionProfile: async (ctxMeta, projectAlias, profileId, options) => {
+      permissionCalls.push({ type: "apply", ctxMeta, projectAlias, profileId, options })
+      return profileId === "reset" ? { ok: true, changed: false, renderOk: false } : { ok: true, changed: false }
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("pc|set|demo|auto-edit", { chatType: "private", threadIdOr0: 0 }))
+  await handlers.handleTelegramCallback(makeCallback("pc|reset|demo", { id: "cb_2", chatType: "private", threadIdOr0: 0 }))
+
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Already current", "No permission changes were needed; refresh failed"])
+  assert.deepEqual(permissionCalls, [
+    { type: "apply", ctxMeta: { chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, projectAlias: "demo", profileId: "auto-edit", options: { editMessageId: 900 } },
+    { type: "apply", ctxMeta: { chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, projectAlias: "demo", profileId: "reset", options: { editMessageId: 900 } },
+  ])
+})
+
 test("createCallbackHandlers reports permission refresh failures after successful writes", async () => {
   const { runtime, callbackAnswers, permissionCalls } = makeRuntime({
     applyPermissionProfile: async (ctxMeta, projectAlias, profileId, options) => {
