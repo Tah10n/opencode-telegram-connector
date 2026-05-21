@@ -71,6 +71,11 @@ export default {
       directory: "/srv/workspaces/team-project",
       usernameEnv: "REMOTE_OPENCODE_USERNAME",
       passwordEnv: "REMOTE_OPENCODE_PASSWORD",
+      // If this same-platform directory is remote/non-local but you still want
+      // /permissions, point permissionConfigPath at opencode.json/jsonc inside
+      // an existing local directory and opt in explicitly:
+      // permissionConfigPath: "./remote-team/opencode.json",
+      // permissionControl: { remoteDirectory: true },
     },
 
     serverOnly: {

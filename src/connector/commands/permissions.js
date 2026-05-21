@@ -59,6 +59,7 @@ export function createPermissionCommandHandlers(deps) {
     unboundGuidanceKeyboard,
     readPermissionConfig = readOpenCodePermissionConfig,
     writePermissionProfile = writeOpenCodePermissionProfile,
+    logger,
     t = (ctxOrLocale, key, params) => translate(typeof ctxOrLocale === "string" ? ctxOrLocale : ctxOrLocale?.locale, key, params),
   } = deps
   const packCallback = callbackPacker(cb)
@@ -68,6 +69,10 @@ export function createPermissionCommandHandlers(deps) {
   }
 
   function canWrite(ctxMeta) {
+    return isPrivateChat(ctxMeta)
+  }
+
+  function shouldShowFilePath(ctxMeta) {
     return isPrivateChat(ctxMeta)
   }
 
@@ -122,7 +127,7 @@ export function createPermissionCommandHandlers(deps) {
     lines.push(t(locale, "permissions.title"))
     lines.push(t(locale, "permissions.project", { project: projectLabel(projects, projectAlias) }))
     lines.push(t(locale, "permissions.currentProfile", { profile: profileLabel(readResult?.profile, locale, t) }))
-    if (readResult?.filePath) lines.push(t(locale, "permissions.configPath", { path: readResult.filePath }))
+    if (readResult?.filePath && shouldShowFilePath(ctxMeta)) lines.push(t(locale, "permissions.configPath", { path: readResult.filePath }))
     lines.push(t(locale, "permissions.status", { status: configStatusLabel(readResult?.status, locale, t) }))
     if (!canWrite(ctxMeta)) lines.push(t(locale, "permissions.privateWriteOnly"))
     if (readResult?.status === "unavailable") lines.push(t(locale, "permissions.noConfigPath"))
@@ -132,6 +137,14 @@ export function createPermissionCommandHandlers(deps) {
     lines.push(t(locale, "permissions.autoEditDescription"))
     lines.push(t(locale, "permissions.fullAutoDescription"))
     lines.push("", t(locale, "permissions.restartHint"))
+    return lines.join("\n")
+  }
+
+  function writeUnavailableText(ctxMeta, result) {
+    const lines = [t(ctxMeta, "permissions.writeUnavailable")]
+    if (result?.status === "unavailable") lines.push(t(ctxMeta, "permissions.noConfigPath"))
+    if (result?.status === "disabled") lines.push(t(ctxMeta, "permissions.disabled"))
+    if (result?.status === "invalid") lines.push(t(ctxMeta, "permissions.invalidConfig"))
     return lines.join("\n")
   }
 
@@ -189,7 +202,7 @@ export function createPermissionCommandHandlers(deps) {
       t(locale, "permissions.currentRawTitle"),
       t(locale, "permissions.project", { project: projectLabel(projects, projectAlias) }),
       t(locale, "permissions.currentProfile", { profile: profileLabel(readResult?.profile, locale, t) }),
-      readResult?.filePath ? t(locale, "permissions.configPath", { path: readResult.filePath }) : "",
+      readResult?.filePath && shouldShowFilePath(ctxMeta) ? t(locale, "permissions.configPath", { path: readResult.filePath }) : "",
       "",
       compactJson(readResult?.permission),
     ].filter(Boolean)
@@ -220,7 +233,7 @@ export function createPermissionCommandHandlers(deps) {
 
     const result = await writePermissionProfile(project, profileId)
     if (!result?.ok) {
-      await editOrSend(ctxMeta, editMessageId, t(ctxMeta, "permissions.writeUnavailable"), makeInlineKeyboard([[{ text: t(ctxMeta, "common.close"), callback_data: packCallback("pc", "close") }]]))
+      await editOrSend(ctxMeta, editMessageId, writeUnavailableText(ctxMeta, result), makeInlineKeyboard([[{ text: t(ctxMeta, "common.close"), callback_data: packCallback("pc", "close") }]]))
       return result
     }
 
@@ -228,7 +241,15 @@ export function createPermissionCommandHandlers(deps) {
     const noticeText = normalizedProfile === PERMISSION_RESET_ID
       ? t(ctxMeta, "permissions.resetChanged")
       : t(ctxMeta, "permissions.changed", { profile: profileLabel(normalizedProfile, ctxMeta?.locale || "en", t) })
-    await renderPermissionSettings(ctxMeta, { projectAlias, editMessageId, noticeText })
+    try {
+      await renderPermissionSettings(ctxMeta, { projectAlias, editMessageId, noticeText })
+    } catch (err) {
+      logger?.error?.("Failed to render permission settings after profile write:", projectAlias, err?.message || String(err))
+      await sendToThread(ctxMeta, t(ctxMeta, "permissions.refreshFailed")).catch((sendErr) => {
+        logger?.error?.("Failed to send permission refresh failure notice:", projectAlias, sendErr?.message || String(sendErr))
+      })
+      return { ...result, renderOk: false }
+    }
     return result
   }
 

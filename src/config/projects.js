@@ -48,6 +48,9 @@ function normalizeProjectPermissionControl(value, { alias }) {
   if (value.maxBackups != null && value.maxBackups !== "") {
     out.maxBackups = readOptionalNonNegativeInteger(value.maxBackups, { alias, fieldName: "permissionControl.maxBackups" })
   }
+  if (value.remoteDirectory != null && value.remoteDirectory !== "") {
+    out.remoteDirectory = readOptionalBoolean(value.remoteDirectory, { alias, fieldName: "permissionControl.remoteDirectory", defaultValue: false })
+  }
   return out
 }
 

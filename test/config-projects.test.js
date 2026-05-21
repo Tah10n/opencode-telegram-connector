@@ -112,8 +112,8 @@ test("loadProjectsConfig resolves optional permission control config", async () 
       demo: {
         baseUrl: "http://127.0.0.1:4312",
         directory: "../repo",
-        permissionConfigPath: "./opencode.custom.json",
-        permissionControl: { enabled: true, maxBackups: 2 },
+        permissionConfigPath: "./remote-team/opencode.json",
+        permissionControl: { enabled: true, maxBackups: 2, remoteDirectory: true },
       },
       disabled: {
         baseUrl: "http://127.0.0.1:4313",
@@ -122,8 +122,8 @@ test("loadProjectsConfig resolves optional permission control config", async () 
     }),
   })
 
-  assert.equal(projects.demo.permissionConfigPath, path.resolve(path.join("workspace", "configs"), "./opencode.custom.json"))
-  assert.deepEqual(projects.demo.permissionControl, { enabled: true, maxBackups: 2 })
+  assert.equal(projects.demo.permissionConfigPath, path.resolve(path.join("workspace", "configs"), "./remote-team/opencode.json"))
+  assert.deepEqual(projects.demo.permissionControl, { enabled: true, maxBackups: 2, remoteDirectory: true })
   assert.deepEqual(projects.disabled.permissionControl, { enabled: false })
 })
 

@@ -70,6 +70,18 @@ test("OpenCode permission config writer does not create implicit configs for mis
   await assert.rejects(fs.stat(dir), /ENOENT/)
 })
 
+test("OpenCode permission config rejects implicit config targets that are not files", async () => {
+  const dir = await makeTempDir()
+  const configPath = path.join(dir, "opencode.json")
+  await fs.mkdir(configPath)
+
+  assert.equal(await resolvePermissionConfigPath({ directory: dir }), "")
+  const result = await writeOpenCodePermissionProfile({ directory: dir }, "suggest")
+
+  assert.equal(result.ok, false)
+  assert.equal(result.status, "unavailable")
+})
+
 test("OpenCode permission config writer skips unchanged profiles without rewriting JSONC", async () => {
   const dir = await makeTempDir()
   const configPath = path.join(dir, "opencode.jsonc")
@@ -88,6 +100,27 @@ test("OpenCode permission config writer skips unchanged profiles without rewriti
   assert.equal(result.changed, false)
   assert.equal(result.backupPath, "")
   assert.equal(await fs.readFile(configPath, "utf8"), original)
+})
+
+test("OpenCode permission config writer rewrites reordered built-in profiles", async () => {
+  const dir = await makeTempDir()
+  const configPath = path.join(dir, "opencode.json")
+  const fullAuto = profileToPermissionConfig("full-auto")
+  const reorderedFullAuto = {
+    ...Object.fromEntries(Object.entries(fullAuto).filter(([key]) => key !== "*")),
+    "*": fullAuto["*"],
+  }
+  await fs.writeFile(configPath, JSON.stringify({ permission: reorderedFullAuto, custom: true }, null, 2), "utf8")
+
+  const result = await writeOpenCodePermissionProfile({ directory: dir }, "full-auto", { now: new Date("2026-05-20T00:00:00.000Z") })
+
+  assert.equal(result.ok, true)
+  assert.equal(result.changed, true)
+  assert.equal(result.profile, "full-auto")
+  const written = JSON.parse(await fs.readFile(configPath, "utf8"))
+  assert.equal(JSON.stringify(written.permission), JSON.stringify(profileToPermissionConfig("full-auto")))
+  assert.equal(Object.keys(written.permission)[0], "*")
+  assert.match(path.basename(result.backupPath), /^opencode\.json\.backup\./)
 })
 
 test("OpenCode permission config writer migrates legacy full-auto repo denials", async () => {
@@ -176,11 +209,208 @@ test("OpenCode permission config writer does not create a missing config on rese
 
 test("OpenCode permission config does not infer local paths from foreign project directories", async () => {
   const foreignDirectory = process.platform === "win32" ? "/srv/workspaces/app" : "C:/Workspaces/App"
-  const explicitConfigPath = path.join(await makeTempDir(), "opencode.remote.json")
+  const explicitConfigPath = path.join(await makeTempDir(), "opencode.json")
 
   assert.equal(await resolvePermissionConfigPath({ directory: foreignDirectory }), "")
   assert.equal(await resolvePermissionConfigPath({ directory: foreignDirectory, permissionConfigPath: explicitConfigPath }), explicitConfigPath)
   assert.equal((await readOpenCodePermissionConfig({ directory: foreignDirectory })).status, "unavailable")
+})
+
+test("OpenCode permission config rejects unsafe explicit config paths", async () => {
+  const root = await makeTempDir()
+  const projectDir = path.join(root, "project")
+  const outsideDir = path.join(root, "outside")
+  await fs.mkdir(projectDir)
+  await fs.mkdir(outsideDir)
+
+  assert.equal(await resolvePermissionConfigPath({
+    directory: projectDir,
+    permissionConfigPath: path.join(projectDir, "opencode.remote.json"),
+  }), "")
+  assert.equal(await resolvePermissionConfigPath({
+    directory: projectDir,
+    permissionConfigPath: path.join(outsideDir, "opencode.json"),
+  }), "")
+  const foreignExplicitPath = process.platform === "win32" ? "/srv/project/opencode.json" : "C:/Project/opencode.json"
+  assert.equal(await resolvePermissionConfigPath({
+    directory: projectDir,
+    permissionConfigPath: foreignExplicitPath,
+  }), "")
+
+  const writeResult = await writeOpenCodePermissionProfile({
+    directory: projectDir,
+    permissionConfigPath: path.join(outsideDir, "opencode.json"),
+  }, "suggest")
+  assert.equal(writeResult.ok, false)
+  assert.equal(writeResult.status, "unavailable")
+  await assert.rejects(fs.readFile(path.join(outsideDir, "opencode.json"), "utf8"), /ENOENT/)
+})
+
+test("OpenCode permission config allows explicit local paths for same-platform remote directories", async () => {
+  const root = await makeTempDir()
+  const missingRemoteDirectory = path.join(root, "remote-on-another-host")
+  const localConfigDir = path.join(root, "local-config")
+  await fs.mkdir(localConfigDir)
+  const explicitConfigPath = path.join(localConfigDir, "opencode.json")
+
+  assert.equal(await resolvePermissionConfigPath({
+    directory: missingRemoteDirectory,
+    permissionConfigPath: explicitConfigPath,
+    permissionControl: { remoteDirectory: true },
+  }), explicitConfigPath)
+
+  const result = await writeOpenCodePermissionProfile({
+    directory: missingRemoteDirectory,
+    permissionConfigPath: explicitConfigPath,
+    permissionControl: { remoteDirectory: true },
+  }, "suggest")
+  assert.equal(result.ok, true)
+  assert.equal(result.filePath, explicitConfigPath)
+  assert.deepEqual(JSON.parse(await fs.readFile(explicitConfigPath, "utf8")).permission, profileToPermissionConfig("suggest"))
+  await assert.rejects(fs.stat(missingRemoteDirectory), /ENOENT/)
+})
+
+test("OpenCode permission config rejects missing local project directories without remote marker", async () => {
+  const root = await makeTempDir()
+  const missingProjectDirectory = path.join(root, "typo-local-project")
+  const localConfigDir = path.join(root, "local-config")
+  await fs.mkdir(localConfigDir)
+  const explicitConfigPath = path.join(localConfigDir, "opencode.json")
+
+  assert.equal(await resolvePermissionConfigPath({
+    directory: missingProjectDirectory,
+    permissionConfigPath: explicitConfigPath,
+  }), "")
+
+  const result = await writeOpenCodePermissionProfile({
+    directory: missingProjectDirectory,
+    permissionConfigPath: explicitConfigPath,
+  }, "suggest")
+  assert.equal(result.ok, false)
+  assert.equal(result.status, "unavailable")
+  await assert.rejects(fs.readFile(explicitConfigPath, "utf8"), /ENOENT/)
+})
+
+test("OpenCode permission config rejects explicit paths when project directory is a local file", async () => {
+  const root = await makeTempDir()
+  const projectFile = path.join(root, "project-file")
+  const outsideDir = path.join(root, "outside")
+  await fs.writeFile(projectFile, "not a directory", "utf8")
+  await fs.mkdir(outsideDir)
+  const explicitConfigPath = path.join(outsideDir, "opencode.json")
+
+  assert.equal(await resolvePermissionConfigPath({
+    directory: projectFile,
+    permissionConfigPath: explicitConfigPath,
+  }), "")
+
+  const result = await writeOpenCodePermissionProfile({
+    directory: projectFile,
+    permissionConfigPath: explicitConfigPath,
+  }, "suggest")
+  assert.equal(result.ok, false)
+  assert.equal(result.status, "unavailable")
+  await assert.rejects(fs.readFile(explicitConfigPath, "utf8"), /ENOENT/)
+})
+
+test("OpenCode permission config rejects explicit paths escaping project dir through symlinks", async (t) => {
+  const root = await makeTempDir()
+  const projectDir = path.join(root, "project")
+  const outsideDir = path.join(root, "outside")
+  const linkDir = path.join(projectDir, "linked-config")
+  await fs.mkdir(projectDir)
+  await fs.mkdir(outsideDir)
+  try {
+    await fs.symlink(outsideDir, linkDir, process.platform === "win32" ? "junction" : "dir")
+  } catch (err) {
+    if (["EPERM", "EACCES", "ENOTSUP", "EINVAL"].includes(err?.code)) {
+      t.skip(`symlinks unavailable: ${err.code}`)
+      return
+    }
+    throw err
+  }
+
+  const explicitConfigPath = path.join(linkDir, "opencode.json")
+  assert.equal(await resolvePermissionConfigPath({
+    directory: projectDir,
+    permissionConfigPath: explicitConfigPath,
+  }), "")
+
+  const result = await writeOpenCodePermissionProfile({
+    directory: projectDir,
+    permissionConfigPath: explicitConfigPath,
+  }, "suggest")
+  assert.equal(result.ok, false)
+  assert.equal(result.status, "unavailable")
+  await assert.rejects(fs.readFile(path.join(outsideDir, "opencode.json"), "utf8"), /ENOENT/)
+})
+
+test("OpenCode permission config rejects explicit symlink targets reported by lstat", async () => {
+  const projectDir = process.platform === "win32" ? "C:/repo/project" : "/repo/project"
+  const configPath = process.platform === "win32" ? "C:/repo/project/opencode.json" : "/repo/project/opencode.json"
+  const fsImpl = {
+    stat: async (filePath) => {
+      if (filePath === projectDir || filePath === path.dirname(configPath)) return { isDirectory: () => true }
+      if (filePath === configPath) return { isFile: () => true }
+      const err = new Error("not found")
+      err.code = "ENOENT"
+      throw err
+    },
+    lstat: async (filePath) => {
+      if (filePath === configPath) return { isSymbolicLink: () => true, isFile: () => false }
+      return { isSymbolicLink: () => false, isDirectory: () => true }
+    },
+    realpath: async (filePath) => filePath,
+  }
+
+  assert.equal(await resolvePermissionConfigPath({
+    directory: projectDir,
+    permissionConfigPath: configPath,
+  }, { fsImpl }), "")
+})
+
+test("OpenCode permission config revalidates target symlinks before writes", async () => {
+  const projectDir = process.platform === "win32" ? "C:/repo/project" : "/repo/project"
+  const configPath = process.platform === "win32" ? "C:/repo/project/opencode.json" : "/repo/project/opencode.json"
+  let afterInitialRead = false
+  let writeCalls = 0
+  const fsImpl = {
+    stat: async (filePath) => {
+      if (filePath === projectDir || filePath === path.dirname(configPath)) return { isDirectory: () => true }
+      if (filePath === configPath) return { isFile: () => true }
+      const err = new Error("not found")
+      err.code = "ENOENT"
+      throw err
+    },
+    lstat: async (filePath) => {
+      if (filePath === configPath) {
+        return afterInitialRead
+          ? { isSymbolicLink: () => true, isFile: () => false }
+          : { isSymbolicLink: () => false, isFile: () => true }
+      }
+      return { isSymbolicLink: () => false, isDirectory: () => true }
+    },
+    realpath: async (filePath) => filePath,
+    async readFile(filePath) {
+      if (filePath !== configPath) throw new Error(`unexpected read: ${filePath}`)
+      afterInitialRead = true
+      return JSON.stringify({ permission: profileToPermissionConfig("suggest") }, null, 2)
+    },
+    writeFile: async () => { writeCalls += 1; throw new Error("write should not be called") },
+    mkdir: async () => { throw new Error("mkdir should not be called") },
+    copyFile: async () => { throw new Error("copyFile should not be called") },
+    readdir: async () => { throw new Error("readdir should not be called") },
+    rename: async () => { throw new Error("rename should not be called") },
+    unlink: async () => { throw new Error("unlink should not be called") },
+  }
+
+  const result = await writeOpenCodePermissionProfile({
+    directory: projectDir,
+    permissionConfigPath: configPath,
+  }, "auto-edit", { fsImpl })
+  assert.equal(result.ok, false)
+  assert.equal(result.status, "unavailable")
+  assert.equal(writeCalls, 0)
 })
 
 test("OpenCode permission config reader reports invalid JSONC without overwriting it", async () => {
@@ -238,4 +468,25 @@ test("OpenCode permission config reader does not probe files for disabled projec
   assert.equal(disabled.editable, false)
   assert.equal(disabled.status, "disabled")
   assert.equal(statCalls, 0)
+})
+
+test("OpenCode permission config writer does not probe or write disabled projects", async () => {
+  let fsCalls = 0
+  const fsImpl = {
+    stat: async () => { fsCalls += 1; throw new Error("stat should not be called") },
+    readFile: async () => { fsCalls += 1; throw new Error("readFile should not be called") },
+    writeFile: async () => { fsCalls += 1; throw new Error("writeFile should not be called") },
+    mkdir: async () => { fsCalls += 1; throw new Error("mkdir should not be called") },
+  }
+
+  const disabled = await writeOpenCodePermissionProfile({
+    directory: process.platform === "win32" ? "C:/blocked" : "/blocked",
+    permissionConfigPath: process.platform === "win32" ? "C:/blocked/opencode.json" : "/blocked/opencode.json",
+    permissionControl: { enabled: false },
+  }, "suggest", { fsImpl })
+
+  assert.equal(disabled.ok, false)
+  assert.equal(disabled.editable, false)
+  assert.equal(disabled.status, "disabled")
+  assert.equal(fsCalls, 0)
 })

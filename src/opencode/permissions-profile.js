@@ -55,7 +55,7 @@ const PERMISSION_PROFILES = Object.freeze({
     doom_loop: "ask",
   }),
   "full-auto": Object.freeze({
-    "*": "allow",
+    "*": "ask",
     ...PASSIVE_ALLOW,
     edit: "allow",
     todowrite: "allow",
@@ -79,27 +79,35 @@ function cloneJson(value) {
   return JSON.parse(JSON.stringify(value))
 }
 
-function sortObjectKeys(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return value
-  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, sortObjectKeys(value[key])]))
+function isPlainObject(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value)
 }
 
-function canonicalJson(value) {
-  return JSON.stringify(sortObjectKeys(value))
+function orderedJson(value) {
+  return JSON.stringify(value)
+}
+
+function omitKeysInOrder(value, keysToOmit) {
+  const out = {}
+  for (const [key, entry] of Object.entries(value)) {
+    if (!keysToOmit.has(key)) out[key] = entry
+  }
+  return out
 }
 
 function matchesPermissionProfile(permission, profile) {
-  if (canonicalJson(permission) === canonicalJson(profile)) return true
-  if (!permission || typeof permission !== "object" || Array.isArray(permission)) return false
+  if (orderedJson(permission) === orderedJson(profile)) return true
+  if (!isPlainObject(permission)) return false
 
-  const permissionWithLegacyDefaults = { ...permission }
+  const optionalMissingKeys = []
   for (const key of LEGACY_OPTIONAL_PROFILE_KEYS) {
-    if (Object.hasOwn(permissionWithLegacyDefaults, key)) continue
+    if (Object.hasOwn(permission, key)) continue
     if (profile[key] !== profile["*"]) return false
-    permissionWithLegacyDefaults[key] = profile[key]
+    optionalMissingKeys.push(key)
   }
+  if (optionalMissingKeys.length === 0) return false
 
-  return canonicalJson(permissionWithLegacyDefaults) === canonicalJson(profile)
+  return orderedJson(permission) === orderedJson(omitKeysInOrder(profile, new Set(optionalMissingKeys)))
 }
 
 export function normalizePermissionProfileId(value, { includeReset = false } = {}) {

@@ -11,6 +11,7 @@ import {
 } from "./permissions-profile.js"
 
 const DEFAULT_OPENCODE_CONFIG_SCHEMA = "https://opencode.ai/config.json"
+const ALLOWED_PERMISSION_CONFIG_FILENAMES = Object.freeze(new Set(["opencode.json", "opencode.jsonc"]))
 
 function hasCode(err, ...codes) {
   return !!err && typeof err === "object" && "code" in err && codes.includes(err.code)
@@ -18,16 +19,6 @@ function hasCode(err, ...codes) {
 
 function isPlainObject(value) {
   return !!value && typeof value === "object" && !Array.isArray(value)
-}
-
-async function fileExists(fsImpl, filePath) {
-  try {
-    const stat = await fsImpl.stat(filePath)
-    return typeof stat?.isFile === "function" ? stat.isFile() : true
-  } catch (err) {
-    if (hasCode(err, "ENOENT", "ENOTDIR")) return false
-    throw err
-  }
 }
 
 async function directoryExists(fsImpl, directory) {
@@ -38,6 +29,34 @@ async function directoryExists(fsImpl, directory) {
     if (hasCode(err, "ENOENT", "ENOTDIR")) return false
     throw err
   }
+}
+
+async function directoryState(fsImpl, directory) {
+  try {
+    const stat = await fsImpl.stat(directory)
+    return typeof stat?.isDirectory === "function" && !stat.isDirectory() ? "not-directory" : "directory"
+  } catch (err) {
+    if (hasCode(err, "ENOENT")) return "missing"
+    if (hasCode(err, "ENOTDIR")) return "not-directory"
+    throw err
+  }
+}
+
+async function fileState(fsImpl, filePath) {
+  try {
+    const stat = typeof fsImpl?.lstat === "function" ? await fsImpl.lstat(filePath) : await fsImpl.stat(filePath)
+    if (typeof stat?.isSymbolicLink === "function" && stat.isSymbolicLink()) return "symlink"
+    return typeof stat?.isFile === "function" && !stat.isFile() ? "not-file" : "file"
+  } catch (err) {
+    if (hasCode(err, "ENOENT")) return "missing"
+    if (hasCode(err, "ENOTDIR")) return "not-file"
+    throw err
+  }
+}
+
+async function permissionConfigTargetState(fsImpl, filePath) {
+  const state = await fileState(fsImpl, filePath)
+  return state === "symlink" || state === "not-file" ? "unsafe" : state
 }
 
 function stripJsonComments(text) {
@@ -149,11 +168,78 @@ function permissionBackupMaxFiles(project) {
   return Number.isInteger(max) && max >= 0 ? max : DEFAULT_STATE_BACKUP_MAX_FILES
 }
 
+function permissionControlRemoteDirectory(project) {
+  return project?.permissionControl?.remoteDirectory === true
+}
+
+function hostLocalPathInfo(value) {
+  const canonical = canonicalDirectoryPath(value)
+  if (!canonical) return null
+  if (process.platform === "win32") {
+    return canonical.flavor === "windows-drive" || canonical.flavor === "windows-unc" ? canonical : null
+  }
+  return canonical.flavor === "posix" ? canonical : null
+}
+
 function isHostLocalDirectory(directory) {
-  const canonical = canonicalDirectoryPath(directory)
-  if (!canonical) return false
-  if (process.platform === "win32") return canonical.flavor === "windows-drive" || canonical.flavor === "windows-unc"
-  return canonical.flavor === "posix"
+  return !!hostLocalPathInfo(directory)
+}
+
+function canonicalBasename(canonical) {
+  const parts = String(canonical?.path || "").split("/")
+  return parts.at(-1) || ""
+}
+
+function canonicalDirname(canonical) {
+  if (!canonical?.path) return ""
+  return canonical.flavor === "posix" ? path.posix.dirname(canonical.path) : path.win32.dirname(canonical.path)
+}
+
+function isPathSameOrInsideDirectory(target, directory) {
+  if (!target || !directory || target.flavor !== directory.flavor) return false
+  if (target.key === directory.key) return true
+  const prefix = directory.key.endsWith("/") ? directory.key : `${directory.key}/`
+  return target.key.startsWith(prefix)
+}
+
+async function realHostLocalPathInfo(fsImpl, value) {
+  const realPath = typeof fsImpl?.realpath === "function" ? await fsImpl.realpath(value) : value
+  return hostLocalPathInfo(realPath)
+}
+
+async function resolveExplicitPermissionConfigPath(project, explicit, { fsImpl }) {
+  const target = hostLocalPathInfo(explicit)
+  if (!target) return ""
+  if (!ALLOWED_PERMISSION_CONFIG_FILENAMES.has(canonicalBasename(target))) return ""
+
+  const parentDirectory = canonicalDirname(target)
+  if (!parentDirectory || !(await directoryExists(fsImpl, parentDirectory))) return ""
+
+  const targetFileState = await fileState(fsImpl, explicit)
+  if (targetFileState === "symlink" || targetFileState === "not-file") return ""
+
+  const configuredProjectDirectory = String(project?.directory || "").trim()
+  const projectDirectory = hostLocalPathInfo(configuredProjectDirectory)
+  if (projectDirectory) {
+    const state = await directoryState(fsImpl, projectDirectory.path)
+    if (state === "not-directory") return ""
+    if (state !== "directory") return permissionControlRemoteDirectory(project) ? explicit : ""
+    const projectReal = await realHostLocalPathInfo(fsImpl, projectDirectory.path)
+    const parentReal = await realHostLocalPathInfo(fsImpl, parentDirectory)
+    if (!isPathSameOrInsideDirectory(parentReal, projectReal)) return ""
+    if (targetFileState === "file") {
+      const targetReal = await realHostLocalPathInfo(fsImpl, explicit)
+      if (!isPathSameOrInsideDirectory(targetReal, projectReal)) return ""
+    }
+  }
+  return explicit
+}
+
+async function revalidatePermissionConfigPathForWrite(project, current, { fsImpl }) {
+  const filePath = String(current?.filePath || "")
+  if (!filePath) return false
+  const resolved = await resolvePermissionConfigPath(project, { fsImpl })
+  return resolved === filePath
 }
 
 function isCurrentProfile(currentProfile, requestedProfile) {
@@ -163,7 +249,7 @@ function isCurrentProfile(currentProfile, requestedProfile) {
 
 export async function resolvePermissionConfigPath(project, { fsImpl = fs } = {}) {
   const explicit = String(project?.permissionConfigPath || "").trim()
-  if (explicit) return explicit
+  if (explicit) return resolveExplicitPermissionConfigPath(project, explicit, { fsImpl })
   const directory = String(project?.directory || "").trim()
   if (!directory) return ""
   if (!isHostLocalDirectory(directory)) return ""
@@ -171,8 +257,12 @@ export async function resolvePermissionConfigPath(project, { fsImpl = fs } = {})
 
   const jsonPath = path.join(directory, "opencode.json")
   const jsoncPath = path.join(directory, "opencode.jsonc")
-  if (await fileExists(fsImpl, jsonPath)) return jsonPath
-  if (await fileExists(fsImpl, jsoncPath)) return jsoncPath
+  const jsonState = await permissionConfigTargetState(fsImpl, jsonPath)
+  if (jsonState === "unsafe") return ""
+  if (jsonState === "file") return jsonPath
+  const jsoncState = await permissionConfigTargetState(fsImpl, jsoncPath)
+  if (jsoncState === "unsafe") return ""
+  if (jsoncState === "file") return jsoncPath
   return jsonPath
 }
 
@@ -277,6 +367,10 @@ export async function writeOpenCodePermissionProfile(project, profileId, { fsImp
     delete nextConfig.permission
   } else {
     nextConfig.permission = profileToPermissionConfig(normalizedProfileId)
+  }
+
+  if (!(await revalidatePermissionConfigPathForWrite(project, current, { fsImpl }))) {
+    return { ok: false, editable: false, status: "unavailable", filePath: current.filePath, config: null, permission: undefined, profile: "custom" }
   }
 
   let backupPath = ""

@@ -457,6 +457,7 @@ export function createCommandHandlers(runtime) {
     unboundGuidanceKeyboard,
     readPermissionConfig: runtime.readPermissionConfig,
     writePermissionProfile: runtime.writePermissionProfile,
+    logger,
     t,
   })
 

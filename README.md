@@ -194,7 +194,7 @@ When opencode asks for a permission decision or a question answer, the connector
 
 ### OpenCode permission profiles
 
-`/permissions` writes the project's OpenCode `permission` config to `opencode.json` by default for local project directories, or to `permissionConfigPath` when configured. If `opencode.jsonc` already exists next to a local project directory, the connector reads and updates that file as strict JSON-compatible JSONC. For remote projects whose `directory` is only used for SSE routing, set an explicit local `permissionConfigPath` or disable `permissionControl`. Existing files are backed up as `opencode.json.backup.*` or `opencode.jsonc.backup.*` before changes.
+`/permissions` writes the project's OpenCode `permission` config to `opencode.json` by default for local project directories, or to `permissionConfigPath` when configured. If `opencode.jsonc` already exists next to a local project directory, the connector reads and updates that file as strict JSON-compatible JSONC. `permissionConfigPath` should point to a local `opencode.json` or `opencode.jsonc`; when the project has an existing local `directory`, the explicit path is constrained to that local project directory and symlink/junction escapes are rejected. For same-platform remote projects whose `directory` path is only used for SSE routing and does not exist on the connector host, set `permissionControl: { remoteDirectory: true }` with an explicit local `permissionConfigPath`, or disable `permissionControl`. Existing files are backed up as `opencode.json.backup.*` or `opencode.jsonc.backup.*` before changes.
 
 The built-in profiles are shaped after Codex-style modes:
 
@@ -202,7 +202,7 @@ The built-in profiles are shaped after Codex-style modes:
 | --- | --- |
 | `suggest` | Read, list, glob, grep, LSP, and todo reads are allowed. Edits, shell commands, subagents, skills, todo writes, questions, network, code search, repository clone/overview, external directories, and repeated identical tool loops ask first. |
 | `auto-edit` | `suggest` plus edits and todo writes are allowed. Shell commands, subagents, skills, questions, network, code search, repository clone/overview, external directories, and repeated identical tool loops still ask first. |
-| `full-auto` | Reads/searches/edits/shell/subagents/skills are allowed. Web fetch/search, code search, repository clone/overview, and external directories are denied; repeated identical tool loops ask first. |
+| `full-auto` | Catch-all is `ask`: unknown future permissions ask first. Reads/searches, edits, shell commands, subagents, skills, todo writes, and questions are explicitly allowed. Web fetch/search, code search, repository clone/overview, and external directories are denied. Repeated identical tool loops ask first. |
 | `reset` | Removes the `permission` key and returns the project to OpenCode defaults. |
 
 OpenCode may need a restart for a running project to pick up file changes.
@@ -317,8 +317,8 @@ Prefer the `limits` object in `connector.config.mjs`; env fallbacks are availabl
   - `new-window` opens a fresh `opencode attach --session ...` window for the new session.
 - `username` / `password` or `usernameEnv` / `passwordEnv`
 - `displayName`
-- `permissionConfigPath` (optional; defaults to local `<directory>/opencode.json`, or existing local `<directory>/opencode.jsonc`, for `/permissions`)
-- `permissionControl` (optional boolean or `{ enabled, maxBackups }`; use `false` to disable Telegram-side permission switching for a project)
+- `permissionConfigPath` (optional; defaults to local `<directory>/opencode.json`, or existing local `<directory>/opencode.jsonc`, for `/permissions`; explicit values should point to a local `opencode.json`/`opencode.jsonc` and, when `directory` is local, must stay inside that local project directory)
+- `permissionControl` (optional boolean or `{ enabled, maxBackups, remoteDirectory }`; use `false` to disable Telegram-side permission switching for a project; set `remoteDirectory: true` only when a same-platform `directory` is remote/non-local and `permissionConfigPath` points to a local config)
 
 ### CLI flags
 

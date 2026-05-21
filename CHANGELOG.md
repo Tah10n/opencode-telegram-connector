@@ -46,7 +46,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - State migrations and invalid parsed state files are preserved in bounded `state.json.backup.*` files before recovery attempts.
 
 ### Added
-- `/permissions` can show and switch Codex-like OpenCode permission profiles (`suggest`, `auto-edit`, `full-auto`, and reset) from Telegram private chats, with read-only group views and backed-up `opencode.json`/`opencode.jsonc` writes.
+- `/permissions` can show and switch Codex-like OpenCode permission profiles (`suggest`, `auto-edit`, `full-auto`, and reset) from Telegram private chats, with read-only group views and backed-up local `opencode.json`/`opencode.jsonc` writes. `full-auto` asks on unknown future permissions, and explicit permission config paths are constrained to local OpenCode config filenames, local project boundaries, and explicit remote-directory opt-in for same-platform remote paths.
 - Full Telegram UI localization infrastructure with English and Russian catalogs, `/language` per-thread selection, Telegram command menus per locale, and config/env overrides.
 - Update-scoped correlation IDs now flow through Telegram update handling, connector handlers, OpenCode HTTP/SSE requests, mirroring, Telegram delivery logs, and `logger.child()` scoped fields. OpenCode requests include `X-Connector-Correlation` when a context is active.
 - Optional no-dependency HTTP health endpoints (`/livez`, `/readyz`, `/healthz`) are available via `CONNECTOR_HEALTH_ENABLED` / `healthServer`, disabled by default and loopback-bound by default.

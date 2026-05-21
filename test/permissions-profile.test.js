@@ -10,6 +10,7 @@ import {
 test("permissions profiles map Codex-like modes to OpenCode permission config", () => {
   const suggest = profileToPermissionConfig("suggest")
   assert.equal(suggest["*"], "ask")
+  assert.deepEqual(Object.keys(suggest.read), ["*", "*.env", "*.env.*", "*.env.example"])
   assert.equal(suggest.read["*"], "allow")
   assert.equal(suggest.read["*.env"], "deny")
   assert.equal(suggest.glob, "allow")
@@ -31,10 +32,13 @@ test("permissions profiles map Codex-like modes to OpenCode permission config", 
   assert.equal(autoEdit.repo_overview, "ask")
 
   const fullAuto = profileToPermissionConfig("full-auto")
-  assert.equal(fullAuto["*"], "allow")
+  assert.equal(fullAuto["*"], "ask")
   assert.equal(fullAuto.edit, "allow")
+  assert.equal(fullAuto.todowrite, "allow")
   assert.equal(fullAuto.bash, "allow")
   assert.equal(fullAuto.task, "allow")
+  assert.equal(fullAuto.skill, "allow")
+  assert.equal(fullAuto.question, "allow")
   assert.equal(fullAuto.webfetch, "deny")
   assert.equal(fullAuto.websearch, "deny")
   assert.equal(fullAuto.repo_clone, "deny")
@@ -42,6 +46,33 @@ test("permissions profiles map Codex-like modes to OpenCode permission config", 
   assert.equal(fullAuto.codesearch, "deny")
   assert.equal(fullAuto.external_directory, "deny")
   assert.equal(fullAuto.doom_loop, "ask")
+})
+
+test("permissions profile detection is order-sensitive because OpenCode uses last matching rule", () => {
+  const fullAuto = profileToPermissionConfig("full-auto")
+  const reorderedFullAuto = {
+    ...Object.fromEntries(Object.entries(fullAuto).filter(([key]) => key !== "*")),
+    "*": fullAuto["*"],
+  }
+
+  assert.equal(detectPermissionProfile(reorderedFullAuto), "custom")
+
+  const suggest = profileToPermissionConfig("suggest")
+  suggest.read = {
+    "*.env": "deny",
+    "*.env.*": "deny",
+    "*.env.example": "allow",
+    "*": "allow",
+  }
+
+  assert.equal(detectPermissionProfile(suggest), "custom")
+})
+
+test("permissions profile detection rejects legacy fail-open full-auto", () => {
+  const legacyFailOpenFullAuto = profileToPermissionConfig("full-auto")
+  legacyFailOpenFullAuto["*"] = "allow"
+
+  assert.equal(detectPermissionProfile(legacyFailOpenFullAuto), "custom")
 })
 
 test("permissions profile detection distinguishes defaults and custom configs", () => {

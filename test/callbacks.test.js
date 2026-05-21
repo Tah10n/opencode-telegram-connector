@@ -4,6 +4,7 @@ import { callbackToast, createCallbackHandlers, localizeCallbackToast } from "..
 import { makeBoundaryError } from "../src/boundary-errors.js"
 import { redactCmdlineSecrets } from "../src/url-utils.js"
 import { encodeCallback } from "../src/connector/callback-data.js"
+import { createPermissionCommandHandlers } from "../src/connector/commands/permissions.js"
 
 function callbackData(...parts) {
   return encodeCallback(parts)
@@ -798,18 +799,79 @@ test("createCallbackHandlers handles permissions control callbacks", async () =>
   ])
 })
 
+test("createCallbackHandlers reports permission refresh failures after successful writes", async () => {
+  const { runtime, callbackAnswers, permissionCalls } = makeRuntime({
+    applyPermissionProfile: async (ctxMeta, projectAlias, profileId, options) => {
+      permissionCalls.push({ type: "apply", ctxMeta, projectAlias, profileId, options })
+      return { ok: true, renderOk: false }
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("pc|apply|demo|full-auto", { chatType: "private", threadIdOr0: 0 }))
+
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Permissions changed; refresh failed"])
+  assert.deepEqual(permissionCalls, [
+    { type: "apply", ctxMeta: { chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, projectAlias: "demo", profileId: "full-auto", options: { editMessageId: 900 } },
+  ])
+})
+
 test("createCallbackHandlers blocks permissions changes outside private chat", async () => {
   const { runtime, callbackAnswers, permissionCalls } = makeRuntime()
   const handlers = createCallbackHandlers(runtime)
 
   await handlers.handleTelegramCallback(makeCallback("pc|set|demo|auto-edit", { chatType: "supergroup", threadIdOr0: 7 }))
   await handlers.handleTelegramCallback(makeCallback("pc|set|demo|full-auto", { id: "cb_2", chatType: "supergroup", threadIdOr0: 7 }))
+  await handlers.handleTelegramCallback(makeCallback("pc|apply|demo|full-auto", { id: "cb_3", chatType: "supergroup", threadIdOr0: 7 }))
+  await handlers.handleTelegramCallback(makeCallback("pc|reset|demo", { id: "cb_4", chatType: "supergroup", threadIdOr0: 7 }))
 
   assert.deepEqual(callbackAnswers, [
     { callbackQueryId: "cb_1", text: "Private chat only" },
     { callbackQueryId: "cb_2", text: "Private chat only" },
+    { callbackQueryId: "cb_3", text: "Private chat only" },
+    { callbackQueryId: "cb_4", text: "Private chat only" },
   ])
   assert.deepEqual(permissionCalls, [])
+})
+
+test("createCallbackHandlers does not read forged group permissions-control project aliases", async () => {
+  const reads = []
+  const permissionMessages = []
+  const storeState = { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } }
+  const projects = {
+    demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" },
+    other: { baseUrl: "http://127.0.0.1:4313", directory: "C:/repo/other" },
+  }
+  const permissionHandlers = createPermissionCommandHandlers({
+    store: { getBinding: (ctxKey) => storeState.bindings?.[ctxKey] ?? null },
+    projects,
+    sendToThread: async (ctxMeta, text, replyMarkup) => {
+      permissionMessages.push({ ctxMeta, text, replyMarkup })
+    },
+    tg: { editMessageText: async () => { throw new Error("should not edit other project details") } },
+    cb: { pack: (value) => value },
+    unboundGuidanceText: () => "Permissions need a bound thread",
+    unboundGuidanceKeyboard: () => null,
+    readPermissionConfig: async (project) => {
+      reads.push(project)
+      return { ok: true, editable: true, status: "ok", filePath: "C:/repo/other/opencode.json", profile: "suggest", permission: {} }
+    },
+  })
+  const { runtime, callbackAnswers } = makeRuntime({
+    storeState,
+    projects,
+    renderPermissionSettings: permissionHandlers.renderPermissionSettings,
+    renderPermissionDetails: permissionHandlers.renderPermissionDetails,
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("pc|project|other", { chatType: "supergroup", threadIdOr0: 7 }))
+  await handlers.handleTelegramCallback(makeCallback("pc|view|other", { id: "cb_2", chatType: "supergroup", threadIdOr0: 7 }))
+
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Permissions", "Permissions"])
+  assert.deepEqual(reads, [])
+  assert.equal(permissionMessages.length, 2)
+  assert.doesNotMatch(permissionMessages.map((entry) => entry.text).join("\n"), /Project: other|C:\/repo\/other/)
 })
 
 test("createCallbackHandlers attributes permissions control failures to the target project", async () => {
