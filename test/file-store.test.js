@@ -190,7 +190,7 @@ test("writeJsonFileAtomic honors explicit file modes", async () => {
   assert.equal(modes.get(filePath), 0o640)
 })
 
-test("writeJsonFileAtomic does not run Windows fallback when target chmod fails after rename", async () => {
+test("writeJsonFileAtomic treats post-commit target chmod as best effort", async () => {
   const filePath = "C:/tmp/state.json"
   const files = new Map([[filePath, '{"old":true}\n']])
   const renameCalls = []
@@ -220,9 +220,50 @@ test("writeJsonFileAtomic does not run Windows fallback when target chmod fails 
     },
   }
 
-  await assert.rejects(() => writeJsonFileAtomic(filePath, { next: true }, { fsImpl, mode: 0o640 }), /target chmod denied/)
+  await writeJsonFileAtomic(filePath, { next: true }, { fsImpl, mode: 0o640 })
 
   assert.deepEqual(renameCalls, [{ from: tmpPath, to: filePath }])
+  assert.equal(files.get(filePath), '{\n  "next": true\n}\n')
+  assert.equal(files.has(tmpPath), false)
+})
+
+test("writeJsonFileAtomic treats post-fallback target chmod as best effort", async () => {
+  const filePath = "C:/tmp/state.json"
+  const files = new Map([[filePath, '{"old":true}\n']])
+  let tmpPath = null
+  let firstRename = true
+
+  const fsImpl = {
+    async mkdir() {},
+    async writeFile(targetPath, contents) {
+      files.set(targetPath, contents)
+      if (targetPath !== filePath) tmpPath = targetPath
+    },
+    async chmod(targetPath) {
+      if (targetPath === filePath) {
+        const err = new Error("target chmod denied")
+        err.code = "EACCES"
+        throw err
+      }
+    },
+    async rename(from, to) {
+      if (firstRename && from === tmpPath && to === filePath) {
+        firstRename = false
+        const err = new Error("replace denied")
+        err.code = "EPERM"
+        throw err
+      }
+      if (!files.has(from)) throw new Error(`Missing source: ${from}`)
+      files.set(to, files.get(from))
+      files.delete(from)
+    },
+    async unlink(targetPath) {
+      files.delete(targetPath)
+    },
+  }
+
+  await writeJsonFileAtomic(filePath, { next: true }, { fsImpl, mode: 0o640 })
+
   assert.equal(files.get(filePath), '{\n  "next": true\n}\n')
   assert.equal(files.has(tmpPath), false)
 })

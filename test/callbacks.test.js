@@ -799,6 +799,24 @@ test("createCallbackHandlers handles permissions control callbacks", async () =>
   ])
 })
 
+test("createCallbackHandlers reports permission render failures instead of swallowing them", async () => {
+  const callbackOutcomes = []
+  const { runtime, callbackAnswers, sentMessages, loggerErrors } = makeRuntime({
+    renderPermissionSettings: async () => {
+      throw new Error("permission config read failed")
+    },
+    recordCallbackOutcome: (projectAlias, outcome) => callbackOutcomes.push({ projectAlias, outcome }),
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("pc|project|demo", { chatType: "private", threadIdOr0: 0 }))
+
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Permissions", "Action failed"])
+  assert.deepEqual(callbackOutcomes, [{ projectAlias: "demo", outcome: "fatal" }])
+  assert.match(loggerErrors.at(-1) || "", /Callback handler error: permission config read failed/)
+  assert.match(sentMessages.at(-1)?.text || "", /Action failed\. Please try again\./)
+})
+
 test("createCallbackHandlers applies permissions reset callbacks in private chat", async () => {
   const { runtime, callbackAnswers, permissionCalls } = makeRuntime({
     applyPermissionProfile: async (ctxMeta, projectAlias, profileId, options) => {

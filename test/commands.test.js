@@ -529,6 +529,31 @@ test("createCommandHandlers handlePermissions explains unavailable permission co
   assert.match(sent[0].text, /No valid local opencode\.json\/opencode\.jsonc permission config path is available/)
 })
 
+test("createCommandHandlers handlePermissions explains access-denied permission configs", async () => {
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    readPermissionConfig: async () => ({
+      ok: false,
+      editable: false,
+      status: "unavailable",
+      reason: "access-denied",
+      filePath: "C:/repo/demo/opencode.json",
+      profile: "custom",
+      permission: undefined,
+    }),
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, [])
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /cannot be read or written by this connector process/)
+  assert.doesNotMatch(sent[0].text, /No valid local opencode\.json/)
+})
+
 test("createCommandHandlers handlePermissions explains unavailable write paths", async () => {
   const { runtime, sent } = makeRuntime({
     storeState: {
@@ -544,6 +569,23 @@ test("createCommandHandlers handlePermissions explains unavailable write paths",
   assert.equal(sent.length, 1)
   assert.match(sent[0].text, /Permission config cannot be changed for this project\./)
   assert.match(sent[0].text, /No valid local opencode\.json\/opencode\.jsonc permission config path is available/)
+})
+
+test("createCommandHandlers handlePermissions explains concurrent write conflicts", async () => {
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    writePermissionProfile: async () => ({ ok: false, editable: false, status: "conflict", reason: "changed" }),
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, ["auto-edit"])
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Permission config cannot be changed for this project\./)
+  assert.match(sent[0].text, /changed while applying the profile/)
 })
 
 test("createCommandHandlers handlePermissions applies non-dangerous profiles in private chat", async () => {

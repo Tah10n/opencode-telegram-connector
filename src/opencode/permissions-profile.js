@@ -13,7 +13,7 @@ export const CUSTOM_PERMISSION_PROFILE_ID = "custom"
 const PASSIVE_ALLOW = Object.freeze({
   read: READ_PERMISSION,
   glob: "allow",
-  grep: "allow",
+  grep: READ_PERMISSION,
   list: "allow",
   lsp: "allow",
   todoread: "allow",

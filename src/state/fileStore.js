@@ -49,6 +49,25 @@ async function chmodIfSupported(fsImpl, filePath, mode) {
   await fsImpl.chmod(filePath, normalized)
 }
 
+async function chmodIfSupportedBestEffort(fsImpl, filePath, mode) {
+  await chmodIfSupported(fsImpl, filePath, mode).catch(() => {})
+}
+
+function comparablePath(value) {
+  const normalized = path.normalize(String(value || ""))
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized
+}
+
+async function assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath) {
+  if (!expectedParentRealPath || typeof fsImpl?.realpath !== "function") return
+  const actual = await fsImpl.realpath(path.dirname(filePath))
+  if (comparablePath(actual) !== comparablePath(expectedParentRealPath)) {
+    const err = new Error(`Parent directory changed while writing '${filePath}'.`)
+    err.code = "EPARENTCHANGED"
+    throw err
+  }
+}
+
 function emergencyBackupPrefix(filePath) {
   return `${path.basename(filePath)}.bak.`
 }
@@ -151,16 +170,28 @@ export async function rotateStateFileBackups(filePath, { maxBackups = DEFAULT_ST
 
 export async function createStateFileBackup(
   filePath,
-  { reason = "state", schemaVersion, maxBackups = DEFAULT_STATE_BACKUP_MAX_FILES, fsImpl = fs, now = new Date(), mode } = {},
+  options = {},
 ) {
+  const {
+    reason = "state",
+    schemaVersion,
+    maxBackups = DEFAULT_STATE_BACKUP_MAX_FILES,
+    fsImpl = fs,
+    now = new Date(),
+    mode,
+    expectedParentRealPath,
+  } = options
   const dir = path.dirname(filePath)
+  await assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath)
   await fsImpl.mkdir(dir, { recursive: true })
+  await assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath)
   const versionLabel = schemaVersion == null ? "unknown" : `v${cleanBackupLabel(schemaVersion, "unknown")}`
   const suffix = [backupTimestamp(now), cleanBackupLabel(reason, "state"), versionLabel, crypto.randomBytes(4).toString("hex")].join(".")
   const backupPath = path.join(dir, `${backupPrefix(filePath)}${suffix}`)
-  const contents = await fsImpl.readFile(filePath)
+  const contents = Object.hasOwn(options, "contents") ? options.contents : await fsImpl.readFile(filePath)
   await fsImpl.writeFile(backupPath, contents, writeFileOptionsForMode(mode))
   await chmodIfSupported(fsImpl, backupPath, mode)
+  await assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath)
   await rotateStateFileBackups(filePath, { maxBackups, fsImpl })
   return backupPath
 }
@@ -197,6 +228,22 @@ async function replaceFileWithoutLosingExisting(fsImpl, sourcePath, targetPath) 
   }
 }
 
+async function commitNewFileWithoutOverwrite(fsImpl, sourcePath, targetPath) {
+  if (typeof fsImpl?.link === "function") {
+    await fsImpl.link(sourcePath, targetPath)
+    return
+  }
+  try {
+    await fsImpl.stat(targetPath)
+    const err = new Error(`Target already exists: ${targetPath}`)
+    err.code = "EEXIST"
+    throw err
+  } catch (err) {
+    if (!hasCode(err, "ENOENT")) throw err
+  }
+  await fsImpl.rename(sourcePath, targetPath)
+}
+
 export async function readJsonFile(filePath) {
   try {
     const txt = await fs.readFile(filePath, "utf8")
@@ -207,24 +254,33 @@ export async function readJsonFile(filePath) {
   }
 }
 
-export async function writeJsonFileAtomic(filePath, data, { fsImpl = fs, mode } = {}) {
+export async function writeJsonFileAtomic(filePath, data, { fsImpl = fs, mode, expectedParentRealPath, overwrite = true } = {}) {
+  await assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath)
   await fsImpl.mkdir(path.dirname(filePath), { recursive: true })
+  await assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath)
   const tmp = `${filePath}.tmp.${process.pid}.${crypto.randomBytes(6).toString("hex")}`
   await fsImpl.writeFile(tmp, JSON.stringify(data, null, 2) + "\n", writeFileOptionsForMode(mode, "utf8"))
   try {
     await chmodIfSupported(fsImpl, tmp, mode)
+    await assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath)
+    if (overwrite === false) {
+      await commitNewFileWithoutOverwrite(fsImpl, tmp, filePath)
+      await chmodIfSupportedBestEffort(fsImpl, filePath, mode)
+      return
+    }
     try {
       await fsImpl.rename(tmp, filePath)
     } catch (err) {
       // Windows may not allow overwrite; preserve the current file before retrying.
       if (hasCode(err, "EEXIST", "EPERM", "EACCES")) {
+        await assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath)
         await replaceFileWithoutLosingExisting(fsImpl, tmp, filePath)
-        await chmodIfSupported(fsImpl, filePath, mode)
+        await chmodIfSupportedBestEffort(fsImpl, filePath, mode)
         return
       }
       throw err
     }
-    await chmodIfSupported(fsImpl, filePath, mode)
+    await chmodIfSupportedBestEffort(fsImpl, filePath, mode)
   } finally {
     await unlinkIfExists(fsImpl, tmp).catch(() => {})
   }

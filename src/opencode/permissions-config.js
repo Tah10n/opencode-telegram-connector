@@ -13,9 +13,16 @@ import {
 const DEFAULT_OPENCODE_CONFIG_SCHEMA = "https://opencode.ai/config.json"
 const NEW_PERMISSION_CONFIG_MODE = 0o600
 const ALLOWED_PERMISSION_CONFIG_FILENAMES = Object.freeze(new Set(["opencode.json", "opencode.jsonc"]))
+const PERMISSION_CONFIG_TEXT = Symbol("permissionConfigText")
+const PERMISSION_CONFIG_PARENT_REALPATH = Symbol("permissionConfigParentRealpath")
+const permissionConfigWriteLocks = new Map()
 
 function hasCode(err, ...codes) {
   return !!err && typeof err === "object" && "code" in err && codes.includes(err.code)
+}
+
+function isAccessDenied(err) {
+  return hasCode(err, "EACCES", "EPERM")
 }
 
 function isPlainObject(value) {
@@ -64,6 +71,92 @@ function normalizedFileMode(mode) {
   if (mode == null) return undefined
   const numeric = Number(mode)
   return Number.isInteger(numeric) && numeric >= 0 ? numeric & 0o777 : undefined
+}
+
+function permissionResultUnavailable(filePath = "", reason = "") {
+  return {
+    ok: false,
+    editable: false,
+    status: "unavailable",
+    ...(reason ? { reason } : {}),
+    filePath,
+    config: null,
+    permission: undefined,
+    profile: "custom",
+  }
+}
+
+function permissionResultConflict(filePath) {
+  return {
+    ok: false,
+    editable: false,
+    status: "conflict",
+    reason: "changed",
+    filePath,
+    config: null,
+    permission: undefined,
+    profile: "custom",
+  }
+}
+
+function attachConfigText(result, text, includeText) {
+  if (!includeText) return result
+  Object.defineProperty(result, PERMISSION_CONFIG_TEXT, { value: text, enumerable: false })
+  return result
+}
+function attachConfigWriteMetadata(result, { text = "", parentRealPath } = {}, includeText) {
+  if (!includeText) return result
+  Object.defineProperty(result, PERMISSION_CONFIG_TEXT, { value: text, enumerable: false })
+  if (parentRealPath) Object.defineProperty(result, PERMISSION_CONFIG_PARENT_REALPATH, { value: parentRealPath, enumerable: false })
+  return result
+}
+
+function comparableFsPath(value) {
+  const normalized = path.normalize(String(value || ""))
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized
+}
+
+function sameFsPath(left, right) {
+  return comparableFsPath(left) === comparableFsPath(right)
+}
+
+function permissionConfigLockKey(filePath) {
+  const normalized = path.normalize(String(filePath || ""))
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized
+}
+
+async function withPermissionConfigWriteLock(lockKey, fn) {
+  const key = permissionConfigLockKey(lockKey)
+  const previous = permissionConfigWriteLocks.get(key) || Promise.resolve()
+  let release
+  const current = new Promise((resolve) => {
+    release = resolve
+  })
+  permissionConfigWriteLocks.set(key, current)
+  await previous.catch(() => {})
+  try {
+    return await fn()
+  } finally {
+    release()
+    if (permissionConfigWriteLocks.get(key) === current) permissionConfigWriteLocks.delete(key)
+  }
+}
+
+async function parentRealPathForWrite(fsImpl, filePath) {
+  if (typeof fsImpl?.realpath !== "function") return undefined
+  return fsImpl.realpath(path.dirname(filePath))
+}
+
+async function permissionConfigWriteLockKey(fsImpl, filePath, expectedParentRealPath) {
+  const parentRealPath = await parentRealPathForWrite(fsImpl, filePath)
+  if (expectedParentRealPath && parentRealPath && !sameFsPath(parentRealPath, expectedParentRealPath)) {
+    const err = new Error(`Parent directory changed while locking '${filePath}'.`)
+    err.code = "EPARENTCHANGED"
+    throw err
+  }
+  if (expectedParentRealPath) return path.join(expectedParentRealPath, path.basename(filePath))
+  if (!parentRealPath) return filePath
+  return path.join(parentRealPath, path.basename(filePath))
 }
 
 async function permissionConfigExistingFileMode(fsImpl, filePath) {
@@ -191,6 +284,19 @@ function permissionControlRemoteDirectory(project) {
   return project?.permissionControl?.remoteDirectory === true
 }
 
+function configuredPermissionConfigParentPath(project) {
+  const explicit = String(project?.permissionConfigPath || "").trim()
+  if (explicit && hostLocalPathInfo(explicit)) return path.dirname(explicit)
+  const directory = String(project?.directory || "").trim()
+  return isHostLocalDirectory(directory) ? directory : ""
+}
+
+async function configuredPermissionConfigParentRealPath(project, { fsImpl }) {
+  const parentPath = configuredPermissionConfigParentPath(project)
+  if (!parentPath || typeof fsImpl?.realpath !== "function") return undefined
+  return fsImpl.realpath(parentPath)
+}
+
 function hostLocalPathInfo(value) {
   const canonical = canonicalDirectoryPath(value)
   if (!canonical) return null
@@ -285,14 +391,34 @@ export async function resolvePermissionConfigPath(project, { fsImpl = fs } = {})
   return jsonPath
 }
 
-export async function readOpenCodePermissionConfig(project, { fsImpl = fs } = {}) {
+async function readOpenCodePermissionConfigInternal(project, { fsImpl = fs, includeText = false, expectedParentRealPath } = {}) {
   if (!permissionControlEnabled(project)) {
     const filePath = String(project?.permissionConfigPath || "").trim()
     return { ok: false, editable: false, status: "disabled", filePath, config: null, permission: undefined, profile: "custom" }
   }
-  const filePath = await resolvePermissionConfigPath(project, { fsImpl })
+  let filePath
+  try {
+    filePath = await resolvePermissionConfigPath(project, { fsImpl })
+  } catch (err) {
+    if (isAccessDenied(err)) return permissionResultUnavailable("", "access-denied")
+    throw err
+  }
   if (!filePath) {
     return { ok: false, editable: false, status: "unavailable", filePath: "", config: null, permission: undefined, profile: "custom" }
+  }
+
+  let parentRealPath
+  if (includeText) {
+    try {
+      parentRealPath = await parentRealPathForWrite(fsImpl, filePath)
+    } catch (err) {
+      if (isAccessDenied(err)) return permissionResultUnavailable(filePath, "access-denied")
+      if (hasCode(err, "ENOENT", "ENOTDIR")) return permissionResultUnavailable(filePath)
+      throw err
+    }
+    if (expectedParentRealPath && parentRealPath && !sameFsPath(parentRealPath, expectedParentRealPath)) {
+      return permissionResultConflict(filePath)
+    }
   }
 
   let text
@@ -300,7 +426,7 @@ export async function readOpenCodePermissionConfig(project, { fsImpl = fs } = {}
     text = await fsImpl.readFile(filePath, "utf8")
   } catch (err) {
     if (hasCode(err, "ENOENT")) {
-      return {
+      return attachConfigWriteMetadata({
         ok: true,
         editable: true,
         exists: false,
@@ -309,8 +435,9 @@ export async function readOpenCodePermissionConfig(project, { fsImpl = fs } = {}
         config: {},
         permission: undefined,
         profile: detectPermissionProfile(undefined),
-      }
+      }, { text: "", parentRealPath }, includeText)
     }
+    if (isAccessDenied(err)) return permissionResultUnavailable(filePath, "access-denied")
     throw err
   }
 
@@ -331,7 +458,7 @@ export async function readOpenCodePermissionConfig(project, { fsImpl = fs } = {}
     }
   }
   const permission = config.permission
-  return {
+  return attachConfigWriteMetadata({
     ok: true,
     editable: true,
     exists: true,
@@ -340,15 +467,136 @@ export async function readOpenCodePermissionConfig(project, { fsImpl = fs } = {}
     config,
     permission,
     profile: detectPermissionProfile(permission),
+  }, { text, parentRealPath }, includeText)
+}
+
+export async function readOpenCodePermissionConfig(project, { fsImpl = fs } = {}) {
+  return readOpenCodePermissionConfigInternal(project, { fsImpl })
+}
+
+async function verifyPermissionConfigWriteTarget(project, current, expectedText, { fsImpl }) {
+  const expectedParentRealPath = current[PERMISSION_CONFIG_PARENT_REALPATH]
+  let parentRealPathBefore
+  try {
+    parentRealPathBefore = await parentRealPathForWrite(fsImpl, current.filePath)
+  } catch (err) {
+    if (isAccessDenied(err) || hasCode(err, "ENOENT", "ENOTDIR")) {
+      return { ok: false, result: permissionResultUnavailable(current.filePath, isAccessDenied(err) ? "access-denied" : "") }
+    }
+    throw err
   }
+  if (expectedParentRealPath && parentRealPathBefore && !sameFsPath(parentRealPathBefore, expectedParentRealPath)) {
+    return { ok: false, result: permissionResultConflict(current.filePath) }
+  }
+
+  let pathStillValid
+  try {
+    pathStillValid = await revalidatePermissionConfigPathForWrite(project, current, { fsImpl })
+  } catch (err) {
+    if (isAccessDenied(err) || hasCode(err, "ENOENT", "ENOTDIR")) {
+      return { ok: false, result: permissionResultUnavailable(current.filePath, isAccessDenied(err) ? "access-denied" : "") }
+    }
+    throw err
+  }
+  if (!pathStillValid) {
+    return { ok: false, result: permissionResultUnavailable(current.filePath) }
+  }
+
+  let parentRealPath
+  try {
+    parentRealPath = await parentRealPathForWrite(fsImpl, current.filePath)
+  } catch (err) {
+    if (isAccessDenied(err) || hasCode(err, "ENOENT", "ENOTDIR")) {
+      return { ok: false, result: permissionResultUnavailable(current.filePath, isAccessDenied(err) ? "access-denied" : "") }
+    }
+    throw err
+  }
+  if (expectedParentRealPath && parentRealPath && !sameFsPath(parentRealPath, expectedParentRealPath)) {
+    return { ok: false, result: permissionResultConflict(current.filePath) }
+  }
+  if (parentRealPathBefore && parentRealPath && !sameFsPath(parentRealPathBefore, parentRealPath)) {
+    return { ok: false, result: permissionResultConflict(current.filePath) }
+  }
+  parentRealPath = expectedParentRealPath || parentRealPath || parentRealPathBefore
+
+  if (!current.exists) {
+    let state
+    try {
+      state = await permissionConfigTargetState(fsImpl, current.filePath)
+    } catch (err) {
+      if (isAccessDenied(err)) return { ok: false, result: permissionResultUnavailable(current.filePath, "access-denied") }
+      throw err
+    }
+    if (state === "missing") return { ok: true, mode: NEW_PERMISSION_CONFIG_MODE, text: "", parentRealPath }
+    if (state === "file") return { ok: false, result: permissionResultConflict(current.filePath) }
+    return { ok: false, result: permissionResultUnavailable(current.filePath) }
+  }
+
+  let modeResult
+  try {
+    modeResult = await permissionConfigExistingFileMode(fsImpl, current.filePath)
+  } catch (err) {
+    if (isAccessDenied(err)) return { ok: false, result: permissionResultUnavailable(current.filePath, "access-denied") }
+    throw err
+  }
+  if (!modeResult.ok) return { ok: false, result: permissionResultUnavailable(current.filePath) }
+
+  let latestText
+  try {
+    latestText = await fsImpl.readFile(current.filePath, "utf8")
+  } catch (err) {
+    if (isAccessDenied(err)) return { ok: false, result: permissionResultUnavailable(current.filePath, "access-denied") }
+    if (hasCode(err, "ENOENT", "ENOTDIR")) return { ok: false, result: permissionResultConflict(current.filePath) }
+    throw err
+  }
+  if (latestText !== expectedText) return { ok: false, result: permissionResultConflict(current.filePath) }
+
+  return { ok: true, mode: modeResult.mode, text: latestText, parentRealPath }
 }
 
 export async function writeOpenCodePermissionProfile(project, profileId, { fsImpl = fs, now = new Date() } = {}) {
   const normalizedProfileId = normalizePermissionProfileId(profileId, { includeReset: true })
   if (!normalizedProfileId) throw new Error(`Unknown permissions profile: ${profileId}`)
 
-  const current = await readOpenCodePermissionConfig(project, { fsImpl })
-  if (!current.editable) return { ok: false, ...current }
+  if (!permissionControlEnabled(project)) {
+    const filePath = String(project?.permissionConfigPath || "").trim()
+    return { ok: false, editable: false, status: "disabled", filePath, config: null, permission: undefined, profile: "custom" }
+  }
+
+  let initialParentRealPath
+  try {
+    initialParentRealPath = await configuredPermissionConfigParentRealPath(project, { fsImpl })
+  } catch (err) {
+    if (isAccessDenied(err)) return permissionResultUnavailable("", "access-denied")
+    if (hasCode(err, "ENOENT", "ENOTDIR")) return permissionResultUnavailable("")
+    throw err
+  }
+
+  let resolvedFilePath
+  try {
+    resolvedFilePath = await resolvePermissionConfigPath(project, { fsImpl })
+  } catch (err) {
+    if (isAccessDenied(err)) return permissionResultUnavailable("", "access-denied")
+    throw err
+  }
+  if (!resolvedFilePath) return permissionResultUnavailable("")
+
+  let lockKey
+  try {
+    lockKey = await permissionConfigWriteLockKey(fsImpl, resolvedFilePath, initialParentRealPath)
+  } catch (err) {
+    if (isAccessDenied(err)) return permissionResultUnavailable(resolvedFilePath, "access-denied")
+    if (hasCode(err, "EPARENTCHANGED", "ENOENT", "ENOTDIR")) return permissionResultConflict(resolvedFilePath)
+    throw err
+  }
+
+  return withPermissionConfigWriteLock(lockKey, async () => writeOpenCodePermissionProfileLocked(project, normalizedProfileId, resolvedFilePath, { fsImpl, now, expectedParentRealPath: initialParentRealPath }))
+}
+
+async function writeOpenCodePermissionProfileLocked(project, normalizedProfileId, resolvedFilePath, { fsImpl, now, expectedParentRealPath }) {
+  const current = await readOpenCodePermissionConfigInternal(project, { fsImpl, includeText: true, expectedParentRealPath })
+  if (!current.editable) return { ok: false, ...current, filePath: current.filePath || resolvedFilePath }
+  if (current.filePath !== resolvedFilePath) return permissionResultUnavailable(current.filePath || resolvedFilePath)
 
   const nextConfig = isPlainObject(current.config) ? { ...current.config } : {}
   const hasOwnPermissionKey = isPlainObject(current.config) && Object.hasOwn(current.config, "permission")
@@ -388,32 +636,47 @@ export async function writeOpenCodePermissionProfile(project, profileId, { fsImp
     nextConfig.permission = profileToPermissionConfig(normalizedProfileId)
   }
 
-  if (!(await revalidatePermissionConfigPathForWrite(project, current, { fsImpl }))) {
-    return { ok: false, editable: false, status: "unavailable", filePath: current.filePath, config: null, permission: undefined, profile: "custom" }
-  }
+  const expectedText = current[PERMISSION_CONFIG_TEXT] ?? ""
+  const verified = await verifyPermissionConfigWriteTarget(project, current, expectedText, { fsImpl })
+  if (!verified.ok) return verified.result
 
-  let writeMode = NEW_PERMISSION_CONFIG_MODE
-  if (current.exists) {
-    const modeResult = await permissionConfigExistingFileMode(fsImpl, current.filePath)
-    if (!modeResult.ok) {
-      return { ok: false, editable: false, status: "unavailable", filePath: current.filePath, config: null, permission: undefined, profile: "custom" }
-    }
-    writeMode = modeResult.mode
-  }
+  const writeMode = verified.mode
 
   let backupPath = ""
   if (current.exists) {
-    backupPath = await createStateFileBackup(current.filePath, {
-      reason: "opencode-permissions",
-      schemaVersion: "config",
-      maxBackups: permissionBackupMaxFiles(project),
-      fsImpl,
-      now,
-      mode: writeMode,
-    })
+    try {
+      backupPath = await createStateFileBackup(current.filePath, {
+        reason: "opencode-permissions",
+        schemaVersion: "config",
+        maxBackups: permissionBackupMaxFiles(project),
+        fsImpl,
+        now,
+        mode: writeMode,
+        contents: Buffer.from(verified.text, "utf8"),
+        expectedParentRealPath: verified.parentRealPath,
+      })
+    } catch (err) {
+      if (isAccessDenied(err)) return permissionResultUnavailable(current.filePath, "access-denied")
+      if (hasCode(err, "EPARENTCHANGED", "ENOENT", "ENOTDIR")) return permissionResultConflict(current.filePath)
+      throw err
+    }
   }
 
-  await writeJsonFileAtomic(current.filePath, nextConfig, { fsImpl, mode: writeMode })
+  const beforeWrite = await verifyPermissionConfigWriteTarget(project, current, expectedText, { fsImpl })
+  if (!beforeWrite.ok) return beforeWrite.result
+
+  try {
+    await writeJsonFileAtomic(current.filePath, nextConfig, {
+      fsImpl,
+      mode: writeMode,
+      expectedParentRealPath: beforeWrite.parentRealPath,
+      overwrite: current.exists !== false,
+    })
+  } catch (err) {
+    if (isAccessDenied(err)) return permissionResultUnavailable(current.filePath, "access-denied")
+    if (hasCode(err, "EPARENTCHANGED", "EEXIST", "ENOENT", "ENOTDIR")) return permissionResultConflict(current.filePath)
+    throw err
+  }
   return {
     ok: true,
     status: "ok",

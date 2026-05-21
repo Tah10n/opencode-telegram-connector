@@ -200,9 +200,9 @@ The built-in profiles are shaped after Codex-style modes:
 
 | Profile | Behavior |
 | --- | --- |
-| `suggest` | Read, list, glob, grep, LSP, and todo reads are allowed. Edits, shell commands, subagents, skills, todo writes, questions, network, code search, repository clone/overview, external directories, and repeated identical tool loops ask first. |
+| `suggest` | Read, list, glob, grep, LSP, and todo reads are allowed, but `.env`/`.env.*` content stays denied for both read and grep while `.env.example` remains allowed. Edits, shell commands, subagents, skills, todo writes, questions, network, code search, repository clone/overview, external directories, and repeated identical tool loops ask first. |
 | `auto-edit` | `suggest` plus edits and todo writes are allowed. Shell commands, subagents, skills, questions, network, code search, repository clone/overview, external directories, and repeated identical tool loops still ask first. |
-| `full-auto` | Catch-all is `ask`: unknown future permissions ask first. Reads/searches, edits, shell commands, subagents, skills, todo writes, and questions are explicitly allowed. Web fetch/search, code search, repository clone/overview, and external directories are denied. Repeated identical tool loops ask first. |
+| `full-auto` | Catch-all is `ask`: unknown future permissions ask first. Reads/searches, edits, shell commands, subagents, skills, todo writes, and questions are explicitly allowed, with `.env`/`.env.*` content still denied for read and grep. Web fetch/search, code search, repository clone/overview, and external directories are denied. Repeated identical tool loops ask first. |
 | `reset` | Removes the `permission` key and returns the project to OpenCode defaults. |
 
 OpenCode may need a restart for a running project to pick up file changes.

@@ -13,8 +13,8 @@ test("permissions profiles map Codex-like modes to OpenCode permission config", 
   assert.deepEqual(Object.keys(suggest.read), ["*", "*.env", "*.env.*", "*.env.example"])
   assert.equal(suggest.read["*"], "allow")
   assert.equal(suggest.read["*.env"], "deny")
+  assert.deepEqual(suggest.grep, suggest.read)
   assert.equal(suggest.glob, "allow")
-  assert.equal(suggest.grep, "allow")
   assert.equal(suggest.list, "allow")
   assert.equal(suggest.edit, "ask")
   assert.equal(suggest.bash, "ask")
@@ -39,6 +39,7 @@ test("permissions profiles map Codex-like modes to OpenCode permission config", 
   assert.equal(fullAuto.task, "allow")
   assert.equal(fullAuto.skill, "allow")
   assert.equal(fullAuto.question, "allow")
+  assert.deepEqual(fullAuto.grep, fullAuto.read)
   assert.equal(fullAuto.webfetch, "deny")
   assert.equal(fullAuto.websearch, "deny")
   assert.equal(fullAuto.repo_clone, "deny")
@@ -107,6 +108,13 @@ test("permissions profile detection rejects mismatched repo tool values", () => 
 
     assert.equal(detectPermissionProfile(permission), "custom")
   }
+})
+
+test("permissions profile detection rejects legacy grep allow profiles", () => {
+  const permission = profileToPermissionConfig("suggest")
+  permission.grep = "allow"
+
+  assert.equal(detectPermissionProfile(permission), "custom")
 })
 
 test("permissions profile normalization accepts Telegram-friendly aliases", () => {

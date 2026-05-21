@@ -1,8 +1,6 @@
 import { callbackToast } from "../callback-toast.js"
 import { normalizePermissionProfileId, PERMISSION_RESET_ID } from "../../opencode/permissions-profile.js"
 
-function ignoreError() {}
-
 function isPrivateChat(ctxMeta) {
   return ctxMeta?.chatType === "private"
 }
@@ -28,7 +26,7 @@ export async function handlePermissionsControlCallback({
   if (action === "project" || action === "settings") {
     const projectAlias = parts[2] || ""
     await answerCallbackQuery(callbackQuery.id, callbackToast("permissions"))
-    await renderPermissionSettings(ctxMeta, { projectAlias, editMessageId: msg?.message_id }).catch(ignoreError)
+    await renderPermissionSettings(ctxMeta, { projectAlias, editMessageId: msg?.message_id })
     return true
   }
 
@@ -39,7 +37,7 @@ export async function handlePermissionsControlCallback({
       return true
     }
     await answerCallbackQuery(callbackQuery.id, callbackToast("permissions"))
-    await renderPermissionDetails(ctxMeta, projectAlias, { editMessageId: msg?.message_id }).catch(ignoreError)
+    await renderPermissionDetails(ctxMeta, projectAlias, { editMessageId: msg?.message_id })
     return true
   }
 
@@ -55,7 +53,7 @@ export async function handlePermissionsControlCallback({
       return true
     }
     await answerCallbackQuery(callbackQuery.id, "Confirm")
-    await renderFullAutoConfirmation(ctxMeta, projectAlias, { editMessageId: msg?.message_id }).catch(ignoreError)
+    await renderFullAutoConfirmation(ctxMeta, projectAlias, { editMessageId: msg?.message_id })
     return true
   }
 
@@ -72,7 +70,7 @@ export async function handlePermissionsControlCallback({
     }
     if (requestedProfile === "full-auto" && action !== "apply") {
       await answerCallbackQuery(callbackQuery.id, "Confirm")
-      await renderFullAutoConfirmation(ctxMeta, projectAlias, { editMessageId: msg?.message_id }).catch(ignoreError)
+      await renderFullAutoConfirmation(ctxMeta, projectAlias, { editMessageId: msg?.message_id })
       return true
     }
     const result = await applyPermissionProfile(ctxMeta, projectAlias, requestedProfile, { editMessageId: msg?.message_id })

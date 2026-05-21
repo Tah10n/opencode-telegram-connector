@@ -36,6 +36,7 @@ function configStatusLabel(status, locale, t) {
     ok: "permissions.statusOk",
     missing: "permissions.statusMissing",
     unavailable: "permissions.statusUnavailable",
+    conflict: "permissions.statusConflict",
     disabled: "permissions.statusDisabled",
     invalid: "permissions.statusInvalid",
   }[status]
@@ -46,6 +47,15 @@ function compactJson(value, maxChars = 2400) {
   if (value == null) return "(not configured)"
   const text = JSON.stringify(value, null, 2)
   return text.length > maxChars ? `${text.slice(0, maxChars)}\n...` : text
+}
+
+function permissionIssueText(ctxOrLocale, result, t) {
+  if (result?.status === "unavailable" && result?.reason === "access-denied") return t(ctxOrLocale, "permissions.accessDenied")
+  if (result?.status === "unavailable") return t(ctxOrLocale, "permissions.noConfigPath")
+  if (result?.status === "conflict") return t(ctxOrLocale, "permissions.configChanged")
+  if (result?.status === "disabled") return t(ctxOrLocale, "permissions.disabled")
+  if (result?.status === "invalid") return t(ctxOrLocale, "permissions.invalidConfig")
+  return ""
 }
 
 export function createPermissionCommandHandlers(deps) {
@@ -130,9 +140,8 @@ export function createPermissionCommandHandlers(deps) {
     if (readResult?.filePath && shouldShowFilePath(ctxMeta)) lines.push(t(locale, "permissions.configPath", { path: readResult.filePath }))
     lines.push(t(locale, "permissions.status", { status: configStatusLabel(readResult?.status, locale, t) }))
     if (!canWrite(ctxMeta)) lines.push(t(locale, "permissions.privateWriteOnly"))
-    if (readResult?.status === "unavailable") lines.push(t(locale, "permissions.noConfigPath"))
-    if (readResult?.status === "disabled") lines.push(t(locale, "permissions.disabled"))
-    if (readResult?.status === "invalid") lines.push(t(locale, "permissions.invalidConfig"))
+    const issueText = permissionIssueText(locale, readResult, t)
+    if (issueText) lines.push(issueText)
     lines.push("", t(locale, "permissions.suggestDescription"))
     lines.push(t(locale, "permissions.autoEditDescription"))
     lines.push(t(locale, "permissions.fullAutoDescription"))
@@ -142,9 +151,8 @@ export function createPermissionCommandHandlers(deps) {
 
   function writeUnavailableText(ctxMeta, result) {
     const lines = [t(ctxMeta, "permissions.writeUnavailable")]
-    if (result?.status === "unavailable") lines.push(t(ctxMeta, "permissions.noConfigPath"))
-    if (result?.status === "disabled") lines.push(t(ctxMeta, "permissions.disabled"))
-    if (result?.status === "invalid") lines.push(t(ctxMeta, "permissions.invalidConfig"))
+    const issueText = permissionIssueText(ctxMeta, result, t)
+    if (issueText) lines.push(issueText)
     return lines.join("\n")
   }
 

@@ -103,6 +103,12 @@ function makeFakePermissionConfigFs({ directories = [], files = {} } = {}) {
     fsImpl,
     chmodCalls,
     textOf: (filePath) => fileEntries.get(normalize(filePath))?.text,
+    setText: (filePath, text) => {
+      const entry = fileEntries.get(normalize(filePath))
+      if (!entry) throw enoent(filePath)
+      entry.text = String(text)
+      entry.mtimeMs = nextMtimeMs++
+    },
     modeOf: (filePath) => fileEntries.get(normalize(filePath))?.mode,
   }
 }
@@ -580,6 +586,192 @@ test("OpenCode permission config reader reports invalid JSONC without overwritin
   assert.equal(writeResult.ok, false)
   assert.equal(writeResult.status, "invalid")
   assert.equal(await fs.readFile(configPath, "utf8"), "{ invalid json")
+})
+
+test("OpenCode permission config reader reports access-denied files as unavailable", async () => {
+  const dir = path.join(await makeTempDir(), "project")
+  const configPath = path.join(dir, "opencode.json")
+  const fake = makeFakePermissionConfigFs({
+    directories: [dir],
+    files: { [configPath]: { text: JSON.stringify({ permission: profileToPermissionConfig("suggest") }) } },
+  })
+  const fsImpl = {
+    ...fake.fsImpl,
+    async readFile(filePath, encoding) {
+      if (path.normalize(filePath) === path.normalize(configPath) && encoding === "utf8") {
+        const err = new Error("permission denied")
+        err.code = "EACCES"
+        throw err
+      }
+      return fake.fsImpl.readFile(filePath, encoding)
+    },
+  }
+
+  const readResult = await readOpenCodePermissionConfig({ directory: dir }, { fsImpl })
+  assert.equal(readResult.ok, false)
+  assert.equal(readResult.editable, false)
+  assert.equal(readResult.status, "unavailable")
+  assert.equal(readResult.reason, "access-denied")
+  assert.equal(readResult.filePath, configPath)
+
+  const writeResult = await writeOpenCodePermissionProfile({ directory: dir }, "auto-edit", { fsImpl })
+  assert.equal(writeResult.ok, false)
+  assert.equal(writeResult.status, "unavailable")
+  assert.equal(writeResult.reason, "access-denied")
+  assert.equal(writeResult.filePath, configPath)
+})
+
+test("OpenCode permission config writer aborts when the file changes before write", async () => {
+  const dir = path.join(await makeTempDir(), "project")
+  const configPath = path.join(dir, "opencode.json")
+  const original = JSON.stringify({ permission: profileToPermissionConfig("suggest"), keep: true }, null, 2)
+  const concurrent = JSON.stringify({ permission: profileToPermissionConfig("full-auto"), concurrent: true }, null, 2)
+  const fake = makeFakePermissionConfigFs({
+    directories: [dir],
+    files: { [configPath]: { text: original, mode: 0o600 } },
+  })
+  let configReads = 0
+  const fsImpl = {
+    ...fake.fsImpl,
+    async readFile(filePath, encoding) {
+      const value = await fake.fsImpl.readFile(filePath, encoding)
+      if (path.normalize(filePath) === path.normalize(configPath) && encoding === "utf8") {
+        configReads += 1
+        if (configReads === 1) fake.setText(configPath, concurrent)
+      }
+      return value
+    },
+  }
+
+  const result = await writeOpenCodePermissionProfile({ directory: dir }, "auto-edit", { fsImpl })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.status, "conflict")
+  assert.equal(result.reason, "changed")
+  assert.equal(fake.textOf(configPath), concurrent)
+})
+
+test("OpenCode permission config writer reports access-denied backup writes", async () => {
+  const dir = path.join(await makeTempDir(), "project")
+  const configPath = path.join(dir, "opencode.json")
+  const original = JSON.stringify({ permission: profileToPermissionConfig("suggest"), keep: true }, null, 2)
+  const fake = makeFakePermissionConfigFs({
+    directories: [dir],
+    files: { [configPath]: { text: original, mode: 0o600 } },
+  })
+  const fsImpl = {
+    ...fake.fsImpl,
+    async writeFile(filePath, contents, options) {
+      if (path.basename(filePath).startsWith("opencode.json.backup.")) {
+        const err = new Error("backup denied")
+        err.code = "EACCES"
+        throw err
+      }
+      return fake.fsImpl.writeFile(filePath, contents, options)
+    },
+  }
+
+  const result = await writeOpenCodePermissionProfile({ directory: dir }, "auto-edit", { fsImpl })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.status, "unavailable")
+  assert.equal(result.reason, "access-denied")
+  assert.equal(fake.textOf(configPath), original)
+})
+
+test("OpenCode permission config writer preserves access-denied from locked re-read", async () => {
+  const dir = path.join(await makeTempDir(), "project")
+  const configPath = path.join(dir, "opencode.json")
+  const original = JSON.stringify({ permission: profileToPermissionConfig("suggest"), keep: true }, null, 2)
+  const fake = makeFakePermissionConfigFs({
+    directories: [dir],
+    files: { [configPath]: { text: original, mode: 0o600 } },
+  })
+  let dirStatCalls = 0
+  const fsImpl = {
+    ...fake.fsImpl,
+    async stat(filePath) {
+      if (path.normalize(filePath) === path.normalize(dir)) {
+        dirStatCalls += 1
+        if (dirStatCalls >= 2) {
+          const err = new Error("directory denied")
+          err.code = "EACCES"
+          throw err
+        }
+      }
+      return fake.fsImpl.stat(filePath)
+    },
+  }
+
+  const result = await writeOpenCodePermissionProfile({ directory: dir }, "auto-edit", { fsImpl })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.status, "unavailable")
+  assert.equal(result.reason, "access-denied")
+  assert.equal(result.filePath, configPath)
+  assert.equal(fake.textOf(configPath), original)
+})
+
+test("OpenCode permission config writer aborts when parent realpath changes", async () => {
+  const dir = path.join(await makeTempDir(), "project")
+  const changedDir = path.join(await makeTempDir(), "project-link-target")
+  const configPath = path.join(dir, "opencode.json")
+  const original = JSON.stringify({ permission: profileToPermissionConfig("suggest"), keep: true }, null, 2)
+  const fake = makeFakePermissionConfigFs({
+    directories: [dir],
+    files: { [configPath]: { text: original, mode: 0o600 } },
+  })
+  let parentRealpathCalls = 0
+  let writeCalls = 0
+  const fsImpl = {
+    ...fake.fsImpl,
+    async realpath(filePath) {
+      if (path.normalize(filePath) === path.normalize(dir)) {
+        parentRealpathCalls += 1
+        return parentRealpathCalls >= 3 ? changedDir : dir
+      }
+      return fake.fsImpl.realpath(filePath)
+    },
+    async writeFile(filePath, contents, options) {
+      writeCalls += 1
+      return fake.fsImpl.writeFile(filePath, contents, options)
+    },
+  }
+
+  const result = await writeOpenCodePermissionProfile({ directory: dir }, "auto-edit", { fsImpl })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.status, "conflict")
+  assert.equal(result.reason, "changed")
+  assert.equal(fake.textOf(configPath), original)
+  assert.equal(writeCalls, 0)
+})
+
+test("OpenCode permission config writer does not overwrite concurrently created configs", async () => {
+  const dir = path.join(await makeTempDir(), "project")
+  const configPath = path.join(dir, "opencode.json")
+  const concurrent = JSON.stringify({ permission: profileToPermissionConfig("full-auto"), concurrent: true }, null, 2)
+  const fake = makeFakePermissionConfigFs({ directories: [dir] })
+  const fsImpl = {
+    ...fake.fsImpl,
+    async link(from, to) {
+      assert.match(path.basename(from), /^opencode\.json\.tmp\./)
+      if (path.normalize(to) === path.normalize(configPath)) {
+        await fake.fsImpl.writeFile(configPath, concurrent, { mode: 0o600 })
+        const err = new Error("target exists")
+        err.code = "EEXIST"
+        throw err
+      }
+      throw new Error(`Unexpected copy target: ${to}`)
+    },
+  }
+
+  const result = await writeOpenCodePermissionProfile({ directory: dir }, "auto-edit", { fsImpl })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.status, "conflict")
+  assert.equal(result.reason, "changed")
+  assert.equal(fake.textOf(configPath), concurrent)
 })
 
 test("OpenCode permission config reader reports unavailable and disabled projects", async () => {
