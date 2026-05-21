@@ -133,7 +133,8 @@ export function createCallbackHandlers(runtime) {
       return
     }
     const kind = parts[0]
-    const callbackProjectAlias = projects?.[parts[1]] ? parts[1] : store.getBinding(ctxMeta.ctxKey)?.projectAlias || null
+    const callbackProjectAliasPart = kind === "pc" ? parts[2] : parts[1]
+    const callbackProjectAlias = projects?.[callbackProjectAliasPart] ? callbackProjectAliasPart : store.getBinding(ctxMeta.ctxKey)?.projectAlias || null
     recordLegacyCallback(legacyPrefix, callbackProjectAlias)
 
     try {

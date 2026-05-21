@@ -236,11 +236,16 @@ export function createPermissionCommandHandlers(deps) {
     const bindingAlias = boundProjectAlias(ctxMeta)
     const first = String(argv?.[0] || "").trim()
     const second = String(argv?.[1] || "").trim()
+    const extra = String(argv?.[2] || "").trim()
     const firstProfile = normalizePermissionProfileId(first, { includeReset: true })
     const secondProfile = normalizePermissionProfileId(second, { includeReset: true })
 
+    if (extra) return { projectAlias: "", invalid: true }
+    if (first && projects?.[first] && isPrivateChat(ctxMeta)) {
+      return { projectAlias: first, profileId: secondProfile, invalid: !!second && !secondProfile }
+    }
+    if (second) return { projectAlias: "", invalid: true }
     if (bindingAlias && (!first || firstProfile)) return { projectAlias: bindingAlias, profileId: firstProfile }
-    if (first && projects?.[first] && isPrivateChat(ctxMeta)) return { projectAlias: first, profileId: secondProfile }
     if (first && projects?.[first]) return { projectAlias: "", profileId: "", invalid: false }
     if (bindingAlias && first && !firstProfile) return { projectAlias: bindingAlias, invalid: true }
     return { projectAlias: "", profileId: firstProfile, invalid: !!first }

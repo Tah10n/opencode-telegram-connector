@@ -812,6 +812,22 @@ test("createCallbackHandlers blocks permissions changes outside private chat", a
   assert.deepEqual(permissionCalls, [])
 })
 
+test("createCallbackHandlers attributes permissions control failures to the target project", async () => {
+  const callbackOutcomes = []
+  const { runtime, callbackAnswers } = makeRuntime({
+    recordCallbackOutcome: (projectAlias, outcome) => callbackOutcomes.push({ projectAlias, outcome }),
+    applyPermissionProfile: async () => {
+      throw new Error("write failed")
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("pc|apply|demo|auto-edit", { chatType: "private", threadIdOr0: 0 }))
+
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Action failed"])
+  assert.deepEqual(callbackOutcomes, [{ projectAlias: "demo", outcome: "fatal" }])
+})
+
 test("createCallbackHandlers reports unavailable project health with start action", async () => {
   const { runtime, callbackAnswers, sentMessages } = makeRuntime({
     projects: { demo: { baseUrl: "http://127.0.0.1:4312" } },

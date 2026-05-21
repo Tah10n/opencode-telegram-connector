@@ -511,6 +511,100 @@ test("createCommandHandlers handlePermissions applies non-dangerous profiles in 
   assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text), ["Suggest", "Auto Edit", "Full Auto", "OpenCode default", "View current", "Close"])
 })
 
+test("createCommandHandlers handlePermissions targets explicit project aliases before profile shorthand", async () => {
+  const writes = []
+  const { runtime } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: {
+      demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" },
+      suggest: { baseUrl: "http://127.0.0.1:4313", directory: "C:/repo/suggest" },
+    },
+    readPermissionConfig: async () => ({
+      ok: true,
+      editable: true,
+      status: "ok",
+      filePath: "C:/repo/suggest/opencode.json",
+      profile: "auto-edit",
+      permission: {},
+    }),
+    writePermissionProfile: async (project, profileId) => {
+      writes.push({ project, profileId })
+      return { ok: true, profile: profileId, filePath: "C:/repo/suggest/opencode.json" }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, ["suggest", "auto-edit"])
+
+  assert.deepEqual(writes, [{ project: runtime.projects.suggest, profileId: "auto-edit" }])
+})
+
+test("createCommandHandlers handlePermissions renders one-arg project alias before bound profile shorthand", async () => {
+  const reads = []
+  const writes = []
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: {
+      demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" },
+      suggest: { baseUrl: "http://127.0.0.1:4313", directory: "C:/repo/suggest" },
+    },
+    readPermissionConfig: async (project) => {
+      reads.push(project)
+      return {
+        ok: true,
+        editable: true,
+        status: "ok",
+        filePath: "C:/repo/suggest/opencode.json",
+        profile: "auto-edit",
+        permission: {},
+      }
+    },
+    writePermissionProfile: async (project, profileId) => {
+      writes.push({ project, profileId })
+      return { ok: true, profile: profileId, filePath: "C:/repo/demo/opencode.json" }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, ["suggest"])
+
+  assert.deepEqual(writes, [])
+  assert.deepEqual(reads, [runtime.projects.suggest])
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Project: suggest/)
+  assert.match(sent[0].text, /Profile: Auto Edit/)
+})
+
+test("createCommandHandlers handlePermissions rejects invalid profile arguments", async () => {
+  const writes = []
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: {
+      demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" },
+      other: { baseUrl: "http://127.0.0.1:4313", directory: "C:/repo/other" },
+    },
+    writePermissionProfile: async (project, profileId) => {
+      writes.push({ project, profileId })
+      return { ok: true, profile: profileId }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, ["other", "ful-auto"])
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, ["auto-edit", "extra"])
+
+  assert.deepEqual(writes, [])
+  assert.equal(sent.length, 2)
+  assert.match(sent[0].text, /^Usage: \/permissions/)
+  assert.match(sent[1].text, /^Usage: \/permissions/)
+})
+
 test("createCommandHandlers handlePermissions asks confirmation for full-auto", async () => {
   const writes = []
   const { runtime, sent } = makeRuntime({

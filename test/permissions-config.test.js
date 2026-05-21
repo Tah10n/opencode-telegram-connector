@@ -56,6 +56,99 @@ test("OpenCode permission config writer creates config when missing", async () =
   assert.deepEqual(written.permission, profileToPermissionConfig("auto-edit"))
 })
 
+test("OpenCode permission config writer does not create implicit configs for missing project directories", async () => {
+  const dir = path.join(await makeTempDir(), "missing-project")
+
+  assert.equal(await resolvePermissionConfigPath({ directory: dir }), "")
+  const readResult = await readOpenCodePermissionConfig({ directory: dir })
+  assert.equal(readResult.status, "unavailable")
+  assert.equal(readResult.editable, false)
+
+  const writeResult = await writeOpenCodePermissionProfile({ directory: dir }, "auto-edit")
+  assert.equal(writeResult.ok, false)
+  assert.equal(writeResult.status, "unavailable")
+  await assert.rejects(fs.stat(dir), /ENOENT/)
+})
+
+test("OpenCode permission config writer skips unchanged profiles without rewriting JSONC", async () => {
+  const dir = await makeTempDir()
+  const configPath = path.join(dir, "opencode.jsonc")
+  const original = [
+    "{",
+    "  // keep local comments on no-op profile writes",
+    '  "permission": ' + JSON.stringify(profileToPermissionConfig("suggest"), null, 2).replaceAll("\n", "\n  "),
+    "}",
+    "",
+  ].join("\n")
+  await fs.writeFile(configPath, original, "utf8")
+
+  const result = await writeOpenCodePermissionProfile({ directory: dir }, "suggest")
+
+  assert.equal(result.ok, true)
+  assert.equal(result.changed, false)
+  assert.equal(result.backupPath, "")
+  assert.equal(await fs.readFile(configPath, "utf8"), original)
+})
+
+test("OpenCode permission config writer migrates legacy full-auto repo denials", async () => {
+  const dir = await makeTempDir()
+  const configPath = path.join(dir, "opencode.json")
+  const legacyFullAuto = profileToPermissionConfig("full-auto")
+  delete legacyFullAuto.repo_clone
+  delete legacyFullAuto.repo_overview
+  await fs.writeFile(configPath, JSON.stringify({ permission: legacyFullAuto, custom: true }, null, 2), "utf8")
+
+  const result = await writeOpenCodePermissionProfile({ directory: dir }, "full-auto", { now: new Date("2026-05-20T00:00:00.000Z") })
+
+  assert.equal(result.ok, true)
+  assert.equal(result.changed, true)
+  assert.equal(result.profile, "full-auto")
+  assert.equal(result.permission.repo_clone, "deny")
+  assert.equal(result.permission.repo_overview, "deny")
+  assert.match(path.basename(result.backupPath), /^opencode\.json\.backup\./)
+  assert.deepEqual(JSON.parse(await fs.readFile(configPath, "utf8")).permission, profileToPermissionConfig("full-auto"))
+  assert.deepEqual(JSON.parse(await fs.readFile(result.backupPath, "utf8")).permission, legacyFullAuto)
+})
+
+test("OpenCode permission config writer skips reset when config is already default", async () => {
+  const dir = await makeTempDir()
+  const configPath = path.join(dir, "opencode.jsonc")
+  const original = [
+    "{",
+    "  // existing config without a permission override",
+    '  "custom": true',
+    "}",
+    "",
+  ].join("\n")
+  await fs.writeFile(configPath, original, "utf8")
+
+  const result = await writeOpenCodePermissionProfile({ directory: dir }, "reset")
+
+  assert.equal(result.ok, true)
+  assert.equal(result.changed, false)
+  assert.equal(result.backupPath, "")
+  assert.equal(result.profile, "opencode-default")
+  assert.equal(await fs.readFile(configPath, "utf8"), original)
+})
+
+test("OpenCode permission config writer removes explicit null permission on reset", async () => {
+  const dir = await makeTempDir()
+  const configPath = path.join(dir, "opencode.json")
+  await fs.writeFile(configPath, JSON.stringify({ permission: null, custom: true }, null, 2), "utf8")
+
+  const result = await writeOpenCodePermissionProfile({ directory: dir }, "reset", { now: new Date("2026-05-20T00:00:00.000Z") })
+
+  assert.equal(result.ok, true)
+  assert.equal(result.changed, true)
+  assert.equal(result.profile, "opencode-default")
+  assert.equal(result.permission, undefined)
+  assert.match(path.basename(result.backupPath), /^opencode\.json\.backup\./)
+  assert.deepEqual(JSON.parse(await fs.readFile(configPath, "utf8")), { custom: true })
+  const backup = JSON.parse(await fs.readFile(result.backupPath, "utf8"))
+  assert.equal(Object.hasOwn(backup, "permission"), true)
+  assert.equal(backup.permission, null)
+})
+
 test("OpenCode permission config writer backs up existing config and resets to default", async () => {
   const dir = await makeTempDir()
   const configPath = path.join(dir, "opencode.json")
@@ -123,4 +216,26 @@ test("OpenCode permission config reader reports unavailable and disabled project
   assert.equal(disabled.ok, false)
   assert.equal(disabled.editable, false)
   assert.equal(disabled.status, "disabled")
+})
+
+test("OpenCode permission config reader does not probe files for disabled projects", async () => {
+  let statCalls = 0
+  const fsImpl = {
+    stat: async () => {
+      statCalls += 1
+      const err = new Error("blocked")
+      err.code = "EACCES"
+      throw err
+    },
+  }
+
+  const disabled = await readOpenCodePermissionConfig({
+    directory: "C:/blocked",
+    permissionControl: { enabled: false },
+  }, { fsImpl })
+
+  assert.equal(disabled.ok, false)
+  assert.equal(disabled.editable, false)
+  assert.equal(disabled.status, "disabled")
+  assert.equal(statCalls, 0)
 })

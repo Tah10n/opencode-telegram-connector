@@ -5,6 +5,7 @@ import { createStateFileBackup, DEFAULT_STATE_BACKUP_MAX_FILES, writeJsonFileAto
 import {
   detectPermissionProfile,
   normalizePermissionProfileId,
+  OPENCODE_DEFAULT_PROFILE_ID,
   PERMISSION_RESET_ID,
   profileToPermissionConfig,
 } from "./permissions-profile.js"
@@ -24,7 +25,17 @@ async function fileExists(fsImpl, filePath) {
     const stat = await fsImpl.stat(filePath)
     return typeof stat?.isFile === "function" ? stat.isFile() : true
   } catch (err) {
-    if (hasCode(err, "ENOENT")) return false
+    if (hasCode(err, "ENOENT", "ENOTDIR")) return false
+    throw err
+  }
+}
+
+async function directoryExists(fsImpl, directory) {
+  try {
+    const stat = await fsImpl.stat(directory)
+    return typeof stat?.isDirectory === "function" ? stat.isDirectory() : true
+  } catch (err) {
+    if (hasCode(err, "ENOENT", "ENOTDIR")) return false
     throw err
   }
 }
@@ -145,12 +156,18 @@ function isHostLocalDirectory(directory) {
   return canonical.flavor === "posix"
 }
 
+function isCurrentProfile(currentProfile, requestedProfile) {
+  if (requestedProfile === PERMISSION_RESET_ID) return currentProfile === OPENCODE_DEFAULT_PROFILE_ID
+  return currentProfile === requestedProfile
+}
+
 export async function resolvePermissionConfigPath(project, { fsImpl = fs } = {}) {
   const explicit = String(project?.permissionConfigPath || "").trim()
   if (explicit) return explicit
   const directory = String(project?.directory || "").trim()
   if (!directory) return ""
   if (!isHostLocalDirectory(directory)) return ""
+  if (!(await directoryExists(fsImpl, directory))) return ""
 
   const jsonPath = path.join(directory, "opencode.json")
   const jsoncPath = path.join(directory, "opencode.jsonc")
@@ -160,10 +177,11 @@ export async function resolvePermissionConfigPath(project, { fsImpl = fs } = {})
 }
 
 export async function readOpenCodePermissionConfig(project, { fsImpl = fs } = {}) {
-  const filePath = await resolvePermissionConfigPath(project, { fsImpl })
   if (!permissionControlEnabled(project)) {
+    const filePath = String(project?.permissionConfigPath || "").trim()
     return { ok: false, editable: false, status: "disabled", filePath, config: null, permission: undefined, profile: "custom" }
   }
+  const filePath = await resolvePermissionConfigPath(project, { fsImpl })
   if (!filePath) {
     return { ok: false, editable: false, status: "unavailable", filePath: "", config: null, permission: undefined, profile: "custom" }
   }
@@ -224,12 +242,30 @@ export async function writeOpenCodePermissionProfile(project, profileId, { fsImp
   if (!current.editable) return { ok: false, ...current }
 
   const nextConfig = isPlainObject(current.config) ? { ...current.config } : {}
+  const hasOwnPermissionKey = isPlainObject(current.config) && Object.hasOwn(current.config, "permission")
+  const isUnchangedProfile = normalizedProfileId === PERMISSION_RESET_ID
+    ? current.profile === OPENCODE_DEFAULT_PROFILE_ID && !hasOwnPermissionKey
+    : isCurrentProfile(current.profile, normalizedProfileId)
+
+  if (isUnchangedProfile) {
+    return {
+      ok: true,
+      status: current.status,
+      filePath: current.filePath,
+      backupPath: "",
+      changed: false,
+      profile: current.profile,
+      permission: current.permission,
+      config: nextConfig,
+    }
+  }
   if (normalizedProfileId === PERMISSION_RESET_ID && !current.exists) {
     return {
       ok: true,
       status: "missing",
       filePath: current.filePath,
       backupPath: "",
+      changed: false,
       profile: detectPermissionProfile(undefined),
       permission: undefined,
       config: nextConfig,
@@ -260,6 +296,7 @@ export async function writeOpenCodePermissionProfile(project, profileId, { fsImp
     status: "ok",
     filePath: current.filePath,
     backupPath,
+    changed: true,
     profile: detectPermissionProfile(nextConfig.permission),
     permission: nextConfig.permission,
     config: nextConfig,

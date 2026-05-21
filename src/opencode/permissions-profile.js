@@ -32,6 +32,8 @@ const PERMISSION_PROFILES = Object.freeze({
     webfetch: "ask",
     websearch: "ask",
     codesearch: "ask",
+    repo_clone: "ask",
+    repo_overview: "ask",
     external_directory: "ask",
     doom_loop: "ask",
   }),
@@ -47,6 +49,8 @@ const PERMISSION_PROFILES = Object.freeze({
     webfetch: "ask",
     websearch: "ask",
     codesearch: "ask",
+    repo_clone: "ask",
+    repo_overview: "ask",
     external_directory: "ask",
     doom_loop: "ask",
   }),
@@ -62,10 +66,14 @@ const PERMISSION_PROFILES = Object.freeze({
     webfetch: "deny",
     websearch: "deny",
     codesearch: "deny",
+    repo_clone: "deny",
+    repo_overview: "deny",
     external_directory: "deny",
     doom_loop: "ask",
   }),
 })
+
+const LEGACY_OPTIONAL_PROFILE_KEYS = Object.freeze(["repo_clone", "repo_overview"])
 
 function cloneJson(value) {
   return JSON.parse(JSON.stringify(value))
@@ -78,6 +86,20 @@ function sortObjectKeys(value) {
 
 function canonicalJson(value) {
   return JSON.stringify(sortObjectKeys(value))
+}
+
+function matchesPermissionProfile(permission, profile) {
+  if (canonicalJson(permission) === canonicalJson(profile)) return true
+  if (!permission || typeof permission !== "object" || Array.isArray(permission)) return false
+
+  const permissionWithLegacyDefaults = { ...permission }
+  for (const key of LEGACY_OPTIONAL_PROFILE_KEYS) {
+    if (Object.hasOwn(permissionWithLegacyDefaults, key)) continue
+    if (profile[key] !== profile["*"]) return false
+    permissionWithLegacyDefaults[key] = profile[key]
+  }
+
+  return canonicalJson(permissionWithLegacyDefaults) === canonicalJson(profile)
 }
 
 export function normalizePermissionProfileId(value, { includeReset = false } = {}) {
@@ -99,9 +121,8 @@ export function profileToPermissionConfig(profileId) {
 
 export function detectPermissionProfile(permission) {
   if (permission == null) return OPENCODE_DEFAULT_PROFILE_ID
-  const current = canonicalJson(permission)
   for (const profileId of PERMISSION_PROFILE_IDS) {
-    if (canonicalJson(PERMISSION_PROFILES[profileId]) === current) return profileId
+    if (matchesPermissionProfile(permission, PERMISSION_PROFILES[profileId])) return profileId
   }
   return CUSTOM_PERMISSION_PROFILE_ID
 }

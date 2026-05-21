@@ -200,9 +200,9 @@ The built-in profiles are shaped after Codex-style modes:
 
 | Profile | Behavior |
 | --- | --- |
-| `suggest` | Read, list, glob, grep, LSP, and todo reads are allowed. Edits, shell commands, subagents, skills, todo writes, questions, network tools, external directories, and repeated identical tool loops ask first. |
-| `auto-edit` | `suggest` plus edits and todo writes are allowed. Shell commands, subagents, skills, questions, network tools, external directories, and repeated identical tool loops still ask first. |
-| `full-auto` | Reads/searches/edits/shell/subagents/skills are allowed. Web fetch/search/code search and external directories are denied; repeated identical tool loops ask first. |
+| `suggest` | Read, list, glob, grep, LSP, and todo reads are allowed. Edits, shell commands, subagents, skills, todo writes, questions, network, code search, repository clone/overview, external directories, and repeated identical tool loops ask first. |
+| `auto-edit` | `suggest` plus edits and todo writes are allowed. Shell commands, subagents, skills, questions, network, code search, repository clone/overview, external directories, and repeated identical tool loops still ask first. |
+| `full-auto` | Reads/searches/edits/shell/subagents/skills are allowed. Web fetch/search, code search, repository clone/overview, and external directories are denied; repeated identical tool loops ask first. |
 | `reset` | Removes the `permission` key and returns the project to OpenCode defaults. |
 
 OpenCode may need a restart for a running project to pick up file changes.
