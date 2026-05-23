@@ -334,7 +334,7 @@ Prefer the `limits` object in `connector.config.mjs`; env fallbacks are availabl
 - `MIRROR_COMPACTION=1` — also mirror compaction messages.
 - `OPENCODE_SERVER_DEBUG=1` — start local `opencode serve` processes with debug logging.
 - `OPENCODE_SSE_EVENT_PATH` — override the opencode SSE endpoint. Defaults to `/global/event`, where events must include project directory metadata to be mirrored; set `/event` only for older opencode builds that do not expose the global stream or its directory metadata.
-- `OPENCODE_SSE_MAX_LINE_BYTES`, `OPENCODE_SSE_MAX_EVENT_BYTES`, `OPENCODE_SSE_MAX_EVENT_LINES` — tune SSE safety limits for unusually large upstream events.
+- `OPENCODE_SSE_MAX_LINE_BYTES`, `OPENCODE_SSE_MAX_EVENT_BYTES`, `OPENCODE_SSE_MAX_EVENT_LINES` — tune SSE safety limits for unusually large upstream events. Line and event byte limits default to 10 MB.
 - `OPENCODE_SSE_CONNECT_TIMEOUT_MS` — timeout for an initial SSE connection that accepts TCP but never returns headers.
 - `OPENCODE_SSE_HEALTHCHECK_MIN_INTERVAL_MS` — tune health-check throttling after SSE disconnects.
 - `OPENCODE_WATCHDOG_FAILURE_THRESHOLD`, `OPENCODE_WATCHDOG_WINDOW_MS`, `OPENCODE_WATCHDOG_COOLDOWN_MS` / `opencodeWatchdog.{failureThreshold,windowMs,cooldownMs}` — tune the autoStart watchdog that restarts a configured opencode server after repeated retryable health/SSE/prompt-poll failures.

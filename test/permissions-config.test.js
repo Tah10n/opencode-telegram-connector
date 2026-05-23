@@ -1,5 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import { constants as fsConstants } from "node:fs"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
@@ -786,6 +787,77 @@ test("OpenCode permission config writer does not overwrite concurrently created 
   assert.equal(result.status, "conflict")
   assert.equal(result.reason, "changed")
   assert.equal(fake.textOf(configPath), concurrent)
+})
+
+test("OpenCode permission config writer creates missing configs when hard links are denied but exclusive copy is available", async () => {
+  const dir = path.join(await makeTempDir(), "project")
+  const configPath = path.join(dir, "opencode.json")
+  const fake = makeFakePermissionConfigFs({ directories: [dir] })
+  let linkCalls = 0
+  let copyCalls = 0
+  const fsImpl = {
+    ...fake.fsImpl,
+    async link(from, to) {
+      linkCalls += 1
+      assert.match(path.basename(from), /^opencode\.json\.tmp\./)
+      assert.equal(path.normalize(to), path.normalize(configPath))
+      const err = new Error("hard links denied")
+      err.code = "EPERM"
+      throw err
+    },
+    async copyFile(from, to, mode) {
+      copyCalls += 1
+      assert.match(path.basename(from), /^opencode\.json\.tmp\./)
+      assert.equal(path.normalize(to), path.normalize(configPath))
+      assert.equal(mode, fsConstants.COPYFILE_EXCL)
+      return fake.fsImpl.copyFile(from, to, mode)
+    },
+  }
+
+  const result = await writeOpenCodePermissionProfile({ directory: dir }, "auto-edit", { fsImpl })
+
+  assert.equal(result.ok, true)
+  assert.equal(result.filePath, configPath)
+  assert.equal(linkCalls, 1)
+  assert.equal(copyCalls, 1)
+  assert.deepEqual(JSON.parse(fake.textOf(configPath)).permission, profileToPermissionConfig("auto-edit"))
+})
+
+test("OpenCode permission config writer reports conflict when parent changes during backup rotation", async () => {
+  const dir = path.join(await makeTempDir(), "project")
+  const changedDir = path.join(await makeTempDir(), "project-link-target")
+  const configPath = path.join(dir, "opencode.json")
+  const original = JSON.stringify({ permission: profileToPermissionConfig("suggest"), keep: true }, null, 2)
+  const fake = makeFakePermissionConfigFs({
+    directories: [dir],
+    files: { [configPath]: { text: original, mode: 0o600 } },
+  })
+  let parentChanged = false
+  let unlinkCalls = 0
+  const fsImpl = {
+    ...fake.fsImpl,
+    async realpath(filePath) {
+      if (path.normalize(filePath) === path.normalize(dir)) return parentChanged ? changedDir : dir
+      return fake.fsImpl.realpath(filePath)
+    },
+    async readdir(dirPath) {
+      const names = await fake.fsImpl.readdir(dirPath)
+      parentChanged = true
+      return names
+    },
+    async unlink(filePath) {
+      unlinkCalls += 1
+      return fake.fsImpl.unlink(filePath)
+    },
+  }
+
+  const result = await writeOpenCodePermissionProfile({ directory: dir }, "auto-edit", { fsImpl })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.status, "conflict")
+  assert.equal(result.reason, "changed")
+  assert.equal(fake.textOf(configPath), original)
+  assert.equal(unlinkCalls, 0)
 })
 
 test("OpenCode permission config writer reports unavailable when exclusive create is unsupported", async () => {

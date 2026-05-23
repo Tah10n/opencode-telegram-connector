@@ -62,6 +62,12 @@ test("normalizeSessionsList keeps valid ids and trimmed titles", () => {
   assert.deepEqual(sessions, [{ id: "ses_1", title: "Demo title" }])
 })
 
+test("normalizeSessionsList accepts paginated session envelopes", () => {
+  const sessions = normalizeSessionsList({ items: [{ id: "ses_1", title: "One" }] })
+
+  assert.deepEqual(sessions, [{ id: "ses_1", title: "One" }])
+})
+
 test("formatSessionButtonLabel adds current and startup markers", () => {
   assert.equal(
     formatSessionButtonLabel({ id: "ses_1", title: "Current session" }, { currentSessionId: "ses_1", startupSessionId: "ses_1" }),

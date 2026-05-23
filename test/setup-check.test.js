@@ -45,6 +45,10 @@ function swapEnv(t, patch) {
   })
 }
 
+function regexEscape(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
 test("runSetupCheck reports successful probes and cleans temp state files", async () => {
   const dir = await makeTempDir()
   const repoDir = path.join(dir, "repo")
@@ -90,7 +94,7 @@ test("runSetupCheck reports successful probes and cleans temp state files", asyn
   })
 
   assert.equal(report.exitCode, 0)
-  assert.deepEqual(report.counts, { pass: 10, warn: 0, fail: 0 })
+  assert.deepEqual(report.counts, { pass: 11, warn: 0, fail: 0 })
   assert.match(lines.join("\n"), /\[PASS\] Telegram API: getMe ok \(@demo_bot, id 7\)/)
   assert.doesNotMatch(lines.join("\n"), /5555555555:AABBCCDDEEFFaabbccddeeff12345678/)
 
@@ -412,6 +416,328 @@ test("runSetupCheck passes a valid explicit permission config path", async () =>
   assert.equal(permissionConfigFinding?.status, "pass")
   assert.match(permissionConfigFinding?.message || "", /valid/)
   assert.doesNotMatch(output.join("\n"), new RegExp(permissionConfigPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))
+})
+
+test("runSetupCheck fails invalid default opencode.json without leaking parser details", async () => {
+  const dir = await makeTempDir()
+  const repoDir = path.join(dir, "repo")
+  const stateFile = path.join(dir, ".data", "state.json")
+  const permissionConfigPath = path.join(repoDir, "opencode.json")
+  const output = []
+  await fs.mkdir(repoDir, { recursive: true })
+  await fs.writeFile(permissionConfigPath, "{ invalid json\n", "utf8")
+
+  const report = await runSetupCheck({
+    stdout: (line) => output.push(line),
+    skipTelegramProbe: true,
+    skipOpenCodeProbe: true,
+    buildRuntimeConfigImpl: async () => makeRuntime({
+      dir,
+      stateFile,
+      projects: {
+        demo: {
+          baseUrl: "http://127.0.0.1:4312",
+          directory: repoDir,
+          autoStart: false,
+          serverLaunchMode: "background",
+          openTuiOnAutoStart: true,
+          openAttachOnNewMode: "same-window",
+          username: "",
+          password: "",
+        },
+      },
+    }),
+  })
+
+  assert.equal(report.exitCode, 1)
+  const permissionConfigFinding = report.findings.find((finding) => finding.item === "Permission config demo")
+  assert.equal(permissionConfigFinding?.status, "fail")
+  assert.match(permissionConfigFinding?.message || "", /invalid opencode permission config/)
+  const setupOutput = output.join("\n")
+  assert.doesNotMatch(setupOutput, new RegExp(regexEscape(permissionConfigPath)))
+  assert.doesNotMatch(setupOutput, /Unexpected|position|parse/i)
+})
+
+test("runSetupCheck prefers and validates default opencode.jsonc", async () => {
+  const dir = await makeTempDir()
+  const repoDir = path.join(dir, "repo")
+  const stateFile = path.join(dir, ".data", "state.json")
+  const jsonPath = path.join(repoDir, "opencode.json")
+  const jsoncPath = path.join(repoDir, "opencode.jsonc")
+  const output = []
+  await fs.mkdir(repoDir, { recursive: true })
+  await fs.writeFile(jsonPath, "{}\n", "utf8")
+  await fs.writeFile(jsoncPath, "{ invalid jsonc\n", "utf8")
+
+  const report = await runSetupCheck({
+    stdout: (line) => output.push(line),
+    skipTelegramProbe: true,
+    skipOpenCodeProbe: true,
+    buildRuntimeConfigImpl: async () => makeRuntime({
+      dir,
+      stateFile,
+      projects: {
+        demo: {
+          baseUrl: "http://127.0.0.1:4312",
+          directory: repoDir,
+          autoStart: false,
+          serverLaunchMode: "background",
+          openTuiOnAutoStart: true,
+          openAttachOnNewMode: "same-window",
+          username: "",
+          password: "",
+        },
+      },
+    }),
+  })
+
+  assert.equal(report.exitCode, 1)
+  const permissionConfigFinding = report.findings.find((finding) => finding.item === "Permission config demo")
+  assert.equal(permissionConfigFinding?.status, "fail")
+  assert.match(permissionConfigFinding?.message || "", /invalid opencode permission config/)
+  assert.doesNotMatch(output.join("\n"), new RegExp(regexEscape(jsoncPath)))
+})
+
+test("runSetupCheck passes missing default permission config target", async () => {
+  const dir = await makeTempDir()
+  const repoDir = path.join(dir, "repo")
+  const stateFile = path.join(dir, ".data", "state.json")
+  await fs.mkdir(repoDir, { recursive: true })
+
+  const report = await runSetupCheck({
+    stdout: () => {},
+    skipTelegramProbe: true,
+    skipOpenCodeProbe: true,
+    buildRuntimeConfigImpl: async () => makeRuntime({
+      dir,
+      stateFile,
+      projects: {
+        demo: {
+          baseUrl: "http://127.0.0.1:4312",
+          directory: repoDir,
+          autoStart: false,
+          serverLaunchMode: "background",
+          openTuiOnAutoStart: true,
+          openAttachOnNewMode: "same-window",
+          username: "",
+          password: "",
+        },
+      },
+    }),
+  })
+
+  assert.equal(report.exitCode, 0)
+  const permissionConfigFinding = report.findings.find((finding) => finding.item === "Permission config demo")
+  assert.equal(permissionConfigFinding?.status, "pass")
+  assert.match(permissionConfigFinding?.message || "", /can be created/)
+})
+
+test("runSetupCheck fails unsafe default permission config directory target", async () => {
+  const dir = await makeTempDir()
+  const repoDir = path.join(dir, "repo")
+  const stateFile = path.join(dir, ".data", "state.json")
+  const permissionConfigPath = path.join(repoDir, "opencode.json")
+  const output = []
+  await fs.mkdir(permissionConfigPath, { recursive: true })
+
+  const report = await runSetupCheck({
+    stdout: (line) => output.push(line),
+    skipTelegramProbe: true,
+    skipOpenCodeProbe: true,
+    buildRuntimeConfigImpl: async () => makeRuntime({
+      dir,
+      stateFile,
+      projects: {
+        demo: {
+          baseUrl: "http://127.0.0.1:4312",
+          directory: repoDir,
+          autoStart: false,
+          serverLaunchMode: "background",
+          openTuiOnAutoStart: true,
+          openAttachOnNewMode: "same-window",
+          username: "",
+          password: "",
+        },
+      },
+    }),
+  })
+
+  assert.equal(report.exitCode, 1)
+  const permissionConfigFinding = report.findings.find((finding) => finding.item === "Permission config demo")
+  assert.equal(permissionConfigFinding?.status, "fail")
+  assert.match(permissionConfigFinding?.message || "", /unsafe/)
+  assert.doesNotMatch(output.join("\n"), new RegExp(regexEscape(permissionConfigPath)))
+})
+
+test("runSetupCheck fails unsafe default permission config symlink target", async () => {
+  const dir = path.join(os.tmpdir(), `telegram-connector-${crypto.randomUUID()}`)
+  const repoDir = path.join(dir, "repo")
+  const stateFile = path.join(dir, ".data", "state.json")
+  const jsonPath = path.join(repoDir, "opencode.json")
+  const jsoncPath = path.join(repoDir, "opencode.jsonc")
+  const output = []
+  const enoent = () => Object.assign(new Error("missing"), { code: "ENOENT" })
+  const directoryStat = { isDirectory: () => true, isFile: () => false, isSymbolicLink: () => false }
+  const symlinkStat = { isDirectory: () => false, isFile: () => false, isSymbolicLink: () => true }
+
+  const report = await runSetupCheck({
+    stdout: (line) => output.push(line),
+    skipTelegramProbe: true,
+    skipOpenCodeProbe: true,
+    buildRuntimeConfigImpl: async () => makeRuntime({
+      dir,
+      stateFile,
+      projects: {
+        demo: {
+          baseUrl: "http://127.0.0.1:4312",
+          directory: repoDir,
+          autoStart: false,
+          serverLaunchMode: "background",
+          openTuiOnAutoStart: true,
+          openAttachOnNewMode: "same-window",
+          username: "",
+          password: "",
+        },
+      },
+    }),
+    fsImpl: {
+      stat: async (target) => {
+        if ([dir, repoDir, path.dirname(stateFile)].includes(target)) return directoryStat
+        if (target === stateFile) throw enoent()
+        throw enoent()
+      },
+      lstat: async (target) => {
+        if (target === jsoncPath) throw enoent()
+        if (target === jsonPath) return symlinkStat
+        throw enoent()
+      },
+      readFile: async () => {
+        throw new Error("unsafe permission config target should not be read")
+      },
+      mkdir: async () => {},
+      writeFile: async () => {},
+      unlink: async () => {},
+      rmdir: async () => {},
+    },
+  })
+
+  assert.equal(report.exitCode, 1)
+  const permissionConfigFinding = report.findings.find((finding) => finding.item === "Permission config demo")
+  assert.equal(permissionConfigFinding?.status, "fail")
+  assert.match(permissionConfigFinding?.message || "", /unsafe/)
+  assert.doesNotMatch(output.join("\n"), new RegExp(regexEscape(jsonPath)))
+})
+
+test("runSetupCheck fails access-denied default permission config", async () => {
+  const dir = path.join(os.tmpdir(), `telegram-connector-${crypto.randomUUID()}`)
+  const repoDir = path.join(dir, "repo")
+  const stateFile = path.join(dir, ".data", "state.json")
+  const jsonPath = path.join(repoDir, "opencode.json")
+  const jsoncPath = path.join(repoDir, "opencode.jsonc")
+  const output = []
+  const enoent = () => Object.assign(new Error("missing"), { code: "ENOENT" })
+  const directoryStat = { isDirectory: () => true, isFile: () => false }
+  const fileStat = { isFile: () => true, isSymbolicLink: () => false }
+
+  const report = await runSetupCheck({
+    stdout: (line) => output.push(line),
+    skipTelegramProbe: true,
+    skipOpenCodeProbe: true,
+    buildRuntimeConfigImpl: async () => makeRuntime({
+      dir,
+      stateFile,
+      projects: {
+        demo: {
+          baseUrl: "http://127.0.0.1:4312",
+          directory: repoDir,
+          autoStart: false,
+          serverLaunchMode: "background",
+          openTuiOnAutoStart: true,
+          openAttachOnNewMode: "same-window",
+          username: "",
+          password: "",
+        },
+      },
+    }),
+    fsImpl: {
+      stat: async (target) => {
+        if ([dir, repoDir, path.dirname(stateFile)].includes(target)) return directoryStat
+        if (target === stateFile) throw enoent()
+        throw enoent()
+      },
+      lstat: async (target) => {
+        if (target === jsoncPath) throw enoent()
+        if (target === jsonPath) return fileStat
+        throw enoent()
+      },
+      readFile: async (target) => {
+        if (target === jsonPath) throw Object.assign(new Error("denied"), { code: "EACCES" })
+        throw enoent()
+      },
+      mkdir: async () => {},
+      writeFile: async () => {},
+      unlink: async () => {},
+      rmdir: async () => {},
+    },
+  })
+
+  assert.equal(report.exitCode, 1)
+  const permissionConfigFinding = report.findings.find((finding) => finding.item === "Permission config demo")
+  assert.equal(permissionConfigFinding?.status, "fail")
+  assert.match(permissionConfigFinding?.message || "", /access-denied/)
+  assert.doesNotMatch(output.join("\n"), new RegExp(regexEscape(jsonPath)))
+})
+
+test("runSetupCheck skips permission config files when permission control is disabled", async () => {
+  const dir = path.join(os.tmpdir(), `telegram-connector-${crypto.randomUUID()}`)
+  const repoDir = path.join(dir, "repo")
+  const stateFile = path.join(dir, ".data", "state.json")
+  const enoent = () => Object.assign(new Error("missing"), { code: "ENOENT" })
+  const directoryStat = { isDirectory: () => true, isFile: () => false }
+
+  const report = await runSetupCheck({
+    stdout: () => {},
+    skipTelegramProbe: true,
+    skipOpenCodeProbe: true,
+    buildRuntimeConfigImpl: async () => makeRuntime({
+      dir,
+      stateFile,
+      projects: {
+        demo: {
+          baseUrl: "http://127.0.0.1:4312",
+          directory: repoDir,
+          permissionControl: { enabled: false },
+          autoStart: false,
+          serverLaunchMode: "background",
+          openTuiOnAutoStart: true,
+          openAttachOnNewMode: "same-window",
+          username: "",
+          password: "",
+        },
+      },
+    }),
+    fsImpl: {
+      stat: async (target) => {
+        assert.doesNotMatch(target, /opencode\.jsonc?$/)
+        if ([dir, repoDir, path.dirname(stateFile)].includes(target)) return directoryStat
+        if (target === stateFile) throw enoent()
+        throw enoent()
+      },
+      lstat: async (target) => {
+        assert.fail(`permission config path should not be probed: ${target}`)
+      },
+      readFile: async (target) => {
+        assert.fail(`permission config file should not be read: ${target}`)
+      },
+      mkdir: async () => {},
+      writeFile: async () => {},
+      unlink: async () => {},
+      rmdir: async () => {},
+    },
+  })
+
+  assert.equal(report.exitCode, 0)
+  assert.equal(report.findings.some((finding) => finding.item === "Permission config demo"), false)
 })
 
 test("runSetupCheck reports Basic Auth safety failures without leaking credentials", async () => {

@@ -32,6 +32,11 @@ function backupPrefix(filePath) {
   return `${path.basename(filePath)}.backup.`
 }
 
+function pathWithExpectedParent(filePath, expectedParentRealPath) {
+  if (!expectedParentRealPath) return filePath
+  return path.join(expectedParentRealPath, path.basename(filePath))
+}
+
 function normalizedFileMode(mode) {
   if (mode == null) return undefined
   const numeric = Number(mode)
@@ -59,13 +64,17 @@ function comparablePath(value) {
   return process.platform === "win32" ? normalized.toLowerCase() : normalized
 }
 
+function parentChangedError(filePath) {
+  const err = new Error(`Parent directory changed while writing '${filePath}'.`)
+  err.code = "EPARENTCHANGED"
+  return err
+}
+
 async function assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath) {
   if (!expectedParentRealPath || typeof fsImpl?.realpath !== "function") return
   const actual = await fsImpl.realpath(path.dirname(filePath))
   if (comparablePath(actual) !== comparablePath(expectedParentRealPath)) {
-    const err = new Error(`Parent directory changed while writing '${filePath}'.`)
-    err.code = "EPARENTCHANGED"
-    throw err
+    throw parentChangedError(filePath)
   }
 }
 
@@ -80,7 +89,7 @@ async function listEmergencyStateBackups(filePath, { fsImpl = fs } = {}) {
   try {
     names = await fsImpl.readdir(dir)
   } catch (err) {
-    if (hasCode(err, "ENOENT")) return []
+    if (hasCode(err, "ENOENT", "ENOTDIR")) return []
     throw err
   }
 
@@ -119,7 +128,18 @@ async function recoverEmergencyJsonBackup(filePath, { fsImpl = fs } = {}) {
   }
 
   try {
-    await fsImpl.copyFile(backup.path, filePath)
+    if (typeof fsImpl?.lstat === "function") {
+      try {
+        await fsImpl.lstat(filePath)
+        const err = new Error(`State file ${filePath} read as missing but restore target exists. Refusing to overwrite it.`)
+        err.code = "EEXIST"
+        throw err
+      } catch (err) {
+        if (!hasCode(err, "ENOENT")) throw err
+      }
+    }
+    const exclusiveCopyFlag = fsImpl?.constants?.COPYFILE_EXCL ?? fsConstants?.COPYFILE_EXCL
+    await fsImpl.copyFile(backup.path, filePath, exclusiveCopyFlag)
   } catch (err) {
     throw new Error(
       `State file ${filePath} is missing, and emergency backup ${backup.path} could not be restored (${err?.message || String(err)}). Refusing to start with empty state.`,
@@ -129,22 +149,28 @@ async function recoverEmergencyJsonBackup(filePath, { fsImpl = fs } = {}) {
   return parsed
 }
 
-async function listStateBackups(filePath, { fsImpl = fs } = {}) {
-  const dir = path.dirname(filePath)
+async function listStateBackups(filePath, { fsImpl = fs, expectedParentRealPath } = {}) {
+  const dir = path.dirname(pathWithExpectedParent(filePath, expectedParentRealPath))
   const prefix = backupPrefix(filePath)
   let names
+  await assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath)
   try {
     names = await fsImpl.readdir(dir)
   } catch (err) {
-    if (hasCode(err, "ENOENT")) return []
+    if (hasCode(err, "ENOENT", "ENOTDIR")) {
+      if (expectedParentRealPath) throw parentChangedError(filePath)
+      return []
+    }
     throw err
   }
+  await assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath)
 
   const backups = []
   for (const name of names) {
     if (!name.startsWith(prefix)) continue
     const backupPath = path.join(dir, name)
     let stat = null
+    await assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath)
     try {
       stat = await fsImpl.stat(backupPath)
     } catch (err) {
@@ -157,12 +183,13 @@ async function listStateBackups(filePath, { fsImpl = fs } = {}) {
   return backups
 }
 
-export async function rotateStateFileBackups(filePath, { maxBackups = DEFAULT_STATE_BACKUP_MAX_FILES, fsImpl = fs } = {}) {
+export async function rotateStateFileBackups(filePath, { maxBackups = DEFAULT_STATE_BACKUP_MAX_FILES, fsImpl = fs, expectedParentRealPath } = {}) {
   const keep = Math.max(0, Number.isFinite(Number(maxBackups)) ? Math.trunc(Number(maxBackups)) : DEFAULT_STATE_BACKUP_MAX_FILES)
-  const backups = await listStateBackups(filePath, { fsImpl })
+  const backups = await listStateBackups(filePath, { fsImpl, expectedParentRealPath })
   backups.sort((a, b) => b.mtimeMs - a.mtimeMs || b.name.localeCompare(a.name))
   const removed = []
   for (const backup of backups.slice(keep)) {
+    await assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath)
     await unlinkIfExists(fsImpl, backup.path)
     removed.push(backup.path)
   }
@@ -182,18 +209,19 @@ export async function createStateFileBackup(
     mode,
     expectedParentRealPath,
   } = options
-  const dir = path.dirname(filePath)
+  const operationFilePath = pathWithExpectedParent(filePath, expectedParentRealPath)
+  const dir = path.dirname(operationFilePath)
   await assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath)
   await fsImpl.mkdir(dir, { recursive: true })
   await assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath)
   const versionLabel = schemaVersion == null ? "unknown" : `v${cleanBackupLabel(schemaVersion, "unknown")}`
   const suffix = [backupTimestamp(now), cleanBackupLabel(reason, "state"), versionLabel, crypto.randomBytes(4).toString("hex")].join(".")
   const backupPath = path.join(dir, `${backupPrefix(filePath)}${suffix}`)
-  const contents = Object.hasOwn(options, "contents") ? options.contents : await fsImpl.readFile(filePath)
+  const contents = Object.hasOwn(options, "contents") ? options.contents : await fsImpl.readFile(operationFilePath)
   await fsImpl.writeFile(backupPath, contents, writeFileOptionsForMode(mode))
   await chmodIfSupported(fsImpl, backupPath, mode)
   await assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath)
-  await rotateStateFileBackups(filePath, { maxBackups, fsImpl })
+  await rotateStateFileBackups(filePath, { maxBackups, fsImpl, expectedParentRealPath })
   return backupPath
 }
 
@@ -235,7 +263,7 @@ async function commitNewFileWithoutOverwrite(fsImpl, sourcePath, targetPath) {
       await fsImpl.link(sourcePath, targetPath)
       return
     } catch (err) {
-      if (!hasCode(err, "ENOTSUP", "ENOSYS", "EOPNOTSUPP")) throw err
+      if (hasCode(err, "EEXIST", "ENOENT", "ENOTDIR")) throw err
     }
   }
   const exclusiveCopyFlag = fsImpl?.constants?.COPYFILE_EXCL ?? fsConstants?.COPYFILE_EXCL
@@ -251,43 +279,44 @@ async function commitNewFileWithoutOverwrite(fsImpl, sourcePath, targetPath) {
   throw err
 }
 
-export async function readJsonFile(filePath) {
+export async function readJsonFile(filePath, { fsImpl = fs } = {}) {
   try {
-    const txt = await fs.readFile(filePath, "utf8")
+    const txt = await fsImpl.readFile(filePath, "utf8")
     return JSON.parse(txt)
   } catch (err) {
-    if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return recoverEmergencyJsonBackup(filePath)
+    if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return recoverEmergencyJsonBackup(filePath, { fsImpl })
     throw err
   }
 }
 
 export async function writeJsonFileAtomic(filePath, data, { fsImpl = fs, mode, expectedParentRealPath, overwrite = true } = {}) {
+  const operationFilePath = pathWithExpectedParent(filePath, expectedParentRealPath)
   await assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath)
-  await fsImpl.mkdir(path.dirname(filePath), { recursive: true })
+  await fsImpl.mkdir(path.dirname(operationFilePath), { recursive: true })
   await assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath)
-  const tmp = `${filePath}.tmp.${process.pid}.${crypto.randomBytes(6).toString("hex")}`
+  const tmp = `${operationFilePath}.tmp.${process.pid}.${crypto.randomBytes(6).toString("hex")}`
   await fsImpl.writeFile(tmp, JSON.stringify(data, null, 2) + "\n", writeFileOptionsForMode(mode, "utf8"))
   try {
     await chmodIfSupported(fsImpl, tmp, mode)
     await assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath)
     if (overwrite === false) {
-      await commitNewFileWithoutOverwrite(fsImpl, tmp, filePath)
-      await chmodIfSupportedBestEffort(fsImpl, filePath, mode)
+      await commitNewFileWithoutOverwrite(fsImpl, tmp, operationFilePath)
+      await chmodIfSupportedBestEffort(fsImpl, operationFilePath, mode)
       return
     }
     try {
-      await fsImpl.rename(tmp, filePath)
+      await fsImpl.rename(tmp, operationFilePath)
     } catch (err) {
       // Windows may not allow overwrite; preserve the current file before retrying.
       if (hasCode(err, "EEXIST", "EPERM", "EACCES")) {
         await assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath)
-        await replaceFileWithoutLosingExisting(fsImpl, tmp, filePath)
-        await chmodIfSupportedBestEffort(fsImpl, filePath, mode)
+        await replaceFileWithoutLosingExisting(fsImpl, tmp, operationFilePath)
+        await chmodIfSupportedBestEffort(fsImpl, operationFilePath, mode)
         return
       }
       throw err
     }
-    await chmodIfSupportedBestEffort(fsImpl, filePath, mode)
+    await chmodIfSupportedBestEffort(fsImpl, operationFilePath, mode)
   } finally {
     await unlinkIfExists(fsImpl, tmp).catch(() => {})
   }

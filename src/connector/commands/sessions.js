@@ -1,6 +1,8 @@
 import { makeInlineKeyboard } from "../../telegram/client.js"
 import { parseSessionReference, findSessionByShareUrl } from "../../session-ref.js"
 import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "../../session-list.js"
+import { sessionItemsFromResponse } from "../../session-response.js"
+import { directoriesMatch } from "../../directory-paths.js"
 import { getLaunchSupport } from "../../opencode/launcher.js"
 import { isSafeOpenCodeId, normalizeOpenCodeId, requireSafeOpenCodeId } from "../../opencode/ids.js"
 import { modelSourceLabel } from "../../model-selection.js"
@@ -64,6 +66,49 @@ export function createSessionCommandHandlers(deps) {
     }
   }
 
+  function projectAliasesSharingClient(projectAlias) {
+    const targetClient = ocByAlias?.[projectAlias]
+    const targetBaseUrl = projects?.[projectAlias]?.baseUrl
+    return Object.keys(projects || {}).filter((alias) => {
+      if (alias === projectAlias) return true
+      if (targetClient && ocByAlias?.[alias] === targetClient) return true
+      return !!targetBaseUrl && projects?.[alias]?.baseUrl === targetBaseUrl
+    })
+  }
+
+  async function listProjectSessions(projectAlias, { limit } = {}) {
+    const oc = ocByAlias[projectAlias]
+    const directory = projects?.[projectAlias]?.directory
+    const sharedClient = projectAliasesSharingClient(projectAlias).length > 1
+    const sessionsMatchingDirectory = (sessions) => {
+      if (!directory) return []
+      return sessionItemsFromResponse(sessions).filter((session) => session?.directory && directoriesMatch(session.directory, directory))
+    }
+    const scopedOptions = { ...(directory ? { directory } : {}), ...(limit != null ? { limit } : {}) }
+    const scoped = await oc.listSessions(scopedOptions)
+    const scopedItems = sessionItemsFromResponse(scoped)
+    if (sharedClient) {
+      const scopedMatches = sessionsMatchingDirectory(scopedItems)
+      if (scopedItems.length > 0 || !directory) return scopedMatches
+
+      const unscopedOptions = limit != null ? { limit } : {}
+      return sessionsMatchingDirectory(await oc.listSessions(unscopedOptions))
+    }
+    if (scopedItems.length > 0 || !directory) return scopedItems
+
+    const unscopedOptions = limit != null ? { limit } : {}
+    const unscopedItems = sessionItemsFromResponse(await oc.listSessions(unscopedOptions))
+    const directoryMatches = unscopedItems.filter((session) => session?.directory && directoriesMatch(session.directory, directory))
+    if (directoryMatches.length > 0) return directoryMatches
+
+    // Some opencode API variants do not include `directory` in session list items,
+    // and exact directory filtering can miss sessions when the server resolves a
+    // project path differently from the connector. Only fall back to unscoped
+    // items when this OpenCode client is configured for a single connector project;
+    // shared clients keep the stricter empty result to avoid cross-project buttons.
+    return unscopedItems
+  }
+
   async function resolveValidStartupSession(alias, oc) {
     let startupSid = startupSessionByProject[alias] || (await resolveStartupSession(alias))
     if (startupSid && !normalizeSafeSessionId(startupSid)) {
@@ -111,8 +156,7 @@ export function createSessionCommandHandlers(deps) {
   }
 
   async function renderSessionsList(ctxMeta, { binding, editMessageId } = {}) {
-    const oc = ocByAlias[binding.projectAlias]
-    const sessions = await oc.listSessions({ directory: projects?.[binding.projectAlias]?.directory, limit: 10 })
+    const sessions = await listProjectSessions(binding.projectAlias, { limit: 10 })
     const [configuredInfo, sessionModelInfo] = await Promise.all([
       resolveConfiguredModelInfo(binding.projectAlias),
       resolveSessionModelInfo(binding.projectAlias, binding.sessionId),
@@ -151,8 +195,7 @@ export function createSessionCommandHandlers(deps) {
     }
     const startupSid = startupSessionByProject[projectAlias] || (await resolveStartupSession(projectAlias)) || ""
     if (existing?.projectAlias !== projectAlias) {
-      const oc = ocByAlias[projectAlias]
-      const sessions = await oc.listSessions({ directory: projects?.[projectAlias]?.directory, limit: 10 })
+      const sessions = await listProjectSessions(projectAlias, { limit: 10 })
       markProjectUp?.(projectAlias)
       const text = `${formatSessionsListText(projectAlias, sessions, { startupSessionId: startupSid, locale: ctxMeta.locale, viewOnly: true })}\n\n${t(ctxMeta, "sessions.viewOnly")}`
       const replyMarkup = closeKeyboard(["srv", "close"], ctxMeta.locale)
@@ -307,7 +350,7 @@ export function createSessionCommandHandlers(deps) {
     const oc = ocByAlias[binding.projectAlias]
 
     async function listSessionsForShareLookup(projectAlias) {
-      return ocByAlias[projectAlias].listSessions({ directory: projects?.[projectAlias]?.directory })
+      return listProjectSessions(projectAlias)
     }
 
     try {

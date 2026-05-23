@@ -15,6 +15,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Project `baseUrl` now rejects non-HTTP(S) schemes, and string `autoStart` / `openTuiOnAutoStart` values are no longer silently treated as `false`.
 - `/use` share links that resolve to unsafe session IDs now receive a clear refusal instead of implying share links bypass session ID safety rules.
 - SSE line-size checks now apply to each individual line, so large chunks made of short lines are accepted while one oversized line still fails.
+- Default SSE line and event byte limits are now 10 MB to tolerate larger upstream opencode events before the safety guard stops the stream.
+- Session listing now accepts both legacy array responses and paginated `{ items }` responses, so `/sessions` works when the configured OpenCode base URL includes an `/api` prefix.
+- `/sessions` now falls back to an unscoped session query for single-project OpenCode clients when exact directory filtering returns no sessions, while keeping shared clients fail-closed unless session directory metadata matches.
 - Scheduled state saves now log write failures instead of silently swallowing them.
 - Repeated embedded `runCli` calls no longer leave duplicate process listeners behind.
 - Telegram sends now skip empty message text and empty HTML blocks instead of calling the API with invalid empty content.

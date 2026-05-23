@@ -12,6 +12,7 @@ import { createCorrelationId, runWithRequestContext } from "../runtime/request-c
 
 export const DEFAULT_OPENCODE_SSE_EVENT_PATH = "/global/event"
 export const OPENCODE_SSE_EVENT_META = Symbol.for("telegram-opencode-connector.opencodeSseEventMeta")
+const DEFAULT_OPENCODE_SSE_MAX_BYTES = 10 * 1024 * 1024
 
 export function canonicalOpenCodeSseEventPath(value) {
   const raw = String(value || "").trim()
@@ -112,7 +113,7 @@ async function* readLines(readableStream) {
   let buf = ""
   // Some SSE lines (single `data:` line with a large JSON payload) can be very large.
   // Keep this bounded, but high enough for long assistant/tool outputs.
-  const MAX_BUF_BYTES = readIntEnv("OPENCODE_SSE_MAX_LINE_BYTES", 8 * 1024 * 1024)
+  const MAX_BUF_BYTES = readIntEnv("OPENCODE_SSE_MAX_LINE_BYTES", DEFAULT_OPENCODE_SSE_MAX_BYTES)
   const assertLineWithinLimit = (line) => {
     if (Buffer.byteLength(line, "utf8") > MAX_BUF_BYTES) {
       throw new Error(`SSE line buffer exceeded limit (${Math.round(MAX_BUF_BYTES / 1024 / 1024)}MB)`)
@@ -251,7 +252,7 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
         let lines = []
         let eventBytes = 0
         // Some events (e.g. long assistant/tool messages) can be large.
-        const MAX_EVENT_BYTES = readIntEnv("OPENCODE_SSE_MAX_EVENT_BYTES", 8 * 1024 * 1024)
+        const MAX_EVENT_BYTES = readIntEnv("OPENCODE_SSE_MAX_EVENT_BYTES", DEFAULT_OPENCODE_SSE_MAX_BYTES)
         const MAX_EVENT_LINES = readIntEnv("OPENCODE_SSE_MAX_EVENT_LINES", 5000)
 
         for await (const line of readLines(res.body)) {
