@@ -78,7 +78,8 @@ export function createSessionCommandHandlers(deps) {
 
   async function listProjectSessions(projectAlias, { limit } = {}) {
     const oc = ocByAlias[projectAlias]
-    const directory = projects?.[projectAlias]?.directory
+    const project = projects?.[projectAlias]
+    const directory = project?.directory
     const sharedClient = projectAliasesSharingClient(projectAlias).length > 1
     const sessionsMatchingDirectory = (sessions) => {
       if (!directory) return []
@@ -103,10 +104,12 @@ export function createSessionCommandHandlers(deps) {
 
     // Some opencode API variants do not include `directory` in session list items,
     // and exact directory filtering can miss sessions when the server resolves a
-    // project path differently from the connector. Only fall back to unscoped
-    // items when this OpenCode client is configured for a single connector project;
-    // shared clients keep the stricter empty result to avoid cross-project buttons.
-    return unscopedItems
+    // project path differently from the connector. This fallback is intentionally
+    // opt-in and only allowed when the unscoped response has no directory evidence
+    // at all; any explicit non-matching directory keeps the project fail-closed.
+    const hasDirectoryEvidence = unscopedItems.some((session) => !!session?.directory)
+    if (project?.allowUnscopedSessionListFallback === true && !hasDirectoryEvidence) return unscopedItems
+    return []
   }
 
   async function resolveValidStartupSession(alias, oc) {

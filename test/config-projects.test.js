@@ -127,6 +127,70 @@ test("loadProjectsConfig resolves optional permission control config", async () 
   assert.deepEqual(projects.disabled.permissionControl, { enabled: false })
 })
 
+test("loadProjectsConfig resolves explicit unscoped session fallback opt-in", async () => {
+  const projects = await loadProjectsConfig({
+    baseDir: path.join("workspace", "configs"),
+    projectsJson: JSON.stringify({
+      demo: {
+        baseUrl: "http://127.0.0.1:4312",
+        directory: "../repo",
+        allowUnscopedSessionListFallback: true,
+      },
+      strict: {
+        baseUrl: "http://127.0.0.1:4313",
+        directory: "../strict",
+      },
+    }),
+  })
+
+  assert.equal(projects.demo.allowUnscopedSessionListFallback, true)
+  assert.equal(projects.strict.allowUnscopedSessionListFallback, undefined)
+})
+
+test("loadProjectsConfig rejects unsafe unscoped session fallback settings", async () => {
+  await assert.rejects(
+    loadProjectsConfig({
+      projectsJson: JSON.stringify({
+        demo: {
+          baseUrl: "http://127.0.0.1:4312",
+          directory: "./repo",
+          allowUnscopedSessionListFallback: "true",
+        },
+      }),
+    }),
+    /Project 'demo' allowUnscopedSessionListFallback must be a boolean/,
+  )
+
+  await assert.rejects(
+    loadProjectsConfig({
+      projectsJson: JSON.stringify({
+        demo: {
+          baseUrl: "http://127.0.0.1:4312",
+          allowUnscopedSessionListFallback: true,
+        },
+      }),
+    }),
+    /Project 'demo' allowUnscopedSessionListFallback requires 'directory'/,
+  )
+
+  await assert.rejects(
+    loadProjectsConfig({
+      projectsJson: JSON.stringify({
+        demo: {
+          baseUrl: "http://127.0.0.1:4312",
+          directory: "./demo",
+          allowUnscopedSessionListFallback: true,
+        },
+        other: {
+          baseUrl: "http://127.0.0.1:4312",
+          directory: "./other",
+        },
+      }),
+    }),
+    /allowUnscopedSessionListFallback cannot be used when projects share baseUrl \(demo, other\)/,
+  )
+})
+
 test("loadProjectsConfig rejects baseUrl query strings and fragments", async () => {
   await assert.rejects(
     loadProjectsConfig({

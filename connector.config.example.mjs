@@ -56,6 +56,9 @@ export default {
       serverLaunchMode: "background",
       openTuiOnAutoStart: true,
       openAttachOnNewMode: "new-window",
+      // Off by default: only set true for a dedicated legacy backend whose
+      // session list cannot filter by directory and never contains other workspaces.
+      // allowUnscopedSessionListFallback: true,
       // Optional: /permissions edits this OpenCode config file.
       // Defaults to <directory>/opencode.json, or existing opencode.jsonc.
       // permissionConfigPath: "./project-a/opencode.json",

@@ -168,6 +168,8 @@ If a Basic Auth project uses a non-loopback `http://` URL, set `OPENCODE_ALLOW_I
 - `/sessions` — list recent sessions and switch with buttons.
 - `/unbind` — remove the current binding.
 
+When a project has `directory`, `/sessions` is project-scoped and only shows unscoped fallback results when the session metadata proves the directory matches. For older dedicated OpenCode backends whose session list cannot filter by directory and omits directory metadata entirely, opt in per project with `allowUnscopedSessionListFallback: true`. Do not enable this for shared base URLs or servers that may contain sessions from other workspaces.
+
 In groups and forum topics, Telegram commands addressed to another bot are ignored: `/start@OtherBot` is ignored, while `/start@<this bot username>` is handled.
 
 ### Thread settings and control
@@ -317,6 +319,7 @@ Prefer the `limits` object in `connector.config.mjs`; env fallbacks are availabl
   - `new-window` opens a fresh `opencode attach --session ...` window for the new session.
 - `username` / `password` or `usernameEnv` / `passwordEnv`
 - `displayName`
+- `allowUnscopedSessionListFallback` (optional boolean, default `false`; legacy compatibility only for a dedicated backend where `/session?directory=...` returns empty and unscoped session list items contain no `directory` metadata. The connector still refuses this fallback when another configured project shares the same `baseUrl` or when unscoped items carry non-matching directory evidence.)
 - `permissionConfigPath` (optional; defaults to local `<directory>/opencode.json`, or existing local `<directory>/opencode.jsonc`, for `/permissions`; explicit values should point to a local `opencode.json`/`opencode.jsonc` and, when `directory` is local, must stay inside that local project directory)
 - `permissionControl` (optional boolean or `{ enabled, maxBackups, remoteDirectory }`; use `false` to disable Telegram-side permission switching for a project; set `remoteDirectory: true` only when a same-platform `directory` is remote/non-local and `permissionConfigPath` points to a local config)
 

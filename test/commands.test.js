@@ -1627,10 +1627,40 @@ test("createCommandHandlers renderSessionsList shows the current model when avai
   assert.deepEqual(sent[0].replyMarkup.inline_keyboard.at(-1)?.map((button) => button.text), ["Refresh", "New", "Close"])
 })
 
-test("createCommandHandlers renderSessionsList falls back to unscoped sessions for one-project clients", async () => {
+test("createCommandHandlers renderSessionsList hides unscoped fallback sessions by default", async () => {
   const calls = []
   const { runtime, sent } = makeRuntime({
     projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    ocByAlias: {
+      demo: {
+        async listSessions(input = {}) {
+          calls.push(input)
+          if (input.directory) return []
+          return [{ id: "ses_unscoped", title: "Unscoped session" }]
+        },
+        async listMessages() {
+          return []
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderSessionsList(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    { binding: { projectAlias: "demo", sessionId: "ses_current" } },
+  )
+
+  assert.deepEqual(calls, [{ directory: "C:/repo/demo", limit: 10 }, { limit: 10 }])
+  assert.match(sent[0].text, /No sessions found/)
+  assert.doesNotMatch(sent[0].text, /ses_unscoped/)
+  assert.equal(sent[0].replyMarkup.inline_keyboard.flat().some((button) => button.text === "Unscoped session"), false)
+})
+
+test("createCommandHandlers renderSessionsList allows explicit legacy unscoped fallback without directory evidence", async () => {
+  const calls = []
+  const { runtime, sent } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo", allowUnscopedSessionListFallback: true } },
     ocByAlias: {
       demo: {
         async listSessions(input = {}) {
@@ -1656,6 +1686,32 @@ test("createCommandHandlers renderSessionsList falls back to unscoped sessions f
   assert.ok(sent[0].replyMarkup.inline_keyboard.flat().some((button) => button.text === "Unscoped session"))
 })
 
+test("createCommandHandlers renderSessionsList ignores unscoped fallback opt-in when directory evidence mismatches", async () => {
+  const { runtime, sent } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo", allowUnscopedSessionListFallback: true } },
+    ocByAlias: {
+      demo: {
+        async listSessions(input = {}) {
+          if (input.directory) return []
+          return [{ id: "ses_other", title: "Other project", directory: "C:/repo/other" }]
+        },
+        async listMessages() {
+          return []
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderSessionsList(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    { binding: { projectAlias: "demo", sessionId: "ses_current" } },
+  )
+
+  assert.match(sent[0].text, /No sessions found/)
+  assert.doesNotMatch(sent[0].text, /ses_other/)
+})
+
 test("createCommandHandlers renderSessionsList keeps shared-client unscoped sessions hidden without directory evidence", async () => {
   const sharedClient = {
     async listSessions(input = {}) {
@@ -1668,7 +1724,7 @@ test("createCommandHandlers renderSessionsList keeps shared-client unscoped sess
   }
   const { runtime, sent } = makeRuntime({
     projects: {
-      demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" },
+      demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo", allowUnscopedSessionListFallback: true },
       other: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/other" },
     },
     ocByAlias: { demo: sharedClient, other: sharedClient },

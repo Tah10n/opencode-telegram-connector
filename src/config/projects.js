@@ -137,6 +137,16 @@ export function normalizeProjectsConfig(raw, { baseDir, sourceLabel } = {}) {
       password: password ? String(password) : "",
       displayName: cfg.displayName ? String(cfg.displayName) : undefined,
     }
+    if (cfg.allowUnscopedSessionListFallback != null) {
+      project.allowUnscopedSessionListFallback = readOptionalBoolean(cfg.allowUnscopedSessionListFallback, {
+        alias,
+        fieldName: "allowUnscopedSessionListFallback",
+        defaultValue: false,
+      })
+      if (project.allowUnscopedSessionListFallback && !directory) {
+        throw new Error(`Project '${alias}' allowUnscopedSessionListFallback requires 'directory'`)
+      }
+    }
     if (cfg.permissionConfigPath != null && cfg.permissionConfigPath !== "") {
       project.permissionConfigPath = normalizeConfiguredDirectory(cfg.permissionConfigPath, { baseDir: resolvedBaseDir })
     }
@@ -146,5 +156,20 @@ export function normalizeProjectsConfig(raw, { baseDir, sourceLabel } = {}) {
     projects[alias] = project
   }
   if (Object.keys(projects).length === 0) throw new Error(`${sourceLabel ? `${sourceLabel}: ` : ""}Projects config is empty`)
+  const aliasesByBaseUrl = new Map()
+  for (const [alias, project] of Object.entries(projects)) {
+    const aliases = aliasesByBaseUrl.get(project.baseUrl) || []
+    aliases.push(alias)
+    aliasesByBaseUrl.set(project.baseUrl, aliases)
+  }
+  for (const [alias, project] of Object.entries(projects)) {
+    if (project.allowUnscopedSessionListFallback !== true) continue
+    const aliases = aliasesByBaseUrl.get(project.baseUrl) || []
+    if (aliases.length > 1) {
+      throw new Error(
+        `Project '${alias}' allowUnscopedSessionListFallback cannot be used when projects share baseUrl (${aliases.join(", ")})`,
+      )
+    }
+  }
   return projects
 }
