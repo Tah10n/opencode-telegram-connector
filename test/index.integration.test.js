@@ -231,7 +231,7 @@ function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, setMyComma
 }
 
 function createFakeOpenCodeClient({
-  startupSessions = [{ id: "ses_startup" }],
+  startupSessions,
   messagesById = {},
   healthImpl,
   getConfigImpl,
@@ -251,6 +251,10 @@ function createFakeOpenCodeClient({
   replyQuestionImpl,
   rejectQuestionImpl,
 } = {}) {
+  function defaultStartupSessions(input = {}) {
+    return input?.directory ? [{ id: "ses_startup", directory: input.directory }] : [{ id: "ses_startup" }]
+  }
+
   const calls = {
     health: 0,
     getConfig: [],
@@ -287,7 +291,7 @@ function createFakeOpenCodeClient({
     },
     async listSessions(input = {}) {
       calls.listSessions.push(input)
-      return listSessionsImpl ? listSessionsImpl(input) : startupSessions
+      return listSessionsImpl ? listSessionsImpl(input) : (startupSessions ?? defaultStartupSessions(input))
     },
     async getSession(sessionId) {
       calls.getSession.push(sessionId)

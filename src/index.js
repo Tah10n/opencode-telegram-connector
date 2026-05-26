@@ -408,6 +408,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         ocByAlias,
         logger,
         directory: projects?.[alias]?.directory,
+        allowUnscopedSessionListFallback: projects?.[alias]?.allowUnscopedSessionListFallback === true,
         abortSignal: abortController.signal,
         ...(options || {}),
       })

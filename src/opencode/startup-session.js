@@ -1,4 +1,17 @@
 import { isSafeOpenCodeId, normalizeOpenCodeId } from "./ids.js"
+import { directoriesMatch } from "../directory-paths.js"
+import { sessionItemsFromResponse } from "../session-response.js"
+
+function latestStartupSessionReuseDecision(latest, { directory, allowUnscopedSessionListFallback } = {}) {
+  const latestId = normalizeOpenCodeId(latest?.id)
+  if (!latestId || !isSafeOpenCodeId(latestId)) return { ok: false, reason: "invalid-id" }
+  if (!directory) return { ok: true, id: latestId }
+
+  const latestDirectory = String(latest?.directory ?? "").trim()
+  if (latestDirectory && directoriesMatch(latestDirectory, directory)) return { ok: true, id: latestId }
+  if (!latestDirectory && allowUnscopedSessionListFallback === true) return { ok: true, id: latestId }
+  return { ok: false, reason: latestDirectory ? "directory-mismatch" : "missing-directory" }
+}
 
 export async function ensureStartupSession({
   alias,
@@ -8,6 +21,7 @@ export async function ensureStartupSession({
   ocByAlias,
   logger,
   directory,
+  allowUnscopedSessionListFallback = false,
   waitForStart = true,
   forceRefresh = false,
   abortSignal,
@@ -41,12 +55,14 @@ export async function ensureStartupSession({
     if (!oc) return null
 
     const list = await oc.listSessions({ directory, limit: 1, signal: abortSignal })
-    const latest = Array.isArray(list) && list[0] ? list[0] : null
-    const latestId = normalizeOpenCodeId(latest?.id)
-    if (latestId && isSafeOpenCodeId(latestId)) {
-      startupSessionByProject[alias] = latestId
+    const latest = sessionItemsFromResponse(list)[0] || null
+    const latestDecision = latestStartupSessionReuseDecision(latest, { directory, allowUnscopedSessionListFallback })
+    if (latestDecision.ok) {
+      startupSessionByProject[alias] = latestDecision.id
     } else {
-      if (latest?.id) logger?.warn?.(`[${alias}] ignored invalid latest session id`)
+      if (latestDecision.reason === "invalid-id" && latest?.id) logger?.warn?.(`[${alias}] ignored invalid latest session id`)
+      if (latestDecision.reason === "directory-mismatch") logger?.warn?.(`[${alias}] ignored latest startup session from another directory`)
+      if (latestDecision.reason === "missing-directory") logger?.warn?.(`[${alias}] ignored latest startup session without directory evidence`)
       const created = await oc.createSession({ directory, signal: abortSignal })
       const createdId = normalizeOpenCodeId(created?.id)
       if (createdId && isSafeOpenCodeId(createdId)) {

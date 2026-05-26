@@ -105,6 +105,136 @@ test("ensureStartupSession scopes listing and creation by directory", async () =
   assert.equal(calls.create[0].directory, "C:/repo/demo")
 })
 
+test("ensureStartupSession reuses latest session only when directory evidence matches", async () => {
+  const startInProgress = new Map()
+  const startupSessionByProject = {}
+  const startupSessionInProgress = new Map()
+  let createCalls = 0
+  const ocByAlias = {
+    demo: {
+      async listSessions() {
+        return [{ id: "sess-latest", directory: "c:/repo/demo" }]
+      },
+      async createSession() {
+        createCalls += 1
+        return { id: "sess-created" }
+      },
+    },
+  }
+
+  const sid = await ensureStartupSession({
+    alias: "demo",
+    directory: "C:/repo/demo",
+    startInProgress,
+    startupSessionByProject,
+    startupSessionInProgress,
+    ocByAlias,
+    logger: makeLogger(),
+  })
+
+  assert.equal(sid, "sess-latest")
+  assert.equal(startupSessionByProject.demo, "sess-latest")
+  assert.equal(createCalls, 0)
+})
+
+test("ensureStartupSession creates a new session when latest directory mismatches", async () => {
+  const startInProgress = new Map()
+  const startupSessionByProject = {}
+  const startupSessionInProgress = new Map()
+  const calls = { create: [] }
+  const ocByAlias = {
+    demo: {
+      async listSessions() {
+        return [{ id: "sess-other", directory: "C:/repo/other" }]
+      },
+      async createSession(input = {}) {
+        calls.create.push(input)
+        return { id: "sess-created" }
+      },
+    },
+  }
+
+  const sid = await ensureStartupSession({
+    alias: "demo",
+    directory: "C:/repo/demo",
+    startInProgress,
+    startupSessionByProject,
+    startupSessionInProgress,
+    ocByAlias,
+    logger: makeLogger(),
+  })
+
+  assert.equal(sid, "sess-created")
+  assert.equal(startupSessionByProject.demo, "sess-created")
+  assert.equal(calls.create.length, 1)
+  assert.equal(calls.create[0].directory, "C:/repo/demo")
+})
+
+test("ensureStartupSession creates a new session for directoryless latest sessions by default", async () => {
+  const startInProgress = new Map()
+  const startupSessionByProject = {}
+  const startupSessionInProgress = new Map()
+  let createCalls = 0
+  const ocByAlias = {
+    demo: {
+      async listSessions() {
+        return [{ id: "sess-unscoped" }]
+      },
+      async createSession() {
+        createCalls += 1
+        return { id: "sess-created" }
+      },
+    },
+  }
+
+  const sid = await ensureStartupSession({
+    alias: "demo",
+    directory: "C:/repo/demo",
+    startInProgress,
+    startupSessionByProject,
+    startupSessionInProgress,
+    ocByAlias,
+    logger: makeLogger(),
+  })
+
+  assert.equal(sid, "sess-created")
+  assert.equal(startupSessionByProject.demo, "sess-created")
+  assert.equal(createCalls, 1)
+})
+
+test("ensureStartupSession allows directoryless latest sessions only with explicit fallback", async () => {
+  const startInProgress = new Map()
+  const startupSessionByProject = {}
+  const startupSessionInProgress = new Map()
+  let createCalls = 0
+  const ocByAlias = {
+    demo: {
+      async listSessions() {
+        return [{ id: "sess-unscoped" }]
+      },
+      async createSession() {
+        createCalls += 1
+        return { id: "sess-created" }
+      },
+    },
+  }
+
+  const sid = await ensureStartupSession({
+    alias: "demo",
+    directory: "C:/repo/demo",
+    allowUnscopedSessionListFallback: true,
+    startInProgress,
+    startupSessionByProject,
+    startupSessionInProgress,
+    ocByAlias,
+    logger: makeLogger(),
+  })
+
+  assert.equal(sid, "sess-unscoped")
+  assert.equal(startupSessionByProject.demo, "sess-unscoped")
+  assert.equal(createCalls, 0)
+})
+
 test("ensureStartupSession does not cache invalid session ids", async () => {
   const startInProgress = new Map()
   const startupSessionByProject = {}
