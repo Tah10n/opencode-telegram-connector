@@ -1551,9 +1551,9 @@ test("startConnector /use accepts a shared session link for the current project"
       },
     },
     ocOptions: {
-      listSessionsImpl: () => [
-        { id: "ses_current", title: "Current" },
-        { id: "ses_shared", title: "Shared", share: { url: "https://opncd.ai/share/abc123/" } },
+      listSessionsImpl: (input = {}) => [
+        { id: "ses_current", title: "Current", directory: input.directory },
+        { id: "ses_shared", title: "Shared", directory: input.directory, share: { url: "https://opncd.ai/share/abc123/" } },
       ],
       listMessagesImpl: async (sessionId) => {
         return sessionId === "ses_shared"
@@ -1599,9 +1599,9 @@ test("startConnector /use rejects share links resolving to unsafe session ids", 
       },
     },
     ocOptions: {
-      listSessionsImpl: () => [
-        { id: "ses_current", title: "Current" },
-        { id: "ses/unsafe", title: "Unsafe shared", share: { url: "https://opncd.ai/share/unsafe" } },
+      listSessionsImpl: (input = {}) => [
+        { id: "ses_current", title: "Current", directory: input.directory },
+        { id: "ses/unsafe", title: "Unsafe shared", directory: input.directory, share: { url: "https://opncd.ai/share/unsafe" } },
       ],
     },
   })
@@ -1638,7 +1638,7 @@ test("startConnector /use reports when a shared session link is not found", asyn
       },
     },
     ocOptions: {
-      listSessionsImpl: () => [{ id: "ses_current", title: "Current" }],
+      listSessionsImpl: (input = {}) => [{ id: "ses_current", title: "Current", directory: input.directory }],
     },
     extraProjects: {
       other: {
@@ -1706,7 +1706,7 @@ test("startConnector rejects a shared session link from a different project", as
     },
     ocOptionsByAlias: {
       other: {
-        listSessionsImpl: () => [{ id: "ses_other", share: { url: "https://opncd.ai/s/xyz789" } }],
+        listSessionsImpl: (input = {}) => [{ id: "ses_other", directory: input.directory, share: { url: "https://opncd.ai/s/xyz789" } }],
       },
     },
   })
@@ -1745,7 +1745,7 @@ test("startConnector /use keeps checking other projects when one lookup fails", 
       },
     },
     ocOptions: {
-      listSessionsImpl: () => [{ id: "ses_current", title: "Current" }],
+      listSessionsImpl: (input = {}) => [{ id: "ses_current", title: "Current", directory: input.directory }],
     },
     extraProjects: {
       broken: {
@@ -1774,7 +1774,7 @@ test("startConnector /use keeps checking other projects when one lookup fails", 
         },
       },
       other: {
-        listSessionsImpl: () => [{ id: "ses_other", share: { url: "https://opncd.ai/s/xyz789" } }],
+        listSessionsImpl: (input = {}) => [{ id: "ses_other", directory: input.directory, share: { url: "https://opncd.ai/s/xyz789" } }],
       },
     },
   })

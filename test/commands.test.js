@@ -1627,6 +1627,96 @@ test("createCommandHandlers renderSessionsList shows the current model when avai
   assert.deepEqual(sent[0].replyMarkup.inline_keyboard.at(-1)?.map((button) => button.text), ["Refresh", "New", "Close"])
 })
 
+test("createCommandHandlers renderSessionsList hides scoped directoryless sessions by default", async () => {
+  const calls = []
+  const { runtime, sent } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    ocByAlias: {
+      demo: {
+        async listSessions(input = {}) {
+          calls.push(input)
+          return [{ id: "ses_hidden", title: "Hidden session" }]
+        },
+        async listMessages() {
+          return []
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderSessionsList(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    { binding: { projectAlias: "demo", sessionId: "ses_current" } },
+  )
+
+  assert.deepEqual(calls, [{ directory: "C:/repo/demo", limit: 10 }])
+  assert.match(sent[0].text, /No sessions found/)
+  assert.doesNotMatch(sent[0].text, /ses_hidden/)
+  assert.equal(sent[0].replyMarkup.inline_keyboard.flat().some((button) => button.text === "Hidden session"), false)
+})
+
+test("createCommandHandlers renderSessionsList allows scoped directoryless sessions with explicit legacy fallback", async () => {
+  const calls = []
+  const { runtime, sent } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo", allowUnscopedSessionListFallback: true } },
+    ocByAlias: {
+      demo: {
+        async listSessions(input = {}) {
+          calls.push(input)
+          return [{ id: "ses_legacy", title: "Legacy session" }]
+        },
+        async listMessages() {
+          return []
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderSessionsList(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    { binding: { projectAlias: "demo", sessionId: "ses_current" } },
+  )
+
+  assert.deepEqual(calls, [{ directory: "C:/repo/demo", limit: 10 }])
+  assert.match(sent[0].text, /ses_legacy.*Legacy session/)
+  assert.ok(sent[0].replyMarkup.inline_keyboard.flat().some((button) => button.text === "Legacy session"))
+})
+
+test("createCommandHandlers handleUseCommand does not bind hidden directoryless share-link sessions by default", async () => {
+  const listCalls = []
+  const getSessionCalls = []
+  const bindCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    ocByAlias: {
+      demo: {
+        async listSessions(input = {}) {
+          listCalls.push(input)
+          return [{ id: "ses_hidden", title: "Hidden session", share: { url: "https://opncd.ai/share/hidden" } }]
+        },
+        async getSession(sessionId) {
+          getSessionCalls.push(sessionId)
+          return { id: sessionId }
+        },
+      },
+    },
+    bindCtxToSession: async (...args) => {
+      bindCalls.push(args)
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleUseCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "https://opncd.ai/share/hidden")
+
+  assert.deepEqual(listCalls, [{ directory: "C:/repo/demo" }])
+  assert.deepEqual(getSessionCalls, [])
+  assert.deepEqual(bindCalls, [])
+  assert.match(sent[0].text, /Share link not found in project 'demo'/)
+})
+
 test("createCommandHandlers renderSessionsList hides unscoped fallback sessions by default", async () => {
   const calls = []
   const { runtime, sent } = makeRuntime({

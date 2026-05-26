@@ -95,7 +95,14 @@ export function createSessionCommandHandlers(deps) {
       const unscopedOptions = limit != null ? { limit } : {}
       return sessionsMatchingDirectory(await oc.listSessions(unscopedOptions))
     }
-    if (scopedItems.length > 0 || !directory) return scopedItems
+    if (!directory) return scopedItems
+
+    const scopedMatches = sessionsMatchingDirectory(scopedItems)
+    if (scopedItems.length > 0) {
+      const hasScopedDirectoryEvidence = scopedItems.some((session) => !!session?.directory)
+      if (hasScopedDirectoryEvidence) return scopedMatches
+      return project?.allowUnscopedSessionListFallback === true ? scopedItems : []
+    }
 
     const unscopedOptions = limit != null ? { limit } : {}
     const unscopedItems = sessionItemsFromResponse(await oc.listSessions(unscopedOptions))
