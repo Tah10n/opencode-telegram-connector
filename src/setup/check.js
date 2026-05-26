@@ -2,6 +2,7 @@ import crypto from "node:crypto"
 import fs from "node:fs/promises"
 import path from "node:path"
 import { buildRuntimeConfig } from "../config/runtime.js"
+import { canonicalDirectoryPath } from "../directory-paths.js"
 import { OpenCodeClient } from "../opencode/client.js"
 import { commandExistsOnPath, getLaunchSupport } from "../opencode/launcher.js"
 import { readOpenCodePermissionConfig, resolvePermissionConfigPath } from "../opencode/permissions-config.js"
@@ -157,8 +158,10 @@ function describeSseRouting(project, { eventPath }) {
   return `${eventPath} does not require project directory routing`
 }
 
-function permissionControlEnabled(project) {
-  return project?.permissionControl?.enabled !== false
+function shouldInspectPermissionConfig(project) {
+  if (project?.permissionControl === false || project?.permissionControl?.enabled === false) return false
+  if (hasExplicitPermissionConfigPath(project)) return true
+  return Object.hasOwn(project || {}, "permissionControl") && project.permissionControl != null
 }
 
 function hasExplicitPermissionConfigPath(project) {
@@ -175,6 +178,17 @@ function isAccessDeniedError(err) {
 
 function isMissingPathError(err) {
   return ["ENOENT", "ENOTDIR"].includes(err?.code)
+}
+
+function isHostLocalPermissionDirectory(directory) {
+  const canonical = canonicalDirectoryPath(directory)
+  if (!canonical) return false
+  if (process.platform === "win32") return canonical.flavor === "windows-drive" || canonical.flavor === "windows-unc"
+  return canonical.flavor === "posix"
+}
+
+function describeUnavailableDefaultPermissionConfigTarget(reason) {
+  return `default permission config target cannot be resolved because project directory is ${reason}; set explicit local permissionConfigPath with permissionControl: { remoteDirectory: true } (or add remoteDirectory: true to existing permissionControl), or disable permissionControl`
 }
 
 async function inspectExplicitPermissionConfigPath(project, { fsImpl, safeText }) {
@@ -202,6 +216,9 @@ function isRegularFileStat(stat) {
 async function inspectDefaultPermissionConfigTarget(project, { fsImpl, safeText }) {
   const directory = String(project?.directory || "").trim()
   if (!directory) return null
+  if (!isHostLocalPermissionDirectory(directory)) {
+    return { ok: false, label: describeUnavailableDefaultPermissionConfigTarget("non-local for local permission config") }
+  }
 
   try {
     const stat = await fsImpl.stat(directory)
@@ -209,7 +226,7 @@ async function inspectDefaultPermissionConfigTarget(project, { fsImpl, safeText 
       return { ok: false, label: "default permission config directory is not a directory" }
     }
   } catch (err) {
-    if (isMissingPathError(err)) return null
+    if (isMissingPathError(err)) return { ok: false, label: describeUnavailableDefaultPermissionConfigTarget("missing") }
     if (isAccessDeniedError(err)) return { ok: false, label: "permission config access-denied" }
     const code = err?.code ? ` (${safeText(err.code)})` : ""
     return { ok: false, label: `could not validate default permission config target${code}` }
@@ -258,6 +275,12 @@ function describePermissionConfigReadResult(result, { explicit }) {
   }
   if (result?.reason === "access-denied") {
     return { ok: false, label: "permission config access-denied" }
+  }
+  if (result?.status === "conflict" && result?.reason === "emergency-backup") {
+    return { ok: false, label: "permission config emergency backup exists; restore or remove it before using permission controls" }
+  }
+  if (result?.status === "conflict") {
+    return { ok: false, label: "permission config changed during validation; retry setup check" }
   }
   return { ok: false, label: "permission config unavailable" }
 }
@@ -427,7 +450,7 @@ export async function runSetupCheck({
       describeSseRouting(project, { eventPath: sseEventPath }),
     )
 
-    if (permissionControlEnabled(project)) {
+    if (shouldInspectPermissionConfig(project)) {
       const permissionConfigStatus = await inspectPermissionConfig(project, { fsImpl, safeText })
       if (permissionConfigStatus) {
         addFinding(

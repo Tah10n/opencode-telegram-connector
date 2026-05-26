@@ -191,6 +191,177 @@ test("OpenCode permission config writer creates config when missing", async () =
   assert.deepEqual(written.permission, profileToPermissionConfig("auto-edit"))
 })
 
+test("OpenCode permission config reader reports conflict for a missing JSONC config with emergency backup", async () => {
+  const dir = await makeTempDir()
+  const configPath = path.join(dir, "opencode.jsonc")
+  const backupPath = `${configPath}.bak.123456.abcdef123456`
+  await fs.writeFile(
+    backupPath,
+    [
+      "{",
+      "  // emergency backup should use JSONC parsing",
+      '  "permission": {',
+      '    "*": "ask",',
+      '    "edit": "allow",',
+      "  },",
+      "}",
+    ].join("\n"),
+    "utf8",
+  )
+
+  assert.equal(await resolvePermissionConfigPath({ directory: dir }), configPath)
+  const result = await readOpenCodePermissionConfig({ directory: dir })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.editable, false)
+  assert.equal(result.status, "conflict")
+  assert.equal(result.filePath, configPath)
+  assert.deepEqual((await fs.readdir(dir)).sort(), [path.basename(backupPath)].sort())
+})
+
+test("OpenCode permission config reader prefers live JSON over stale JSONC emergency backup", async () => {
+  const dir = await makeTempDir()
+  const jsonPath = path.join(dir, "opencode.json")
+  const jsoncPath = path.join(dir, "opencode.jsonc")
+  const backupPath = `${jsoncPath}.bak.123456.abcdef123456`
+  await fs.writeFile(jsonPath, JSON.stringify({ permission: profileToPermissionConfig("suggest"), liveJson: true }, null, 2), "utf8")
+  await fs.writeFile(backupPath, JSON.stringify({ permission: profileToPermissionConfig("auto-edit"), staleJsonc: true }, null, 2), "utf8")
+
+  assert.equal(await resolvePermissionConfigPath({ directory: dir }), jsonPath)
+  const result = await readOpenCodePermissionConfig({ directory: dir })
+
+  assert.equal(result.ok, true)
+  assert.equal(result.filePath, jsonPath)
+  assert.equal(result.profile, "suggest")
+  await assert.rejects(fs.readFile(jsoncPath, "utf8"), /ENOENT/)
+})
+
+test("OpenCode permission config writer fails closed on invalid JSONC emergency backup", async () => {
+  const dir = await makeTempDir()
+  const jsonPath = path.join(dir, "opencode.json")
+  const jsoncPath = path.join(dir, "opencode.jsonc")
+  const backupPath = `${jsoncPath}.bak.123456.abcdef123456`
+  await fs.writeFile(backupPath, "{ // backup exists but is invalid\n", "utf8")
+
+  const readResult = await readOpenCodePermissionConfig({ directory: dir })
+  assert.equal(readResult.ok, false)
+  assert.equal(readResult.editable, false)
+  assert.equal(readResult.status, "invalid")
+  assert.equal(readResult.filePath, jsoncPath)
+
+  const writeResult = await writeOpenCodePermissionProfile({ directory: dir }, "auto-edit")
+  assert.equal(writeResult.ok, false)
+  assert.equal(writeResult.status, "invalid")
+  assert.equal(writeResult.filePath, jsoncPath)
+  await assert.rejects(fs.readFile(jsonPath, "utf8"), /ENOENT/)
+  await assert.rejects(fs.readFile(jsoncPath, "utf8"), /ENOENT/)
+})
+
+test("OpenCode permission config reader reports conflict without restoring emergency backups", async () => {
+  const dir = process.platform === "win32" ? "C:/repo/project" : "/repo/project"
+  const configPath = path.join(dir, "opencode.json")
+  const backupPath = `${configPath}.bak.123456.abcdef123456`
+  const backupText = JSON.stringify({ permission: profileToPermissionConfig("suggest") }, null, 2)
+  const copyCalls = []
+  let writeCalls = 0
+  const fsImpl = {
+    constants: { COPYFILE_EXCL: fsConstants.COPYFILE_EXCL },
+    async stat(filePath) {
+      if (path.normalize(filePath) === path.normalize(dir)) return { isDirectory: () => true, isFile: () => false }
+      if (path.normalize(filePath) === path.normalize(backupPath)) return { isFile: () => true, mtimeMs: 1 }
+      throw enoent(filePath)
+    },
+    async lstat(filePath) {
+      if (path.normalize(filePath) === path.normalize(configPath)) throw enoent(filePath)
+      return this.stat(filePath)
+    },
+    async realpath(filePath) {
+      return path.normalize(filePath)
+    },
+    async readdir(filePath) {
+      if (path.normalize(filePath) !== path.normalize(dir)) throw enoent(filePath)
+      return [path.basename(backupPath)]
+    },
+    async readFile(filePath) {
+      if (path.normalize(filePath) === path.normalize(configPath)) throw enoent(filePath)
+      if (path.normalize(filePath) === path.normalize(backupPath)) return backupText
+      throw new Error(`Unexpected readFile: ${filePath}`)
+    },
+    async copyFile(from, to, flags) {
+      copyCalls.push({ from, to, flags })
+      const err = new Error("concurrent config creation")
+      err.code = "EEXIST"
+      throw err
+    },
+    async writeFile() {
+      writeCalls += 1
+      throw new Error("writeFile should not be called")
+    },
+  }
+
+  const readResult = await readOpenCodePermissionConfig({ directory: dir }, { fsImpl })
+  assert.equal(readResult.ok, false)
+  assert.equal(readResult.status, "conflict")
+  assert.equal(readResult.reason, "emergency-backup")
+  assert.deepEqual(copyCalls, [])
+
+  const writeResult = await writeOpenCodePermissionProfile({ directory: dir }, "auto-edit", { fsImpl })
+  assert.equal(writeResult.ok, false)
+  assert.equal(writeResult.status, "conflict")
+  assert.deepEqual(copyCalls, [])
+  assert.equal(writeCalls, 0)
+})
+
+test("OpenCode permission config reader fails closed on unsafe emergency backup symlink", async () => {
+  const dir = process.platform === "win32" ? "C:/repo/project" : "/repo/project"
+  const jsonPath = path.join(dir, "opencode.json")
+  const jsoncPath = path.join(dir, "opencode.jsonc")
+  const backupPath = `${jsonPath}.bak.123456.abcdef123456`
+  let readCalls = 0
+  let copyCalls = 0
+  const directoryStat = { isDirectory: () => true, isFile: () => false, isSymbolicLink: () => false, mtimeMs: 0 }
+  const symlinkStat = { isDirectory: () => false, isFile: () => false, isSymbolicLink: () => true, mtimeMs: 1 }
+  const fsImpl = {
+    async stat(filePath) {
+      if (path.normalize(filePath) === path.normalize(dir)) return directoryStat
+      throw enoent(filePath)
+    },
+    async lstat(filePath) {
+      if (path.normalize(filePath) === path.normalize(jsoncPath)) throw enoent(filePath)
+      if (path.normalize(filePath) === path.normalize(jsonPath)) throw enoent(filePath)
+      if (path.normalize(filePath) === path.normalize(backupPath)) return symlinkStat
+      return this.stat(filePath)
+    },
+    async realpath(filePath) {
+      return path.normalize(filePath)
+    },
+    async readdir(filePath) {
+      if (path.normalize(filePath) !== path.normalize(dir)) throw enoent(filePath)
+      return [path.basename(backupPath)]
+    },
+    async readFile(filePath) {
+      if (path.normalize(filePath) === path.normalize(jsonPath)) throw enoent(filePath)
+      readCalls += 1
+      throw new Error("unsafe emergency backup should not be read")
+    },
+    async copyFile() {
+      copyCalls += 1
+      throw new Error("unsafe emergency backup should not be copied")
+    },
+  }
+
+  const readResult = await readOpenCodePermissionConfig({ directory: dir }, { fsImpl })
+  assert.equal(readResult.ok, false)
+  assert.equal(readResult.status, "invalid")
+  assert.equal(readResult.filePath, jsonPath)
+  assert.equal(readCalls, 0)
+
+  const writeResult = await writeOpenCodePermissionProfile({ directory: dir }, "auto-edit", { fsImpl })
+  assert.equal(writeResult.ok, false)
+  assert.equal(writeResult.status, "invalid")
+  assert.equal(copyCalls, 0)
+})
+
 test("OpenCode permission config writer does not create implicit configs for missing project directories", async () => {
   const dir = path.join(await makeTempDir(), "missing-project")
 

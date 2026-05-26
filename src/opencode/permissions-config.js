@@ -86,12 +86,12 @@ function permissionResultUnavailable(filePath = "", reason = "") {
   }
 }
 
-function permissionResultConflict(filePath) {
+function permissionResultConflict(filePath, reason = "changed") {
   return {
     ok: false,
     editable: false,
     status: "conflict",
-    reason: "changed",
+    reason,
     filePath,
     config: null,
     permission: undefined,
@@ -123,6 +123,101 @@ function sameFsPath(left, right) {
 function permissionConfigLockKey(filePath) {
   const normalized = path.normalize(String(filePath || ""))
   return process.platform === "win32" ? normalized.toLowerCase() : normalized
+}
+
+function permissionEmergencyBackupPrefix(filePath) {
+  return `${path.basename(filePath)}.bak.`
+}
+
+function permissionEmergencyBackupIsUnsafe(stat) {
+  return (typeof stat?.isSymbolicLink === "function" && stat.isSymbolicLink())
+    || (typeof stat?.isFile === "function" && !stat.isFile())
+}
+
+async function permissionEmergencyBackupState(fsImpl, backupPath) {
+  const statFile = typeof fsImpl?.lstat === "function" ? fsImpl.lstat.bind(fsImpl) : fsImpl.stat.bind(fsImpl)
+  const stat = await statFile(backupPath)
+  return permissionEmergencyBackupIsUnsafe(stat) ? "unsafe" : "file"
+}
+
+async function listPermissionEmergencyBackups(filePath, { fsImpl = fs } = {}) {
+  const dir = path.dirname(filePath)
+  const prefix = permissionEmergencyBackupPrefix(filePath)
+  let names
+  if (typeof fsImpl?.readdir !== "function") return []
+  try {
+    names = await fsImpl.readdir(dir)
+  } catch (err) {
+    if (hasCode(err, "ENOENT", "ENOTDIR")) return []
+    throw err
+  }
+
+  const backups = []
+  for (const name of names) {
+    if (!name.startsWith(prefix)) continue
+    const backupPath = path.join(dir, name)
+    let stat = null
+    try {
+      const statFile = typeof fsImpl?.lstat === "function" ? fsImpl.lstat.bind(fsImpl) : fsImpl.stat.bind(fsImpl)
+      stat = await statFile(backupPath)
+    } catch (err) {
+      if (!hasCode(err, "ENOENT")) throw err
+      continue
+    }
+    backups.push({ path: backupPath, name, mtimeMs: Number(stat?.mtimeMs) || 0, unsafe: permissionEmergencyBackupIsUnsafe(stat) })
+  }
+  backups.sort((a, b) => b.mtimeMs - a.mtimeMs || b.name.localeCompare(a.name))
+  return backups
+}
+
+async function hasPermissionEmergencyBackup(filePath, { fsImpl = fs } = {}) {
+  return (await listPermissionEmergencyBackups(filePath, { fsImpl })).length > 0
+}
+
+function permissionResultInvalidEmergencyBackup(filePath, backupPath, err) {
+  return {
+    ok: false,
+    editable: false,
+    exists: false,
+    status: "invalid",
+    filePath,
+    config: null,
+    permission: undefined,
+    profile: "custom",
+    error: new Error(
+      `OpenCode config '${filePath}' is missing, and emergency backup '${backupPath}' could not be loaded (${err?.message || String(err)}). Refusing to create a new config over it.`,
+      { cause: err },
+    ),
+  }
+}
+
+async function inspectMissingPermissionConfigEmergencyBackup(filePath, { fsImpl = fs } = {}) {
+  let backups
+  try {
+    backups = await listPermissionEmergencyBackups(filePath, { fsImpl })
+  } catch (err) {
+    if (isAccessDenied(err)) return permissionResultUnavailable(filePath, "access-denied")
+    throw err
+  }
+  if (backups.length === 0) return null
+
+  const backup = backups[0]
+  if (backup.unsafe) {
+    return permissionResultInvalidEmergencyBackup(filePath, backup.path, new Error("unsafe emergency backup target; expected a regular file"))
+  }
+  try {
+    const backupState = await permissionEmergencyBackupState(fsImpl, backup.path)
+    if (backupState === "unsafe") {
+      return permissionResultInvalidEmergencyBackup(filePath, backup.path, new Error("unsafe emergency backup target; expected a regular file"))
+    }
+    parseJsonc(await fsImpl.readFile(backup.path, "utf8"), backup.path)
+  } catch (err) {
+    if (isAccessDenied(err)) return permissionResultUnavailable(filePath, "access-denied")
+    if (hasCode(err, "ENOENT", "ENOTDIR")) return permissionResultUnavailable(filePath)
+    return permissionResultInvalidEmergencyBackup(filePath, backup.path, err)
+  }
+
+  return permissionResultConflict(filePath, "emergency-backup")
 }
 
 async function withPermissionConfigWriteLock(lockKey, fn) {
@@ -388,6 +483,8 @@ export async function resolvePermissionConfigPath(project, { fsImpl = fs } = {})
   const jsonState = await permissionConfigTargetState(fsImpl, jsonPath)
   if (jsonState === "unsafe") return ""
   if (jsonState === "file") return jsonPath
+  if (jsoncState === "missing" && await hasPermissionEmergencyBackup(jsoncPath, { fsImpl })) return jsoncPath
+  if (jsonState === "missing" && await hasPermissionEmergencyBackup(jsonPath, { fsImpl })) return jsonPath
   return jsonPath
 }
 
@@ -426,6 +523,8 @@ async function readOpenCodePermissionConfigInternal(project, { fsImpl = fs, incl
     text = await fsImpl.readFile(filePath, "utf8")
   } catch (err) {
     if (hasCode(err, "ENOENT")) {
+      const emergencyBackupResult = await inspectMissingPermissionConfigEmergencyBackup(filePath, { fsImpl })
+      if (emergencyBackupResult) return emergencyBackupResult
       return attachConfigWriteMetadata({
         ok: true,
         editable: true,
@@ -527,7 +626,17 @@ async function verifyPermissionConfigWriteTarget(project, current, expectedText,
       if (isAccessDenied(err)) return { ok: false, result: permissionResultUnavailable(current.filePath, "access-denied") }
       throw err
     }
-    if (state === "missing") return { ok: true, mode: NEW_PERMISSION_CONFIG_MODE, text: "", parentRealPath }
+    if (state === "missing") {
+      let emergencyBackups
+      try {
+        emergencyBackups = await listPermissionEmergencyBackups(current.filePath, { fsImpl })
+      } catch (err) {
+        if (isAccessDenied(err)) return { ok: false, result: permissionResultUnavailable(current.filePath, "access-denied") }
+        throw err
+      }
+      if (emergencyBackups.length > 0) return { ok: false, result: permissionResultConflict(current.filePath, "emergency-backup") }
+      return { ok: true, mode: NEW_PERMISSION_CONFIG_MODE, text: "", parentRealPath }
+    }
     if (state === "file") return { ok: false, result: permissionResultConflict(current.filePath) }
     return { ok: false, result: permissionResultUnavailable(current.filePath) }
   }

@@ -63,6 +63,7 @@ export const CALLBACK_TOAST_KEYS = Object.freeze({
   "Send answer": "sendAnswer",
   "Permissions changed": "permissionsChanged",
   "Permissions reset": "permissionsReset",
+  "Applying permissions…": "permissionsApplying",
 })
 
 const CALLBACK_TOAST_KIND = "callback-toast"

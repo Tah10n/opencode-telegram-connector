@@ -24,6 +24,7 @@ test("localizeCallbackToast covers attachment and dynamic callback statuses", ()
     "Permissions",
     "Permissions changed",
     "Permissions reset",
+    "Applying permissions…",
   ]) {
     assert.notEqual(localizeCallbackToast(text, "ru"), text)
   }
@@ -790,7 +791,7 @@ test("createCallbackHandlers handles permissions control callbacks", async () =>
   await handlers.handleTelegramCallback(makeCallback("pc|set|demo|auto-edit", { id: "cb_3", chatType: "private", threadIdOr0: 0 }))
   await handlers.handleTelegramCallback(makeCallback("pc|confirm|demo|full-auto", { id: "cb_4", chatType: "private", threadIdOr0: 0 }))
 
-  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Permissions", "Permissions", "Permissions changed", "Confirm"])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Permissions", "Permissions", "Applying permissions…", "Confirm"])
   assert.deepEqual(permissionCalls, [
     { type: "render", ctxMeta: { chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, options: { projectAlias: "demo", editMessageId: 900 } },
     { type: "details", ctxMeta: { chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, projectAlias: "demo", options: { editMessageId: 900 } },
@@ -828,13 +829,46 @@ test("createCallbackHandlers applies permissions reset callbacks in private chat
 
   await handlers.handleTelegramCallback(makeCallback("pc|reset|demo", { chatType: "private", threadIdOr0: 0 }))
 
-  assert.deepEqual(callbackAnswers, [{ callbackQueryId: "cb_1", text: "Permissions reset" }])
+  assert.deepEqual(callbackAnswers, [{ callbackQueryId: "cb_1", text: "Applying permissions…" }])
   assert.deepEqual(permissionCalls, [
     { type: "apply", ctxMeta: { chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, projectAlias: "demo", profileId: "reset", options: { editMessageId: 900 } },
   ])
 })
 
-test("createCallbackHandlers answers no-op permission callbacks without changed/reset toasts", async () => {
+test("createCallbackHandlers answers permission apply callbacks before slow profile writes finish", async () => {
+  let resolveApply
+  let markApplyStarted
+  const applyStarted = new Promise((resolve) => {
+    markApplyStarted = resolve
+  })
+  const applyFinished = new Promise((resolve) => {
+    resolveApply = resolve
+  })
+  const { runtime, callbackAnswers, permissionCalls } = makeRuntime({
+    applyPermissionProfile: async (ctxMeta, projectAlias, profileId, options) => {
+      permissionCalls.push({ type: "apply", ctxMeta, projectAlias, profileId, options })
+      markApplyStarted()
+      await applyFinished
+      return { ok: true }
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  const handling = handlers.handleTelegramCallback(makeCallback("pc|apply|demo|auto-edit", { chatType: "private", threadIdOr0: 0 }))
+  await applyStarted
+  const callbackAnswersBeforeWriteResolves = [...callbackAnswers]
+
+  resolveApply()
+  await handling
+
+  assert.deepEqual(callbackAnswersBeforeWriteResolves, [{ callbackQueryId: "cb_1", text: "Applying permissions…" }])
+  assert.deepEqual(callbackAnswers, [{ callbackQueryId: "cb_1", text: "Applying permissions…" }])
+  assert.deepEqual(permissionCalls, [
+    { type: "apply", ctxMeta: { chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, projectAlias: "demo", profileId: "auto-edit", options: { editMessageId: 900 } },
+  ])
+})
+
+test("createCallbackHandlers answers no-op permission callbacks with working toasts", async () => {
   const { runtime, callbackAnswers, permissionCalls } = makeRuntime({
     applyPermissionProfile: async (ctxMeta, projectAlias, profileId, options) => {
       permissionCalls.push({ type: "apply", ctxMeta, projectAlias, profileId, options })
@@ -846,7 +880,7 @@ test("createCallbackHandlers answers no-op permission callbacks without changed/
   await handlers.handleTelegramCallback(makeCallback("pc|set|demo|auto-edit", { chatType: "private", threadIdOr0: 0 }))
   await handlers.handleTelegramCallback(makeCallback("pc|reset|demo", { id: "cb_2", chatType: "private", threadIdOr0: 0 }))
 
-  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Already current", "No permission changes were needed; refresh failed"])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Applying permissions…", "Applying permissions…"])
   assert.deepEqual(permissionCalls, [
     { type: "apply", ctxMeta: { chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, projectAlias: "demo", profileId: "auto-edit", options: { editMessageId: 900 } },
     { type: "apply", ctxMeta: { chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, projectAlias: "demo", profileId: "reset", options: { editMessageId: 900 } },
@@ -864,7 +898,7 @@ test("createCallbackHandlers reports permission refresh failures after successfu
 
   await handlers.handleTelegramCallback(makeCallback("pc|apply|demo|full-auto", { chatType: "private", threadIdOr0: 0 }))
 
-  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Permissions changed; refresh failed"])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Applying permissions…"])
   assert.deepEqual(permissionCalls, [
     { type: "apply", ctxMeta: { chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, projectAlias: "demo", profileId: "full-auto", options: { editMessageId: 900 } },
   ])
@@ -940,7 +974,7 @@ test("createCallbackHandlers attributes permissions control failures to the targ
 
   await handlers.handleTelegramCallback(makeCallback("pc|apply|demo|auto-edit", { chatType: "private", threadIdOr0: 0 }))
 
-  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Action failed"])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Applying permissions…", "Action failed"])
   assert.deepEqual(callbackOutcomes, [{ projectAlias: "demo", outcome: "fatal" }])
 })
 

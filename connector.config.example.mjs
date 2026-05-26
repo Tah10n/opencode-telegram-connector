@@ -76,7 +76,8 @@ export default {
       passwordEnv: "REMOTE_OPENCODE_PASSWORD",
       // If this same-platform directory is remote/non-local but you still want
       // /permissions, point permissionConfigPath at opencode.json/jsonc inside
-      // an existing local directory and opt in explicitly:
+      // an existing local directory and opt in explicitly. setup:check skips
+      // permission config validation for this project until you opt in here.
       // permissionConfigPath: "./remote-team/opencode.json",
       // permissionControl: { remoteDirectory: true },
     },

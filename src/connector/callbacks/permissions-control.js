@@ -73,13 +73,8 @@ export async function handlePermissionsControlCallback({
       await renderFullAutoConfirmation(ctxMeta, projectAlias, { editMessageId: msg?.message_id })
       return true
     }
-    const result = await applyPermissionProfile(ctxMeta, projectAlias, requestedProfile, { editMessageId: msg?.message_id })
-    const successToast = result?.changed === false
-      ? result?.renderOk === false ? "permissionsNoChangeRefreshFailed" : "alreadyCurrent"
-      : result?.renderOk === false
-        ? "permissionsRefreshFailed"
-        : requestedProfile === PERMISSION_RESET_ID ? "permissionsReset" : "permissionsChanged"
-    await answerCallbackQuery(callbackQuery.id, result?.ok === false ? "Unavailable" : callbackToast(successToast))
+    await answerCallbackQuery(callbackQuery.id, callbackToast("permissionsApplying"))
+    await applyPermissionProfile(ctxMeta, projectAlias, requestedProfile, { editMessageId: msg?.message_id })
     return true
   }
 

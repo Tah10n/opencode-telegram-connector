@@ -52,6 +52,7 @@ function compactJson(value, maxChars = 2400) {
 function permissionIssueText(ctxOrLocale, result, t) {
   if (result?.status === "unavailable" && result?.reason === "access-denied") return t(ctxOrLocale, "permissions.accessDenied")
   if (result?.status === "unavailable") return t(ctxOrLocale, "permissions.noConfigPath")
+  if (result?.status === "conflict" && result?.reason === "emergency-backup") return t(ctxOrLocale, "permissions.configEmergencyBackup")
   if (result?.status === "conflict") return t(ctxOrLocale, "permissions.configChanged")
   if (result?.status === "disabled") return t(ctxOrLocale, "permissions.disabled")
   if (result?.status === "invalid") return t(ctxOrLocale, "permissions.invalidConfig")

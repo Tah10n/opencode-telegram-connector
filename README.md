@@ -198,6 +198,8 @@ When opencode asks for a permission decision or a question answer, the connector
 
 `/permissions` writes the project's OpenCode `permission` config to `opencode.json` by default for local project directories, or to `permissionConfigPath` when configured. If `opencode.jsonc` already exists next to a local project directory, the connector reads and updates that file as strict JSON-compatible JSONC; `opencode.jsonc` takes precedence when both `opencode.jsonc` and `opencode.json` exist. `permissionConfigPath` should point to a local `opencode.json` or `opencode.jsonc`; when the project has an existing local `directory`, the explicit path is constrained to that local project directory and symlink/junction escapes are rejected. For same-platform remote projects whose `directory` path is only used for SSE routing and does not exist on the connector host, set `permissionControl: { remoteDirectory: true }` with an explicit local `permissionConfigPath`, or disable `permissionControl`. Existing files are backed up as `opencode.json.backup.*` or `opencode.jsonc.backup.*` before changes.
 
+`setup:check` validates permission config targets only when `permissionConfigPath` is set or `permissionControl` is explicitly configured. This keeps remote/SSE-only projects from failing setup just because their routing `directory` is not local. If an interrupted write leaves an `opencode.json(.c).bak.*` emergency backup, reads stay side-effect-free and report a conflict until you manually restore or remove the backup.
+
 The built-in profiles are shaped after Codex-style modes:
 
 | Profile | Behavior |

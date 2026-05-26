@@ -94,7 +94,8 @@ test("runSetupCheck reports successful probes and cleans temp state files", asyn
   })
 
   assert.equal(report.exitCode, 0)
-  assert.deepEqual(report.counts, { pass: 11, warn: 0, fail: 0 })
+  assert.deepEqual(report.counts, { pass: 10, warn: 0, fail: 0 })
+  assert.equal(report.findings.some((finding) => finding.item === "Permission config demo"), false)
   assert.match(lines.join("\n"), /\[PASS\] Telegram API: getMe ok \(@demo_bot, id 7\)/)
   assert.doesNotMatch(lines.join("\n"), /5555555555:AABBCCDDEEFFaabbccddeeff12345678/)
 
@@ -438,6 +439,7 @@ test("runSetupCheck fails invalid default opencode.json without leaking parser d
         demo: {
           baseUrl: "http://127.0.0.1:4312",
           directory: repoDir,
+          permissionControl: { enabled: true },
           autoStart: false,
           serverLaunchMode: "background",
           openTuiOnAutoStart: true,
@@ -480,6 +482,7 @@ test("runSetupCheck prefers and validates default opencode.jsonc", async () => {
         demo: {
           baseUrl: "http://127.0.0.1:4312",
           directory: repoDir,
+          permissionControl: { enabled: true },
           autoStart: false,
           serverLaunchMode: "background",
           openTuiOnAutoStart: true,
@@ -515,6 +518,7 @@ test("runSetupCheck passes missing default permission config target", async () =
         demo: {
           baseUrl: "http://127.0.0.1:4312",
           directory: repoDir,
+          permissionControl: { enabled: true },
           autoStart: false,
           serverLaunchMode: "background",
           openTuiOnAutoStart: true,
@@ -530,6 +534,76 @@ test("runSetupCheck passes missing default permission config target", async () =
   const permissionConfigFinding = report.findings.find((finding) => finding.item === "Permission config demo")
   assert.equal(permissionConfigFinding?.status, "pass")
   assert.match(permissionConfigFinding?.message || "", /can be created/)
+})
+
+test("runSetupCheck skips implicit permission config validation without opt-in", async () => {
+  const dir = await makeTempDir()
+  const remoteDirectory = process.platform === "win32" ? "/srv/workspaces/team-project" : "C:/remote/team-project"
+  const stateFile = path.join(dir, ".data", "state.json")
+
+  const report = await runSetupCheck({
+    stdout: () => {},
+    skipTelegramProbe: true,
+    skipOpenCodeProbe: true,
+    buildRuntimeConfigImpl: async () => makeRuntime({
+      dir,
+      stateFile,
+      projects: {
+        demo: {
+          baseUrl: "http://127.0.0.1:4312",
+          directory: remoteDirectory,
+          autoStart: false,
+          serverLaunchMode: "background",
+          openTuiOnAutoStart: true,
+          openAttachOnNewMode: "same-window",
+          username: "",
+          password: "",
+        },
+      },
+    }),
+  })
+
+  assert.equal(report.exitCode, 0)
+  assert.equal(report.findings.some((finding) => finding.item === "Permission config demo"), false)
+})
+
+test("runSetupCheck fails missing project directory when permission control needs default config target", async () => {
+  const dir = await makeTempDir()
+  const missingProjectDir = path.join(dir, "remote-repo")
+  const stateFile = path.join(dir, ".data", "state.json")
+  const output = []
+
+  const report = await runSetupCheck({
+    stdout: (line) => output.push(line),
+    skipTelegramProbe: true,
+    skipOpenCodeProbe: true,
+    buildRuntimeConfigImpl: async () => makeRuntime({
+      dir,
+      stateFile,
+      projects: {
+        demo: {
+          baseUrl: "http://127.0.0.1:4312",
+          directory: missingProjectDir,
+          permissionControl: { enabled: true },
+          autoStart: false,
+          serverLaunchMode: "background",
+          openTuiOnAutoStart: true,
+          openAttachOnNewMode: "same-window",
+          username: "",
+          password: "",
+        },
+      },
+    }),
+  })
+
+  assert.equal(report.exitCode, 1)
+  const permissionConfigFinding = report.findings.find((finding) => finding.item === "Permission config demo")
+  assert.equal(permissionConfigFinding?.status, "fail")
+  assert.match(permissionConfigFinding?.message || "", /project directory is missing/)
+  assert.match(permissionConfigFinding?.message || "", /explicit local permissionConfigPath/)
+  assert.match(permissionConfigFinding?.message || "", /remoteDirectory: true/)
+  assert.match(permissionConfigFinding?.message || "", /disable permissionControl/)
+  assert.match(output.join("\n"), /\[FAIL\] Permission config demo:/)
 })
 
 test("runSetupCheck fails unsafe default permission config directory target", async () => {
@@ -551,6 +625,7 @@ test("runSetupCheck fails unsafe default permission config directory target", as
         demo: {
           baseUrl: "http://127.0.0.1:4312",
           directory: repoDir,
+          permissionControl: { enabled: true },
           autoStart: false,
           serverLaunchMode: "background",
           openTuiOnAutoStart: true,
@@ -591,6 +666,7 @@ test("runSetupCheck fails unsafe default permission config symlink target", asyn
         demo: {
           baseUrl: "http://127.0.0.1:4312",
           directory: repoDir,
+          permissionControl: { enabled: true },
           autoStart: false,
           serverLaunchMode: "background",
           openTuiOnAutoStart: true,
@@ -650,6 +726,7 @@ test("runSetupCheck fails access-denied default permission config", async () => 
         demo: {
           baseUrl: "http://127.0.0.1:4312",
           directory: repoDir,
+          permissionControl: { enabled: true },
           autoStart: false,
           serverLaunchMode: "background",
           openTuiOnAutoStart: true,
