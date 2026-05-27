@@ -506,6 +506,69 @@ test("createCommandHandlers renderPermissionDetails hides config path outside pr
   assert.doesNotMatch(sent[0].text, /C:\/repo\/demo\/opencode\.json|Config:/)
 })
 
+test("createCommandHandlers permission renderers edit existing messages for unknown projects", async () => {
+  const editCalls = []
+  const { runtime, sent } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    tg: {
+      editMessageText: async (...args) => {
+        editCalls.push(args)
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+  const ctxMeta = { chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }
+
+  await handlers.renderPermissionSettings(ctxMeta, { projectAlias: "missing", editMessageId: 321 })
+  await handlers.renderPermissionDetails(ctxMeta, "missing", { editMessageId: 322 })
+
+  assert.deepEqual(sent, [])
+  assert.equal(editCalls.length, 2)
+  assert.deepEqual(editCalls[0].slice(0, 2), [100, 321])
+  assert.match(editCalls[0][2], /Unknown project\./)
+  assert.deepEqual(editCalls[0][3].inline_keyboard.flat().map((button) => button.text), ["Close"])
+  assert.deepEqual(editCalls[1].slice(0, 2), [100, 322])
+  assert.match(editCalls[1][2], /Unknown project\./)
+})
+
+test("createCommandHandlers renderPermissionSettings requires a binding in unbound group chats", async () => {
+  let readCalls = 0
+  const { runtime, sent } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    readPermissionConfig: async () => {
+      readCalls += 1
+      return { ok: true, editable: true, status: "ok", profile: "suggest", permission: {} }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderPermissionSettings({ chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" })
+
+  assert.equal(readCalls, 0)
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Permissions need a bound thread/)
+})
+
+test("createCommandHandlers applyPermissionProfile rejects missing projects and group writes", async () => {
+  const writes = []
+  const { runtime, sent } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    writePermissionProfile: async (project, profileId) => {
+      writes.push({ project, profileId })
+      return { ok: true }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.applyPermissionProfile({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, "missing", "auto-edit")
+  await handlers.applyPermissionProfile({ chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" }, "demo", "auto-edit")
+
+  assert.deepEqual(writes, [])
+  assert.equal(sent.length, 2)
+  assert.match(sent[0].text, /Unknown project\./)
+  assert.match(sent[1].text, /Profile changes are private-chat only/)
+})
+
 test("createCommandHandlers handlePermissions explains unavailable permission config paths", async () => {
   const { runtime, sent } = makeRuntime({
     storeState: {
@@ -617,6 +680,62 @@ test("createCommandHandlers handlePermissions applies non-dangerous profiles in 
   assert.match(sent[0].text, /Changed: permissions profile is now Auto Edit\./)
   assert.match(sent[0].text, /Config: C:\/repo\/demo\/opencode\.json/)
   assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text), ["Suggest", "Auto Edit", "Full Auto", "OpenCode default", "View current", "Close"])
+})
+
+test("createCommandHandlers handleTelegramMessage routes /permissions and records the command", async () => {
+  const writes = []
+  const marked = []
+  const flushes = []
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    store: {
+      markIdempotencyKey: (key, metadata) => {
+        marked.push({ key, metadata })
+        return true
+      },
+      flush: async () => {
+        flushes.push(true)
+      },
+    },
+    ctxMetaFromMessage: (msg) => ({
+      chatId: msg?.chat?.id,
+      chatType: msg?.chat?.type,
+      threadIdOr0: msg?.message_thread_id || 0,
+      ctxKey: `${msg?.chat?.id}:${msg?.message_thread_id || 0}`,
+    }),
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    readPermissionConfig: async () => ({
+      ok: true,
+      editable: true,
+      status: "ok",
+      filePath: "C:/repo/demo/opencode.json",
+      profile: "auto-edit",
+      permission: {},
+    }),
+    writePermissionProfile: async (project, profileId) => {
+      writes.push({ project, profileId })
+      return { ok: true, profile: profileId, filePath: "C:/repo/demo/opencode.json" }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    message_id: 55,
+    chat: { id: 100, type: "private" },
+    from: { id: 42 },
+    text: "/permissions auto-edit",
+  }, { updateId: 77 })
+
+  assert.deepEqual(writes, [{ project: runtime.projects.demo, profileId: "auto-edit" }])
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Changed: permissions profile is now Auto Edit\./)
+  assert.equal(marked.length, 1)
+  assert.equal(marked[0].metadata.operation, "permissions")
+  assert.equal(marked[0].metadata.updateId, 77)
+  assert.equal(marked[0].metadata.messageId, 55)
+  assert.equal(flushes.length, 1)
 })
 
 test("createCommandHandlers handlePermissions reports no-op profile writes without changed notice", async () => {

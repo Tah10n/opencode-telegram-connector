@@ -800,6 +800,48 @@ test("createCallbackHandlers handles permissions control callbacks", async () =>
   ])
 })
 
+test("createCallbackHandlers closes and rejects malformed permissions control callbacks", async () => {
+  const deletedMessages = []
+  const { runtime, callbackAnswers, permissionCalls } = makeRuntime({
+    tg: {
+      deleteMessage: async (chatId, messageId) => {
+        deletedMessages.push({ chatId, messageId })
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("pc|close", { chatType: "private", threadIdOr0: 0, messageId: 901 }))
+  await handlers.handleTelegramCallback(makeCallback("pc|view", { id: "cb_2", chatType: "private", threadIdOr0: 0 }))
+  await handlers.handleTelegramCallback(makeCallback("pc|confirm|demo|suggest", { id: "cb_3", chatType: "private", threadIdOr0: 0 }))
+  await handlers.handleTelegramCallback(makeCallback("pc|confirm|demo|full-auto", { id: "cb_4", chatType: "supergroup", threadIdOr0: 7 }))
+  await handlers.handleTelegramCallback(makeCallback("pc|set|demo|bogus", { id: "cb_5", chatType: "private", threadIdOr0: 0 }))
+  await handlers.handleTelegramCallback(makeCallback("pc|unknown|demo", { id: "cb_6", chatType: "private", threadIdOr0: 0 }))
+
+  assert.deepEqual(callbackAnswers, [
+    { callbackQueryId: "cb_1", text: "Closed" },
+    { callbackQueryId: "cb_2", text: "Invalid" },
+    { callbackQueryId: "cb_3", text: "Invalid" },
+    { callbackQueryId: "cb_4", text: "Private chat only" },
+    { callbackQueryId: "cb_5", text: "Invalid" },
+    { callbackQueryId: "cb_6", text: "Invalid" },
+  ])
+  assert.deepEqual(deletedMessages, [{ chatId: 100, messageId: 901 }])
+  assert.deepEqual(permissionCalls, [])
+})
+
+test("createCallbackHandlers asks for full-auto confirmation before applying set callbacks", async () => {
+  const { runtime, callbackAnswers, permissionCalls } = makeRuntime()
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("pc|set|demo|full-auto", { chatType: "private", threadIdOr0: 0 }))
+
+  assert.deepEqual(callbackAnswers, [{ callbackQueryId: "cb_1", text: "Confirm" }])
+  assert.deepEqual(permissionCalls, [
+    { type: "confirm", ctxMeta: { chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, projectAlias: "demo", options: { editMessageId: 900 } },
+  ])
+})
+
 test("createCallbackHandlers reports permission render failures instead of swallowing them", async () => {
   const callbackOutcomes = []
   const { runtime, callbackAnswers, sentMessages, loggerErrors } = makeRuntime({
