@@ -1436,7 +1436,12 @@ test("startConnector /use without arguments returns usage", async () => {
 })
 
 test("startConnector /use keeps supporting raw session ids", async () => {
+  const projectDirectory = path.join(os.tmpdir(), `telegram-connector-use-${crypto.randomUUID()}`)
   const harness = await createHarness({
+    projectPatch: { directory: projectDirectory },
+    ocOptions: {
+      getSessionImpl: async (sessionId) => ({ id: sessionId, parentID: null, directory: projectDirectory }),
+    },
     statePatch: {
       updateOffset: 220,
       bindings: {

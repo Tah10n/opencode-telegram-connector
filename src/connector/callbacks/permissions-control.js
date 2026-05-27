@@ -36,6 +36,10 @@ export async function handlePermissionsControlCallback({
       await answerCallbackQuery(callbackQuery.id, "Invalid")
       return true
     }
+    if (!isPrivateChat(ctxMeta)) {
+      await answerCallbackQuery(callbackQuery.id, "Private chat only")
+      return true
+    }
     await answerCallbackQuery(callbackQuery.id, callbackToast("permissions"))
     await renderPermissionDetails(ctxMeta, projectAlias, { editMessageId: msg?.message_id })
     return true

@@ -188,6 +188,7 @@ export default {
     chooseProject: "Choose a project for permissions:",
     chooseProjectHint: "Profile changes are available only in a private chat with the bot.",
     currentRawTitle: "Current OpenCode permission config:",
+    rawPrivateOnly: "Raw OpenCode permission config is available only in a private chat with the bot.",
     fullAutoConfirmTitle: "Confirm Full Auto permissions:",
     fullAutoConfirmBody: "This explicitly allows edits, commands, subagents, skills, todo writes, and questions without approval. Read/search is allowed except .env secrets. Web search/fetch, code search, repository clone/overview, and external directories stay blocked. Unknown future permissions and repeated identical loops still ask.",
     confirmFullAutoButton: "Enable Full Auto",

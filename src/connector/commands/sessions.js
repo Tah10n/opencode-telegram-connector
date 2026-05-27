@@ -3,6 +3,7 @@ import { parseSessionReference, findSessionByShareUrl } from "../../session-ref.
 import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "../../session-list.js"
 import { sessionItemsFromResponse } from "../../session-response.js"
 import { directoriesMatch } from "../../directory-paths.js"
+import { sessionProjectScopeDecisionWithFallback, sessionProjectScopeErrorText } from "../../session-project-scope.js"
 import { getLaunchSupport } from "../../opencode/launcher.js"
 import { isSafeOpenCodeId, normalizeOpenCodeId, requireSafeOpenCodeId } from "../../opencode/ids.js"
 import { modelSourceLabel } from "../../model-selection.js"
@@ -56,6 +57,10 @@ export function createSessionCommandHandlers(deps) {
 
   function unsafeShareLinkSessionText() {
     return "Share link resolved to a session id this connector cannot safely bind. Use a session id without whitespace, colon, pipe, or URL path/query characters."
+  }
+
+  function scopedSessionDecision(projectAlias, session, fallbackEvidence = null) {
+    return sessionProjectScopeDecisionWithFallback(session, projects?.[projectAlias], fallbackEvidence)
   }
 
   function createSessionOptions(projectAlias, extra = {}) {
@@ -365,6 +370,7 @@ export function createSessionCommandHandlers(deps) {
 
     try {
       let targetSessionId = sessionRef.sessionId
+      let targetSessionEvidence = null
       if (sessionRef.type === "session-id") {
         targetSessionId = normalizeSafeSessionId(targetSessionId)
         if (!targetSessionId) {
@@ -376,6 +382,7 @@ export function createSessionCommandHandlers(deps) {
         const currentSessions = await listSessionsForShareLookup(binding.projectAlias)
         const currentMatch = findSessionByShareUrl(currentSessions, sessionRef.shareUrl)
         if (currentMatch?.id) {
+          targetSessionEvidence = currentMatch
           targetSessionId = normalizeSafeSessionId(currentMatch.id)
           if (!targetSessionId) {
             await safeInformThread(ctxMeta, unsafeShareLinkSessionText())
@@ -428,7 +435,12 @@ export function createSessionCommandHandlers(deps) {
         await safeInformThread(ctxMeta, invalidSessionReferenceText())
         return
       }
-      await oc.getSession(targetSessionId)
+      const targetSession = await oc.getSession(targetSessionId)
+      const scopeDecision = scopedSessionDecision(binding.projectAlias, targetSession, targetSessionEvidence)
+      if (!scopeDecision.ok) {
+        await safeInformThread(ctxMeta, sessionProjectScopeErrorText(binding.projectAlias, targetSessionId, scopeDecision))
+        return
+      }
       const bindResult = await bindCtxToSession(ctxMeta, binding.projectAlias, targetSessionId)
       await sendToThread(
         ctxMeta,

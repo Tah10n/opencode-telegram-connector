@@ -470,6 +470,33 @@ test("createCallbackHandlers switches sessions and refreshes the sessions list",
   ])
 })
 
+test("createCallbackHandlers accepts session switch callbacks with matching list evidence", async () => {
+  const listSessionCalls = []
+  const { runtime, callbackAnswers, bindCalls, sessionListCalls } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    ocByAlias: {
+      demo: {
+        async getSession(sessionId) {
+          return { id: sessionId }
+        },
+        async listSessions(input) {
+          listSessionCalls.push(input)
+          return [{ id: "ses_next", directory: "C:/repo/demo" }]
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("s|demo|ses_next"))
+
+  assert.deepEqual(listSessionCalls, [{ directory: "C:/repo/demo" }])
+  assert.equal(callbackAnswers.at(-1)?.text, "Switched")
+  assert.deepEqual(bindCalls.map((entry) => entry.sessionId), ["ses_next"])
+  assert.equal(sessionListCalls.length, 1)
+})
+
 test("createCallbackHandlers does not confirm state changes when flush fails", async () => {
   const switchState = { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } }, sessionIndex: {} }
   const switchRuntime = makeRuntime({
@@ -659,6 +686,51 @@ test("createCallbackHandlers reports unavailable target sessions", async () => {
 
   assert.equal(callbackAnswers.at(-1)?.text, "Unavailable")
   assert.match(sentMessages[0].text, /Project 'demo' is unavailable: missing session/)
+})
+
+test("createCallbackHandlers rejects session switch callbacks outside the project directory", async () => {
+  const { runtime, callbackAnswers, bindCalls, sessionListCalls, sentMessages } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    ocByAlias: {
+      demo: {
+        async getSession(sessionId) {
+          return { id: sessionId, directory: "C:/repo/other" }
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("s|demo|ses_other"))
+
+  assert.deepEqual(callbackAnswers, [{ callbackQueryId: "cb_1", text: "Wrong project" }])
+  assert.deepEqual(bindCalls, [])
+  assert.deepEqual(sessionListCalls, [])
+  assert.match(sentMessages[0].text, /cannot be used for project 'demo'/)
+  assert.match(sentMessages[0].text, /different project directory/)
+  assert.doesNotMatch(sentMessages[0].text, /C:\/repo\/other/)
+})
+
+test("createCallbackHandlers rejects directoryless session switch callbacks by default", async () => {
+  const { runtime, callbackAnswers, bindCalls, sentMessages } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    ocByAlias: {
+      demo: {
+        async getSession(sessionId) {
+          return { id: sessionId }
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("s|demo|ses_hidden"))
+
+  assert.deepEqual(callbackAnswers, [{ callbackQueryId: "cb_1", text: "Wrong project" }])
+  assert.deepEqual(bindCalls, [])
+  assert.match(sentMessages[0].text, /did not return project directory evidence/)
 })
 
 test("createCallbackHandlers reports session guard states and invalid start actions", async () => {
@@ -954,12 +1026,14 @@ test("createCallbackHandlers blocks permissions changes outside private chat", a
   await handlers.handleTelegramCallback(makeCallback("pc|set|demo|full-auto", { id: "cb_2", chatType: "supergroup", threadIdOr0: 7 }))
   await handlers.handleTelegramCallback(makeCallback("pc|apply|demo|full-auto", { id: "cb_3", chatType: "supergroup", threadIdOr0: 7 }))
   await handlers.handleTelegramCallback(makeCallback("pc|reset|demo", { id: "cb_4", chatType: "supergroup", threadIdOr0: 7 }))
+  await handlers.handleTelegramCallback(makeCallback("pc|view|demo", { id: "cb_5", chatType: "supergroup", threadIdOr0: 7 }))
 
   assert.deepEqual(callbackAnswers, [
     { callbackQueryId: "cb_1", text: "Private chat only" },
     { callbackQueryId: "cb_2", text: "Private chat only" },
     { callbackQueryId: "cb_3", text: "Private chat only" },
     { callbackQueryId: "cb_4", text: "Private chat only" },
+    { callbackQueryId: "cb_5", text: "Private chat only" },
   ])
   assert.deepEqual(permissionCalls, [])
 })
@@ -998,9 +1072,9 @@ test("createCallbackHandlers does not read forged group permissions-control proj
   await handlers.handleTelegramCallback(makeCallback("pc|project|other", { chatType: "supergroup", threadIdOr0: 7 }))
   await handlers.handleTelegramCallback(makeCallback("pc|view|other", { id: "cb_2", chatType: "supergroup", threadIdOr0: 7 }))
 
-  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Permissions", "Permissions"])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Permissions", "Private chat only"])
   assert.deepEqual(reads, [])
-  assert.equal(permissionMessages.length, 2)
+  assert.equal(permissionMessages.length, 1)
   assert.doesNotMatch(permissionMessages.map((entry) => entry.text).join("\n"), /Project: other|C:\/repo\/other/)
 })
 

@@ -479,31 +479,36 @@ test("createCommandHandlers handlePermissions renders bound project read-only ou
   assert.match(sent[0].text, /Profile: Suggest/)
   assert.doesNotMatch(sent[0].text, /C:\/repo\/demo\/opencode\.json|Config:/)
   assert.match(sent[0].text, /read-only here/)
-  assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text), ["View current", "Close"])
+  assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text), ["Close"])
 })
 
-test("createCommandHandlers renderPermissionDetails hides config path outside private chat", async () => {
+test("createCommandHandlers renderPermissionDetails is private-chat only", async () => {
+  let readCalls = 0
   const { runtime, sent } = makeRuntime({
     storeState: {
       bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } },
     },
     projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
-    readPermissionConfig: async () => ({
-      ok: true,
-      editable: true,
-      status: "ok",
-      filePath: "C:/repo/demo/opencode.json",
-      profile: "suggest",
-      permission: { edit: "ask" },
-    }),
+    readPermissionConfig: async () => {
+      readCalls += 1
+      return {
+        ok: true,
+        editable: true,
+        status: "ok",
+        filePath: "C:/repo/demo/opencode.json",
+        profile: "suggest",
+        permission: { edit: "ask" },
+      }
+    },
   })
   const handlers = createCommandHandlers(runtime)
 
   await handlers.renderPermissionDetails({ chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" }, "demo")
 
   assert.equal(sent.length, 1)
-  assert.match(sent[0].text, /Current OpenCode permission config:/)
-  assert.doesNotMatch(sent[0].text, /C:\/repo\/demo\/opencode\.json|Config:/)
+  assert.equal(readCalls, 0)
+  assert.match(sent[0].text, /Raw OpenCode permission config is available only in a private chat/)
+  assert.doesNotMatch(sent[0].text, /C:\/repo\/demo\/opencode\.json|Config:|"edit"|ask/)
 })
 
 test("createCommandHandlers permission renderers edit existing messages for unknown projects", async () => {
@@ -1044,12 +1049,12 @@ test("createCommandHandlers permission renderers do not read forged group callba
   const ctxMeta = { chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" }
 
   await handlers.renderPermissionSettings(ctxMeta, { projectAlias: "other", editMessageId: 901 })
-  await handlers.renderPermissionDetails(ctxMeta, "other", { editMessageId: 902 })
+  await handlers.renderPermissionDetails(ctxMeta, "other")
 
   assert.deepEqual(reads, [])
   assert.equal(sent.length, 2)
   assert.match(sent[0].text, /Permissions need a bound thread/)
-  assert.match(sent[1].text, /Permissions need a bound thread/)
+  assert.match(sent[1].text, /Raw OpenCode permission config is available only in a private chat/)
   assert.doesNotMatch(sent.map((entry) => entry.text).join("\n"), /Project: other|C:\/repo\/other/)
 })
 
@@ -1436,6 +1441,57 @@ test("createCommandHandlers handleUseCommand rejects unsafe raw session ids", as
   assert.deepEqual(getSessionCalls, [])
   assert.deepEqual(bindCalls, [])
   assert.match(sent[0].text, /Invalid session id/)
+})
+
+test("createCommandHandlers handleUseCommand rejects raw sessions outside the bound project directory", async () => {
+  const bindCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    ocByAlias: {
+      demo: {
+        async getSession(sessionId) {
+          return { id: sessionId, directory: "C:/repo/other" }
+        },
+      },
+    },
+    bindCtxToSession: async (...args) => {
+      bindCalls.push(args)
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleUseCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "ses_other")
+
+  assert.deepEqual(bindCalls, [])
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /cannot be used for project 'demo'/)
+  assert.match(sent[0].text, /different project directory/)
+  assert.doesNotMatch(sent[0].text, /C:\/repo\/other/)
+})
+
+test("createCommandHandlers handleUseCommand rejects directoryless raw sessions by default", async () => {
+  const bindCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    ocByAlias: {
+      demo: {
+        async getSession(sessionId) {
+          return { id: sessionId }
+        },
+      },
+    },
+    bindCtxToSession: async (...args) => {
+      bindCalls.push(args)
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleUseCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "ses_hidden")
+
+  assert.deepEqual(bindCalls, [])
+  assert.match(sent[0].text, /did not return project directory evidence/)
 })
 
 test("createCommandHandlers handleUnbind asks for confirmation before removing a binding", async () => {

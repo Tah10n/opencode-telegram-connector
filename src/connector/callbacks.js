@@ -185,6 +185,7 @@ export function createCallbackHandlers(runtime) {
           ctxMeta,
           msg,
           store,
+          projects,
           ocByAlias,
           answerCallbackQuery,
           closeInteractiveMessage,

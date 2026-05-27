@@ -100,7 +100,7 @@ export function createPermissionCommandHandlers(deps) {
       rows.push([profileButton("full-auto", locale, projectAlias)])
       rows.push([{ text: t(locale, "permissions.resetButton"), callback_data: packCallback("pc", "reset", projectAlias) }])
     }
-    rows.push([{ text: t(locale, "permissions.viewCurrent"), callback_data: packCallback("pc", "view", projectAlias) }])
+    if (isPrivateChat(ctxMeta)) rows.push([{ text: t(locale, "permissions.viewCurrent"), callback_data: packCallback("pc", "view", projectAlias) }])
     rows.push([{ text: t(locale, "common.close"), callback_data: packCallback("pc", "close") }])
     return makeInlineKeyboard(rows)
   }
@@ -197,8 +197,8 @@ export function createPermissionCommandHandlers(deps) {
 
   async function renderPermissionDetails(ctxMeta, projectAlias, { editMessageId } = {}) {
     const locale = ctxMeta?.locale || "en"
-    if (projectAlias && !isPrivateChat(ctxMeta) && projectAlias !== boundProjectAlias(ctxMeta)) {
-      await sendToThread(ctxMeta, unboundGuidanceText(ctxMeta, t(ctxMeta, "commands.unbound.permissionsNeedsBound")), unboundGuidanceKeyboard(ctxMeta))
+    if (!isPrivateChat(ctxMeta)) {
+      await editOrSend(ctxMeta, editMessageId, t(locale, "permissions.rawPrivateOnly"), makeInlineKeyboard([[{ text: t(locale, "common.close"), callback_data: packCallback("pc", "close") }]]))
       return
     }
     const project = projects?.[projectAlias]

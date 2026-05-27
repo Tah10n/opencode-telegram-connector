@@ -188,6 +188,7 @@ export default {
     chooseProject: "Выберите проект для permissions:",
     chooseProjectHint: "Изменение профиля доступно только в личном чате с ботом.",
     currentRawTitle: "Текущий permission config OpenCode:",
+    rawPrivateOnly: "Raw permission config OpenCode доступен только в личном чате с ботом.",
     fullAutoConfirmTitle: "Подтвердите Full Auto permissions:",
     fullAutoConfirmBody: "Профиль явно разрешает правки, команды, subagents, skills, todo writes и вопросы без подтверждения. Чтение/поиск разрешены, кроме .env секретов. Web search/fetch, поиск кода, clone/overview репозитория и внешние директории остаются заблокированы. Неизвестные будущие разрешения и повторяющиеся одинаковые loop всё ещё спрашивают.",
     confirmFullAutoButton: "Включить Full Auto",
