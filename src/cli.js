@@ -46,6 +46,31 @@ function registerCliProcessHandlers(processImpl, handlers) {
   }
 }
 
+function startupShutdownTimeoutError(timeoutMs) {
+  const err = new Error(`Connector startup did not finish within ${timeoutMs}ms during shutdown.`)
+  err.code = "STARTUP_SHUTDOWN_TIMEOUT"
+  return err
+}
+
+function waitForStartupDuringShutdown(startupPromise, timeoutMs) {
+  const waitMs = Number(timeoutMs)
+  if (!Number.isFinite(waitMs) || waitMs <= 0) return startupPromise
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(startupShutdownTimeoutError(waitMs)), waitMs)
+    timer.unref?.()
+    startupPromise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (err) => {
+        clearTimeout(timer)
+        reject(err)
+      },
+    )
+  })
+}
+
 function createCliReporter({ stderr, getLogFormat, now = () => new Date().toISOString() }) {
   return {
     error(message, err) {
@@ -98,12 +123,20 @@ export async function runCli({
   startConnectorImpl = startConnector,
   runSetupCheckImpl = runSetupCheck,
   registerProcessHandlers = true,
+  startupShutdownWaitMs = 10_000,
 } = {}) {
   const stopConnectorRef = { current: async () => {} }
+  let startupPromise = null
+  stopConnectorRef.current = async () => {
+    if (!startupPromise) return
+    const started = await waitForStartupDuringShutdown(startupPromise, startupShutdownWaitMs)
+    if (typeof started?.stop === "function") await started.stop()
+  }
   let cliLogFormat = normalizeCliLogFormat(envForProcess(processImpl).CONNECTOR_LOG_FORMAT)
   const reporter = createCliReporter({ stderr, getLogFormat: () => cliLogFormat })
   let cleanupProcessHandlers = () => {}
-  const shutdown = createShutdownHandler({
+  let shutdownRequested = false
+  const shutdownImpl = createShutdownHandler({
     stopConnectorRef,
     exit: (code) => {
       cleanupProcessHandlers()
@@ -112,6 +145,10 @@ export async function runCli({
     stderr,
     reporter,
   })
+  const shutdown = (exitCode, options) => {
+    shutdownRequested = true
+    return shutdownImpl(exitCode, options)
+  }
 
   if (registerProcessHandlers) {
     cleanupProcessHandlers = registerCliProcessHandlers(processImpl, [
@@ -183,18 +220,20 @@ export async function runCli({
     ;({ config } = await buildRuntimeConfigImpl({ args }))
     cliLogFormat = normalizeCliLogFormat(config?.logFormat)
 
-    ;({ stop, stateFile } = await startConnectorImpl({
+    startupPromise = Promise.resolve().then(() => startConnectorImpl({
       config,
       deps: {
         requestRuntimeShutdown: ({ action } = {}) => shutdown(action === "restart" ? 1 : 0, { reason: `runtime ${action || "stop"}` }),
       },
     }))
+    ;({ stop, stateFile } = await startupPromise)
   } catch (err) {
     cleanupProcessHandlers()
     reporter.error("Connector startup failed:", err)
     throw markCliLogged(err)
   }
   stopConnectorRef.current = stop
+  if (shutdownRequested) return { cleanupProcessHandlers }
   const stateFileDisplay = redactSensitiveText(stateFile, { sensitivePaths: [{ path: stateFile, label: "state-file" }] })
   if (config?.logFormat === "json") {
     stdout(JSON.stringify({ ts: new Date().toISOString(), level: "info", msg: "State file configured", stateFile: stateFileDisplay }))

@@ -4,7 +4,7 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import crypto from "node:crypto"
-import { DEFAULT_FEED_MODE, STATE_SCHEMA_VERSION, StateStore, resolveDefaultStatePath } from "../src/state/store.js"
+import { DEFAULT_FEED_MODE, DEFAULT_STATE_FILE_MODE, STATE_SCHEMA_VERSION, StateStore, resolveDefaultStatePath } from "../src/state/store.js"
 
 function makeLogger() {
   return { info() {}, warn() {}, error() {} }
@@ -92,6 +92,43 @@ test("StateStore marks failed flushes unhealthy", async () => {
   assert.doesNotMatch(health.lastFlushError, /telegram-connector-|state\.json/)
   assert.match(health.lastFlushError, /<state-file>/)
   assert.ok(health.lastFlushErrorAt > 0)
+})
+
+test("StateStore writes state with a restrictive default mode", async () => {
+  const dir = await makeTempDir()
+  let writeOptions = null
+  const store = new StateStore({
+    filePath: path.join(dir, "state.json"),
+    logger: makeLogger(),
+    writeJsonFileAtomicImpl: async (_filePath, _snapshot, options = {}) => {
+      writeOptions = options
+    },
+  })
+
+  await store.load()
+  store.setUpdateOffset(123)
+  await store.flush()
+
+  assert.equal(writeOptions?.mode, DEFAULT_STATE_FILE_MODE)
+})
+
+test("StateStore preserves invalid state backups with a restrictive default mode", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  await fs.writeFile(filePath, "null\n", "utf8")
+  let backupOptions = null
+  const store = new StateStore({
+    filePath,
+    logger: makeLogger(),
+    createStateFileBackupImpl: async (_filePath, options = {}) => {
+      backupOptions = options
+      return path.join(dir, "backup.json")
+    },
+  })
+
+  await assert.rejects(() => store.load(), /state must be an object/)
+
+  assert.equal(backupOptions?.mode, DEFAULT_STATE_FILE_MODE)
 })
 
 test("StateStore redacts load health errors", async () => {

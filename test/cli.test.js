@@ -90,6 +90,90 @@ test("runCli wires signal handlers and preserves fatal exit codes", async () => 
   assert.match(errors.join("\n"), /fatal stop failed/)
 })
 
+test("runCli waits for startup handle before stopping on startup-time signals", async () => {
+  const exits = []
+  const output = []
+  const processStub = makeProcessStub()
+  let stopCalls = 0
+  let resolveStart
+  const startEntered = new Promise((resolve) => {
+    resolveStart = resolve
+  })
+  let releaseStart
+  const startResult = new Promise((resolve) => {
+    releaseStart = resolve
+  })
+
+  const runPromise = runCli({
+    argv: [],
+    processImpl: processStub,
+    stdout: (...args) => output.push(args.join(" ")),
+    stderr: () => {},
+    exit: (code) => exits.push(code),
+    buildRuntimeConfigImpl: async () => ({ config: { stateFile: "state.json" } }),
+    startConnectorImpl: async () => {
+      resolveStart()
+      return startResult
+    },
+  })
+
+  await startEntered
+  const sigtermHandler = processStub.handlers.find((entry) => entry.event === "SIGTERM")?.handler
+  assert.equal(typeof sigtermHandler, "function")
+  sigtermHandler()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(exits, [])
+  assert.equal(stopCalls, 0)
+
+  releaseStart({
+    stateFile: "state.json",
+    async stop() {
+      stopCalls += 1
+    },
+  })
+
+  const result = await runPromise
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.deepEqual(output, [])
+  assert.equal(stopCalls, 1)
+  assert.deepEqual(exits, [0])
+  result.cleanupProcessHandlers()
+})
+
+test("runCli bounds startup-time signal shutdown when startup never resolves", async () => {
+  const exits = []
+  const errors = []
+  const processStub = makeProcessStub()
+  let resolveStart
+  const startEntered = new Promise((resolve) => {
+    resolveStart = resolve
+  })
+
+  runCli({
+    argv: [],
+    processImpl: processStub,
+    stdout: () => {},
+    stderr: (...args) => errors.push(args.join(" ")),
+    exit: (code) => exits.push(code),
+    buildRuntimeConfigImpl: async () => ({ config: { stateFile: "state.json" } }),
+    startupShutdownWaitMs: 5,
+    startConnectorImpl: async () => {
+      resolveStart()
+      return new Promise(() => {})
+    },
+  }).catch(() => {})
+
+  await startEntered
+  const sigtermHandler = processStub.handlers.find((entry) => entry.event === "SIGTERM")?.handler
+  sigtermHandler()
+  await new Promise((resolve) => setTimeout(resolve, 25))
+
+  assert.deepEqual(exits, [1])
+  assert.match(errors.join("\n"), /Connector startup did not finish within 5ms during shutdown/)
+  assert.equal(processStub.handlers.length, 0)
+})
+
 test("runCli can clean up process handlers between repeated embedded runs", async () => {
   const processStub = makeProcessStub()
 

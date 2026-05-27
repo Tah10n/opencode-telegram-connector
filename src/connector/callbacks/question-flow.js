@@ -1,4 +1,6 @@
 import { isRetryableBoundaryError, isStaleBoundaryError } from "../../boundary-errors.js"
+import { promptSubmissionIdempotencyKey } from "../idempotency.js"
+import { liveQuestionPromptStatus, shouldRetrySubmittedPrompt } from "../prompt-submission.js"
 import { hasHandledQuestion, questionRejectIdempotencyKey } from "./question-state.js"
 
 function ignoreError() {}
@@ -47,12 +49,44 @@ export async function handleQuestionRejectAction({
   t,
 }) {
   const rejectKey = questionRejectIdempotencyKey(projectAlias, effectiveSessionID, questionId)
+  const submittedKey = promptSubmissionIdempotencyKey(rejectKey)
   if (hasIdempotencyKey(rejectKey) || hasHandledQuestion(store, projectAlias, effectiveSessionID, questionId)) {
     cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, effectiveSessionID)
     await flushStoreIfAvailable()
     await answerCallbackQuery(callbackQuery.id, "Already handled")
     await deleteInteractiveMessage(ctxMeta, msg?.message_id)
     return true
+  }
+  if (hasIdempotencyKey(submittedKey)) {
+    const liveStatus = await liveQuestionPromptStatus(oc, questionId, effectiveSessionID)
+    if (liveStatus === "retryable") {
+      recordCallbackOutcome?.(projectAlias, "retryable")
+      await answerCallbackQuery(callbackQuery.id, "Temporarily unavailable")
+      await sendToThread(ctxMeta, t(ctxMeta, "callbacks.actionTemporarilyUnavailable")).catch(ignoreError)
+      return true
+    }
+    if (!shouldRetrySubmittedPrompt(liveStatus)) {
+      await markIdempotencyKey(rejectKey, {
+        kind: "question-reject",
+        projectAlias,
+        ctxKey: ctxMeta.ctxKey,
+        operation: "rejectQuestion",
+      })
+      cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, effectiveSessionID)
+      await flushStoreIfAvailable()
+      await answerCallbackQuery(callbackQuery.id, "Already handled")
+      await deleteInteractiveMessage(ctxMeta, msg?.message_id)
+      return true
+    }
+  } else {
+    await markIdempotencyKey(submittedKey, {
+      kind: "prompt-submission",
+      projectAlias,
+      ctxKey: ctxMeta.ctxKey,
+      sessionId: effectiveSessionID,
+      operation: "rejectQuestion",
+    })
+    await flushStoreIfAvailable()
   }
   try {
     await oc.rejectQuestion(questionId)

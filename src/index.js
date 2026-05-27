@@ -1075,7 +1075,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     while (!abortController.signal.aborted) {
       for (const alias of Object.keys(projects)) {
         try {
-          await ensureBaselineLoaded(alias, { populateInitialSnapshot: false })
+          await ensureBaselineLoaded(alias, { populateInitialSnapshot: false, signal: abortController.signal })
           if (!promptBaseline[alias]?.loaded) continue
           const oc = ocByAlias[alias]
           const [permsResult, questionsResult] = await Promise.allSettled([

@@ -3,6 +3,7 @@ import assert from "node:assert/strict"
 import { createPromptHandlers } from "../src/connector/prompts.js"
 import { createPromptRecovery } from "../src/connector/prompt-recovery.js"
 import { makeBoundaryError } from "../src/boundary-errors.js"
+import { promptSubmissionIdempotencyKey, questionReplyIdempotencyKey } from "../src/connector/idempotency.js"
 
 class FakeLruSet {
   constructor() {
@@ -370,7 +371,7 @@ test("sendCurrentQuestionStep surfaces edit failures without recording message i
   assert.deepEqual(wizard.messageIdByIndex, {})
 })
 
-test("finishQuestionWizard rethrows durability failures after accepted replies", async () => {
+test("finishQuestionWizard rethrows durability failures before remote replies", async () => {
   const replyCalls = []
   const marked = []
   const deletedIdempotencyKeys = []
@@ -431,12 +432,78 @@ test("finishQuestionWizard rethrows durability failures after accepted replies",
     return true
   })
 
-  assert.deepEqual(replyCalls, [{ questionId: "q_durable", answers: [["because"]] }])
-  assert.equal(marked.length, 2)
-  assert.equal(marked[1].key, "telegram-message:100:7:77")
-  assert.deepEqual(deletedIdempotencyKeys, ["telegram-message:100:7:77"])
+  assert.deepEqual(replyCalls, [])
+  assert.equal(marked.length, 1)
+  assert.equal(marked[0].metadata.kind, "prompt-submission")
+  assert.deepEqual(deletedIdempotencyKeys, [])
   assert.equal(questionWizards.get("demo:ses_1:q_durable"), wizard)
   assert.deepEqual(awaitingCustomAnswer.get("100:7"), awaitingState)
+})
+
+test("finishQuestionWizard finalizes submitted inactive questions without reposting", async () => {
+  const replyCalls = []
+  const marked = []
+  const questionWizards = new Map()
+  const awaitingCustomAnswer = new Map()
+  const wizard = {
+    projectAlias: "demo",
+    id: "q_submitted",
+    sessionID: "ses_1",
+    request: { id: "q_submitted", sessionID: "ses_1", questions: [{ header: "Reason", question: "Why?" }] },
+    answers: [["because"]],
+    ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+  }
+  questionWizards.set("demo:ses_1:q_submitted", wizard)
+  awaitingCustomAnswer.set("100:7", { projectAlias: "demo", requestId: "q_submitted", qIndex: 0, sessionID: "ses_1" })
+  const replyKey = questionReplyIdempotencyKey("demo", "ses_1", "q_submitted", [["because"]])
+  const submittedKey = promptSubmissionIdempotencyKey(replyKey)
+  const idempotencyKeys = new Set([submittedKey])
+  const { handlers } = makePromptRuntime({
+    questionWizards,
+    awaitingCustomAnswer,
+    store: {
+      hasIdempotencyKey: (key) => idempotencyKeys.has(key),
+      markIdempotencyKey(key, metadata) {
+        marked.push({ key, metadata })
+        idempotencyKeys.add(key)
+        return true
+      },
+      setQuestionWizard(key, currentWizard) {
+        questionWizards.set(key, currentWizard)
+      },
+      deleteQuestionWizard(projectAlias, questionId, sessionID = "") {
+        questionWizards.delete(sessionID ? `${projectAlias}:${sessionID}:${questionId}` : `${projectAlias}:${questionId}`)
+      },
+      setAwaitingCustomAnswer(ctxKey, value) {
+        awaitingCustomAnswer.set(ctxKey, value)
+      },
+      deleteAwaitingCustomAnswer(ctxKey) {
+        awaitingCustomAnswer.delete(ctxKey)
+      },
+      async flush() {},
+    },
+    ocByAlias: {
+      demo: {
+        async listQuestions() {
+          return []
+        },
+        async replyQuestion(questionId, answers) {
+          replyCalls.push({ questionId, answers })
+        },
+      },
+    },
+  })
+
+  const result = await handlers.finishQuestionWizard(wizard, {
+    idempotencyEntries: [{ key: "telegram-message:100:7:77", metadata: { kind: "telegram-message", operation: "replyQuestion" } }],
+  })
+
+  assert.deepEqual(replyCalls, [])
+  assert.equal(result.outcome, "duplicate")
+  assert.equal(idempotencyKeys.has(replyKey), true)
+  assert.deepEqual(marked.map((entry) => entry.key), [replyKey, "telegram-message:100:7:77"])
+  assert.equal(questionWizards.has("demo:ses_1:q_submitted"), false)
+  assert.equal(awaitingCustomAnswer.has("100:7"), false)
 })
 
 test("handleQuestionAsked does not baseline-suppress a first SSE prompt after Telegram delivery fails", async () => {
@@ -480,6 +547,35 @@ test("handleQuestionAsked does not baseline-suppress a first SSE prompt after Te
   await handlers.handleQuestionAsked(input)
   assert.equal(calls.sendMessage.length, 2)
   assert.equal(runtime.prompted.demo.question.has("ses_1:q_self_baseline"), true)
+})
+
+test("ensureBaselineLoaded forwards abort signals and skips loaded state after abort", async () => {
+  const controller = new AbortController()
+  const seenSignals = []
+  const promptBaseline = { demo: { loaded: false, permission: new Set(), question: new Set() } }
+  const { handlers } = makePromptRuntime({
+    promptBaseline,
+    ocByAlias: {
+      demo: {
+        async listPermissions({ signal } = {}) {
+          seenSignals.push(signal)
+          controller.abort()
+          return [{ id: "perm_aborted", sessionID: "ses_1" }]
+        },
+        async listQuestions({ signal } = {}) {
+          seenSignals.push(signal)
+          return [{ id: "q_aborted", sessionID: "ses_1" }]
+        },
+      },
+    },
+  })
+
+  await handlers.ensureBaselineLoaded("demo", { signal: controller.signal })
+
+  assert.deepEqual(seenSignals, [controller.signal, controller.signal])
+  assert.equal(promptBaseline.demo.loaded, false)
+  assert.equal(promptBaseline.demo.permission.size, 0)
+  assert.equal(promptBaseline.demo.question.size, 0)
 })
 
 test("handleQuestionAsked flushes recovery state before Telegram delivery", async () => {

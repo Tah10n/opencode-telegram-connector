@@ -4,6 +4,7 @@ import path from "node:path"
 import crypto from "node:crypto"
 
 export const DEFAULT_STATE_BACKUP_MAX_FILES = 5
+export const DEFAULT_STATE_FILE_MODE = 0o600
 
 function hasCode(err, ...codes) {
   return !!err && typeof err === "object" && "code" in err && codes.includes(err.code)
@@ -111,7 +112,7 @@ async function listEmergencyStateBackups(filePath, { fsImpl = fs } = {}) {
   return backups
 }
 
-async function recoverEmergencyJsonBackup(filePath, { fsImpl = fs } = {}) {
+async function recoverEmergencyJsonBackup(filePath, { fsImpl = fs, mode } = {}) {
   const backups = await listEmergencyStateBackups(filePath, { fsImpl })
   if (backups.length === 0) return null
 
@@ -140,6 +141,7 @@ async function recoverEmergencyJsonBackup(filePath, { fsImpl = fs } = {}) {
     }
     const exclusiveCopyFlag = fsImpl?.constants?.COPYFILE_EXCL ?? fsConstants?.COPYFILE_EXCL
     await fsImpl.copyFile(backup.path, filePath, exclusiveCopyFlag)
+    await chmodIfSupportedBestEffort(fsImpl, filePath, mode)
   } catch (err) {
     throw new Error(
       `State file ${filePath} is missing, and emergency backup ${backup.path} could not be restored (${err?.message || String(err)}). Refusing to start with empty state.`,
@@ -279,12 +281,12 @@ async function commitNewFileWithoutOverwrite(fsImpl, sourcePath, targetPath) {
   throw err
 }
 
-export async function readJsonFile(filePath, { fsImpl = fs } = {}) {
+export async function readJsonFile(filePath, { fsImpl = fs, mode } = {}) {
   try {
     const txt = await fsImpl.readFile(filePath, "utf8")
     return JSON.parse(txt)
   } catch (err) {
-    if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return recoverEmergencyJsonBackup(filePath, { fsImpl })
+    if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return recoverEmergencyJsonBackup(filePath, { fsImpl, mode })
     throw err
   }
 }

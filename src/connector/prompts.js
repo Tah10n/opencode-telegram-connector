@@ -7,10 +7,12 @@ import {
   permissionNoteIdempotencyPrefix,
   permissionReplyIdempotencyPrefix,
   promptIdentity,
+  promptSubmissionIdempotencyKey,
   questionRejectIdempotencyKey,
   questionReplyIdempotencyKey,
   questionReplyIdempotencyPrefix,
 } from "./idempotency.js"
+import { liveQuestionPromptStatus, shouldRetrySubmittedPrompt } from "./prompt-submission.js"
 import { callbackPacker } from "./callback-data.js"
 import { matchSupportedLocale, normalizeLocale, t as translate } from "../i18n/index.js"
 
@@ -356,10 +358,36 @@ export function createPromptHandlers(runtime) {
   async function finishQuestionWizard(wizard, { idempotencyEntries = [] } = {}) {
     const oc = ocByAlias[wizard.projectAlias]
     const replyKey = questionReplyIdempotencyKey(wizard.projectAlias, wizard.sessionID, wizard.request.id, wizard.answers)
+    const submittedKey = promptSubmissionIdempotencyKey(replyKey)
     if (hasIdempotencyKey(replyKey)) {
       await markIdempotencyEntries(idempotencyEntries)
       await clearQuestionWizardStateDurably(wizard, "persist duplicate question reply state", { rollbackIdempotencyEntries: idempotencyEntries })
       return { outcome: "duplicate", duplicate: true }
+    }
+    if (hasIdempotencyKey(submittedKey)) {
+      const liveStatus = await liveQuestionPromptStatus(oc, wizard.request.id, wizard.sessionID)
+      if (liveStatus === "retryable") return { outcome: "retryable", retryable: true }
+      if (!shouldRetrySubmittedPrompt(liveStatus)) {
+        await markIdempotencyKey(replyKey, {
+          kind: "question-reply",
+          projectAlias: wizard.projectAlias,
+          ctxKey: wizard.ctx?.ctxKey,
+          sessionId: wizard.sessionID,
+          operation: "replyQuestion",
+        })
+        await markIdempotencyEntries(idempotencyEntries)
+        await clearQuestionWizardStateDurably(wizard, "persist submitted question reply state", { rollbackIdempotencyEntries: idempotencyEntries })
+        return { outcome: "duplicate", duplicate: true }
+      }
+    } else {
+      await markIdempotencyKey(submittedKey, {
+        kind: "prompt-submission",
+        projectAlias: wizard.projectAlias,
+        ctxKey: wizard.ctx?.ctxKey,
+        sessionId: wizard.sessionID,
+        operation: "replyQuestion",
+      })
+      await flushDurableState("persist question reply submission state")
     }
     try {
       await oc.replyQuestion(wizard.request.id, wizard.answers)
@@ -398,12 +426,13 @@ export function createPromptHandlers(runtime) {
     return { outcome: "ok", stale: false }
   }
 
-  async function ensureBaselineLoaded(projectAlias, { populateInitialSnapshot = true } = {}) {
+  async function ensureBaselineLoaded(projectAlias, { populateInitialSnapshot = true, signal } = {}) {
     const base = promptBaseline[projectAlias]
-    if (!base || base.loaded) return
+    if (!base || base.loaded || signal?.aborted) return
     const oc = ocByAlias[projectAlias]
     try {
-      const [perms, questions] = await Promise.all([oc.listPermissions(), oc.listQuestions()])
+      const [perms, questions] = await Promise.all([oc.listPermissions({ signal }), oc.listQuestions({ signal })])
+      if (signal?.aborted) return
       if (!Array.isArray(perms) || !Array.isArray(questions)) return
       if (populateInitialSnapshot) {
         const pending = collectPendingPromptIdentities(projectAlias)

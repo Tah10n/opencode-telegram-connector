@@ -1,6 +1,6 @@
 import path from "node:path"
 import fs from "node:fs/promises"
-import { createStateFileBackup, readJsonFile, writeJsonFileAtomic } from "./fileStore.js"
+import { DEFAULT_STATE_FILE_MODE, createStateFileBackup, readJsonFile, writeJsonFileAtomic } from "./fileStore.js"
 import { loadStateWithMigration, migrateStateIfNeeded, preserveStateBeforeRecovery } from "./backup.js"
 import { normalizeModelPreference, storedModelPreference } from "../model-selection.js"
 import { isSafeOpenCodeId } from "../opencode/ids.js"
@@ -12,6 +12,7 @@ export const DEFAULT_FEED_MODE = "main+changes"
 export const DEFAULT_IDEMPOTENCY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 export const DEFAULT_IDEMPOTENCY_MAX_ENTRIES = 5000
 export const DEFAULT_STATE_MIGRATION_BACKUP_MAX_FILES = 5
+export { DEFAULT_STATE_FILE_MODE }
 
 export class StateSchemaValidationError extends Error {
   constructor(errors, { filePath } = {}) {
@@ -117,10 +118,11 @@ export function promptKey(projectAlias, promptId, sessionID = "") {
 }
 
 export class StateStore {
-  constructor({ filePath, logger, backupMaxFiles = DEFAULT_STATE_MIGRATION_BACKUP_MAX_FILES, writeJsonFileAtomicImpl = writeJsonFileAtomic, createStateFileBackupImpl = createStateFileBackup }) {
+  constructor({ filePath, logger, backupMaxFiles = DEFAULT_STATE_MIGRATION_BACKUP_MAX_FILES, stateFileMode = DEFAULT_STATE_FILE_MODE, writeJsonFileAtomicImpl = writeJsonFileAtomic, createStateFileBackupImpl = createStateFileBackup }) {
     this.filePath = filePath
     this.logger = logger
     this.backupMaxFiles = backupMaxFiles
+    this.stateFileMode = stateFileMode
     this._writeJsonFileAtomic = writeJsonFileAtomicImpl
     this._createStateFileBackup = createStateFileBackupImpl
     this.state = defaultState()
@@ -167,7 +169,7 @@ export class StateStore {
   async load() {
     let loaded
     try {
-      loaded = await readJsonFile(this.filePath)
+      loaded = await readJsonFile(this.filePath, { mode: this.stateFileMode })
     } catch (err) {
       this._markLoadError(err)
       this.logger?.error?.("Failed to read state file:", err?.message || String(err))
@@ -197,6 +199,7 @@ export class StateStore {
         writeJsonFileAtomicImpl: this._writeJsonFileAtomic,
         createStateFileBackupImpl: this._createStateFileBackup,
         schemaVersion: STATE_SCHEMA_VERSION,
+        mode: this.stateFileMode,
       })
     } catch (err) {
       this._markLoadError(err)
@@ -215,6 +218,7 @@ export class StateStore {
       maxBackups: this.backupMaxFiles,
       createStateFileBackupImpl: this._createStateFileBackup,
       logger: this.logger,
+      mode: this.stateFileMode,
     })
   }
 
@@ -406,7 +410,7 @@ export class StateStore {
     }
     const snapshot = cloneStateForWrite(this.state)
     this._flushInFlight += 1
-    const write = this._writeChain.then(() => this._writeJsonFileAtomic(this.filePath, snapshot))
+    const write = this._writeChain.then(() => this._writeJsonFileAtomic(this.filePath, snapshot, { mode: this.stateFileMode }))
     this._writeChain = write.catch(() => {})
     try {
       await write

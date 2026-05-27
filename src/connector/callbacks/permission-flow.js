@@ -1,4 +1,6 @@
 import { isRetryableBoundaryError, isStaleBoundaryError } from "../../boundary-errors.js"
+import { promptSubmissionIdempotencyKey } from "../idempotency.js"
+import { livePermissionPromptStatus, shouldRetrySubmittedPrompt } from "../prompt-submission.js"
 import { hasHandledPermission, permissionReplyIdempotencyKey } from "./permission-state.js"
 
 function ignoreError() {}
@@ -74,12 +76,46 @@ export async function handlePermissionReplyAction({
   })) return true
 
   const replyKey = permissionReplyIdempotencyKey(projectAlias, effectiveSessionID, permissionId, action)
+  const submittedKey = promptSubmissionIdempotencyKey(replyKey)
   if (hasIdempotencyKey(replyKey) || hasHandledPermission(store, projectAlias, effectiveSessionID, permissionId)) {
     cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, effectiveSessionID)
     await flushStoreIfAvailable()
     await answerCallbackQuery(callbackQuery.id, "Already handled")
     await deleteInteractiveMessage(ctxMeta, msg?.message_id)
     return true
+  }
+  if (hasIdempotencyKey(submittedKey)) {
+    const liveStatus = await livePermissionPromptStatus(oc, permissionId, effectiveSessionID)
+    if (liveStatus === "retryable") {
+      recordCallbackOutcome?.(projectAlias, "retryable")
+      await answerCallbackQuery(callbackQuery.id, "Temporarily unavailable")
+      await sendToThread(ctxMeta, t(ctxMeta, "callbacks.actionTemporarilyUnavailable")).catch(ignoreError)
+      return true
+    }
+    if (!shouldRetrySubmittedPrompt(liveStatus)) {
+      await markIdempotencyKey(replyKey, {
+        kind: "permission-reply",
+        projectAlias,
+        ctxKey: ctxMeta.ctxKey,
+        operation: "replyPermission",
+        action,
+      })
+      cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, effectiveSessionID)
+      await flushStoreIfAvailable()
+      await answerCallbackQuery(callbackQuery.id, "Already handled")
+      await deleteInteractiveMessage(ctxMeta, msg?.message_id)
+      return true
+    }
+  } else {
+    await markIdempotencyKey(submittedKey, {
+      kind: "prompt-submission",
+      projectAlias,
+      ctxKey: ctxMeta.ctxKey,
+      sessionId: effectiveSessionID,
+      operation: "replyPermission",
+      action,
+    })
+    await flushStoreIfAvailable()
   }
   try {
     await oc.replyPermission(permissionId, { reply: action })

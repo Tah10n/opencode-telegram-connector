@@ -23,12 +23,14 @@ export async function preserveStateBeforeRecovery(
     maxBackups,
     createStateFileBackupImpl = createStateFileBackup,
     logger,
+    mode,
   } = {},
 ) {
   const backupPath = await createStateFileBackupImpl(filePath, {
     reason,
     schemaVersion,
     maxBackups,
+    mode,
   })
   logger?.warn?.(`Preserved ${reason} state file before recovery:`, backupPath)
   return backupPath
@@ -205,6 +207,7 @@ export async function loadStateWithMigration({
   createStateFileBackupImpl = createStateFileBackup,
   schemaVersion,
   cloneState = cloneStateForWrite,
+  mode,
 }) {
   let result
   try {
@@ -217,6 +220,7 @@ export async function loadStateWithMigration({
         maxBackups: backupMaxFiles,
         createStateFileBackupImpl,
         logger,
+        mode,
       }).catch((backupErr) => {
         logger?.error?.("Failed to preserve invalid state file:", backupErr?.message || String(backupErr))
       })
@@ -231,10 +235,11 @@ export async function loadStateWithMigration({
       maxBackups: backupMaxFiles,
       createStateFileBackupImpl,
       logger,
+      mode,
     })
     const snapshot = cloneState(result.state)
     try {
-      await writeJsonFileAtomicImpl(filePath, snapshot)
+      await writeJsonFileAtomicImpl(filePath, snapshot, { mode })
     } catch (err) {
       logger?.error?.(
         "Failed to persist migrated state; original state file was preserved before migration:",

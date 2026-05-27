@@ -5,6 +5,11 @@ import { makeBoundaryError } from "../src/boundary-errors.js"
 import { redactCmdlineSecrets } from "../src/url-utils.js"
 import { encodeCallback } from "../src/connector/callback-data.js"
 import { createPermissionCommandHandlers } from "../src/connector/commands/permissions.js"
+import {
+  permissionReplyIdempotencyKey,
+  promptSubmissionIdempotencyKey,
+  questionRejectIdempotencyKey,
+} from "../src/connector/idempotency.js"
 
 function callbackData(...parts) {
   return encodeCallback(parts)
@@ -1651,7 +1656,43 @@ test("createCallbackHandlers skips duplicate permission callbacks via idempotenc
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["OK", "Already handled"])
 })
 
-test("createCallbackHandlers rethrows permission reply durability failures", async () => {
+test("createCallbackHandlers finalizes submitted permission replies without reposting inactive prompts", async () => {
+  const replyKey = permissionReplyIdempotencyKey("demo", "ses_current", "perm_submitted", "once")
+  const submittedKey = promptSubmissionIdempotencyKey(replyKey)
+  const idempotencyKeys = new Set([submittedKey])
+  const replyCalls = []
+  const { runtime, callbackAnswers } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    store: {
+      hasIdempotencyKey: (key) => idempotencyKeys.has(key),
+      markIdempotencyKey: (key) => {
+        idempotencyKeys.add(key)
+        return true
+      },
+      deletePendingPermission: () => true,
+      flush: async () => {},
+    },
+    ocByAlias: {
+      demo: {
+        async listPermissions() {
+          return []
+        },
+        async replyPermission(permissionId, payload) {
+          replyCalls.push({ permissionId, payload })
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("p|demo|ses_current|perm_submitted|once", { id: "cb_submitted" }))
+
+  assert.deepEqual(replyCalls, [])
+  assert.equal(idempotencyKeys.has(replyKey), true)
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Already handled"])
+})
+
+test("createCallbackHandlers rethrows permission reply durability failures before remote side effects", async () => {
   const idempotencyKeys = new Set()
   const replyCalls = []
   const { runtime, callbackAnswers } = makeRuntime({
@@ -1684,7 +1725,7 @@ test("createCallbackHandlers rethrows permission reply durability failures", asy
     return true
   })
 
-  assert.deepEqual(replyCalls, [{ permissionId: "perm_durable", payload: { reply: "once" } }])
+  assert.deepEqual(replyCalls, [])
   assert.equal(idempotencyKeys.size, 1)
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Temporarily unavailable"])
 })
@@ -1902,8 +1943,9 @@ test("createCallbackHandlers cleans scoped question wizards from old-shape rejec
     { projectAlias: "demo", questionId: "q_done", sessionID: "ses_current" },
     { projectAlias: "demo", questionId: "q_done" },
   ])
-  assert.equal(markedKeys.length, 2)
+  assert.equal(markedKeys.length, 4)
   assert.ok(markedKeys.every((key) => key.includes("ses_")))
+  assert.equal(markedKeys.filter((key) => key.startsWith("prompt-submit:")).length, 2)
 })
 
 test("createCallbackHandlers treats question callbacks for changed bindings as stale", async () => {
@@ -1981,6 +2023,44 @@ test("createCallbackHandlers skips duplicate question reject callbacks via idemp
 
   assert.deepEqual(rejectCalls, [{ questionId: "q_dup" }])
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Rejected", "Already handled"])
+})
+
+test("createCallbackHandlers finalizes submitted question rejects without reposting inactive prompts", async () => {
+  const wizard = { ...makeWizard({ id: "q_submitted" }), sessionID: "ses_current" }
+  const rejectKey = questionRejectIdempotencyKey("demo", "ses_current", "q_submitted")
+  const submittedKey = promptSubmissionIdempotencyKey(rejectKey)
+  const idempotencyKeys = new Set([submittedKey])
+  const rejectCalls = []
+  const { runtime, callbackAnswers } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    questionWizards: new Map([["demo:ses_current:q_submitted", wizard]]),
+    getWizard: () => wizard,
+    store: {
+      hasIdempotencyKey: (key) => idempotencyKeys.has(key),
+      markIdempotencyKey: (key) => {
+        idempotencyKeys.add(key)
+        return true
+      },
+      flush: async () => {},
+    },
+    ocByAlias: {
+      demo: {
+        async listQuestions() {
+          return []
+        },
+        async rejectQuestion(questionId) {
+          rejectCalls.push({ questionId })
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("q|demo|ses_current|q_submitted|reject", { id: "cb_q_submitted" }))
+
+  assert.deepEqual(rejectCalls, [])
+  assert.equal(idempotencyKeys.has(rejectKey), true)
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Already handled"])
 })
 
 test("createCallbackHandlers clears persisted question state even without an in-memory wizard", async () => {

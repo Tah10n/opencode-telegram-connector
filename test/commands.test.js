@@ -2,7 +2,12 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { makeBoundaryError } from "../src/boundary-errors.js"
 import { createCommandHandlers } from "../src/connector/commands.js"
-import { hashIdempotencyValue, telegramMessageIdempotencyKey } from "../src/connector/idempotency.js"
+import {
+  hashIdempotencyValue,
+  permissionNoteIdempotencyKey,
+  promptSubmissionIdempotencyKey,
+  telegramMessageIdempotencyKey,
+} from "../src/connector/idempotency.js"
 import { buildProjectsOverviewText as buildProjectsOverviewTextBase } from "../src/connector/overview.js"
 import { USER_ATTACHMENT_LIMITS } from "../src/connector/incoming-attachments.js"
 import { decodeCallbackData } from "../src/connector/callback-data.js"
@@ -2747,7 +2752,7 @@ test("createCommandHandlers retries replayed message idempotency until it is dur
   assert.deepEqual(promptCalls, [])
 })
 
-test("createCommandHandlers rethrows reject-note durability failures after accepted replies", async () => {
+test("createCommandHandlers rethrows reject-note durability failures before remote side effects", async () => {
   const replyCalls = []
   const marked = []
   const rejectNoteAwaiting = new Map([
@@ -2792,8 +2797,60 @@ test("createCommandHandlers rethrows reject-note durability failures after accep
     },
   )
 
-  assert.deepEqual(replyCalls, [{ permissionId: "perm_1", payload: { reply: "reject", message: "no, thanks" } }])
-  assert.equal(marked.length, 2)
+  assert.deepEqual(replyCalls, [])
+  assert.equal(marked.length, 1)
+  assert.equal(marked[0].metadata.kind, "prompt-submission")
+})
+
+test("createCommandHandlers finalizes submitted reject notes without reposting inactive prompts", async () => {
+  const noteText = "no, thanks"
+  const noteKey = permissionNoteIdempotencyKey("demo", "ses_1", "perm_1", noteText)
+  const submittedKey = promptSubmissionIdempotencyKey(noteKey)
+  const idempotencyKeys = new Set([submittedKey])
+  const replyCalls = []
+  const rejectNoteAwaiting = new Map([
+    ["100:7", { projectAlias: "demo", permissionId: "perm_1", sessionID: "ses_1" }],
+  ])
+  const { runtime, sent } = makeRuntime({
+    rejectNoteAwaiting,
+    store: {
+      hasIdempotencyKey: (key) => idempotencyKeys.has(key),
+      markIdempotencyKey(key) {
+        idempotencyKeys.add(key)
+        return true
+      },
+      deletePendingPermission: () => true,
+      async flush() {},
+    },
+    setRejectNoteAwaitingState(ctxKey, value) {
+      if (value) rejectNoteAwaiting.set(ctxKey, value)
+      else rejectNoteAwaiting.delete(ctxKey)
+    },
+    ocByAlias: {
+      demo: {
+        async listPermissions() {
+          return []
+        },
+        async replyPermission(permissionId, payload) {
+          replyCalls.push({ permissionId, payload })
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 322,
+    message_thread_id: 7,
+    text: noteText,
+  })
+
+  assert.deepEqual(replyCalls, [])
+  assert.equal(idempotencyKeys.has(noteKey), true)
+  assert.equal(rejectNoteAwaiting.has("100:7"), false)
+  assert.equal(sent.at(-1)?.text, "Rejection note already sent.")
 })
 
 test("createCommandHandlers handleTelegramMessage forwards small text documents as attachment prompts", async () => {

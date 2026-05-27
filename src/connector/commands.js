@@ -1,7 +1,8 @@
 import { makeInlineKeyboard } from "../telegram/client.js"
 import { sessionKey } from "../state/store.js"
-import { permissionNoteIdempotencyKey, telegramMessageIdempotencyKey } from "./idempotency.js"
+import { permissionNoteIdempotencyKey, promptSubmissionIdempotencyKey, telegramMessageIdempotencyKey } from "./idempotency.js"
 import { classifyBoundaryError, isRetryableBoundaryError, isStaleBoundaryError, makeBoundaryError } from "../boundary-errors.js"
+import { livePermissionPromptStatus, shouldRetrySubmittedPrompt } from "./prompt-submission.js"
 import { userAttachmentLimitsFromConfig } from "../limits.js"
 import { createAttachmentHandlers } from "./commands/attachments.js"
 import { createLanguageCommandHandler } from "./commands/language.js"
@@ -599,12 +600,54 @@ export function createCommandHandlers(runtime) {
       }
       const oc = ocByAlias[awaiting.projectAlias]
       const noteKey = permissionNoteIdempotencyKey(awaiting.projectAlias, awaiting.sessionID, awaiting.permissionId, text)
+      const submittedKey = promptSubmissionIdempotencyKey(noteKey)
       if (hasIdempotencyKey(noteKey)) {
         store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId, awaiting.sessionID)
         setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
         await markMessageHandled("replyPermissionNote", { projectAlias: awaiting.projectAlias })
         await sendToThread(ctxMeta, t(ctxMeta, "commands.rejectionNoteAlreadySent")).catch(() => {})
         return
+      }
+      if (hasIdempotencyKey(submittedKey)) {
+        const liveStatus = await livePermissionPromptStatus(oc, awaiting.permissionId, awaiting.sessionID)
+        if (liveStatus === "retryable") {
+          await sendToThread(ctxMeta, t(ctxMeta, "commands.permissionRetry")).catch(() => {})
+          return
+        }
+        if (!shouldRetrySubmittedPrompt(liveStatus)) {
+          await markIdempotencyEntries([
+            {
+              key: noteKey,
+              metadata: {
+                kind: "permission-note",
+                projectAlias: awaiting.projectAlias,
+                ctxKey: ctxMeta.ctxKey,
+                operation: "replyPermission",
+                action: "reject_note",
+              },
+            },
+            messageIdempotencyEntry("replyPermissionNote", { projectAlias: awaiting.projectAlias }),
+          ], { flush: false })
+          store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId, awaiting.sessionID)
+          setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
+          await flushDurableState("persist submitted permission note state")
+          await sendToThread(ctxMeta, t(ctxMeta, "commands.rejectionNoteAlreadySent")).catch(() => {})
+          return
+        }
+      } else {
+        await markIdempotencyEntries([
+          {
+            key: submittedKey,
+            metadata: {
+              kind: "prompt-submission",
+              projectAlias: awaiting.projectAlias,
+              ctxKey: ctxMeta.ctxKey,
+              sessionId: awaiting.sessionID,
+              operation: "replyPermission",
+              action: "reject_note",
+            },
+          },
+        ], { rollbackOnFlushFailure: true })
       }
       try {
         await oc.replyPermission(awaiting.permissionId, { reply: "reject", message: text })
