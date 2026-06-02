@@ -385,6 +385,35 @@ test("StateStore persists pending prompt recovery state", () => {
   })
 })
 
+test("StateStore keeps sessionless pending permission lookup and cleanup exact", () => {
+  const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-state.json"), logger: makeLogger() })
+  store.scheduleSave = () => {}
+
+  store.setPendingPermission({
+    projectAlias: "demo",
+    permissionId: "perm_same",
+    sessionID: "ses_1",
+    permission: "shell",
+    ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+  })
+
+  assert.equal(store.getPendingPermission("demo", "perm_same"), null)
+  assert.equal(store.deletePendingPermission("demo", "perm_same"), false)
+  assert.equal(store.getPendingPermission("demo", "perm_same", "ses_1")?.sessionID, "ses_1")
+
+  store.setPendingPermission({
+    projectAlias: "demo",
+    permissionId: "perm_same",
+    permission: "shell",
+    ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+  })
+
+  assert.equal(store.getPendingPermission("demo", "perm_same")?.sessionID, "")
+  assert.equal(store.deletePendingPermission("demo", "perm_same"), true)
+  assert.equal(store.getPendingPermission("demo", "perm_same"), null)
+  assert.equal(store.getPendingPermission("demo", "perm_same", "ses_1")?.sessionID, "ses_1")
+})
+
 test("StateStore keeps feed mode per context and defaults to main+changes", () => {
   const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-state.json"), logger: makeLogger() })
   store.scheduleSave = () => {}

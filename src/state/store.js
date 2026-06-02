@@ -455,15 +455,14 @@ export class StateStore {
   deletePendingPermission(projectAlias, permissionId, sessionID = "") {
     if (!projectAlias || !permissionId) return false
     const key = promptKey(projectAlias, permissionId, sessionID)
-    let existed = delete this.state.pendingPrompts.permissions[key]
+    const records = this.state.pendingPrompts.permissions
+    let existed = Object.prototype.hasOwnProperty.call(records, key)
+    if (existed) delete records[key]
     if (!sessionID) {
       const legacyKey = sessionKey(projectAlias, permissionId)
-      existed = delete this.state.pendingPrompts.permissions[legacyKey] || existed
-      for (const [entryKey, entry] of Object.entries(this.state.pendingPrompts.permissions)) {
-        if (entry?.projectAlias === projectAlias && entry?.permissionId === permissionId) {
-          delete this.state.pendingPrompts.permissions[entryKey]
-          existed = true
-        }
+      if (legacyKey !== key && Object.prototype.hasOwnProperty.call(records, legacyKey)) {
+        delete records[legacyKey]
+        existed = true
       }
     }
     if (existed) this.scheduleSave()
@@ -1004,12 +1003,13 @@ function findPromptRecord(records, projectAlias, promptId, sessionID = "") {
   if (!sessionID) {
     const legacy = records[sessionKey(projectAlias, promptId)]
     if (legacy) return legacy
+    return null
   }
   return Object.values(records).find((entry) => {
     if (entry?.projectAlias !== projectAlias) return false
     const entryId = entry?.permissionId || entry?.id || entry?.request?.id
     if (entryId !== promptId) return false
-    return sessionID ? entry?.sessionID === sessionID : true
+    return entry?.sessionID === sessionID
   }) || null
 }
 

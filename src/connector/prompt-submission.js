@@ -5,7 +5,8 @@ function promptEntryMatches(entry, promptId, sessionID = "") {
   const id = String(promptId || "").trim()
   if (!id || entry?.id !== id) return false
   const expectedSession = String(sessionID || "").trim()
-  if (!expectedSession) return true
+  const entrySession = String(entry?.sessionID || "").trim()
+  if (!expectedSession) return !entrySession
   return promptIdentity(entry.id, entry.sessionID) === promptIdentity(id, expectedSession)
 }
 

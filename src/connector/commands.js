@@ -88,6 +88,7 @@ export function createCommandHandlers(runtime) {
     awaitingCustomAnswer,
     bindAliasAwaiting,
     getWizard,
+    getUniqueWizard,
     cloneWizardState,
     applyWizardState,
     persistQuestionWizard,
@@ -531,7 +532,13 @@ export function createCommandHandlers(runtime) {
 
     const awaitingQ = awaitingCustomAnswer.get(ctxMeta.ctxKey)
     if (awaitingQ) {
-      const bindingStatus = await promptContinuationBindingStatus(ctxMeta.ctxKey, awaitingQ.projectAlias, awaitingQ.sessionID)
+      let expectedSessionID = String(awaitingQ.sessionID || "").trim()
+      let wizard = getWizard(awaitingQ.projectAlias, awaitingQ.requestId, expectedSessionID)
+      if (!wizard && !expectedSessionID && typeof getUniqueWizard === "function") {
+        wizard = getUniqueWizard(awaitingQ.projectAlias, awaitingQ.requestId)
+        expectedSessionID = String(wizard?.sessionID || "").trim()
+      }
+      const bindingStatus = await promptContinuationBindingStatus(ctxMeta.ctxKey, awaitingQ.projectAlias, expectedSessionID)
       if (bindingStatus === "retryable") {
         await sendToThread(ctxMeta, t(ctxMeta, "commands.questionRetry")).catch(() => {})
         return
@@ -547,8 +554,7 @@ export function createCommandHandlers(runtime) {
         await markMessageHandled("questionNonText", { projectAlias: awaitingQ.projectAlias })
         return
       }
-      const wizard = getWizard(awaitingQ.projectAlias, awaitingQ.requestId, awaitingQ.sessionID)
-      if (!wizard || wizard.index !== awaitingQ.qIndex) {
+      if (!wizard || String(wizard.sessionID || "").trim() !== expectedSessionID || wizard.index !== awaitingQ.qIndex) {
         setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
         await sendToThread(ctxMeta, t(ctxMeta, "prompts.questionInactive"))
         await markMessageHandled("customAnswerStale", { projectAlias: awaitingQ.projectAlias })
@@ -569,11 +575,23 @@ export function createCommandHandlers(runtime) {
         }
       } else {
         const previousWizard = cloneWizardState(wizard)
-        const previousAwaiting = { ...awaitingQ }
+        const previousAwaiting = { ...awaitingQ, ...(expectedSessionID ? { sessionID: expectedSessionID } : {}) }
         nextWizard.index = nextIndex
-        await sendCurrentQuestionStep(nextWizard)
         applyWizardState(wizard, nextWizard)
         await persistCustomAnswerProgressDurably(wizard, previousWizard, previousAwaiting)
+        try {
+          await sendCurrentQuestionStep(wizard)
+        } catch (err) {
+          try {
+            applyWizardState(wizard, previousWizard)
+            persistQuestionWizard(wizard)
+            setAwaitingCustomAnswerState(ctxMeta.ctxKey, previousAwaiting)
+            await flushDurableState("roll back question wizard state after delivery failure")
+          } catch (rollbackErr) {
+            logger?.error?.("Failed to roll back custom-answer delivery state:", rollbackErr?.message || String(rollbackErr))
+          }
+          throw err
+        }
         await markMessageHandled("questionNextStep", { projectAlias: awaitingQ.projectAlias, sessionId: wizard.sessionID })
       }
       return

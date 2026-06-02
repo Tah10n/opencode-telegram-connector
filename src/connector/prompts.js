@@ -61,8 +61,26 @@ export function createPromptHandlers(runtime) {
   const wizardKey = (projectAlias, requestId, sessionID = "") => promptKey(projectAlias, requestId, sessionID)
   const initialPendingPrompts = JSON.parse(JSON.stringify(store.getPendingPrompts?.() || store.get?.().pendingPrompts || {}))
   const getWizard = (projectAlias, requestId, sessionID = "") => {
-    if (sessionID) return questionWizards.get(wizardKey(projectAlias, requestId, sessionID)) || null
-    return questionWizards.get(wizardKey(projectAlias, requestId)) || [...questionWizards.values()].find((wizard) => wizard?.projectAlias === projectAlias && (wizard?.id || wizard?.request?.id) === requestId) || null
+    const expectedSessionID = String(sessionID || "").trim()
+    const wizard = questionWizards.get(wizardKey(projectAlias, requestId, expectedSessionID)) || null
+    if (!wizard) return null
+    return String(wizard.sessionID || "").trim() === expectedSessionID ? wizard : null
+  }
+  const getUniqueWizard = (projectAlias, requestId) => {
+    const matches = new Map()
+    for (const wizard of questionWizards.values()) {
+      if (wizard?.projectAlias !== projectAlias) continue
+      const id = wizard?.id || wizard?.request?.id
+      if (id !== requestId) continue
+      const sessionID = String(wizard.sessionID || "").trim()
+      if (!sessionID) continue
+      matches.set(sessionID, wizard)
+      if (matches.size > 1) return null
+    }
+    if (matches.size !== 1) return null
+    const [[sessionID, wizard]] = matches.entries()
+    if (wizard.request && typeof wizard.request === "object" && !wizard.request.sessionID) wizard.request = { ...wizard.request, sessionID }
+    return wizard
   }
   function persistQuestionWizard(wizard) {
     store.setQuestionWizard(wizardKey(wizard.projectAlias, wizard.request.id, wizard.sessionID), wizard)
@@ -540,6 +558,7 @@ export function createPromptHandlers(runtime) {
   return {
     wizardKey,
     getWizard,
+    getUniqueWizard,
     persistQuestionWizard,
     clearPersistedQuestionWizard,
     setRejectNoteAwaitingState,

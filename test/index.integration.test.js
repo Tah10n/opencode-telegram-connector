@@ -8,7 +8,7 @@ import { setTimeout as delay } from "node:timers/promises"
 import { startConnector } from "../src/index.js"
 import { makeBoundaryError } from "../src/boundary-errors.js"
 import { defaultState, StateStore } from "../src/state/store.js"
-import { questionReplyIdempotencyKey } from "../src/connector/idempotency.js"
+import { permissionReplyIdempotencyKey, questionReplyIdempotencyKey } from "../src/connector/idempotency.js"
 import { getRequestContext } from "../src/runtime/request-context.js"
 import { startHealthServer } from "../src/runtime/health-server.js"
 import { canonicalOpenCodeSseEventPath, openCodeSseEventPathRequiresDirectoryRouting, OPENCODE_SSE_EVENT_META } from "../src/opencode/sse.js"
@@ -3328,7 +3328,7 @@ test("startConnector restores final question submission after a restart during r
 
   assert.ok(Object.keys(persistedState.pendingPrompts.questionWizards).includes("demo:ses_1:q_restart"))
   assert.deepEqual(persistedState.pendingPrompts.customAnswers, {
-    "100:7": { projectAlias: "demo", requestId: "q_restart", sessionID: "", qIndex: 0 },
+    "100:7": { projectAlias: "demo", requestId: "q_restart", sessionID: "ses_1", qIndex: 0 },
   })
 
   const secondHarness = await createHarness({
@@ -3388,7 +3388,7 @@ test("startConnector delivers permission prompts and handles allow callbacks", a
     assert.deepEqual(prompt.replyMarkup.inline_keyboard[0].map((button) => button.text), ["Allow once", "Always allow"])
 
     const promptMessageId = prompt.result.message_id
-    harness.tg.enqueue(makeCallbackUpdate(301, "p|demo|perm_1|once", { messageId: promptMessageId }))
+    harness.tg.enqueue(makeCallbackUpdate(301, prompt.replyMarkup.inline_keyboard[0][0].callback_data, { messageId: promptMessageId }))
     await waitFor(() => harness.ocCalls.replyPermission.length === 1)
     await waitFor(() => harness.tg.callbackAnswers.length === 1)
 
@@ -3577,17 +3577,17 @@ test("startConnector completes multi-step question wizard flows", async () => {
     assert.match(harness.tg.sentMessages[0].text, /Pick checks \(1\/2\)/)
 
     const firstStepMessageId = harness.tg.sentMessages[0].result.message_id
-    harness.tg.enqueue(makeCallbackUpdate(401, "q|demo|q_1|0|t|0", { messageId: firstStepMessageId }))
+    harness.tg.enqueue(makeCallbackUpdate(401, "q|demo|ses_1|q_1|0|t|0", { messageId: firstStepMessageId }))
     await waitFor(() => harness.tg.editedMessages.length >= 1)
     assert.equal(harness.tg.editedMessages[0].kind, "text")
 
-    harness.tg.enqueue(makeCallbackUpdate(402, "q|demo|q_1|0|done", { messageId: firstStepMessageId }))
+    harness.tg.enqueue(makeCallbackUpdate(402, "q|demo|ses_1|q_1|0|done", { messageId: firstStepMessageId }))
     await waitFor(() => harness.tg.sentMessages.length >= 2)
     assert.match(harness.tg.sentMessages[1].text, /Reason \(2\/2\)/)
     await waitFor(() => harness.tg.deletedMessages.some((entry) => entry.messageId === firstStepMessageId))
 
     const secondStepMessageId = harness.tg.sentMessages[1].result.message_id
-    harness.tg.enqueue(makeCallbackUpdate(403, "q|demo|q_1|1|custom", { messageId: secondStepMessageId }))
+    harness.tg.enqueue(makeCallbackUpdate(403, "q|demo|ses_1|q_1|1|custom", { messageId: secondStepMessageId }))
     await waitFor(() => harness.tg.sentMessages.length >= 3)
     assert.match(harness.tg.sentMessages[2].text, /Send your answer for: Reason/)
     await waitFor(() => harness.tg.deletedMessages.some((entry) => entry.messageId === secondStepMessageId))
@@ -4276,7 +4276,7 @@ test("startConnector skips duplicate permission callback replays after ledger pe
       },
       idempotency: {
         keys: {
-          "permission-reply:demo:perm_replay:once": {
+          [permissionReplyIdempotencyKey("demo", "ses_1", "perm_replay", "once")]: {
             createdAt: Date.now(),
             kind: "permission-reply",
             projectAlias: "demo",
@@ -5225,7 +5225,15 @@ test("startConnector keeps pending prompts when restart recovery hits retryable 
     assert.equal(harness.tg.sentMessages.length, 0)
 
     const state = await readState(harness.stateFile)
-    assert.deepEqual(state.pendingPrompts, pendingPrompts)
+    assert.deepEqual(state.pendingPrompts, {
+      ...pendingPrompts,
+      rejectNotes: {
+        "100:7": { projectAlias: "demo", permissionId: "perm_retry", sessionID: "ses_1" },
+      },
+      customAnswers: {
+        "100:7": { projectAlias: "demo", requestId: "q_retry_restore", sessionID: "ses_1", qIndex: 0 },
+      },
+    })
   } finally {
     await harness.connector.stop()
   }

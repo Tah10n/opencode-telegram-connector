@@ -8,6 +8,7 @@ import { createPermissionCommandHandlers } from "../src/connector/commands/permi
 import {
   permissionReplyIdempotencyKey,
   promptSubmissionIdempotencyKey,
+  questionReplyIdempotencyPrefix,
   questionRejectIdempotencyKey,
 } from "../src/connector/idempotency.js"
 
@@ -1656,6 +1657,42 @@ test("createCallbackHandlers skips duplicate permission callbacks via idempotenc
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["OK", "Already handled"])
 })
 
+test("createCallbackHandlers ignores unscoped permission idempotency keys for scoped callbacks", async () => {
+  const legacyReplyKey = permissionReplyIdempotencyKey("demo", "perm_scoped", "once")
+  const scopedReplyKey = permissionReplyIdempotencyKey("demo", "ses_current", "perm_scoped", "once")
+  const scopedSubmittedKey = promptSubmissionIdempotencyKey(scopedReplyKey)
+  const idempotencyKeys = new Set([legacyReplyKey])
+  const markedKeys = []
+  const replyCalls = []
+  const { runtime, callbackAnswers } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    store: {
+      hasIdempotencyKey: (key) => idempotencyKeys.has(key),
+      markIdempotencyKey: (key) => {
+        markedKeys.push(key)
+        idempotencyKeys.add(key)
+        return true
+      },
+      flush: async () => {},
+    },
+    ocByAlias: {
+      demo: {
+        async replyPermission(permissionId, payload) {
+          replyCalls.push({ permissionId, payload })
+          return { ok: true }
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("p|demo|ses_current|perm_scoped|once"))
+
+  assert.deepEqual(replyCalls, [{ permissionId: "perm_scoped", payload: { reply: "once" } }])
+  assert.deepEqual(markedKeys, [scopedSubmittedKey, scopedReplyKey])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["OK"])
+})
+
 test("createCallbackHandlers finalizes submitted permission replies without reposting inactive prompts", async () => {
   const replyKey = permissionReplyIdempotencyKey("demo", "ses_current", "perm_submitted", "once")
   const submittedKey = promptSubmissionIdempotencyKey(replyKey)
@@ -1794,10 +1831,70 @@ test("createCallbackHandlers treats permission callbacks for changed bindings as
   assert.deepEqual(replyCalls, [])
   assert.deepEqual(deletedPermissions, [
     { projectAlias: "demo", permissionId: "perm_scoped", sessionID: "ses_prompt" },
-    { projectAlias: "demo", permissionId: "perm_old", sessionID: "ses_prompt" },
+    { projectAlias: "demo", permissionId: "perm_old" },
   ])
   assert.equal(flushCount, 2)
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["No longer active", "No longer active"])
+})
+
+test("createCallbackHandlers does not bind old-shape permission callbacks to scoped pending permissions", async () => {
+  const replyCalls = []
+  const { runtime, callbackAnswers, deletedPermissions } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    store: {
+      getPendingPermission: (projectAlias, permissionId) =>
+        permissionId === "perm_old" ? { projectAlias, permissionId, sessionID: "ses_current" } : null,
+      async flush() {},
+    },
+    ocByAlias: {
+      demo: {
+        async replyPermission(permissionId, payload) {
+          replyCalls.push({ permissionId, payload })
+          return { ok: true }
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("p|demo|perm_old|once"))
+
+  assert.deepEqual(replyCalls, [])
+  assert.deepEqual(deletedPermissions, [{ projectAlias: "demo", permissionId: "perm_old" }])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["No longer active"])
+})
+
+test("createCallbackHandlers does not bind empty-session permission callbacks to scoped pending permissions", async () => {
+  const replyCalls = []
+  const { runtime, callbackAnswers, deletedPermissions, rejectStateCalls } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    store: {
+      getPendingPermission: (projectAlias, permissionId) =>
+        permissionId === "perm_empty" ? { projectAlias, permissionId, sessionID: "ses_current" } : null,
+      getPendingPrompts: () => ({
+        rejectNotes: {
+          "100:7": { projectAlias: "demo", permissionId: "perm_empty", sessionID: "ses_current" },
+        },
+      }),
+      async flush() {},
+    },
+    ocByAlias: {
+      demo: {
+        async replyPermission(permissionId, payload) {
+          replyCalls.push({ permissionId, payload })
+          return { ok: true }
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("p|demo||perm_empty|once"))
+
+  assert.deepEqual(replyCalls, [])
+  assert.deepEqual(deletedPermissions, [{ projectAlias: "demo", permissionId: "perm_empty" }])
+  assert.deepEqual(rejectStateCalls, [])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["No longer active"])
 })
 
 test("createCallbackHandlers handles permission guard branches and fatal callback failures", async () => {
@@ -1874,7 +1971,7 @@ test("createCallbackHandlers rejects stale and successful question callbacks", a
   ])
 })
 
-test("createCallbackHandlers cleans scoped question wizards from old-shape reject callbacks", async () => {
+test("createCallbackHandlers resolves old-shape question rejects to one scoped wizard", async () => {
   const scopedWizards = [
     { questionId: "q_success", sessionID: "ses_current" },
     { questionId: "q_stale", sessionID: "ses_current" },
@@ -1883,18 +1980,23 @@ test("createCallbackHandlers cleans scoped question wizards from old-shape rejec
   const questionWizards = new Map()
   for (const wizard of scopedWizards) {
     questionWizards.set(`demo:${wizard.sessionID}:${wizard.id}`, wizard)
-    questionWizards.set(`demo:${wizard.id}`, wizard)
   }
   const rejectCalls = []
+  const getWizardCalls = []
+  const getUniqueWizardCalls = []
   const markedKeys = []
+  let flushCount = 0
   const { runtime, callbackAnswers, clearedQuestionIds } = makeRuntime({
     storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
     questionWizards,
     getWizard: (projectAlias, questionId, sessionID = "") => {
+      getWizardCalls.push({ projectAlias, questionId, sessionID })
       if (sessionID) return questionWizards.get(`${projectAlias}:${sessionID}:${questionId}`) || null
-      return questionWizards.get(`${projectAlias}:${questionId}`) ||
-        [...questionWizards.values()].find((wizard) => wizard?.projectAlias === projectAlias && (wizard?.id || wizard?.request?.id) === questionId) ||
-        null
+      return null
+    },
+    getUniqueWizard: (projectAlias, questionId) => {
+      getUniqueWizardCalls.push({ projectAlias, questionId })
+      return questionWizards.get(`${projectAlias}:ses_current:${questionId}`) || null
     },
     store: {
       hasIdempotencyKey: (key) => key.includes("q_done"),
@@ -1902,7 +2004,9 @@ test("createCallbackHandlers cleans scoped question wizards from old-shape rejec
         markedKeys.push(key)
         return true
       },
-      flush: async () => {},
+      flush: async () => {
+        flushCount += 1
+      },
     },
     ocByAlias: {
       demo: {
@@ -1931,9 +2035,18 @@ test("createCallbackHandlers cleans scoped question wizards from old-shape rejec
 
   assert.deepEqual(rejectCalls, ["q_success", "q_stale"])
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Rejected", "No longer active", "Already handled"])
+  assert.deepEqual(getWizardCalls, [
+    { projectAlias: "demo", questionId: "q_success", sessionID: "" },
+    { projectAlias: "demo", questionId: "q_stale", sessionID: "" },
+    { projectAlias: "demo", questionId: "q_done", sessionID: "" },
+  ])
+  assert.deepEqual(getUniqueWizardCalls, [
+    { projectAlias: "demo", questionId: "q_success" },
+    { projectAlias: "demo", questionId: "q_stale" },
+    { projectAlias: "demo", questionId: "q_done" },
+  ])
   for (const wizard of scopedWizards) {
     assert.equal(questionWizards.has(`demo:${wizard.sessionID}:${wizard.id}`), false)
-    assert.equal(questionWizards.has(`demo:${wizard.id}`), false)
   }
   assert.deepEqual(clearedQuestionIds, [
     { projectAlias: "demo", questionId: "q_success", sessionID: "ses_current" },
@@ -1943,8 +2056,9 @@ test("createCallbackHandlers cleans scoped question wizards from old-shape rejec
     { projectAlias: "demo", questionId: "q_done", sessionID: "ses_current" },
     { projectAlias: "demo", questionId: "q_done" },
   ])
+  assert.equal(flushCount, 5)
   assert.equal(markedKeys.length, 4)
-  assert.ok(markedKeys.every((key) => key.includes("ses_")))
+  assert.ok(markedKeys.every((key) => key.includes("ses_current")))
   assert.equal(markedKeys.filter((key) => key.startsWith("prompt-submit:")).length, 2)
 })
 
@@ -1987,6 +2101,8 @@ test("createCallbackHandlers treats question callbacks for changed bindings as s
     { projectAlias: "demo", questionId: "q_old", sessionID: "ses_prompt" },
     { projectAlias: "demo", questionId: "q_old" },
   ])
+  assert.equal(questionWizards.has("demo:ses_prompt:q_old"), false)
+  assert.equal(questionWizards.has("demo:q_old"), false)
   assert.equal(flushCount, 2)
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["No longer active", "No longer active"])
 })
@@ -2023,6 +2139,55 @@ test("createCallbackHandlers skips duplicate question reject callbacks via idemp
 
   assert.deepEqual(rejectCalls, [{ questionId: "q_dup" }])
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Rejected", "Already handled"])
+})
+
+test("createCallbackHandlers ignores unscoped question idempotency keys for scoped reject callbacks", async () => {
+  const wizard = { ...makeWizard({ id: "q_scoped" }), sessionID: "ses_current" }
+  const legacyRejectKey = questionRejectIdempotencyKey("demo", "q_scoped")
+  const legacyReplyPrefix = questionReplyIdempotencyPrefix("demo", "", "q_scoped")
+  const scopedRejectKey = questionRejectIdempotencyKey("demo", "ses_current", "q_scoped")
+  const scopedReplyPrefix = questionReplyIdempotencyPrefix("demo", "ses_current", "q_scoped")
+  const scopedSubmittedKey = promptSubmissionIdempotencyKey(scopedRejectKey)
+  const idempotencyKeys = new Set([legacyRejectKey])
+  const replyPrefixes = new Set([legacyReplyPrefix])
+  const checkedPrefixes = []
+  const markedKeys = []
+  const rejectCalls = []
+  const { runtime, callbackAnswers } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    questionWizards: new Map([["demo:ses_current:q_scoped", wizard]]),
+    getWizard: (projectAlias, questionId, sessionID) =>
+      projectAlias === "demo" && questionId === "q_scoped" && sessionID === "ses_current" ? wizard : null,
+    store: {
+      hasIdempotencyKey: (key) => idempotencyKeys.has(key),
+      hasIdempotencyKeyPrefix: (prefix) => {
+        checkedPrefixes.push(prefix)
+        return replyPrefixes.has(prefix)
+      },
+      markIdempotencyKey: (key) => {
+        markedKeys.push(key)
+        idempotencyKeys.add(key)
+        return true
+      },
+      flush: async () => {},
+    },
+    ocByAlias: {
+      demo: {
+        async rejectQuestion(questionId) {
+          rejectCalls.push({ questionId })
+          return { ok: true }
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("q|demo|ses_current|q_scoped|reject"))
+
+  assert.deepEqual(rejectCalls, [{ questionId: "q_scoped" }])
+  assert.deepEqual(checkedPrefixes, [scopedReplyPrefix])
+  assert.deepEqual(markedKeys, [scopedSubmittedKey, scopedRejectKey])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Rejected"])
 })
 
 test("createCallbackHandlers finalizes submitted question rejects without reposting inactive prompts", async () => {
@@ -2063,13 +2228,15 @@ test("createCallbackHandlers finalizes submitted question rejects without repost
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Already handled"])
 })
 
-test("createCallbackHandlers clears persisted question state even without an in-memory wizard", async () => {
+test("createCallbackHandlers rejects sessionless question rejects without an in-memory wizard", async () => {
+  const rejectCalls = []
   const { runtime, callbackAnswers, clearedQuestionIds } = makeRuntime({
     storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
     getWizard: () => null,
     ocByAlias: {
       demo: {
         async rejectQuestion() {
+          rejectCalls.push(true)
           return { ok: true }
         },
       },
@@ -2079,8 +2246,9 @@ test("createCallbackHandlers clears persisted question state even without an in-
 
   await handlers.handleTelegramCallback(makeCallback("q|demo||q_missing_mem|reject"))
 
-  assert.deepEqual(clearedQuestionIds, [{ projectAlias: "demo", questionId: "q_missing_mem" }])
-  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Rejected"])
+  assert.deepEqual(rejectCalls, [])
+  assert.deepEqual(clearedQuestionIds, [])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Not found"])
 })
 
 test("createCallbackHandlers starts and cancels custom-answer question flows", async () => {
@@ -2122,7 +2290,7 @@ test("createCallbackHandlers starts and cancels custom-answer question flows", a
 })
 
 test("createCallbackHandlers parses session-scoped question callbacks with numeric question ids", async () => {
-  const wizard = makeWizard({ id: "123", questions: [{ header: "Reason", question: "Why?", custom: true, options: [] }] })
+  const wizard = { ...makeWizard({ id: "123", questions: [{ header: "Reason", question: "Why?", custom: true, options: [] }] }), sessionID: "ses_123" }
   const deletedMessages = []
   const getWizardCalls = []
   const promptCalls = []

@@ -3,7 +3,14 @@ import assert from "node:assert/strict"
 import { createPromptHandlers } from "../src/connector/prompts.js"
 import { createPromptRecovery } from "../src/connector/prompt-recovery.js"
 import { makeBoundaryError } from "../src/boundary-errors.js"
-import { promptSubmissionIdempotencyKey, questionReplyIdempotencyKey } from "../src/connector/idempotency.js"
+import {
+  permissionNoteIdempotencyPrefix,
+  permissionReplyIdempotencyPrefix,
+  promptSubmissionIdempotencyKey,
+  questionRejectIdempotencyKey,
+  questionReplyIdempotencyKey,
+  questionReplyIdempotencyPrefix,
+} from "../src/connector/idempotency.js"
 
 class FakeLruSet {
   constructor() {
@@ -980,4 +987,272 @@ test("restorePendingPromptState does not recover scoped custom answers from anot
 
   assert.deepEqual(awaitingChanges, [{ ctxKey: "100:7", value: null }])
   assert.equal(summary.customAnswers.stale, 1)
+})
+
+test("restorePendingPromptState ignores legacy handled keys for scoped pending prompts", async () => {
+  const restoredPermissions = []
+  const resumedQuestions = []
+  const resumedCustomAnswers = []
+  const awaitingChanges = []
+  const questionWizards = new Map([
+    [
+      "demo:ses_1:q_custom_scoped",
+      {
+        projectAlias: "demo",
+        id: "q_custom_scoped",
+        sessionID: "ses_1",
+        request: {
+          id: "q_custom_scoped",
+          sessionID: "ses_1",
+          questions: [{ header: "Custom", question: "Explain", custom: true, options: [] }],
+        },
+      },
+    ],
+  ])
+  const legacyHandledPrefixes = new Set([
+    permissionNoteIdempotencyPrefix("demo", "", "perm_scoped"),
+    permissionReplyIdempotencyPrefix("demo", "", "perm_scoped"),
+    questionReplyIdempotencyPrefix("demo", "", "q_scoped"),
+    questionReplyIdempotencyPrefix("demo", "", "q_custom_scoped"),
+  ])
+  const legacyRejectKeys = new Set([
+    questionRejectIdempotencyKey("demo", "q_scoped"),
+    questionRejectIdempotencyKey("demo", "q_custom_scoped"),
+  ])
+  const pendingPrompts = {
+    permissions: {
+      "demo:ses_1:perm_scoped": {
+        projectAlias: "demo",
+        permissionId: "perm_scoped",
+        sessionID: "ses_1",
+        permission: "shell",
+        patterns: ["npm test"],
+        ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+      },
+    },
+    rejectNotes: {},
+    customAnswers: {
+      "100:7": { projectAlias: "demo", requestId: "q_custom_scoped", sessionID: "ses_1", qIndex: 0 },
+    },
+    questionWizards: {
+      "demo:ses_1:q_scoped": {
+        projectAlias: "demo",
+        id: "q_scoped",
+        sessionID: "ses_1",
+        request: { id: "q_scoped", sessionID: "ses_1", questions: [{ header: "Scoped", question: "Proceed?", options: [] }] },
+        index: 0,
+        answers: [[]],
+        selectedByIndex: {},
+        ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+      },
+    },
+  }
+
+  const recovery = createPromptRecovery({
+    store: {
+      getPendingPrompts: () => pendingPrompts,
+      getBinding: () => ({ projectAlias: "demo", sessionId: "ses_1" }),
+      hasIdempotencyKeyPrefix: (prefix) => legacyHandledPrefixes.has(prefix),
+      hasIdempotencyKey: (key) => legacyRejectKeys.has(key),
+      deletePendingPermission() {
+        throw new Error("should not delete scoped permission because only legacy keys exist")
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async listPermissions() {
+          return [{ id: "perm_scoped", sessionID: "ses_1" }]
+        },
+        async listQuestions() {
+          return [
+            { id: "q_scoped", sessionID: "ses_1", questions: [{ header: "Scoped", question: "Proceed?", options: [] }] },
+            { id: "q_custom_scoped", sessionID: "ses_1", questions: [{ header: "Custom", question: "Explain", custom: true, options: [] }] },
+          ]
+        },
+      },
+    },
+    prompted: { demo: { permission: new FakeLruSet(), question: new FakeLruSet() } },
+    questionWizards,
+    wizardKey: (projectAlias, requestId, sessionID = "") => (sessionID ? `${projectAlias}:${sessionID}:${requestId}` : `${projectAlias}:${requestId}`),
+    parseCtxKey: () => ({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }),
+    async sendPermissionPrompt(projectAlias, props) {
+      restoredPermissions.push({ projectAlias, permissionId: props.id, sessionID: props.sessionID })
+    },
+    async sendBlocksToThread() {},
+    async sendCurrentQuestionStep(wizard) {
+      resumedQuestions.push({ id: wizard.id, sessionID: wizard.sessionID })
+    },
+    async sendRejectNotePrompt() {},
+    async sendQuestionCustomAnswerPrompt(ctx, projectAlias, requestId, qIndex, label, options) {
+      resumedCustomAnswers.push({ projectAlias, requestId, qIndex, label, sessionID: options?.sessionID })
+    },
+    clearPersistedQuestionWizard() {
+      throw new Error("should not clear scoped question because only legacy keys exist")
+    },
+    setRejectNoteAwaitingState() {},
+    setAwaitingCustomAnswerState(ctxKey, value) {
+      awaitingChanges.push({ ctxKey, value })
+    },
+    markProjectUp() {},
+  })
+
+  const summary = await recovery.restorePendingPromptState()
+
+  assert.deepEqual(restoredPermissions, [{ projectAlias: "demo", permissionId: "perm_scoped", sessionID: "ses_1" }])
+  assert.deepEqual(resumedQuestions, [{ id: "q_scoped", sessionID: "ses_1" }])
+  assert.deepEqual(resumedCustomAnswers, [{ projectAlias: "demo", requestId: "q_custom_scoped", qIndex: 0, label: "Custom", sessionID: "ses_1" }])
+  assert.deepEqual(awaitingChanges, [{ ctxKey: "100:7", value: pendingPrompts.customAnswers["100:7"] }])
+  assert.equal(summary.permissions.restored, 1)
+  assert.equal(summary.questionWizards.restored, 1)
+  assert.equal(summary.customAnswers.restored, 1)
+  assert.equal(summary.totals.stale, 0)
+})
+
+test("restorePendingPromptState upgrades sessionless prompts from unique scoped live prompts", async () => {
+  const restoredPermissions = []
+  const resumedQuestions = []
+  const resumedRejectNotes = []
+  const resumedCustomAnswers = []
+  const storedPermissions = []
+  const storedQuestionWizards = []
+  const deletedPermissions = []
+  const clearedQuestions = []
+  const rejectNoteChanges = []
+  const customAnswerChanges = []
+  const questionWizards = new Map([
+    [
+      "demo:q_answer_live_scoped",
+      {
+        projectAlias: "demo",
+        id: "q_answer_live_scoped",
+        request: { id: "q_answer_live_scoped", questions: [{ header: "Answer", question: "Answer?", custom: true, options: [] }] },
+      },
+    ],
+  ])
+  const pendingPrompts = {
+    permissions: {
+      "demo:perm_live_scoped": {
+        projectAlias: "demo",
+        permissionId: "perm_live_scoped",
+        sessionID: "",
+        permission: "shell",
+        patterns: [],
+        ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+      },
+    },
+    rejectNotes: {
+      "100:7": { projectAlias: "demo", permissionId: "perm_note_live_scoped", sessionID: "" },
+    },
+    customAnswers: {
+      "100:7": { projectAlias: "demo", requestId: "q_answer_live_scoped", sessionID: "", qIndex: 0 },
+    },
+    questionWizards: {
+      "demo:q_live_scoped": {
+        projectAlias: "demo",
+        id: "q_live_scoped",
+        sessionID: "",
+        request: { id: "q_live_scoped", questions: [{ header: "Question", question: "Question?", options: [] }] },
+        index: 0,
+        answers: [[]],
+        selectedByIndex: {},
+        ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+      },
+    },
+  }
+
+  const recovery = createPromptRecovery({
+    store: {
+      getPendingPrompts: () => pendingPrompts,
+      getBinding: () => ({ projectAlias: "demo", sessionId: "ses_scoped" }),
+      setPendingPermission(record) {
+        storedPermissions.push(record)
+        pendingPrompts.permissions[`demo:${record.sessionID}:${record.permissionId}`] = record
+      },
+      deletePendingPermission(projectAlias, permissionId, sessionID) {
+        deletedPermissions.push({ projectAlias, permissionId, sessionID })
+        delete pendingPrompts.permissions["demo:perm_live_scoped"]
+      },
+      setQuestionWizard(key, wizard) {
+        storedQuestionWizards.push({ key, sessionID: wizard.sessionID })
+        pendingPrompts.questionWizards[key] = wizard
+      },
+      async flush() {},
+    },
+    ocByAlias: {
+      demo: {
+        async listPermissions() {
+          return [
+            { id: "perm_live_scoped", sessionID: "ses_scoped" },
+            { id: "perm_note_live_scoped", sessionID: "ses_scoped" },
+          ]
+        },
+        async listQuestions() {
+          return [
+            { id: "q_live_scoped", sessionID: "ses_scoped", questions: [{ header: "Question", question: "Question?", options: [] }] },
+            { id: "q_answer_live_scoped", sessionID: "ses_scoped", questions: [{ header: "Answer", question: "Answer?", custom: true, options: [] }] },
+          ]
+        },
+      },
+    },
+    prompted: { demo: { permission: new FakeLruSet(), question: new FakeLruSet() } },
+    questionWizards,
+    wizardKey: (projectAlias, requestId, sessionID = "") => (sessionID ? `${projectAlias}:${sessionID}:${requestId}` : `${projectAlias}:${requestId}`),
+    parseCtxKey: () => ({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }),
+    async sendPermissionPrompt(projectAlias, props) {
+      restoredPermissions.push({ projectAlias, permissionId: props.id, sessionID: props.sessionID })
+    },
+    async sendBlocksToThread() {},
+    async sendCurrentQuestionStep(wizard) {
+      resumedQuestions.push({ id: wizard.id, sessionID: wizard.sessionID, requestSessionID: wizard.request?.sessionID })
+    },
+    async sendRejectNotePrompt(ctx, projectAlias, permissionId, options) {
+      resumedRejectNotes.push({ projectAlias, permissionId, sessionID: options?.sessionID })
+    },
+    async sendQuestionCustomAnswerPrompt(ctx, projectAlias, requestId, qIndex, label, options) {
+      resumedCustomAnswers.push({ projectAlias, requestId, qIndex, label, sessionID: options?.sessionID })
+    },
+    clearPersistedQuestionWizard(projectAlias, questionId, sessionID) {
+      clearedQuestions.push({ projectAlias, questionId, sessionID })
+      delete pendingPrompts.questionWizards["demo:q_live_scoped"]
+      delete pendingPrompts.questionWizards["demo:q_answer_live_scoped"]
+    },
+    setRejectNoteAwaitingState(ctxKey, value) {
+      rejectNoteChanges.push({ ctxKey, value })
+      if (value == null) delete pendingPrompts.rejectNotes[ctxKey]
+    },
+    setAwaitingCustomAnswerState(ctxKey, value) {
+      customAnswerChanges.push({ ctxKey, value })
+      if (value == null) delete pendingPrompts.customAnswers[ctxKey]
+    },
+    markProjectUp() {},
+  })
+
+  const summary = await recovery.restorePendingPromptState()
+
+  assert.deepEqual(restoredPermissions, [{ projectAlias: "demo", permissionId: "perm_live_scoped", sessionID: "ses_scoped" }])
+  assert.deepEqual(resumedQuestions, [{ id: "q_live_scoped", sessionID: "ses_scoped", requestSessionID: "ses_scoped" }])
+  assert.deepEqual(resumedRejectNotes, [{ projectAlias: "demo", permissionId: "perm_note_live_scoped", sessionID: "ses_scoped" }])
+  assert.deepEqual(resumedCustomAnswers, [{ projectAlias: "demo", requestId: "q_answer_live_scoped", qIndex: 0, label: "Answer", sessionID: "ses_scoped" }])
+  assert.deepEqual(storedPermissions.map((entry) => ({ permissionId: entry.permissionId, sessionID: entry.sessionID })), [
+    { permissionId: "perm_live_scoped", sessionID: "ses_scoped" },
+  ])
+  assert.deepEqual(storedQuestionWizards.map((entry) => entry.key), ["demo:ses_scoped:q_live_scoped", "demo:ses_scoped:q_answer_live_scoped"])
+  assert.deepEqual(deletedPermissions, [{ projectAlias: "demo", permissionId: "perm_live_scoped", sessionID: "" }])
+  assert.deepEqual(clearedQuestions, [
+    { projectAlias: "demo", questionId: "q_live_scoped", sessionID: "" },
+    { projectAlias: "demo", questionId: "q_answer_live_scoped", sessionID: "" },
+  ])
+  assert.deepEqual(rejectNoteChanges, [
+    { ctxKey: "100:7", value: { projectAlias: "demo", permissionId: "perm_note_live_scoped", sessionID: "ses_scoped" } },
+    { ctxKey: "100:7", value: { projectAlias: "demo", permissionId: "perm_note_live_scoped", sessionID: "ses_scoped" } },
+  ])
+  assert.deepEqual(customAnswerChanges, [
+    { ctxKey: "100:7", value: { projectAlias: "demo", requestId: "q_answer_live_scoped", sessionID: "ses_scoped", qIndex: 0 } },
+    { ctxKey: "100:7", value: { projectAlias: "demo", requestId: "q_answer_live_scoped", sessionID: "ses_scoped", qIndex: 0 } },
+  ])
+  assert.equal(summary.permissions.restored, 1)
+  assert.equal(summary.questionWizards.restored, 1)
+  assert.equal(summary.rejectNotes.restored, 1)
+  assert.equal(summary.customAnswers.restored, 1)
+  assert.equal(summary.totals.stale, 0)
 })

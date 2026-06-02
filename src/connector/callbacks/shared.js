@@ -153,7 +153,13 @@ export function createCallbackSharedContext({
 
   function cleanupPermissionState(ctxKey, projectAlias, permissionId, sessionID = "") {
     store.deletePendingPermission(projectAlias, permissionId, sessionID)
-    setRejectNoteAwaitingState(ctxKey, null)
+    const pendingRejectNotes = store.getPendingPrompts?.().rejectNotes || store.get?.().pendingPrompts?.rejectNotes || null
+    const pendingRejectNote = pendingRejectNotes?.[ctxKey] || null
+    const expectedSessionID = String(sessionID || "").trim()
+    const pendingSessionID = String(pendingRejectNote?.sessionID || "").trim()
+    const shouldClearRejectNote = !pendingRejectNote ||
+      (pendingRejectNote.projectAlias === projectAlias && pendingRejectNote.permissionId === permissionId && pendingSessionID === expectedSessionID)
+    if (shouldClearRejectNote) setRejectNoteAwaitingState(ctxKey, null)
   }
 
   function cleanupQuestionState(ctxKey, projectAlias, questionId, sessionID = "") {

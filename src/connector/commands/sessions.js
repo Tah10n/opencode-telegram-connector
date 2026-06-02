@@ -71,6 +71,17 @@ export function createSessionCommandHandlers(deps) {
     }
   }
 
+  function isSubagentSession(session) {
+    const parentID = typeof session?.parentID === "string" ? session.parentID.trim() : ""
+    const parentId = typeof session?.parentId === "string" ? session.parentId.trim() : ""
+    return !!(parentID || parentId)
+  }
+
+  function sessionItemsForProjectList(sessions, { includeSubagents = false } = {}) {
+    const items = sessionItemsFromResponse(sessions)
+    return includeSubagents ? items : items.filter((session) => !isSubagentSession(session))
+  }
+
   function projectAliasesSharingClient(projectAlias) {
     const targetClient = ocByAlias?.[projectAlias]
     const targetBaseUrl = projects?.[projectAlias]?.baseUrl
@@ -81,36 +92,43 @@ export function createSessionCommandHandlers(deps) {
     })
   }
 
-  async function listProjectSessions(projectAlias, { limit } = {}) {
+  async function listProjectSessions(projectAlias, { limit, includeSubagents = false } = {}) {
     const oc = ocByAlias[projectAlias]
     const project = projects?.[projectAlias]
     const directory = project?.directory
     const sharedClient = projectAliasesSharingClient(projectAlias).length > 1
     const sessionsMatchingDirectory = (sessions) => {
       if (!directory) return []
-      return sessionItemsFromResponse(sessions).filter((session) => session?.directory && directoriesMatch(session.directory, directory))
+      return sessionItemsForProjectList(sessions, { includeSubagents }).filter((session) => session?.directory && directoriesMatch(session.directory, directory))
     }
-    const scopedOptions = { ...(directory ? { directory } : {}), ...(limit != null ? { limit } : {}) }
+    // Hide subagent sessions from user-facing lists after fetching enough data to
+    // avoid backend limits filled entirely by child sessions. Share-link lookup
+    // uses includeSubagents only when explicitly allowed by the caller.
+    const backendLimit = includeSubagents ? limit : undefined
+    const scopedOptions = { ...(directory ? { directory } : {}), ...(backendLimit != null ? { limit: backendLimit } : {}) }
     const scoped = await oc.listSessions(scopedOptions)
-    const scopedItems = sessionItemsFromResponse(scoped)
+    const scopedRawItems = sessionItemsFromResponse(scoped)
+    const scopedItems = sessionItemsForProjectList(scopedRawItems, { includeSubagents })
     if (sharedClient) {
       const scopedMatches = sessionsMatchingDirectory(scopedItems)
-      if (scopedItems.length > 0 || !directory) return scopedMatches
+      const hasScopedDirectoryEvidence = scopedRawItems.some((session) => !!session?.directory)
+      if (scopedItems.length > 0 || hasScopedDirectoryEvidence || !directory) return scopedMatches
 
-      const unscopedOptions = limit != null ? { limit } : {}
+      const unscopedOptions = backendLimit != null ? { limit: backendLimit } : {}
       return sessionsMatchingDirectory(await oc.listSessions(unscopedOptions))
     }
     if (!directory) return scopedItems
 
     const scopedMatches = sessionsMatchingDirectory(scopedItems)
-    if (scopedItems.length > 0) {
-      const hasScopedDirectoryEvidence = scopedItems.some((session) => !!session?.directory)
+    const hasScopedDirectoryEvidence = scopedRawItems.some((session) => !!session?.directory)
+    if (scopedItems.length > 0 || hasScopedDirectoryEvidence) {
       if (hasScopedDirectoryEvidence) return scopedMatches
       return project?.allowUnscopedSessionListFallback === true ? scopedItems : []
     }
 
-    const unscopedOptions = limit != null ? { limit } : {}
-    const unscopedItems = sessionItemsFromResponse(await oc.listSessions(unscopedOptions))
+    const unscopedOptions = backendLimit != null ? { limit: backendLimit } : {}
+    const unscopedRawItems = sessionItemsFromResponse(await oc.listSessions(unscopedOptions))
+    const unscopedItems = sessionItemsForProjectList(unscopedRawItems, { includeSubagents })
     const directoryMatches = unscopedItems.filter((session) => session?.directory && directoriesMatch(session.directory, directory))
     if (directoryMatches.length > 0) return directoryMatches
 
@@ -119,7 +137,7 @@ export function createSessionCommandHandlers(deps) {
     // project path differently from the connector. This fallback is intentionally
     // opt-in and only allowed when the unscoped response has no directory evidence
     // at all; any explicit non-matching directory keeps the project fail-closed.
-    const hasDirectoryEvidence = unscopedItems.some((session) => !!session?.directory)
+    const hasDirectoryEvidence = unscopedRawItems.some((session) => !!session?.directory)
     if (project?.allowUnscopedSessionListFallback === true && !hasDirectoryEvidence) return unscopedItems
     return []
   }

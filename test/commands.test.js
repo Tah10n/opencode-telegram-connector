@@ -1288,6 +1288,71 @@ test("createCommandHandlers clears stale awaiting custom-answer state", async ()
   assert.match(sent[1].text, /Use \/projects to see available aliases\./)
 })
 
+test("createCommandHandlers continues sessionless awaiting custom answers when one scoped wizard matches", async () => {
+  const awaitingCustomAnswer = new Map([
+    ["100:7", { projectAlias: "demo", requestId: "q_same", qIndex: 0 }],
+  ])
+  const wizard = {
+    projectAlias: "demo",
+    id: "q_same",
+    sessionID: "ses_scoped",
+    index: 0,
+    request: { id: "q_same", questions: [{ header: "First", question: "one" }, { header: "Second", question: "two" }] },
+    answers: [[], []],
+    selectedByIndex: {},
+    messageIdByIndex: {},
+    ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+  }
+  const cleared = []
+  const progressCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_scoped" } } },
+    awaitingCustomAnswer,
+    getWizard: (projectAlias, requestId, sessionID) => {
+      assert.equal(projectAlias, "demo")
+      assert.equal(requestId, "q_same")
+      assert.equal(sessionID || "", "")
+      return null
+    },
+    getUniqueWizard: (projectAlias, requestId) => {
+      assert.equal(projectAlias, "demo")
+      assert.equal(requestId, "q_same")
+      return wizard
+    },
+    applyWizardState: (target, source) => {
+      progressCalls.push(["applyWizardState", source.index, source.answers])
+      target.index = source.index
+      target.answers = source.answers
+      target.selectedByIndex = source.selectedByIndex
+      target.messageIdByIndex = source.messageIdByIndex
+    },
+    persistQuestionWizard: (...args) => progressCalls.push(["persistQuestionWizard", args]),
+    finishQuestionWizard: async (...args) => progressCalls.push(["finishQuestionWizard", args]),
+    sendCurrentQuestionStep: async (...args) => progressCalls.push(["sendCurrentQuestionStep", args]),
+    setAwaitingCustomAnswerState: (ctxKey, value) => {
+      cleared.push({ ctxKey, value })
+      if (value) awaitingCustomAnswer.set(ctxKey, value)
+      else awaitingCustomAnswer.delete(ctxKey)
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_thread_id: 7,
+    text: "first answer",
+  })
+
+  assert.deepEqual(cleared, [{ ctxKey: "100:7", value: null }])
+  assert.equal(awaitingCustomAnswer.has("100:7"), false)
+  assert.ok(progressCalls.findIndex((entry) => entry[0] === "persistQuestionWizard") < progressCalls.findIndex((entry) => entry[0] === "sendCurrentQuestionStep"))
+  assert.equal(progressCalls.some((entry) => entry[0] === "finishQuestionWizard"), false)
+  assert.equal(wizard.index, 1)
+  assert.deepEqual(wizard.answers, [["first answer"], []])
+  assert.equal(sent.length, 0)
+})
+
 test("createCommandHandlers handleBindCommand validates arguments and current bindings", async () => {
   const { runtime, sent } = makeRuntime({
     storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
@@ -1427,6 +1492,7 @@ test("createCommandHandlers handleUseCommand rejects unsafe raw session ids", as
   const bindCalls = []
   const { runtime, sent } = makeRuntime({
     storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312" } },
     ocByAlias: {
       demo: {
         async getSession(sessionId) {
@@ -1807,6 +1873,72 @@ test("createCommandHandlers renderSessionsList shows the current model when avai
   assert.deepEqual(sent[0].replyMarkup.inline_keyboard.at(-1)?.map((button) => button.text), ["Refresh", "New", "Close"])
 })
 
+test("createCommandHandlers renderSessionsList hides subagent sessions", async () => {
+  const { runtime, sent } = makeRuntime({
+    ocByAlias: {
+      demo: {
+        async listSessions() {
+          return [
+            { id: "ses_root", title: "Root session" },
+            { id: "ses_child", title: "Child agent", parentID: "ses_root" },
+            { id: "ses_child_alt", title: "Child agent alt", parentId: "ses_root" },
+          ]
+        },
+        async listMessages() {
+          return []
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderSessionsList(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    { binding: { projectAlias: "demo", sessionId: "ses_root" } },
+  )
+
+  const buttons = sent[0].replyMarkup.inline_keyboard.flat()
+  assert.match(sent[0].text, /ses_root.*Root session/)
+  assert.doesNotMatch(sent[0].text, /ses_child/)
+  assert.doesNotMatch(sent[0].text, /Child agent/)
+  assert.deepEqual(buttons.map((button) => button.text), ["✅ Root session", "Refresh", "New", "Close"])
+})
+
+test("createCommandHandlers renderSessionsList applies display limit after hiding subagent sessions", async () => {
+  const calls = []
+  const subagents = Array.from({ length: 10 }, (_, index) => ({ id: `ses_child_${index}`, title: `Child ${index}`, parentID: "ses_root" }))
+  const roots = Array.from({ length: 11 }, (_, index) => ({ id: `ses_root_${index}`, title: `Root ${index}` }))
+  const { runtime, sent } = makeRuntime({
+    ocByAlias: {
+      demo: {
+        async listSessions(input = {}) {
+          calls.push(input)
+          return [...subagents, ...roots]
+        },
+        async listMessages() {
+          return []
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderSessionsList(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    { binding: { projectAlias: "demo", sessionId: "ses_root_0" } },
+  )
+
+  const buttons = sent[0].replyMarkup.inline_keyboard.flat()
+  assert.deepEqual(calls, [{}])
+  assert.match(sent[0].text, /ses_root_0.*Root 0/)
+  assert.match(sent[0].text, /ses_root_9.*Root 9/)
+  assert.match(sent[0].text, /1 more/)
+  assert.doesNotMatch(sent[0].text, /ses_root_10/)
+  assert.doesNotMatch(sent[0].text, /ses_child_/)
+  assert.equal(buttons.some((button) => /Child/.test(button.text)), false)
+  assert.equal(buttons.filter((button) => /^Root /.test(button.text) || /^✅ Root /.test(button.text)).length, 10)
+})
+
 test("createCommandHandlers renderSessionsList hides scoped directoryless sessions by default", async () => {
   const calls = []
   const { runtime, sent } = makeRuntime({
@@ -1830,7 +1962,7 @@ test("createCommandHandlers renderSessionsList hides scoped directoryless sessio
     { binding: { projectAlias: "demo", sessionId: "ses_current" } },
   )
 
-  assert.deepEqual(calls, [{ directory: "C:/repo/demo", limit: 10 }])
+  assert.deepEqual(calls, [{ directory: "C:/repo/demo" }])
   assert.match(sent[0].text, /No sessions found/)
   assert.doesNotMatch(sent[0].text, /ses_hidden/)
   assert.equal(sent[0].replyMarkup.inline_keyboard.flat().some((button) => button.text === "Hidden session"), false)
@@ -1859,7 +1991,7 @@ test("createCommandHandlers renderSessionsList allows scoped directoryless sessi
     { binding: { projectAlias: "demo", sessionId: "ses_current" } },
   )
 
-  assert.deepEqual(calls, [{ directory: "C:/repo/demo", limit: 10 }])
+  assert.deepEqual(calls, [{ directory: "C:/repo/demo" }])
   assert.match(sent[0].text, /ses_legacy.*Legacy session/)
   assert.ok(sent[0].replyMarkup.inline_keyboard.flat().some((button) => button.text === "Legacy session"))
 })
@@ -1897,6 +2029,36 @@ test("createCommandHandlers handleUseCommand does not bind hidden directoryless 
   assert.match(sent[0].text, /Share link not found in project 'demo'/)
 })
 
+test("createCommandHandlers handleUseCommand does not bind subagent share-link sessions", async () => {
+  const bindCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312" } },
+    ocByAlias: {
+      demo: {
+        async listSessions() {
+          return [
+            { id: "ses_child", title: "Child agent", parentID: "ses_root", share: { url: "https://opncd.ai/share/child" } },
+          ]
+        },
+        async getSession(sessionId) {
+          return { id: sessionId, parentID: "ses_root" }
+        },
+      },
+    },
+    bindCtxToSession: async (...args) => {
+      bindCalls.push(args)
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleUseCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "https://opncd.ai/share/child")
+
+  assert.deepEqual(bindCalls, [])
+  assert.match(sent[0].text, /Share link not found in project 'demo'/)
+  assert.doesNotMatch(sent[0].text, /ses_child/)
+})
+
 test("createCommandHandlers renderSessionsList hides unscoped fallback sessions by default", async () => {
   const calls = []
   const { runtime, sent } = makeRuntime({
@@ -1921,7 +2083,7 @@ test("createCommandHandlers renderSessionsList hides unscoped fallback sessions 
     { binding: { projectAlias: "demo", sessionId: "ses_current" } },
   )
 
-  assert.deepEqual(calls, [{ directory: "C:/repo/demo", limit: 10 }, { limit: 10 }])
+  assert.deepEqual(calls, [{ directory: "C:/repo/demo" }, {}])
   assert.match(sent[0].text, /No sessions found/)
   assert.doesNotMatch(sent[0].text, /ses_unscoped/)
   assert.equal(sent[0].replyMarkup.inline_keyboard.flat().some((button) => button.text === "Unscoped session"), false)
@@ -1951,9 +2113,91 @@ test("createCommandHandlers renderSessionsList allows explicit legacy unscoped f
     { binding: { projectAlias: "demo", sessionId: "ses_current" } },
   )
 
-  assert.deepEqual(calls, [{ directory: "C:/repo/demo", limit: 10 }, { limit: 10 }])
+  assert.deepEqual(calls, [{ directory: "C:/repo/demo" }, {}])
   assert.match(sent[0].text, /ses_unscoped.*Unscoped session/)
   assert.ok(sent[0].replyMarkup.inline_keyboard.flat().some((button) => button.text === "Unscoped session"))
+})
+
+test("createCommandHandlers renderSessionsList treats hidden subagent directories as fallback-blocking evidence", async () => {
+  const calls = []
+  const { runtime, sent } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo", allowUnscopedSessionListFallback: true } },
+    ocByAlias: {
+      demo: {
+        async listSessions(input = {}) {
+          calls.push(input)
+          if (input.directory) return []
+          return [
+            { id: "ses_unscoped", title: "Directoryless root" },
+            { id: "ses_child_other", title: "Hidden other child", parentID: "ses_root", directory: "C:/repo/other" },
+          ]
+        },
+        async listMessages() {
+          return []
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderSessionsList(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    { binding: { projectAlias: "demo", sessionId: "ses_current" } },
+  )
+
+  assert.deepEqual(calls, [{ directory: "C:/repo/demo" }, {}])
+  assert.match(sent[0].text, /No sessions found/)
+  assert.doesNotMatch(sent[0].text, /ses_unscoped/)
+  assert.doesNotMatch(sent[0].text, /ses_child_other|Hidden other child/)
+  assert.equal(sent[0].replyMarkup.inline_keyboard.flat().some((button) => button.text === "Directoryless root"), false)
+})
+
+test("createCommandHandlers does not display or bind hidden subagents that match project directory", async () => {
+  const getSessionCalls = []
+  const bindCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo", allowUnscopedSessionListFallback: true } },
+    ocByAlias: {
+      demo: {
+        async listSessions(input = {}) {
+          if (input.directory) return []
+          return [
+            {
+              id: "ses_child_demo",
+              title: "Hidden demo child",
+              parentID: "ses_root",
+              directory: "C:/repo/demo",
+              share: { url: "https://opncd.ai/share/child-demo" },
+            },
+          ]
+        },
+        async listMessages() {
+          return []
+        },
+        async getSession(sessionId) {
+          getSessionCalls.push(sessionId)
+          return { id: sessionId, directory: "C:/repo/demo", parentID: "ses_root" }
+        },
+      },
+    },
+    bindCtxToSession: async (...args) => {
+      bindCalls.push(args)
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+  const ctxMeta = { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }
+
+  await handlers.renderSessionsList(ctxMeta, { binding: { projectAlias: "demo", sessionId: "ses_current" } })
+  await handlers.handleUseCommand(ctxMeta, "https://opncd.ai/share/child-demo")
+
+  assert.match(sent[0].text, /No sessions found/)
+  assert.doesNotMatch(sent[0].text, /ses_child_demo|Hidden demo child/)
+  assert.equal(sent[0].replyMarkup.inline_keyboard.flat().some((button) => button.text === "Hidden demo child"), false)
+  assert.deepEqual(getSessionCalls, [])
+  assert.deepEqual(bindCalls, [])
+  assert.match(sent[1].text, /Share link not found in project 'demo'/)
+  assert.doesNotMatch(sent[1].text, /ses_child_demo/)
 })
 
 test("createCommandHandlers renderSessionsList ignores unscoped fallback opt-in when directory evidence mismatches", async () => {
@@ -2013,7 +2257,7 @@ test("createCommandHandlers renderSessionsList keeps shared-client unscoped sess
 test("createCommandHandlers renderSessionsList filters scoped shared-client sessions by directory evidence", async () => {
   const sharedClient = {
     async listSessions(input = {}) {
-      assert.deepEqual(input, { directory: "C:/repo/demo", limit: 10 })
+      assert.deepEqual(input, { directory: "C:/repo/demo" })
       return [
         { id: "ses_missing_dir", title: "Missing directory" },
         { id: "ses_other", title: "Other project", directory: "C:/repo/other" },
@@ -2361,8 +2605,7 @@ test("createCommandHandlers rolls back custom-answer wizard progress when flush 
     },
   )
 
-  assert.equal(stepCalls.length, 1)
-  assert.equal(stepCalls[0].index, 1)
+  assert.equal(stepCalls.length, 0)
   assert.deepEqual(persistCalls.map((entry) => ({ index: entry.index, answers: entry.answers })), [
     { index: 1, answers: [["next answer"], []] },
     { index: 0, answers: [[], []] },

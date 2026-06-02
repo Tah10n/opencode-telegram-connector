@@ -6,10 +6,13 @@ import { hasHandledPermission, permissionReplyIdempotencyKey } from "./permissio
 function ignoreError() {}
 
 function pendingPermissionSession(store, projectAlias, permissionId, sessionID) {
-  const pendingPermission = store.getPendingPermission?.(projectAlias, permissionId, sessionID) || null
+  const callbackSessionID = String(sessionID || "").trim()
+  const candidate = store.getPendingPermission?.(projectAlias, permissionId, callbackSessionID) || null
+  const candidateSessionID = String(candidate?.sessionID || "").trim()
+  const pendingPermission = !callbackSessionID && candidateSessionID ? null : candidate
   return {
     pendingPermission,
-    effectiveSessionID: sessionID || pendingPermission?.sessionID || "",
+    effectiveSessionID: callbackSessionID || pendingPermission?.sessionID || "",
   }
 }
 
@@ -31,6 +34,24 @@ async function answerStaleIfBindingChanged({
     return false
   }
   cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, effectiveSessionID)
+  await answerStalePromptCallback(callbackQuery, ctxMeta, msg?.message_id, projectAlias)
+  return true
+}
+
+async function answerStaleIfSessionlessPendingMissing({
+  store,
+  sessionID,
+  pendingPermission,
+  ctxMeta,
+  msg,
+  projectAlias,
+  permissionId,
+  cleanupPermissionState,
+  answerStalePromptCallback,
+  callbackQuery,
+}) {
+  if (sessionID || pendingPermission || typeof store?.getPendingPermission !== "function") return false
+  cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, "")
   await answerStalePromptCallback(callbackQuery, ctxMeta, msg?.message_id, projectAlias)
   return true
 }
@@ -84,6 +105,18 @@ export async function handlePermissionReplyAction({
     await deleteInteractiveMessage(ctxMeta, msg?.message_id)
     return true
   }
+  if (await answerStaleIfSessionlessPendingMissing({
+    store,
+    sessionID,
+    pendingPermission,
+    ctxMeta,
+    msg,
+    projectAlias,
+    permissionId,
+    cleanupPermissionState,
+    answerStalePromptCallback,
+    callbackQuery,
+  })) return true
   if (hasIdempotencyKey(submittedKey)) {
     const liveStatus = await livePermissionPromptStatus(oc, permissionId, effectiveSessionID)
     if (liveStatus === "retryable") {
@@ -178,6 +211,18 @@ export async function handlePermissionRejectNoteAction({
   runtime,
 }) {
   const { pendingPermission, effectiveSessionID } = pendingPermissionSession(store, projectAlias, permissionId, sessionID)
+  if (await answerStaleIfSessionlessPendingMissing({
+    store,
+    sessionID,
+    pendingPermission,
+    ctxMeta,
+    msg,
+    projectAlias,
+    permissionId,
+    cleanupPermissionState,
+    answerStalePromptCallback,
+    callbackQuery,
+  })) return true
   if (await answerStaleIfBindingChanged({
     ctxMeta,
     msg,
@@ -233,6 +278,18 @@ export async function handlePermissionCancelNoteAction({
   setRejectNoteAwaitingState,
 }) {
   const { pendingPermission, effectiveSessionID } = pendingPermissionSession(store, projectAlias, permissionId, sessionID)
+  if (await answerStaleIfSessionlessPendingMissing({
+    store,
+    sessionID,
+    pendingPermission,
+    ctxMeta,
+    msg,
+    projectAlias,
+    permissionId,
+    cleanupPermissionState,
+    answerStalePromptCallback,
+    callbackQuery,
+  })) return true
   if (await answerStaleIfBindingChanged({
     ctxMeta,
     msg,
