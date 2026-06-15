@@ -1,5 +1,5 @@
-import { isRetryableBoundaryError, isStaleBoundaryError } from "../../boundary-errors.js"
-import { promptSubmissionIdempotencyKey } from "../idempotency.js"
+import { classifyBoundaryError, isStaleBoundaryError, makeBoundaryError } from "../../boundary-errors.js"
+import { promptScopedSubmissionIdempotencyKey, promptSubmissionIdempotencyKey } from "../idempotency.js"
 import { livePermissionPromptStatus, shouldRetrySubmittedPrompt } from "../prompt-submission.js"
 import { hasHandledPermission, permissionReplyIdempotencyKey } from "./permission-state.js"
 
@@ -14,6 +14,31 @@ function pendingPermissionSession(store, projectAlias, permissionId, sessionID) 
     pendingPermission,
     effectiveSessionID: callbackSessionID || pendingPermission?.sessionID || "",
   }
+}
+
+function promptSubmissionScopeMetadata({ projectAlias, ctxKey, sessionID, promptId, promptType, operation, finalKey }) {
+  return {
+    kind: "prompt-submission-scope",
+    projectAlias,
+    ctxKey,
+    sessionId: sessionID,
+    promptId,
+    promptType,
+    operation,
+    finalKey,
+  }
+}
+
+function makePermissionSubmissionInFlightError() {
+  return makeBoundaryError({
+    source: "opencode",
+    operation: "GET /permission",
+    method: "GET",
+    pathname: "/permission",
+    kind: "network",
+    outcome: "retryable",
+    message: "Permission prompt submission is already in progress",
+  })
 }
 
 async function answerStaleIfBindingChanged({
@@ -98,6 +123,7 @@ export async function handlePermissionReplyAction({
 
   const replyKey = permissionReplyIdempotencyKey(projectAlias, effectiveSessionID, permissionId, action)
   const submittedKey = promptSubmissionIdempotencyKey(replyKey)
+  const scopedSubmittedKey = promptScopedSubmissionIdempotencyKey(projectAlias, effectiveSessionID, permissionId, "permission")
   if (hasIdempotencyKey(replyKey) || hasHandledPermission(store, projectAlias, effectiveSessionID, permissionId)) {
     cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, effectiveSessionID)
     await flushStoreIfAvailable()
@@ -120,10 +146,15 @@ export async function handlePermissionReplyAction({
   if (hasIdempotencyKey(submittedKey)) {
     const liveStatus = await livePermissionPromptStatus(oc, permissionId, effectiveSessionID)
     if (liveStatus === "retryable") {
-      recordCallbackOutcome?.(projectAlias, "retryable")
-      await answerCallbackQuery(callbackQuery.id, "Temporarily unavailable")
-      await sendToThread(ctxMeta, t(ctxMeta, "callbacks.actionTemporarilyUnavailable")).catch(ignoreError)
-      return true
+      throw makeBoundaryError({
+        source: "opencode",
+        operation: "GET /permission",
+        method: "GET",
+        pathname: "/permission",
+        kind: "network",
+        outcome: "retryable",
+        message: "Permission prompt status temporarily unavailable",
+      })
     }
     if (!shouldRetrySubmittedPrompt(liveStatus)) {
       await markIdempotencyKey(replyKey, {
@@ -139,7 +170,24 @@ export async function handlePermissionReplyAction({
       await deleteInteractiveMessage(ctxMeta, msg?.message_id)
       return true
     }
+  } else if (hasIdempotencyKey(scopedSubmittedKey)) {
+    const liveStatus = await livePermissionPromptStatus(oc, permissionId, effectiveSessionID)
+    if (liveStatus === "retryable" || shouldRetrySubmittedPrompt(liveStatus)) throw makePermissionSubmissionInFlightError()
+    cleanupPermissionState(ctxMeta.ctxKey, projectAlias, permissionId, effectiveSessionID)
+    await flushStoreIfAvailable()
+    await answerCallbackQuery(callbackQuery.id, "Already handled")
+    await deleteInteractiveMessage(ctxMeta, msg?.message_id)
+    return true
   } else {
+    await markIdempotencyKey(scopedSubmittedKey, promptSubmissionScopeMetadata({
+      projectAlias,
+      ctxKey: ctxMeta.ctxKey,
+      sessionID: effectiveSessionID,
+      promptId: permissionId,
+      promptType: "permission",
+      operation: "replyPermission",
+      finalKey: replyKey,
+    }))
     await markIdempotencyKey(submittedKey, {
       kind: "prompt-submission",
       projectAlias,
@@ -168,11 +216,9 @@ export async function handlePermissionReplyAction({
       await deleteInteractiveMessage(ctxMeta, msg?.message_id)
       return true
     }
-    if (isRetryableBoundaryError(err, { source: "opencode", pathname: `/permission/${permissionId}/reply`, method: "POST" })) {
-      recordCallbackOutcome?.(projectAlias, "retryable")
-      await answerCallbackQuery(callbackQuery.id, "Temporarily unavailable")
-      await sendToThread(ctxMeta, t(ctxMeta, "callbacks.actionTemporarilyUnavailable")).catch(ignoreError)
-      return true
+    const retryableClassification = classifyBoundaryError(err, { source: "opencode", pathname: `/permission/${permissionId}/reply`, method: "POST" })
+    if (retryableClassification.retryable) {
+      throw retryableClassification.error
     }
     throw err
   }
@@ -247,14 +293,32 @@ export async function handlePermissionRejectNoteAction({
   }
   setRejectNoteAwaitingState(ctxMeta.ctxKey, { projectAlias, permissionId, ...(effectiveSessionID ? { sessionID: effectiveSessionID } : {}) })
   try {
+    await flushStoreIfAvailable()
+  } catch (err) {
+    setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
+    try {
+      await flushStoreIfAvailable()
+    } catch (rollbackErr) {
+      runtime.logger?.error?.("Failed to roll back reject-note flow state:", rollbackErr?.message || String(rollbackErr))
+    }
+    throw err
+  }
+  try {
     await sendRejectNotePrompt(ctxMeta, projectAlias, permissionId, { sessionID: effectiveSessionID })
   } catch (err) {
     setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
     runtime.logger?.error?.("Failed to start reject-note flow:", err?.message || String(err))
+    try {
+      await flushStoreIfAvailable()
+    } catch (rollbackErr) {
+      runtime.logger?.error?.("Failed to roll back reject-note flow state:", rollbackErr?.message || String(rollbackErr))
+      throw rollbackErr
+    }
+    const classification = classifyBoundaryError(err, { source: "telegram", operation: "send reject-note prompt" })
+    if (classification.retryable) throw classification.error
     await answerCallbackQuery(callbackQuery.id, "Unavailable")
     return true
   }
-  await flushStoreIfAvailable()
   await answerCallbackQuery(callbackQuery.id, "Send note")
   await deleteInteractiveMessage(ctxMeta, msg?.message_id)
   return true

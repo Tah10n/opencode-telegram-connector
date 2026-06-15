@@ -1,4 +1,4 @@
-import { classifyBoundaryError } from "../boundary-errors.js"
+import { classifyBoundaryError, makeBoundaryError } from "../boundary-errors.js"
 import { escapeHtml } from "../telegram/formatter.js"
 import { t as translate } from "../i18n/index.js"
 import { isSafeOpenCodeId } from "../opencode/ids.js"
@@ -37,6 +37,22 @@ function classifySnapshotFailure(err, { pathname }) {
     pathname,
   })
   return classification.retryable ? "retryable" : "fatal"
+}
+
+function classifyTelegramDeliveryFailure(err, { operation }) {
+  const classification = classifyBoundaryError(err, {
+    source: "telegram",
+    operation,
+  })
+  if (classification.retryable) return "retryable"
+  if (classification.stale) return "stale"
+  return "fatal"
+}
+
+function recordRecoveryDeliveryFailure(summaryBucket, projectAlias, err, { operation, record }) {
+  const outcome = classifyTelegramDeliveryFailure(err, { operation })
+  summaryBucket[outcome] += 1
+  record(projectAlias, outcome)
 }
 
 function buildWizardFromSnapshot(snapshot, { request } = {}) {
@@ -161,7 +177,19 @@ export function createPromptRecovery(runtime) {
   }
 
   async function flushStoreIfAvailable() {
-    if (typeof store?.flush === "function") await store.flush()
+    if (typeof store?.flush !== "function") return
+    try {
+      await store.flush()
+    } catch (err) {
+      throw makeBoundaryError({
+        source: "state",
+        operation: "persist pending prompt recovery state",
+        kind: "durability",
+        outcome: "fatal",
+        message: `persist pending prompt recovery state failed: ${err?.message || String(err)}`,
+        cause: err,
+      })
+    }
   }
 
   async function getLivePromptSnapshot(projectAlias) {
@@ -259,6 +287,15 @@ export function createPromptRecovery(runtime) {
 
     function withEffectiveSession(value, sessionID) {
       return sessionID && !value?.sessionID ? { ...value, sessionID } : value
+    }
+
+    function hasPendingCustomAnswerForQuestion(projectAlias, sessionID, questionId) {
+      for (const value of Object.values(pending.customAnswers || {})) {
+        if (value?.projectAlias !== projectAlias || value?.requestId !== questionId) continue
+        const effectiveSessionID = effectivePendingValueSession(value, pending.questionWizards, questionId)
+        if (String(effectiveSessionID || "").trim() === String(sessionID || "").trim()) return true
+      }
+      return false
     }
 
     async function materializeRecoveredPermission(entry, sessionID) {
@@ -386,9 +423,8 @@ export function createPromptRecovery(runtime) {
             },
             ctx,
           )
-        } catch {
-          summary.permissions.retryable += 1
-          record(entry.projectAlias, "retryable")
+        } catch (err) {
+          recordRecoveryDeliveryFailure(summary.permissions, entry.projectAlias, err, { operation: "send recovered permission prompt", record })
             continue
           }
         prompted[effectiveEntry.projectAlias]?.permission.add(promptIdentity(effectiveEntry.permissionId, effectiveEntry.sessionID))
@@ -505,9 +541,8 @@ export function createPromptRecovery(runtime) {
             },
           ])
           await sendCurrentQuestionStep(wizard)
-        } catch {
-          summary.questionWizards.retryable += 1
-          record(snapshot.projectAlias, "retryable")
+        } catch (err) {
+          recordRecoveryDeliveryFailure(summary.questionWizards, snapshot.projectAlias, err, { operation: "send recovered question prompt", record })
             continue
           }
         prompted[snapshot.projectAlias]?.question.add(promptIdentity(snapshot.id, effectiveSessionID))
@@ -541,11 +576,13 @@ export function createPromptRecovery(runtime) {
       }
 
       if (questions.outcome === "retryable") {
-        prompted[snapshot.projectAlias]?.question.add(promptIdentity(snapshot.id, snapshot.sessionID))
         questionWizards.set(
           wizardKey(snapshot.projectAlias, snapshot.id, snapshot.sessionID),
           buildWizardFromSnapshot({ ...snapshot, ctx }),
         )
+        if (hasPendingCustomAnswerForQuestion(snapshot.projectAlias, snapshot.sessionID, snapshot.id)) {
+          prompted[snapshot.projectAlias]?.question.add(promptIdentity(snapshot.id, snapshot.sessionID))
+        }
       }
 
       summary.questionWizards[questions.outcome] += 1
@@ -624,9 +661,8 @@ export function createPromptRecovery(runtime) {
         if (bindingCtx?.chatId) {
           try {
             await sendRejectNotePrompt(bindingCtx, value.projectAlias, value.permissionId, { resumed: true, sessionID: effectiveSessionID })
-          } catch {
-            summary.rejectNotes.retryable += 1
-            record(value.projectAlias, "retryable")
+          } catch (err) {
+            recordRecoveryDeliveryFailure(summary.rejectNotes, value.projectAlias, err, { operation: "send recovered reject-note prompt", record })
             continue
           }
         }
@@ -754,9 +790,8 @@ export function createPromptRecovery(runtime) {
         if (bindingCtx?.chatId) {
           try {
             await sendQuestionCustomAnswerPrompt(bindingCtx, value.projectAlias, value.requestId, value.qIndex, label, { resumed: true, sessionID: effectiveSessionID })
-          } catch {
-            summary.customAnswers.retryable += 1
-            record(value.projectAlias, "retryable")
+          } catch (err) {
+            recordRecoveryDeliveryFailure(summary.customAnswers, value.projectAlias, err, { operation: "send recovered custom-answer prompt", record })
             continue
           }
         }

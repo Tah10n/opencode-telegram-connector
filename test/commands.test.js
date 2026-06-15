@@ -5,6 +5,7 @@ import { createCommandHandlers } from "../src/connector/commands.js"
 import {
   hashIdempotencyValue,
   permissionNoteIdempotencyKey,
+  promptScopedSubmissionIdempotencyKey,
   promptSubmissionIdempotencyKey,
   telegramMessageIdempotencyKey,
 } from "../src/connector/idempotency.js"
@@ -485,6 +486,41 @@ test("createCommandHandlers handlePermissions renders bound project read-only ou
   assert.doesNotMatch(sent[0].text, /C:\/repo\/demo\/opencode\.json|Config:/)
   assert.match(sent[0].text, /read-only here/)
   assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text), ["Close"])
+})
+
+test("createCommandHandlers handlePermissions renders Russian permission UI without English profile terms", async () => {
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    readPermissionConfig: async () => ({
+      ok: true,
+      editable: true,
+      status: "ok",
+      filePath: "C:/repo/demo/opencode.json",
+      profile: "auto-edit",
+      permission: {},
+    }),
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0", locale: "ru" }, [])
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Права OpenCode:/)
+  assert.match(sent[0].text, /Профиль: Автоправки/)
+  assert.match(sent[0].text, /С подтверждением:/)
+  assert.match(sent[0].text, /Полный авто:/)
+  assert.doesNotMatch(sent[0].text, /Suggest|Auto Edit|Full Auto|Custom|OpenCode default|subagents|skills|todo writes|Web search|catch-all|clone\/overview|loop/)
+  assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text), [
+    "С подтверждением",
+    "Автоправки",
+    "Полный авто",
+    "Дефолт OpenCode",
+    "Показать текущие",
+    "Закрыть",
+  ])
 })
 
 test("createCommandHandlers renderPermissionDetails is private-chat only", async () => {
@@ -998,6 +1034,7 @@ test("createCommandHandlers handlePermissions asks confirmation for full-auto", 
   assert.deepEqual(writes, [])
   assert.equal(sent.length, 1)
   assert.match(sent[0].text, /Confirm Full Auto permissions:/)
+  assert.match(sent[0].text, /Shell commands still ask for approval\./)
   assert.deepEqual(callbackParts(sent[0].replyMarkup.inline_keyboard[0][0].callback_data), ["pc", "apply", "demo", "full-auto"])
 })
 
@@ -1707,6 +1744,67 @@ test("createCommandHandlers handleNewCommand refuses invalid created session ids
       demo: {
         async createSession() {
           return { id: "bad/id" }
+        },
+        async selectTuiSession(sessionId) {
+          selectCalls.push(sessionId)
+        },
+      },
+    },
+    bindCtxToSession: async (...args) => {
+      bindCalls.push(args)
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleNewCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "Demo title")
+
+  assert.deepEqual(selectCalls, [])
+  assert.deepEqual(bindCalls, [])
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Project 'demo' is unavailable/)
+})
+
+test("createCommandHandlers handleBindCommand rejects created scoped sessions without directory evidence", async () => {
+  const bindCalls = []
+  const createCalls = []
+  const startupSessionByProject = {}
+  const { runtime, sent } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/demo" } },
+    startupSessionByProject,
+    getStartupSession: async () => null,
+    ocByAlias: {
+      demo: {
+        async createSession(options) {
+          createCalls.push(options)
+          return { id: "ses_new" }
+        },
+      },
+    },
+    bindCtxToSession: async (...args) => {
+      bindCalls.push(args)
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleBindCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, ["demo"])
+
+  assert.deepEqual(createCalls, [{ directory: "C:/demo" }])
+  assert.deepEqual(bindCalls, [])
+  assert.deepEqual(startupSessionByProject, {})
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Project 'demo' is unavailable/)
+})
+
+test("createCommandHandlers handleNewCommand rejects created scoped sessions from another directory", async () => {
+  const bindCalls = []
+  const selectCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/demo", openAttachOnNewMode: "same-window" } },
+    ocByAlias: {
+      demo: {
+        async createSession() {
+          return { id: "ses_new", directory: "C:/other" }
         },
         async selectTuiSession(sessionId) {
           selectCalls.push(sessionId)
@@ -2741,6 +2839,7 @@ test("createCommandHandlers handleModelCommand refuses project default when none
 
 test("createCommandHandlers handleTelegramMessage forwards the custom model override", async () => {
   const promptCalls = []
+  const markProjectUpCalls = []
   const { runtime } = makeRuntime({
     config: { tgPrefix: "[TG] " },
     storeState: {
@@ -2757,6 +2856,7 @@ test("createCommandHandlers handleTelegramMessage forwards the custom model over
         },
       },
     },
+    markProjectUp: (alias) => markProjectUpCalls.push(alias),
   })
   const handlers = createCommandHandlers(runtime)
 
@@ -2774,6 +2874,7 @@ test("createCommandHandlers handleTelegramMessage forwards the custom model over
       options: { model: { providerID: "openai", modelID: "gpt-5" }, variant: "xhigh" },
     },
   ])
+  assert.deepEqual(markProjectUpCalls, ["demo"])
 })
 
 test("createCommandHandlers handleTelegramMessage blocks prompts behind stale active turns", async () => {
@@ -2857,6 +2958,49 @@ test("createCommandHandlers handleTelegramMessage rethrows retryable promptAsync
 
   assert.deepEqual(promptCalls, [{ sessionId: "ses_current", text: "[TG] retry me" }])
   assert.match(sent[0].text, /Project 'demo' is unavailable/)
+})
+
+test("createCommandHandlers delegates retryable promptAsync failure notices to the throttled notifier", async () => {
+  const notices = []
+  const err = makeBoundaryError({
+    source: "opencode",
+    operation: "POST /session/ses_current/prompt_async",
+    method: "POST",
+    pathname: "/session/ses_current/prompt_async",
+    status: 503,
+    message: "opencode unavailable",
+  })
+  const { runtime, sent } = makeRuntime({
+    config: { tgPrefix: "[TG] " },
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    ocByAlias: {
+      demo: {
+        async promptAsync() {
+          throw err
+        },
+      },
+    },
+    isRetryableProjectError: () => true,
+    notifyProjectUnavailableForThread: async (ctxMeta, alias, error, options) => {
+      notices.push({ ctxMeta, alias, error, options })
+      return true
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await assert.rejects(() => handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_thread_id: 7,
+    text: "retry me",
+  }), /opencode unavailable/)
+
+  assert.equal(sent.length, 0)
+  assert.equal(notices.length, 1)
+  assert.equal(notices[0].ctxMeta.ctxKey, "100:7")
+  assert.equal(notices[0].alias, "demo")
+  assert.equal(notices[0].error, err)
+  assert.equal(notices[0].options.platform, "win32")
 })
 
 test("createCommandHandlers clears preflight prompt idempotency after promptAsync failure", async () => {
@@ -3041,8 +3185,7 @@ test("createCommandHandlers rethrows reject-note durability failures before remo
   )
 
   assert.deepEqual(replyCalls, [])
-  assert.equal(marked.length, 1)
-  assert.equal(marked[0].metadata.kind, "prompt-submission")
+  assert.deepEqual(marked.map((entry) => entry.metadata.kind), ["prompt-submission-scope", "prompt-submission"])
 })
 
 test("createCommandHandlers finalizes submitted reject notes without reposting inactive prompts", async () => {
@@ -3096,9 +3239,62 @@ test("createCommandHandlers finalizes submitted reject notes without reposting i
   assert.equal(sent.at(-1)?.text, "Rejection note already sent.")
 })
 
+test("createCommandHandlers blocks alternate reject notes while another permission submission is in flight", async () => {
+  const originalNoteKey = permissionNoteIdempotencyKey("demo", "ses_1", "perm_1", "first note")
+  const scopedSubmissionKey = promptScopedSubmissionIdempotencyKey("demo", "ses_1", "perm_1", "permission")
+  const idempotencyKeys = new Set([scopedSubmissionKey, promptSubmissionIdempotencyKey(originalNoteKey)])
+  const replyCalls = []
+  const marked = []
+  const rejectNoteAwaiting = new Map([
+    ["100:7", { projectAlias: "demo", permissionId: "perm_1", sessionID: "ses_1" }],
+  ])
+  const { runtime, sent } = makeRuntime({
+    rejectNoteAwaiting,
+    store: {
+      hasIdempotencyKey: (key) => idempotencyKeys.has(key),
+      markIdempotencyKey(key, metadata) {
+        marked.push({ key, metadata })
+        idempotencyKeys.add(key)
+        return true
+      },
+      deletePendingPermission: () => true,
+      async flush() {},
+    },
+    setRejectNoteAwaitingState(ctxKey, value) {
+      if (value) rejectNoteAwaiting.set(ctxKey, value)
+      else rejectNoteAwaiting.delete(ctxKey)
+    },
+    ocByAlias: {
+      demo: {
+        async listPermissions() {
+          return [{ id: "perm_1", sessionID: "ses_1" }]
+        },
+        async replyPermission(permissionId, payload) {
+          replyCalls.push({ permissionId, payload })
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 323,
+    message_thread_id: 7,
+    text: "different note",
+  })
+
+  assert.deepEqual(replyCalls, [])
+  assert.deepEqual(marked, [])
+  assert.equal(rejectNoteAwaiting.has("100:7"), true)
+  assert.equal(sent.at(-1)?.text, "Permission reply is temporarily unavailable. Send the note again or /cancel.")
+})
+
 test("createCommandHandlers handleTelegramMessage forwards small text documents as attachment prompts", async () => {
   const promptCalls = []
   const events = []
+  const markProjectUpCalls = []
   const idempotencyKeys = new Set()
   const { runtime, sent } = makeRuntime({
     config: { tgPrefix: "[TG] " },
@@ -3134,6 +3330,7 @@ test("createCommandHandlers handleTelegramMessage forwards small text documents 
         },
       },
     },
+    markProjectUp: (alias) => markProjectUpCalls.push(alias),
   })
   const handlers = createCommandHandlers(runtime)
 
@@ -3152,6 +3349,7 @@ test("createCommandHandlers handleTelegramMessage forwards small text documents 
   assert.match(promptCalls[0].text, /Filename: app\.js/)
   assert.match(promptCalls[0].text, /console\.log\(1\)/)
   assert.deepEqual(events.slice(0, 3), ["mark:promptAsyncAttachment", "flush", "prompt"])
+  assert.deepEqual(markProjectUpCalls, ["demo"])
   assert.match(sent.at(-1).text, /Attachment sent to demo\/ses_current: app\.js/)
 })
 
@@ -3927,6 +4125,7 @@ test("createCommandHandlers rethrows retryable Telegram attachment download fail
 })
 
 test("createCommandHandlers rethrows retryable OpenCode send failures for attachments", async () => {
+  const notices = []
   const err = makeBoundaryError({
     source: "opencode",
     operation: "POST /session/ses_current/prompt_async",
@@ -3953,6 +4152,10 @@ test("createCommandHandlers rethrows retryable OpenCode send failures for attach
       },
     },
     isRetryableProjectError: () => true,
+    notifyProjectUnavailableForThread: async (ctxMeta, alias, error, options) => {
+      notices.push({ ctxMeta, alias, error, options })
+      return true
+    },
   })
   const handlers = createCommandHandlers(runtime)
 
@@ -3966,7 +4169,12 @@ test("createCommandHandlers rethrows retryable OpenCode send failures for attach
     }),
     /opencode unavailable/,
   )
-  assert.match(sent[0].text, /Project 'demo' is unavailable/)
+  assert.equal(sent.length, 0)
+  assert.equal(notices.length, 1)
+  assert.equal(notices[0].ctxMeta.ctxKey, "100:7")
+  assert.equal(notices[0].alias, "demo")
+  assert.equal(notices[0].error, err)
+  assert.ok(notices[0].options.fallbackReplyMarkup)
 })
 
 test("createCommandHandlers handleTelegramMessage serves help and unknown commands", async () => {

@@ -299,7 +299,11 @@ function createFakeOpenCodeClient({
     },
     async createSession(input = {}) {
       calls.createSession.push(input)
-      return createSessionImpl ? createSessionImpl(input) : { id: "ses_created" }
+      const created = createSessionImpl ? await createSessionImpl(input) : { id: "ses_created" }
+      if (input?.directory && created && typeof created === "object" && !("directory" in created)) {
+        return { ...created, directory: input.directory }
+      }
+      return created
     },
     async selectTuiSession(sessionId, options = {}) {
       calls.selectTuiSession.push(options === undefined ? { sessionId } : { sessionId, options })
@@ -373,6 +377,9 @@ async function createHarness({
   wizardTtlMs,
   wizardGcIntervalMs,
   assistantDrainTimeoutMs,
+  autoStartStaggerMs,
+  autoStartRetryDelayMs,
+  autoStartRetryAttempts,
   opencodeWatchdog,
   createStateStoreImpl,
   configPatch,
@@ -450,6 +457,9 @@ async function createHarness({
       ...(wizardTtlMs != null ? { wizardTtlMs } : {}),
       ...(wizardGcIntervalMs != null ? { wizardGcIntervalMs } : {}),
       ...(assistantDrainTimeoutMs != null ? { assistantDrainTimeoutMs } : {}),
+      ...(autoStartStaggerMs != null ? { autoStartStaggerMs } : {}),
+      ...(autoStartRetryDelayMs != null ? { autoStartRetryDelayMs } : {}),
+      ...(autoStartRetryAttempts != null ? { autoStartRetryAttempts } : {}),
       ...(opencodeWatchdog ? { opencodeWatchdog } : {}),
       delay: delayImpl,
     },
@@ -2850,6 +2860,65 @@ test("startConnector restores pending permission reject-note flows after restart
   }
 })
 
+test("startConnector recovers pending prompts before first-run backlog drain", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: null,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+      },
+      pendingPrompts: {
+        permissions: {
+          "demo:ses_1:perm_first_run": {
+            projectAlias: "demo",
+            permissionId: "perm_first_run",
+            sessionID: "ses_1",
+            permission: "shell",
+            patterns: ["npm test"],
+            ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+            createdAt: Date.now(),
+          },
+        },
+        rejectNotes: {
+          "100:7": { projectAlias: "demo", permissionId: "perm_first_run", sessionID: "ses_1" },
+        },
+        customAnswers: {},
+        questionWizards: {},
+      },
+    },
+    ocOptions: {
+      listPermissionsImpl: async () => [
+        {
+          id: "perm_first_run",
+          sessionID: "ses_1",
+          permission: "shell",
+          patterns: ["npm test"],
+        },
+      ],
+    },
+    initialUpdates: [[makeMessageUpdate(1, "because the restored prompt is still active")]],
+  })
+
+  try {
+    await waitFor(() => harness.ocCalls.replyPermission.length === 1)
+    await harness.connector.stop()
+
+    assert.deepEqual(harness.ocCalls.replyPermission, [
+      { permissionId: "perm_first_run", payload: { reply: "reject", message: "because the restored prompt is still active" } },
+    ])
+
+    const state = await readState(harness.stateFile)
+    assert.equal(state.updateOffset, 2)
+    assert.deepEqual(state.pendingPrompts.permissions, {})
+    assert.deepEqual(state.pendingPrompts.rejectNotes, {})
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
 test("startConnector retries reject-note input after a transient permission reply failure", async () => {
   let replyAttempts = 0
   const firstNoteUpdate = makeMessageUpdate(362, "because it is unsafe")
@@ -3340,12 +3409,12 @@ test("startConnector restores final question submission after a restart during r
 
   try {
     await waitFor(() => secondHarness.tg.sentHtmlBlocks.length >= 1 && secondHarness.tg.sentMessages.length >= 2)
-    secondHarness.tg.enqueue(makeMessageUpdate(373, "because the retry succeeded"))
+    secondHarness.tg.enqueue(makeMessageUpdate(373, "because the first try failed"))
     await waitFor(() => secondHarness.ocCalls.replyQuestion.length === 1)
     await secondHarness.connector.stop()
 
     assert.deepEqual(secondHarness.ocCalls.replyQuestion, [
-      { questionId: "q_restart", answers: [["because the retry succeeded"]] },
+      { questionId: "q_restart", answers: [["because the first try failed"]] },
     ])
 
     const finalState = await readState(secondHarness.stateFile)
@@ -3643,6 +3712,251 @@ test("startConnector defers SSE startup until the initial auto-start settles", a
   }
 })
 
+test("startConnector treats startup-session refresh failures as best-effort after auto-start succeeds", async () => {
+  const startCalls = []
+  let startupSessionCalls = 0
+  const harness = await createHarness({
+    projectPatch: {
+      autoStart: true,
+      port: 4312,
+    },
+    autoStartRetryDelayMs: 1,
+    ensureOpenCodeRunningImpl: async ({ projectAlias }) => {
+      startCalls.push(projectAlias)
+      return { stop() {} }
+    },
+    ensureStartupSessionImpl: async () => {
+      startupSessionCalls += 1
+      throw makeBoundaryError({ source: "opencode", kind: "network", outcome: "retryable", message: "session list unavailable" })
+    },
+  })
+
+  try {
+    await waitFor(() => harness.hasSseHandler("demo"))
+    await delay(20)
+
+    assert.deepEqual(startCalls, ["demo"])
+    assert.ok(startupSessionCalls >= 1)
+    assert.equal(harness.tg.sentMessages.some((entry) => /Project 'demo' is unavailable/.test(entry.text)), false)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector starts initial auto-start projects sequentially and retries failures", async () => {
+  const startCalls = []
+  const attemptsByAlias = new Map()
+  const activeStarts = new Set()
+  let maxConcurrentStarts = 0
+  const harness = await createHarness({
+    projectPatch: {
+      autoStart: true,
+      port: 4312,
+    },
+    extraProjects: {
+      alpha: {
+        baseUrl: "http://127.0.0.1:4313",
+        directory: "C:/alpha",
+        autoStart: true,
+        port: 4313,
+      },
+      beta: {
+        baseUrl: "http://127.0.0.1:4314",
+        directory: "C:/beta",
+        autoStart: true,
+        port: 4314,
+      },
+    },
+    ensureOpenCodeRunningImpl: async ({ projectAlias }) => {
+      startCalls.push(projectAlias)
+      activeStarts.add(projectAlias)
+      maxConcurrentStarts = Math.max(maxConcurrentStarts, activeStarts.size)
+      await delay(1)
+      activeStarts.delete(projectAlias)
+
+      const attempt = (attemptsByAlias.get(projectAlias) || 0) + 1
+      attemptsByAlias.set(projectAlias, attempt)
+      if (projectAlias === "alpha" && attempt === 1) {
+        throw makeBoundaryError({ source: "opencode", kind: "network", outcome: "retryable", message: "fetch failed" })
+      }
+      return { stop() {} }
+    },
+    ensureStartupSessionImpl: async ({ alias, startupSessionByProject }) => {
+      startupSessionByProject[alias] = `ses_${alias}`
+      return `ses_${alias}`
+    },
+  })
+
+  try {
+    await waitFor(() => startCalls.length === 4 && harness.hasSseHandler("demo") && harness.hasSseHandler("alpha") && harness.hasSseHandler("beta"))
+
+    assert.equal(maxConcurrentStarts, 1)
+    assert.deepEqual(startCalls, ["demo", "alpha", "beta", "alpha"])
+    assert.deepEqual(Object.fromEntries(attemptsByAlias), { demo: 1, alpha: 2, beta: 1 })
+    assert.equal(harness.tg.sentMessages.some((entry) => /Project 'alpha' is unavailable/.test(entry.text)), false)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector defers queued initial auto-start session prefetch until project start settles", async () => {
+  const started = new Set()
+  const listBeforeStart = []
+  let releaseDemoStart = () => {}
+  const demoStartGate = new Promise((resolve) => {
+    releaseDemoStart = resolve
+  })
+  const harness = await createHarness({
+    projectPatch: {
+      autoStart: true,
+      port: 4312,
+    },
+    extraProjects: {
+      alpha: {
+        baseUrl: "http://127.0.0.1:4313",
+        directory: "C:/alpha",
+        autoStart: true,
+        port: 4313,
+      },
+    },
+    ocOptionsByAlias: {
+      alpha: {
+        listSessionsImpl: async (input = {}) => {
+          if (!started.has("alpha")) listBeforeStart.push("alpha")
+          return [{ id: "ses_alpha", directory: input.directory }]
+        },
+      },
+    },
+    ensureOpenCodeRunningImpl: async ({ projectAlias }) => {
+      if (projectAlias === "demo") await demoStartGate
+      started.add(projectAlias)
+      return { stop() {} }
+    },
+  })
+
+  try {
+    await delay(5)
+    assert.deepEqual(listBeforeStart, [])
+    assert.equal(harness.ocCallsByAlias.alpha.listSessions.length, 0)
+
+    releaseDemoStart()
+    await waitFor(() => started.has("alpha") && harness.hasSseHandler("alpha"))
+
+    assert.deepEqual(listBeforeStart, [])
+    assert.equal(harness.ocCallsByAlias.alpha.listSessions.length, 1)
+  } finally {
+    releaseDemoStart()
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector suppresses watchdog restarts while initial auto-start retry is pending", async () => {
+  const retryableErr = makeBoundaryError({
+    source: "opencode",
+    operation: "POST /session/:id/prompt_async",
+    method: "POST",
+    pathname: "/session/ses_current/prompt_async",
+    kind: "network",
+    outcome: "retryable",
+    message: "fetch failed",
+  })
+  const startCalls = []
+  const stopCalls = []
+  const portStopCalls = []
+  const uiStopCalls = []
+  let retryDelayHasStarted = false
+  let markRetryDelayStarted = () => {
+    retryDelayHasStarted = true
+  }
+  let releaseRetryDelayGate = () => {}
+  let retryDelayReleased = false
+  const retryDelayGate = new Promise((resolve) => {
+    releaseRetryDelayGate = resolve
+  })
+  function releaseRetryDelay() {
+    if (retryDelayReleased) return
+    retryDelayReleased = true
+    releaseRetryDelayGate()
+  }
+  const delayImpl = async (ms) => {
+    if (ms === 100) {
+      markRetryDelayStarted()
+      await retryDelayGate
+      return
+    }
+    await delay(Math.min(ms, 2))
+  }
+
+  const harness = await createHarness({
+    statePatch: {
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_current" },
+      },
+    },
+    projectPatch: {
+      autoStart: true,
+      port: 4312,
+      openTuiOnAutoStart: true,
+    },
+    ocOptions: {
+      promptAsyncImpl: async () => {
+        throw retryableErr
+      },
+    },
+    opencodeWatchdog: { failureThreshold: 1, windowMs: 60_000, cooldownMs: 0 },
+    autoStartStaggerMs: 0,
+    autoStartRetryDelayMs: 100,
+    autoStartRetryAttempts: 1,
+    delayImpl,
+    ensureOpenCodeRunningImpl: async ({ projectAlias }) => {
+      startCalls.push(projectAlias)
+      if (startCalls.length === 1) throw retryableErr
+      return {
+        stop: async () => {
+          stopCalls.push(projectAlias)
+        },
+      }
+    },
+    stopOpenCodeServeOnPortImpl: async ({ projectAlias, port }) => {
+      portStopCalls.push({ projectAlias, port })
+      return { stopped: true, count: 1, pids: [1234] }
+    },
+    stopOpenCodeUiOnPortImpl: async ({ projectAlias, port }) => {
+      uiStopCalls.push({ projectAlias, port })
+      return { stopped: true, count: 1, pids: [5678] }
+    },
+    ensureStartupSessionImpl: async ({ alias, startupSessionByProject }) => {
+      startupSessionByProject[alias] = "ses_current"
+      return "ses_current"
+    },
+  })
+
+  try {
+    await waitFor(() => retryDelayHasStarted)
+    assert.deepEqual(startCalls, ["demo"])
+
+    harness.tg.enqueue(makeMessageUpdate(411, "hello during initial retry"))
+    await waitFor(() => harness.ocCalls.promptAsync.length >= 1)
+    await delay(5)
+
+    assert.deepEqual(startCalls, ["demo"])
+    assert.deepEqual(stopCalls, [])
+    assert.deepEqual(portStopCalls, [])
+    assert.deepEqual(uiStopCalls, [])
+
+    releaseRetryDelay()
+    await waitFor(() => startCalls.length === 2 && harness.hasSseHandler("demo"))
+
+    assert.deepEqual(startCalls, ["demo", "demo"])
+    assert.deepEqual(stopCalls, [])
+    assert.deepEqual(portStopCalls, [])
+    assert.deepEqual(uiStopCalls, [])
+  } finally {
+    releaseRetryDelay()
+    await harness.connector.stop()
+  }
+})
+
 test("startConnector watchdog restarts an autoStart project after repeated SSE failures", async () => {
   const startCalls = []
   const stopCalls = []
@@ -3932,6 +4246,65 @@ test("startConnector surfaces state flush failures during shutdown", async () =>
   await assert.rejects(() => harness.connector.stop(), /shutdown write failed/)
 })
 
+test("startConnector fails closed when pending prompt recovery cleanup is not durable", async () => {
+  let autoStartCalls = 0
+  let sseStarts = 0
+
+  await assert.rejects(
+    () => createHarness({
+      statePatch: {
+        updateOffset: 700,
+        bindings: {
+          "100:7": { projectAlias: "demo", sessionId: "ses_other" },
+        },
+        pendingPrompts: {
+          permissions: {
+            "demo:ses_1:perm_stale": {
+              projectAlias: "demo",
+              permissionId: "perm_stale",
+              sessionID: "ses_1",
+              permission: "shell",
+              patterns: [],
+              ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+            },
+          },
+          rejectNotes: {},
+          customAnswers: {},
+          questionWizards: {},
+        },
+      },
+      projectPatch: {
+        autoStart: true,
+        port: 4312,
+      },
+      createStateStoreImpl: (options) => {
+        const store = new StateStore(options)
+        store.flush = async () => {
+          throw new Error("recovery write failed")
+        }
+        return store
+      },
+      startSseLoopImpl: () => {
+        sseStarts += 1
+        return { stop() {} }
+      },
+      ensureOpenCodeRunningImpl: async () => {
+        autoStartCalls += 1
+        return { stop() {} }
+      },
+    }),
+    (err) => {
+      assert.equal(err.isBoundaryError, true)
+      assert.equal(err.source, "state")
+      assert.equal(err.kind, "durability")
+      assert.match(err.message, /persist pending prompt recovery state failed: recovery write failed/)
+      return true
+    },
+  )
+  assert.equal(autoStartCalls, 0)
+  assert.equal(sseStarts, 0)
+})
+
 test("startConnector offers a start button on connect errors and recovers after start callback", async () => {
   const startCalls = []
   let promptAttempts = 0
@@ -3967,7 +4340,7 @@ test("startConnector offers a start button on connect errors and recovers after 
   })
 
   try {
-    await waitFor(() => startCalls.length >= 1 && harness.tg.sentMessages.length >= 1)
+    await waitFor(() => startCalls.length >= 2)
     const sentBeforePrompt = harness.tg.sentMessages.length
 
     harness.tg.enqueue(makeMessageUpdate(501, "hello after outage"))
@@ -3980,12 +4353,12 @@ test("startConnector offers a start button on connect errors and recovers after 
     assert.match(recoveryPrompt.text, /Project 'demo' is unavailable/)
 
     harness.tg.enqueue(makeCallbackUpdate(502, "srv|demo|start", { messageId: recoveryPrompt.result.message_id }))
-    await waitFor(() => startCalls.length >= 2)
+    await waitFor(() => startCalls.length >= 3)
     await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text === "Starting opencode for 'demo'…"))
     await waitFor(() => harness.tg.sentMessages.some((entry) => entry.text.includes("Project 'demo' is up:")))
 
     assert.ok(harness.tg.callbackAnswers.some((entry) => entry.callbackQueryId === "cb_502" && entry.text === "Starting…"))
-    assert.deepEqual(startCalls, ["demo", "demo"])
+    assert.deepEqual(startCalls, ["demo", "demo", "demo"])
   } finally {
     await harness.connector.stop()
   }
@@ -4102,6 +4475,67 @@ test("startConnector replays remaining updates after a mid-batch Telegram handle
     assert.ok(harness.tg.getUpdatesCalls.some((call) => call?.timeout === 30 && call?.offset === 601))
   } finally {
     await harness.connector.stop()
+  }
+})
+
+test("startConnector replays retryable continuation prompt delivery without checkpointing the callback", async () => {
+  let rejectNotePromptAttempts = 0
+  const callbackUpdate = makeCallbackUpdate(620, "p|demo|ses_1|perm_note|reject_note")
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 620,
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+      sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+      pendingPrompts: {
+        permissions: {
+          "demo:ses_1:perm_note": {
+            projectAlias: "demo",
+            permissionId: "perm_note",
+            sessionID: "ses_1",
+            permission: "shell",
+            patterns: ["npm test"],
+            ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+          },
+        },
+        rejectNotes: {},
+        customAnswers: {},
+        questionWizards: {},
+      },
+    },
+    ocOptions: {
+      listPermissionsImpl: async () => [{ id: "perm_note", sessionID: "ses_1" }],
+      listQuestionsImpl: async () => [],
+    },
+    tgOptions: {
+      sendMessageImpl: async ({ text }) => {
+        if (String(text || "").includes("Send rejection note")) {
+          rejectNotePromptAttempts += 1
+          if (rejectNotePromptAttempts === 1) {
+            throw makeBoundaryError({
+              source: "telegram",
+              operation: "sendMessage",
+              kind: "network",
+              outcome: "retryable",
+              message: "temporary Telegram send failure",
+            })
+          }
+        }
+      },
+    },
+    initialUpdates: [[callbackUpdate], [callbackUpdate]],
+  })
+
+  try {
+    await waitFor(() => rejectNotePromptAttempts === 2)
+    await waitFor(() => harness.tg.callbackAnswers.some((entry) => entry.text === "Send note"))
+    await harness.connector.stop()
+
+    const state = await readState(harness.stateFile)
+    assert.equal(state.updateOffset, 621)
+    assert.deepEqual(harness.tg.callbackAnswers.map((entry) => entry.text), ["Temporarily unavailable", "Send note"])
+    assert.ok(harness.tg.getUpdatesCalls.filter((call) => call?.offset === 620).length >= 2)
+  } finally {
+    await harness.connector.stop().catch(() => {})
   }
 })
 
@@ -4922,7 +5356,7 @@ test("startConnector clears stale permission callbacks without blocking later up
   }
 })
 
-test("startConnector transient callback failures do not block later updates", async () => {
+test("startConnector keeps retryable callback failures uncheckpointed without thread notices", async () => {
   const harness = await createHarness({
     statePatch: {
       updateOffset: 675,
@@ -4966,16 +5400,16 @@ test("startConnector transient callback failures do not block later updates", as
   })
 
   try {
-    await waitFor(() => harness.ocCalls.promptAsync.length === 1)
+    await waitFor(() => harness.tg.callbackAnswers.some((entry) => entry.callbackQueryId === "cb_675"))
     await harness.connector.stop()
 
     assert.deepEqual(harness.ocCalls.replyPermission, [{ permissionId: "perm_retry", payload: { reply: "once" } }])
-    assert.deepEqual(harness.ocCalls.promptAsync, [{ sessionId: "ses_1", text: "[TG] hello after callback failure" }])
+    assert.deepEqual(harness.ocCalls.promptAsync, [])
     assert.ok(harness.tg.callbackAnswers.some((entry) => entry.callbackQueryId === "cb_675" && entry.text === "Temporarily unavailable"))
-    assert.ok(harness.tg.sentMessages.some((entry) => entry.text === "Action is temporarily unavailable. Please try again."))
+    assert.equal(harness.tg.sentMessages.some((entry) => entry.text === "Action is temporarily unavailable. Please try again."), false)
 
     const state = await readState(harness.stateFile)
-    assert.equal(state.updateOffset, 677)
+    assert.equal(state.updateOffset, 675)
   } finally {
     await harness.connector.stop()
   }

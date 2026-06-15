@@ -33,9 +33,11 @@ test("permissions profiles map Codex-like modes to OpenCode permission config", 
 
   const fullAuto = profileToPermissionConfig("full-auto")
   assert.equal(fullAuto["*"], "ask")
+  assert.equal(fullAuto.read["*.env"], "deny")
+  assert.equal(fullAuto.grep["*.env.*"], "deny")
   assert.equal(fullAuto.edit, "allow")
   assert.equal(fullAuto.todowrite, "allow")
-  assert.equal(fullAuto.bash, "allow")
+  assert.equal(fullAuto.bash, "ask")
   assert.equal(fullAuto.task, "allow")
   assert.equal(fullAuto.skill, "allow")
   assert.equal(fullAuto.question, "allow")
@@ -74,6 +76,13 @@ test("permissions profile detection rejects legacy fail-open full-auto", () => {
   legacyFailOpenFullAuto["*"] = "allow"
 
   assert.equal(detectPermissionProfile(legacyFailOpenFullAuto), "custom")
+})
+
+test("permissions profile detection rejects legacy full-auto with unrestricted shell", () => {
+  const legacyShellBypassFullAuto = profileToPermissionConfig("full-auto")
+  legacyShellBypassFullAuto.bash = "allow"
+
+  assert.equal(detectPermissionProfile(legacyShellBypassFullAuto), "custom")
 })
 
 test("permissions profile detection distinguishes defaults and custom configs", () => {

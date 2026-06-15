@@ -1,6 +1,6 @@
 import { makeInlineKeyboard } from "../telegram/client.js"
 import { sessionKey } from "../state/store.js"
-import { permissionNoteIdempotencyKey, promptSubmissionIdempotencyKey, telegramMessageIdempotencyKey } from "./idempotency.js"
+import { permissionNoteIdempotencyKey, promptScopedSubmissionIdempotencyKey, promptSubmissionIdempotencyKey, telegramMessageIdempotencyKey } from "./idempotency.js"
 import { classifyBoundaryError, isRetryableBoundaryError, isStaleBoundaryError, makeBoundaryError } from "../boundary-errors.js"
 import { livePermissionPromptStatus, shouldRetrySubmittedPrompt } from "./prompt-submission.js"
 import { userAttachmentLimitsFromConfig } from "../limits.js"
@@ -77,6 +77,8 @@ export function createCommandHandlers(runtime) {
     canAutoStartProject,
     isRetryableProjectError,
     startServerKeyboard,
+    notifyProjectUnavailableForThread: notifyProjectUnavailableForThreadRuntime,
+    markProjectUp,
     ensureRecentPromptSet,
     hashTextForEcho,
     formatProjectUnavailable,
@@ -179,6 +181,8 @@ export function createCommandHandlers(runtime) {
     platform,
     formatProjectUnavailable,
     startServerKeyboard,
+    notifyProjectUnavailableForThread: notifyUnavailableForThread,
+    markProjectUp,
     ensureRecentPromptSet,
     hashTextForEcho,
     staleActiveTurnGuard: maybeBlockStaleActiveTurn,
@@ -191,6 +195,17 @@ export function createCommandHandlers(runtime) {
 
   async function safeInformThread(ctxMeta, text, replyMarkup, options) {
     await sendToThread(ctxMeta, text, replyMarkup, options).catch(() => {})
+  }
+
+  async function notifyUnavailableForThread(ctxMeta, alias, err, { locale = ctxMeta?.locale, fallbackReplyMarkup = null } = {}) {
+    if (typeof notifyProjectUnavailableForThreadRuntime === "function") {
+      return notifyProjectUnavailableForThreadRuntime(ctxMeta, alias, err, { locale, platform, fallbackReplyMarkup })
+    }
+    const noticeLocale = locale || ctxMeta?.locale || "en"
+    const withButton = isRetryableProjectError(err) && canAutoStartProject(alias, { platform })
+    const replyMarkup = withButton ? startServerKeyboard(alias, { locale: noticeLocale }) : fallbackReplyMarkup
+    await sendToThread(ctxMeta, formatProjectUnavailable(alias, err, { locale: noticeLocale }), replyMarkup).catch(() => {})
+    return true
   }
 
   async function safeEditMessage(ctxMeta, messageId, text, replyMarkup, options) {
@@ -277,6 +292,19 @@ export function createCommandHandlers(runtime) {
 
   function hasIdempotencyKey(key) {
     return !!key && typeof store?.hasIdempotencyKey === "function" && store.hasIdempotencyKey(key)
+  }
+
+  function promptSubmissionScopeMetadata({ projectAlias, ctxKey, sessionID, promptId, promptType, operation, finalKey }) {
+    return {
+      kind: "prompt-submission-scope",
+      projectAlias,
+      ctxKey,
+      sessionId: sessionID,
+      promptId,
+      promptType,
+      operation,
+      finalKey,
+    }
   }
 
   async function flushDurableState(operation) {
@@ -619,6 +647,7 @@ export function createCommandHandlers(runtime) {
       const oc = ocByAlias[awaiting.projectAlias]
       const noteKey = permissionNoteIdempotencyKey(awaiting.projectAlias, awaiting.sessionID, awaiting.permissionId, text)
       const submittedKey = promptSubmissionIdempotencyKey(noteKey)
+      const scopedSubmittedKey = promptScopedSubmissionIdempotencyKey(awaiting.projectAlias, awaiting.sessionID, awaiting.permissionId, "permission")
       if (hasIdempotencyKey(noteKey)) {
         store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId, awaiting.sessionID)
         setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
@@ -652,8 +681,34 @@ export function createCommandHandlers(runtime) {
           await sendToThread(ctxMeta, t(ctxMeta, "commands.rejectionNoteAlreadySent")).catch(() => {})
           return
         }
+      } else if (hasIdempotencyKey(scopedSubmittedKey)) {
+        const liveStatus = await livePermissionPromptStatus(oc, awaiting.permissionId, awaiting.sessionID)
+        if (liveStatus === "retryable" || shouldRetrySubmittedPrompt(liveStatus)) {
+          await sendToThread(ctxMeta, t(ctxMeta, "commands.permissionRetry")).catch(() => {})
+          return
+        }
+        await markIdempotencyEntries([
+          messageIdempotencyEntry("replyPermissionNote", { projectAlias: awaiting.projectAlias }),
+        ], { flush: false })
+        store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId, awaiting.sessionID)
+        setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
+        await flushDurableState("persist submitted permission note state")
+        await sendToThread(ctxMeta, t(ctxMeta, "commands.rejectionNoteAlreadySent")).catch(() => {})
+        return
       } else {
         await markIdempotencyEntries([
+          {
+            key: scopedSubmittedKey,
+            metadata: promptSubmissionScopeMetadata({
+              projectAlias: awaiting.projectAlias,
+              ctxKey: ctxMeta.ctxKey,
+              sessionID: awaiting.sessionID,
+              promptId: awaiting.permissionId,
+              promptType: "permission",
+              operation: "replyPermission",
+              finalKey: noteKey,
+            }),
+          },
           {
             key: submittedKey,
             metadata: {
@@ -916,6 +971,7 @@ export function createCommandHandlers(runtime) {
     })
     try {
       await oc.promptAsync(binding.sessionId, promptText, promptOverride || undefined)
+      markProjectUp?.(binding.projectAlias)
     } catch (err) {
       let cleanupErr = null
       try {
@@ -924,13 +980,12 @@ export function createCommandHandlers(runtime) {
         cleanupErr = deleteErr
       }
       const alias = binding.projectAlias
-      const withButton = isRetryableProjectError(err) && canAutoStartProject(alias, { platform })
       recordRetryableOpenCodeFailure(alias, err, {
         operation: "POST /session/:id/prompt_async",
         method: "POST",
         pathname: `/session/${binding.sessionId}/prompt_async`,
       })
-      await sendToThread(ctxMeta, formatProjectUnavailable(alias, err, { locale: ctxMeta.locale }), withButton ? startServerKeyboard(alias, { locale: ctxMeta.locale }) : null).catch(() => {})
+      await notifyUnavailableForThread(ctxMeta, alias, err)
       if (cleanupErr) throw cleanupErr
       if (isRetryableProjectError(err)) throw err
       return

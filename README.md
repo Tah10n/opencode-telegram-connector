@@ -187,7 +187,7 @@ In groups and forum topics, Telegram commands addressed to another bot are ignor
 
 ### Overview
 
-- `/projects` — show projects, startup sessions, SSE status, active-binding summary, and safe action buttons: Start where auto-start is supported, Retry health check, Show sessions in private chats, and Close. Binding scopes are hidden outside private chats.
+- `/projects` — show projects, startup sessions, SSE status, active-binding summary, and safe action buttons: Start where auto-start is supported, Status, Show sessions in private chats, and Close. Binding scopes are hidden outside private chats.
 - `/bindings` — list all active bindings (**private chat only**).
 
 ### Prompt requests
@@ -206,7 +206,7 @@ The built-in profiles are shaped after Codex-style modes:
 | --- | --- |
 | `suggest` | Read, list, glob, grep, LSP, and todo reads are allowed, but `.env`/`.env.*` content stays denied for both read and grep while `.env.example` remains allowed. Edits, shell commands, subagents, skills, todo writes, questions, network, code search, repository clone/overview, external directories, and repeated identical tool loops ask first. |
 | `auto-edit` | `suggest` plus edits and todo writes are allowed. Shell commands, subagents, skills, questions, network, code search, repository clone/overview, external directories, and repeated identical tool loops still ask first. |
-| `full-auto` | Catch-all is `ask`: unknown future permissions ask first. Reads/searches, edits, shell commands, subagents, skills, todo writes, and questions are explicitly allowed, with `.env`/`.env.*` content still denied for read and grep. Web fetch/search, code search, repository clone/overview, and external directories are denied. Repeated identical tool loops ask first. |
+| `full-auto` | Catch-all is `ask`: unknown future permissions ask first. Reads/searches, edits, subagents, skills, todo writes, and questions are explicitly allowed, with `.env`/`.env.*` content still denied for read and grep. Shell commands still ask first. Web fetch/search, code search, repository clone/overview, and external directories are denied. Repeated identical tool loops ask first. |
 | `reset` | Removes the `permission` key and returns the project to OpenCode defaults. |
 
 OpenCode may need a restart for a running project to pick up file changes.
@@ -564,11 +564,11 @@ SSE disconnects reconnect with backoff when they are retryable. The connector li
 After changing runtime/recovery behavior, run the connector under your usual supervisor and check:
 
 1. `/runtime` in a private chat shows managed tasks, Telegram polling, backlog drain, prompt polling, update retry/skip counts, message/prompt/Telegram-delivery/attachment counters, shutdown state, and Restart/Stop/Close buttons.
-2. `/projects` offers Retry health check and Close for every project, Start only where auto-start is configured and supported, and Show sessions only in private chats.
+2. `/projects` offers Status and Close for every project, Start only where auto-start is configured and supported, and Show sessions only in private chats.
 3. Tap `/runtime` Restart or Stop, confirm the warning screen appears, then Cancel once to verify confirmation without stopping the process.
 4. In a supervised environment, confirm `/runtime` Restart exits, is relaunched by the supervisor, and sends the online-again notice; confirm `/runtime` Stop exits cleanly and remains stopped.
 5. Stop and restart the supervisor-managed process; bindings, offset, feed mode, model preference, and pending prompts should recover without duplicate actions.
-6. Temporarily stop one opencode server, use `/projects` → Retry health check, then restore the server and retry again to confirm project-scoped recovery works without restarting the connector.
+6. Temporarily stop one opencode server, use `/projects` → Status, then restore the server and check Status again to confirm project-scoped recovery works without restarting the connector.
 7. If `healthServer.enabled` is on, confirm `/livez` returns `200` and `/readyz` returns `200` only after Telegram polling/state health are ready.
 8. In a group, confirm `/start@OtherBot` is ignored and `/start@<this bot username>` is handled.
 9. Answer an opencode permission or question prompt and confirm the handled prompt message is removed; for multi-select questions, confirm the message remains while toggling options and is removed after **Done**.
@@ -581,8 +581,8 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 | Symptom | What to check | Safe recovery action |
 | --- | --- | --- |
 | Telegram polling appears stuck | Use `/runtime` in a private chat and inspect `Telegram poll` retries, `lastErrorAt`, and update retry/skip counts. Ensure only one connector instance is running for the bot token. | Fix the Telegram/API/network issue; restart the connector only if the supervisor reports the process is unhealthy. |
-| OpenCode unavailable | Use `/projects` and the project's Retry health check. `/status` also shows the current project's SSE and sanitized base URL. | Start opencode manually, or press Start if the project exposes a Start button. Retry health after the server is up. |
-| Windows TUI/attach window appears hung | Check logs for watchdog restarts or repeated retryable SSE/prompt-poll failures. A stale attach window can remain after a server restart. | Let the auto-start watchdog recover the project; it closes matching stale attach windows and opens a fresh one. If needed, close the old TUI window manually and use `/projects` → Start/Retry health. |
+| OpenCode unavailable | Use `/projects` and the project's Status button. `/status` also shows the current project's SSE and sanitized base URL. | Start opencode manually, or press Start if the project exposes a Start button. Check Status after the server is up. |
+| Windows TUI/attach window appears hung | Check logs for watchdog restarts or repeated retryable SSE/prompt-poll failures. A stale attach window can remain after a server restart. | Let the auto-start watchdog recover the project; it closes matching stale attach windows and opens a fresh one. If needed, close the old TUI window manually and use `/projects` → Start/Status. |
 | State file cannot be read, written, or validated | Startup or runtime logs report a state read/write/schema failure. The connector fails closed instead of silently resetting state. Schema errors include the malformed section path, and migration/invalid-state backups are written next to `state.json` when possible. | Fix permissions/path/corruption, repair the reported section, or restore a known-good `state.json.backup.*` file. Treat backups as sensitive; they contain the same bindings, offset, prompts, and idempotency history as `state.json`. |
 | Prompt send reports project unavailable | A retryable opencode `prompt_async` failure happened while forwarding a user message. | Restore the project; the Telegram update remains retryable and should be processed again after recovery. |
 | OpenCode works but assistant replies do not appear in Telegram | Check logs for `SSE disabled for project`, rapid `SSE connected` / `SSE disconnected` loops, or `drop=global_directory_missing` SSE debug lines. Current opencode builds expose the long-lived stream at `/global/event` with project directory metadata; older connector versions listening to `/event` may only receive `server.connected` before the stream closes. | Add the project `directory` and run `npm run setup:check`. If you run an older opencode build that lacks `/global/event` or does not send directory metadata there, set `OPENCODE_SSE_EVENT_PATH=/event` and restart. Prompt polling remains available while SSE is disabled or down. |

@@ -7,6 +7,7 @@ import {
   permissionNoteIdempotencyPrefix,
   permissionReplyIdempotencyPrefix,
   promptIdentity,
+  promptScopedSubmissionIdempotencyKey,
   promptSubmissionIdempotencyKey,
   questionRejectIdempotencyKey,
   questionReplyIdempotencyKey,
@@ -148,6 +149,19 @@ export function createPromptHandlers(runtime) {
     for (const entry of entries) {
       if (!entry?.key) continue
       await markIdempotencyKey(entry.key, entry.metadata || {})
+    }
+  }
+
+  function promptSubmissionScopeMetadata({ projectAlias, ctxKey, sessionID, promptId, promptType, operation, finalKey }) {
+    return {
+      kind: "prompt-submission-scope",
+      projectAlias,
+      ctxKey,
+      sessionId: sessionID,
+      promptId,
+      promptType,
+      operation,
+      finalKey,
     }
   }
 
@@ -377,6 +391,7 @@ export function createPromptHandlers(runtime) {
     const oc = ocByAlias[wizard.projectAlias]
     const replyKey = questionReplyIdempotencyKey(wizard.projectAlias, wizard.sessionID, wizard.request.id, wizard.answers)
     const submittedKey = promptSubmissionIdempotencyKey(replyKey)
+    const scopedSubmittedKey = promptScopedSubmissionIdempotencyKey(wizard.projectAlias, wizard.sessionID, wizard.request.id, "question")
     if (hasIdempotencyKey(replyKey)) {
       await markIdempotencyEntries(idempotencyEntries)
       await clearQuestionWizardStateDurably(wizard, "persist duplicate question reply state", { rollbackIdempotencyEntries: idempotencyEntries })
@@ -397,7 +412,22 @@ export function createPromptHandlers(runtime) {
         await clearQuestionWizardStateDurably(wizard, "persist submitted question reply state", { rollbackIdempotencyEntries: idempotencyEntries })
         return { outcome: "duplicate", duplicate: true }
       }
+    } else if (hasIdempotencyKey(scopedSubmittedKey)) {
+      const liveStatus = await liveQuestionPromptStatus(oc, wizard.request.id, wizard.sessionID)
+      if (liveStatus === "retryable" || shouldRetrySubmittedPrompt(liveStatus)) return { outcome: "retryable", retryable: true }
+      await markIdempotencyEntries(idempotencyEntries)
+      await clearQuestionWizardStateDurably(wizard, "persist submitted question reply state", { rollbackIdempotencyEntries: idempotencyEntries })
+      return { outcome: "duplicate", duplicate: true }
     } else {
+      await markIdempotencyKey(scopedSubmittedKey, promptSubmissionScopeMetadata({
+        projectAlias: wizard.projectAlias,
+        ctxKey: wizard.ctx?.ctxKey,
+        sessionID: wizard.sessionID,
+        promptId: wizard.request.id,
+        promptType: "question",
+        operation: "replyQuestion",
+        finalKey: replyKey,
+      }))
       await markIdempotencyKey(submittedKey, {
         kind: "prompt-submission",
         projectAlias: wizard.projectAlias,
@@ -481,6 +511,8 @@ export function createPromptHandlers(runtime) {
     }
     const route = resolved.route
     const permissionIdentity = promptIdentity(props.id, props.sessionID)
+    const scopedSubmittedKey = promptScopedSubmissionIdempotencyKey(projectAlias, props.sessionID, props.id, "permission")
+    if (hasIdempotencyKey(scopedSubmittedKey)) return false
     if (hasIdempotencyPrefix(permissionReplyIdempotencyPrefix(projectAlias, props.sessionID, props.id)) || hasIdempotencyPrefix(permissionNoteIdempotencyPrefix(projectAlias, props.sessionID, props.id))) return false
     if (prompted[projectAlias].permission.has(permissionIdentity)) return false
     prompted[projectAlias].permission.add(permissionIdentity)
@@ -517,6 +549,8 @@ export function createPromptHandlers(runtime) {
     }
     const route = resolved.route
     const questionIdentity = promptIdentity(props.id, props.sessionID)
+    const scopedSubmittedKey = promptScopedSubmissionIdempotencyKey(projectAlias, props.sessionID, props.id, "question")
+    if (hasIdempotencyKey(scopedSubmittedKey)) return false
     if (hasIdempotencyPrefix(questionReplyIdempotencyPrefix(projectAlias, props.sessionID, props.id)) || hasIdempotencyKey(questionRejectIdempotencyKey(projectAlias, props.sessionID, props.id))) return false
     if (prompted[projectAlias].question.has(questionIdentity)) return false
     if (!props?.id || !Array.isArray(props.questions) || props.questions.length === 0) return false

@@ -214,6 +214,385 @@ test("createOverviewHelpers sends unavailable and recovered notices only to thre
   assert.ok(!sent.some((entry) => entry.ctx.ctxKey === "200:0"))
 })
 
+test("createOverviewHelpers throttles retryable targeted unavailable notices per thread", async () => {
+  const sent = []
+  const helpers = createOverviewHelpers({
+    projects: {
+      demo: { baseUrl: "http://127.0.0.1:4312", autoStart: true, directory: "C:/demo", port: 4312 },
+    },
+    store: {
+      get: () => ({
+        bindings: {
+          "100:7": { projectAlias: "demo", sessionId: "ses_demo_1" },
+          "100:9": { projectAlias: "demo", sessionId: "ses_demo_2" },
+        },
+      }),
+    },
+    startInProgress: new Map(),
+    parseCtxKey: (ctxKey) => {
+      const [chatId, threadIdOr0] = String(ctxKey).split(":")
+      return { chatId: Number(chatId), threadIdOr0: Number(threadIdOr0), ctxKey }
+    },
+    sendToThread: async (ctx, text, replyMarkup) => {
+      sent.push({ ctx, text, replyMarkup })
+    },
+    cb: { pack: (value) => value },
+  })
+
+  const ctxA = { chatId: 100, threadIdOr0: 7, ctxKey: "100:7", locale: "en" }
+  const ctxB = { chatId: 100, threadIdOr0: 9, ctxKey: "100:9", locale: "en" }
+  assert.equal(await helpers.notifyProjectUnavailableForThread(ctxA, "demo", new Error("fetch failed"), { platform: "win32" }), true)
+  assert.equal(await helpers.notifyProjectUnavailableForThread(ctxA, "demo", new Error("fetch failed"), { platform: "win32" }), false)
+  assert.equal(await helpers.notifyProjectUnavailable("demo", new Error("fetch failed"), { platform: "win32" }), true)
+  assert.equal(await helpers.notifyProjectUnavailableForThread(ctxB, "demo", new Error("fetch failed"), { platform: "win32" }), false)
+
+  assert.equal(sent.length, 2)
+  assert.deepEqual(sent.map((entry) => entry.ctx.ctxKey), ["100:7", "100:9"])
+  assert.match(sent[0].text, /Project 'demo' is unavailable/)
+  assert.match(sent[0].text, /fetch failed/)
+})
+
+test("createOverviewHelpers does not throttle targeted unavailable notices until delivery succeeds", async () => {
+  const attempts = []
+  const helpers = createOverviewHelpers({
+    projects: {
+      demo: { baseUrl: "http://127.0.0.1:4312", autoStart: true, directory: "C:/demo", port: 4312 },
+    },
+    store: {
+      get: () => ({ bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_demo_1" } } }),
+    },
+    startInProgress: new Map(),
+    parseCtxKey: (ctxKey) => {
+      const [chatId, threadIdOr0] = String(ctxKey).split(":")
+      return { chatId: Number(chatId), threadIdOr0: Number(threadIdOr0), ctxKey }
+    },
+    sendToThread: async (ctx, text, replyMarkup) => {
+      attempts.push({ ctx, text, replyMarkup })
+      if (attempts.length === 1) throw new Error("telegram send failed")
+    },
+    cb: { pack: (value) => value },
+  })
+
+  const ctx = { chatId: 100, threadIdOr0: 7, ctxKey: "100:7", locale: "en" }
+  assert.equal(await helpers.notifyProjectUnavailableForThread(ctx, "demo", new Error("fetch failed"), { platform: "win32" }), true)
+  helpers.markProjectUp("demo")
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(await helpers.notifyProjectUnavailableForThread(ctx, "demo", new Error("fetch failed"), { platform: "win32" }), true)
+  assert.equal(await helpers.notifyProjectUnavailableForThread(ctx, "demo", new Error("fetch failed"), { platform: "win32" }), false)
+
+  assert.equal(attempts.length, 2)
+  assert.deepEqual(attempts.map((entry) => entry.ctx.ctxKey), ["100:7", "100:7"])
+  assert.match(attempts[1].text, /Project 'demo' is unavailable/)
+})
+
+test("createOverviewHelpers does not throttle project-wide unavailable notices for threads where delivery failed", async () => {
+  const attempts = []
+  const helpers = createOverviewHelpers({
+    projects: {
+      demo: { baseUrl: "http://127.0.0.1:4312", autoStart: true, directory: "C:/demo", port: 4312 },
+    },
+    store: { get: () => ({ bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_demo_1" } } }) },
+    startInProgress: new Map(),
+    parseCtxKey: (ctxKey) => {
+      const [chatId, threadIdOr0] = String(ctxKey).split(":")
+      return { chatId: Number(chatId), threadIdOr0: Number(threadIdOr0), ctxKey }
+    },
+    sendToThread: async (ctx, text, replyMarkup) => {
+      attempts.push({ ctx, text, replyMarkup })
+      if (attempts.length === 1) throw new Error("telegram send failed")
+    },
+    cb: { pack: (value) => value },
+  })
+
+  const ctx = { chatId: 100, threadIdOr0: 7, ctxKey: "100:7", locale: "en" }
+  assert.equal(await helpers.notifyProjectUnavailable("demo", new Error("fetch failed"), { platform: "win32" }), true)
+  assert.equal(await helpers.notifyProjectUnavailableForThread(ctx, "demo", new Error("fetch failed"), { platform: "win32" }), true)
+  assert.equal(await helpers.notifyProjectUnavailableForThread(ctx, "demo", new Error("fetch failed"), { platform: "win32" }), false)
+
+  assert.equal(attempts.length, 2)
+  assert.deepEqual(attempts.map((entry) => entry.ctx.ctxKey), ["100:7", "100:7"])
+})
+
+test("createOverviewHelpers does not mark a project down after recovery clears an in-flight targeted notice", async () => {
+  const sent = []
+  let releaseBlockedSend = () => {}
+  const blockedSend = new Promise((resolve) => {
+    releaseBlockedSend = resolve
+  })
+  let shouldBlockCtxB = false
+  const helpers = createOverviewHelpers({
+    projects: {
+      demo: { baseUrl: "http://127.0.0.1:4312", autoStart: true, directory: "C:/demo", port: 4312 },
+    },
+    store: {
+      get: () => ({
+        bindings: {
+          "100:7": { projectAlias: "demo", sessionId: "ses_demo_1" },
+          "100:9": { projectAlias: "demo", sessionId: "ses_demo_2" },
+        },
+      }),
+    },
+    startInProgress: new Map(),
+    parseCtxKey: (ctxKey) => {
+      const [chatId, threadIdOr0] = String(ctxKey).split(":")
+      return { chatId: Number(chatId), threadIdOr0: Number(threadIdOr0), ctxKey }
+    },
+    sendToThread: async (ctx, text, replyMarkup) => {
+      if (ctx.ctxKey === "100:9" && shouldBlockCtxB) {
+        shouldBlockCtxB = false
+        await blockedSend
+      }
+      sent.push({ ctx, text, replyMarkup })
+    },
+    cb: { pack: (value) => value },
+  })
+
+  const ctxA = { chatId: 100, threadIdOr0: 7, ctxKey: "100:7", locale: "en" }
+  const ctxB = { chatId: 100, threadIdOr0: 9, ctxKey: "100:9", locale: "en" }
+  assert.equal(await helpers.notifyProjectUnavailableForThread(ctxA, "demo", new Error("fetch failed"), { platform: "win32" }), true)
+
+  shouldBlockCtxB = true
+  const inFlight = helpers.notifyProjectUnavailableForThread(ctxB, "demo", new Error("fetch failed"), { platform: "win32" })
+  await new Promise((resolve) => setImmediate(resolve))
+  helpers.markProjectUp("demo")
+  await new Promise((resolve) => setImmediate(resolve))
+  releaseBlockedSend()
+  assert.equal(await inFlight, true)
+  helpers.markProjectUp("demo")
+  await new Promise((resolve) => setImmediate(resolve))
+
+  const recoveredCtxKeys = sent.filter((entry) => /back online/.test(entry.text)).map((entry) => entry.ctx.ctxKey)
+  assert.deepEqual(recoveredCtxKeys, ["100:7", "100:9"])
+  assert.equal(await helpers.notifyProjectUnavailableForThread(ctxB, "demo", new Error("fetch failed"), { platform: "win32" }), true)
+  assert.equal(sent.filter((entry) => /Project 'demo' is unavailable/.test(entry.text) && entry.ctx.ctxKey === "100:9").length, 2)
+})
+
+test("createOverviewHelpers pairs a first late unavailable notice with recovery when project recovered in flight", async () => {
+  const sent = []
+  let releaseBlockedSend = () => {}
+  const blockedSend = new Promise((resolve) => {
+    releaseBlockedSend = resolve
+  })
+  let shouldBlock = true
+  const helpers = createOverviewHelpers({
+    projects: {
+      demo: { baseUrl: "http://127.0.0.1:4312", autoStart: true, directory: "C:/demo", port: 4312 },
+    },
+    store: { get: () => ({ bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_demo_1" } } }) },
+    startInProgress: new Map(),
+    parseCtxKey: (ctxKey) => {
+      const [chatId, threadIdOr0] = String(ctxKey).split(":")
+      return { chatId: Number(chatId), threadIdOr0: Number(threadIdOr0), ctxKey }
+    },
+    sendToThread: async (ctx, text, replyMarkup) => {
+      if (shouldBlock) {
+        shouldBlock = false
+        await blockedSend
+      }
+      sent.push({ ctx, text, replyMarkup })
+    },
+    cb: { pack: (value) => value },
+  })
+
+  const ctx = { chatId: 100, threadIdOr0: 7, ctxKey: "100:7", locale: "en" }
+  const inFlight = helpers.notifyProjectUnavailableForThread(ctx, "demo", new Error("fetch failed"), { platform: "win32" })
+  await new Promise((resolve) => setImmediate(resolve))
+  helpers.markProjectUp("demo")
+  releaseBlockedSend()
+  assert.equal(await inFlight, true)
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.deepEqual(sent.map((entry) => entry.ctx.ctxKey), ["100:7", "100:7"])
+  assert.match(sent[0].text, /Project 'demo' is unavailable/)
+  assert.match(sent[1].text, /Project 'demo' is back online/)
+  assert.equal(await helpers.notifyProjectUnavailableForThread(ctx, "demo", new Error("fetch failed"), { platform: "win32" }), true)
+})
+
+test("createOverviewHelpers pairs project-wide late unavailable notices with recovery when project recovers mid-delivery", async () => {
+  const sent = []
+  let releaseBlockedSend = () => {}
+  const blockedSend = new Promise((resolve) => {
+    releaseBlockedSend = resolve
+  })
+  let firstUnavailableStarted = () => {}
+  const firstUnavailableGate = new Promise((resolve) => {
+    firstUnavailableStarted = resolve
+  })
+  let shouldBlockFirst = true
+  const helpers = createOverviewHelpers({
+    projects: {
+      demo: { baseUrl: "http://127.0.0.1:4312", autoStart: true, directory: "C:/demo", port: 4312 },
+    },
+    store: {
+      get: () => ({
+        bindings: {
+          "100:7": { projectAlias: "demo", sessionId: "ses_demo_1" },
+          "100:9": { projectAlias: "demo", sessionId: "ses_demo_2" },
+        },
+      }),
+    },
+    startInProgress: new Map(),
+    parseCtxKey: (ctxKey) => {
+      const [chatId, threadIdOr0] = String(ctxKey).split(":")
+      return { chatId: Number(chatId), threadIdOr0: Number(threadIdOr0), ctxKey }
+    },
+    sendToThread: async (ctx, text, replyMarkup) => {
+      if (ctx.ctxKey === "100:7" && /Project 'demo' is unavailable/.test(text) && shouldBlockFirst) {
+        shouldBlockFirst = false
+        firstUnavailableStarted()
+        await blockedSend
+      }
+      sent.push({ ctx, text, replyMarkup })
+    },
+    cb: { pack: (value) => value },
+  })
+
+  const inFlight = helpers.notifyProjectUnavailable("demo", new Error("fetch failed"), { platform: "win32" })
+  await firstUnavailableGate
+  helpers.markProjectUp("demo")
+  releaseBlockedSend()
+  assert.equal(await inFlight, true)
+  await new Promise((resolve) => setImmediate(resolve))
+
+  const recoveredCtxKeys = sent.filter((entry) => /back online/.test(entry.text)).map((entry) => entry.ctx.ctxKey)
+  assert.deepEqual(recoveredCtxKeys, ["100:7", "100:9"])
+  assert.equal(await helpers.notifyProjectUnavailableForThread({ chatId: 100, threadIdOr0: 9, ctxKey: "100:9", locale: "en" }, "demo", new Error("fetch failed"), { platform: "win32" }), true)
+})
+
+test("createOverviewHelpers ignores unavailable thread notices without chat metadata", async () => {
+  const sent = []
+  const helpers = createOverviewHelpers({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", autoStart: true, directory: "C:/demo", port: 4312 } },
+    store: { get: () => ({ bindings: {} }) },
+    startInProgress: new Map(),
+    parseCtxKey: () => null,
+    sendToThread: async (ctx, text, replyMarkup) => {
+      sent.push({ ctx, text, replyMarkup })
+    },
+    cb: { pack: (value) => value },
+  })
+
+  assert.equal(await helpers.notifyProjectUnavailableForThread({ ctxKey: "missing-chat", locale: "en" }, "demo", new Error("fetch failed"), { platform: "win32" }), false)
+  assert.deepEqual(sent, [])
+})
+
+test("createOverviewHelpers forced unavailable notices bypass per-thread throttle", async () => {
+  const sent = []
+  const helpers = createOverviewHelpers({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", autoStart: true, directory: "C:/demo", port: 4312 } },
+    store: {
+      get: () => ({
+        bindings: {
+          "100:7": { projectAlias: "demo", sessionId: "ses_demo_1" },
+          "100:9": { projectAlias: "demo", sessionId: "ses_demo_2" },
+        },
+      }),
+    },
+    startInProgress: new Map(),
+    parseCtxKey: (ctxKey) => {
+      const [chatId, threadIdOr0] = String(ctxKey).split(":")
+      return { chatId: Number(chatId), threadIdOr0: Number(threadIdOr0), ctxKey }
+    },
+    sendToThread: async (ctx, text, replyMarkup) => {
+      sent.push({ ctx, text, replyMarkup })
+    },
+    cb: { pack: (value) => value },
+  })
+
+  const ctx = { chatId: 100, threadIdOr0: 7, ctxKey: "100:7", locale: "en" }
+  assert.equal(await helpers.notifyProjectUnavailableForThread(ctx, "demo", new Error("fetch failed"), { platform: "win32" }), true)
+  assert.equal(await helpers.notifyProjectUnavailable("demo", new Error("final auto-start failed"), { platform: "win32", force: true }), true)
+
+  assert.equal(sent.length, 3)
+  assert.deepEqual(sent.map((entry) => entry.ctx.ctxKey), ["100:7", "100:7", "100:9"])
+  assert.match(sent[1].text, /final auto-start failed/)
+})
+
+test("createOverviewHelpers sends recovery only to threads that saw unavailable notices", async () => {
+  const sent = []
+  const helpers = createOverviewHelpers({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312" } },
+    store: {
+      get: () => ({
+        bindings: {
+          "100:7": { projectAlias: "demo", sessionId: "ses_demo_1" },
+          "100:9": { projectAlias: "demo", sessionId: "ses_demo_2" },
+        },
+      }),
+    },
+    startInProgress: new Map(),
+    parseCtxKey: (ctxKey) => {
+      const [chatId, threadIdOr0] = String(ctxKey).split(":")
+      return { chatId: Number(chatId), threadIdOr0: Number(threadIdOr0), ctxKey }
+    },
+    sendToThread: async (ctx, text, replyMarkup) => {
+      sent.push({ ctx, text, replyMarkup })
+    },
+    cb: { pack: (value) => value },
+  })
+
+  await helpers.notifyProjectUnavailableForThread({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7", locale: "en" }, "demo", new Error("fetch failed"))
+  helpers.markProjectUp("demo")
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.equal(sent.length, 2)
+  assert.deepEqual(sent.map((entry) => entry.ctx.ctxKey), ["100:7", "100:7"])
+  assert.match(sent[1].text, /Project 'demo' is back online/)
+})
+
+test("createOverviewHelpers does not mark projects down for non-retryable targeted unavailable notices", async () => {
+  const sent = []
+  const helpers = createOverviewHelpers({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", autoStart: true, directory: "C:/demo", port: 4312 } },
+    store: { get: () => ({ bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_demo" } } }) },
+    startInProgress: new Map(),
+    parseCtxKey: (ctxKey) => ({ chatId: 100, threadIdOr0: 7, ctxKey }),
+    sendToThread: async (ctx, text, replyMarkup) => {
+      sent.push({ ctx, text, replyMarkup })
+    },
+    cb: { pack: (value) => value },
+  })
+
+  const ctx = { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }
+
+  assert.equal(await helpers.notifyProjectUnavailableForThread(ctx, "demo", new Error("invalid session id"), { platform: "win32" }), true)
+  helpers.markProjectUp("demo")
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(await helpers.notifyProjectUnavailable("demo", new Error("fetch failed"), { platform: "win32" }), true)
+
+  assert.equal(sent.length, 2)
+  assert.equal(sent[0].replyMarkup, null)
+  assert.match(sent[0].text, /invalid session id/)
+  assert.match(sent[1].text, /fetch failed/)
+  assert.doesNotMatch(sent.map((entry) => entry.text).join("\n"), /back online/)
+})
+
+test("createOverviewHelpers resets targeted unavailable throttling after recovery", async () => {
+  const sent = []
+  const helpers = createOverviewHelpers({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312" } },
+    store: { get: () => ({ bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_demo" } } }) },
+    startInProgress: new Map(),
+    parseCtxKey: (ctxKey) => ({ chatId: 100, threadIdOr0: 7, ctxKey }),
+    sendToThread: async (ctx, text, replyMarkup) => {
+      sent.push({ ctx, text, replyMarkup })
+    },
+    cb: { pack: (value) => value },
+  })
+  const ctx = { chatId: 100, threadIdOr0: 7, ctxKey: "100:7", locale: "en" }
+
+  assert.equal(await helpers.notifyProjectUnavailableForThread(ctx, "demo", new Error("fetch failed")), true)
+  assert.equal(await helpers.notifyProjectUnavailableForThread(ctx, "demo", new Error("fetch failed")), false)
+  helpers.markProjectUp("demo")
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(await helpers.notifyProjectUnavailableForThread(ctx, "demo", new Error("fetch failed")), true)
+
+  assert.equal(sent.length, 3)
+  assert.match(sent[0].text, /Project 'demo' is unavailable/)
+  assert.match(sent[1].text, /Project 'demo' is back online/)
+  assert.match(sent[2].text, /Project 'demo' is unavailable/)
+})
+
 test("createOverviewHelpers ignores Telegram-detected locale when unavailable notices run with auto-detect disabled", async () => {
   const sent = []
   const helpers = createOverviewHelpers({

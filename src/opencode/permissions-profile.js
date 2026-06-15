@@ -1,3 +1,12 @@
+/**
+ * @typedef {"allow" | "ask" | "deny"} PermissionDecision
+ * @typedef {PermissionDecision | Readonly<Record<string, PermissionDecision>>} PermissionRule
+ * @typedef {Record<string, PermissionRule>} PermissionConfig
+ * @typedef {"suggest" | "auto-edit" | "full-auto"} PermissionProfileId
+ * @typedef {PermissionProfileId | "opencode-default" | "custom"} PermissionProfileDisplayId
+ */
+
+/** @type {Readonly<Record<string, PermissionDecision>>} */
 const READ_PERMISSION = Object.freeze({
   "*": "allow",
   "*.env": "deny",
@@ -5,11 +14,13 @@ const READ_PERMISSION = Object.freeze({
   "*.env.example": "allow",
 })
 
+/** @type {readonly PermissionProfileId[]} */
 export const PERMISSION_PROFILE_IDS = Object.freeze(["suggest", "auto-edit", "full-auto"])
 export const PERMISSION_RESET_ID = "reset"
 export const OPENCODE_DEFAULT_PROFILE_ID = "opencode-default"
 export const CUSTOM_PERMISSION_PROFILE_ID = "custom"
 
+/** @type {Readonly<PermissionConfig>} */
 const PASSIVE_ALLOW = Object.freeze({
   read: READ_PERMISSION,
   glob: "allow",
@@ -19,6 +30,7 @@ const PASSIVE_ALLOW = Object.freeze({
   todoread: "allow",
 })
 
+/** @type {Readonly<Record<PermissionProfileId, Readonly<PermissionConfig>>>} */
 const PERMISSION_PROFILES = Object.freeze({
   "suggest": Object.freeze({
     "*": "ask",
@@ -59,7 +71,7 @@ const PERMISSION_PROFILES = Object.freeze({
     ...PASSIVE_ALLOW,
     edit: "allow",
     todowrite: "allow",
-    bash: "allow",
+    bash: "ask",
     task: "allow",
     skill: "allow",
     question: "allow",
@@ -73,21 +85,38 @@ const PERMISSION_PROFILES = Object.freeze({
   }),
 })
 
+/** @type {readonly string[]} */
 const LEGACY_OPTIONAL_PROFILE_KEYS = Object.freeze(["repo_clone", "repo_overview"])
 
+/**
+ * @template T
+ * @param {T} value
+ * @returns {T}
+ */
 function cloneJson(value) {
   return JSON.parse(JSON.stringify(value))
 }
 
+/**
+ * @param {unknown} value
+ * @returns {value is Record<string, unknown>}
+ */
 function isPlainObject(value) {
   return !!value && typeof value === "object" && !Array.isArray(value)
 }
 
+/** @param {unknown} value */
 function orderedJson(value) {
   return JSON.stringify(value)
 }
 
+/**
+ * @param {PermissionConfig} value
+ * @param {Set<string>} keysToOmit
+ * @returns {PermissionConfig}
+ */
 function omitKeysInOrder(value, keysToOmit) {
+  /** @type {PermissionConfig} */
   const out = {}
   for (const [key, entry] of Object.entries(value)) {
     if (!keysToOmit.has(key)) out[key] = entry
@@ -95,6 +124,11 @@ function omitKeysInOrder(value, keysToOmit) {
   return out
 }
 
+/**
+ * @param {unknown} permission
+ * @param {Readonly<PermissionConfig>} profile
+ * @returns {boolean}
+ */
 function matchesPermissionProfile(permission, profile) {
   if (orderedJson(permission) === orderedJson(profile)) return true
   if (!isPlainObject(permission)) return false
@@ -110,6 +144,11 @@ function matchesPermissionProfile(permission, profile) {
   return orderedJson(permission) === orderedJson(omitKeysInOrder(profile, new Set(optionalMissingKeys)))
 }
 
+/**
+ * @param {unknown} value
+ * @param {{ includeReset?: boolean }} [options]
+ * @returns {PermissionProfileId | typeof PERMISSION_RESET_ID | ""}
+ */
 export function normalizePermissionProfileId(value, { includeReset = false } = {}) {
   const normalized = String(value ?? "").trim().toLowerCase().replaceAll("_", "-")
   if (!normalized) return ""
@@ -120,13 +159,22 @@ export function normalizePermissionProfileId(value, { includeReset = false } = {
   return ""
 }
 
+/**
+ * @param {unknown} profileId
+ * @returns {PermissionConfig}
+ */
 export function profileToPermissionConfig(profileId) {
   const normalized = normalizePermissionProfileId(profileId)
+  if (!normalized || normalized === PERMISSION_RESET_ID) throw new Error(`Unknown permissions profile: ${profileId}`)
   const profile = PERMISSION_PROFILES[normalized]
   if (!profile) throw new Error(`Unknown permissions profile: ${profileId}`)
   return cloneJson(profile)
 }
 
+/**
+ * @param {unknown} permission
+ * @returns {PermissionProfileDisplayId}
+ */
 export function detectPermissionProfile(permission) {
   if (permission == null) return OPENCODE_DEFAULT_PROFILE_ID
   for (const profileId of PERMISSION_PROFILE_IDS) {
@@ -135,6 +183,10 @@ export function detectPermissionProfile(permission) {
   return CUSTOM_PERMISSION_PROFILE_ID
 }
 
+/**
+ * @param {unknown} profileId
+ * @returns {string}
+ */
 export function permissionProfileLabel(profileId) {
   switch (profileId) {
     case "suggest":
@@ -150,6 +202,10 @@ export function permissionProfileLabel(profileId) {
   }
 }
 
+/**
+ * @param {unknown} profileId
+ * @returns {PermissionConfig | null}
+ */
 export function permissionProfileConfigForDisplay(profileId) {
   const normalized = normalizePermissionProfileId(profileId)
   return normalized ? profileToPermissionConfig(normalized) : null

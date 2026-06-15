@@ -3,7 +3,7 @@ import { parseSessionReference, findSessionByShareUrl } from "../../session-ref.
 import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "../../session-list.js"
 import { sessionItemsFromResponse } from "../../session-response.js"
 import { directoriesMatch } from "../../directory-paths.js"
-import { sessionProjectScopeDecisionWithFallback, sessionProjectScopeErrorText } from "../../session-project-scope.js"
+import { sessionProjectScopeDecision, sessionProjectScopeDecisionWithFallback, sessionProjectScopeErrorText } from "../../session-project-scope.js"
 import { getLaunchSupport } from "../../opencode/launcher.js"
 import { isSafeOpenCodeId, normalizeOpenCodeId, requireSafeOpenCodeId } from "../../opencode/ids.js"
 import { modelSourceLabel } from "../../model-selection.js"
@@ -61,6 +61,14 @@ export function createSessionCommandHandlers(deps) {
 
   function scopedSessionDecision(projectAlias, session, fallbackEvidence = null) {
     return sessionProjectScopeDecisionWithFallback(session, projects?.[projectAlias], fallbackEvidence)
+  }
+
+  function requireCreatedSessionIdForProject(projectAlias, created, context) {
+    const createdId = requireSessionIdFromBackend(created?.id, context || "created session id")
+    const project = projects?.[projectAlias]
+    const scopeDecision = sessionProjectScopeDecision(created, project?.directory ? { ...project, allowUnscopedSessionListFallback: false } : project)
+    if (!scopeDecision.ok) throw new Error(sessionProjectScopeErrorText(projectAlias, createdId, scopeDecision))
+    return createdId
   }
 
   function createSessionOptions(projectAlias, extra = {}) {
@@ -266,7 +274,7 @@ export function createSessionCommandHandlers(deps) {
         await sendToThread(ctxMeta, appendMoveConflict([t(ctxMeta, "sessions.boundStartup", { project: alias, session: startupSid })], bindResult, ctxMeta.locale).join("\n"))
       } else {
         const created = await oc.createSession(createSessionOptions(alias))
-        const createdId = requireSessionIdFromBackend(created?.id, "created session id")
+        const createdId = requireCreatedSessionIdForProject(alias, created, "created session id")
         logger.info(`[${alias}] created session for bind:`, createdId)
         startupSessionByProject[alias] = createdId
         const bindResult = await bindCtxToSession(ctxMeta, alias, createdId)
@@ -288,7 +296,7 @@ export function createSessionCommandHandlers(deps) {
       const p = projects[binding.projectAlias]
       const attachOnNewMode = String(p?.openAttachOnNewMode || "same-window")
       const created = await oc.createSession(createSessionOptions(binding.projectAlias, title ? { title } : {}))
-      const createdId = requireSessionIdFromBackend(created?.id, "created session id")
+      const createdId = requireCreatedSessionIdForProject(binding.projectAlias, created, "created session id")
       logger.info(`[${binding.projectAlias}] /new created session:`, createdId)
 
       let tuiSwitchErr = null

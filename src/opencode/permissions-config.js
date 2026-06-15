@@ -365,6 +365,7 @@ function parseJsonc(text, filePath) {
 }
 
 function permissionControlEnabled(project) {
+  if (project?.permissionControl === false) return false
   return project?.permissionControl?.enabled !== false
 }
 

@@ -6,6 +6,7 @@ import { makeBoundaryError } from "../src/boundary-errors.js"
 import {
   permissionNoteIdempotencyPrefix,
   permissionReplyIdempotencyPrefix,
+  promptScopedSubmissionIdempotencyKey,
   promptSubmissionIdempotencyKey,
   questionRejectIdempotencyKey,
   questionReplyIdempotencyKey,
@@ -440,8 +441,7 @@ test("finishQuestionWizard rethrows durability failures before remote replies", 
   })
 
   assert.deepEqual(replyCalls, [])
-  assert.equal(marked.length, 1)
-  assert.equal(marked[0].metadata.kind, "prompt-submission")
+  assert.deepEqual(marked.map((entry) => entry.metadata.kind), ["prompt-submission-scope", "prompt-submission"])
   assert.deepEqual(deletedIdempotencyKeys, [])
   assert.equal(questionWizards.get("demo:ses_1:q_durable"), wizard)
   assert.deepEqual(awaitingCustomAnswer.get("100:7"), awaitingState)
@@ -511,6 +511,99 @@ test("finishQuestionWizard finalizes submitted inactive questions without repost
   assert.deepEqual(marked.map((entry) => entry.key), [replyKey, "telegram-message:100:7:77"])
   assert.equal(questionWizards.has("demo:ses_1:q_submitted"), false)
   assert.equal(awaitingCustomAnswer.has("100:7"), false)
+})
+
+test("finishQuestionWizard blocks alternate answers while another question submission is in flight", async () => {
+  const replyCalls = []
+  const marked = []
+  const questionWizards = new Map()
+  const awaitingCustomAnswer = new Map()
+  const wizard = {
+    projectAlias: "demo",
+    id: "q_inflight",
+    sessionID: "ses_1",
+    request: { id: "q_inflight", sessionID: "ses_1", questions: [{ header: "Reason", question: "Why?" }] },
+    answers: [["different answer"]],
+    ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+  }
+  questionWizards.set("demo:ses_1:q_inflight", wizard)
+  awaitingCustomAnswer.set("100:7", { projectAlias: "demo", requestId: "q_inflight", qIndex: 0, sessionID: "ses_1" })
+  const originalReplyKey = questionReplyIdempotencyKey("demo", "ses_1", "q_inflight", [["first answer"]])
+  const scopedSubmissionKey = promptScopedSubmissionIdempotencyKey("demo", "ses_1", "q_inflight", "question")
+  const idempotencyKeys = new Set([scopedSubmissionKey, promptSubmissionIdempotencyKey(originalReplyKey)])
+  const { handlers } = makePromptRuntime({
+    questionWizards,
+    awaitingCustomAnswer,
+    store: {
+      hasIdempotencyKey: (key) => idempotencyKeys.has(key),
+      markIdempotencyKey(key, metadata) {
+        marked.push({ key, metadata })
+        idempotencyKeys.add(key)
+        return true
+      },
+      setQuestionWizard(key, currentWizard) {
+        questionWizards.set(key, currentWizard)
+      },
+      deleteQuestionWizard(projectAlias, questionId, sessionID = "") {
+        questionWizards.delete(sessionID ? `${projectAlias}:${sessionID}:${questionId}` : `${projectAlias}:${questionId}`)
+      },
+      setAwaitingCustomAnswer(ctxKey, value) {
+        awaitingCustomAnswer.set(ctxKey, value)
+      },
+      deleteAwaitingCustomAnswer(ctxKey) {
+        awaitingCustomAnswer.delete(ctxKey)
+      },
+      async flush() {},
+    },
+    ocByAlias: {
+      demo: {
+        async listQuestions() {
+          return [{ id: "q_inflight", sessionID: "ses_1" }]
+        },
+        async replyQuestion(questionId, answers) {
+          replyCalls.push({ questionId, answers })
+        },
+      },
+    },
+  })
+
+  const result = await handlers.finishQuestionWizard(wizard, {
+    idempotencyEntries: [{ key: "telegram-message:100:7:78", metadata: { kind: "telegram-message", operation: "replyQuestion" } }],
+  })
+
+  assert.equal(result.outcome, "retryable")
+  assert.deepEqual(replyCalls, [])
+  assert.deepEqual(marked, [])
+  assert.equal(questionWizards.get("demo:ses_1:q_inflight"), wizard)
+  assert.deepEqual(awaitingCustomAnswer.get("100:7"), { projectAlias: "demo", requestId: "q_inflight", qIndex: 0, sessionID: "ses_1" })
+})
+
+test("handlePromptAsked suppresses prompts while prompt-scoped submission is in flight", async () => {
+  const scopedPermissionKey = promptScopedSubmissionIdempotencyKey("demo", "ses_1", "perm_inflight", "permission")
+  const scopedQuestionKey = promptScopedSubmissionIdempotencyKey("demo", "ses_1", "q_inflight", "question")
+  const idempotencyKeys = new Set([scopedPermissionKey, scopedQuestionKey])
+  const { calls, handlers } = makePromptRuntime({
+    store: {
+      hasIdempotencyKey: (key) => idempotencyKeys.has(key),
+      hasIdempotencyKeyPrefix: () => false,
+    },
+  })
+
+  assert.equal(await handlers.handlePermissionAsked({
+    projectAlias: "demo",
+    props: { id: "perm_inflight", sessionID: "ses_1", permission: "edit", patterns: [] },
+    resolveBoundRoute: routeResolver,
+    logSseDebug,
+  }), false)
+  assert.equal(await handlers.handleQuestionAsked({
+    projectAlias: "demo",
+    props: { id: "q_inflight", sessionID: "ses_1", questions: [{ header: "Reason", question: "Why?", options: [{ label: "A" }] }] },
+    resolveBoundRoute: routeResolver,
+    logSseDebug,
+  }), false)
+
+  assert.deepEqual(calls.sendBlocksToThread, [])
+  assert.deepEqual(calls.sendMessage, [])
 })
 
 test("handleQuestionAsked does not baseline-suppress a first SSE prompt after Telegram delivery fails", async () => {
@@ -658,7 +751,7 @@ test("restorePendingPromptState leaves permission recovery retryable when Telegr
     wizardKey: (projectAlias, requestId) => `${projectAlias}:${requestId}`,
     parseCtxKey: () => null,
     async sendPermissionPrompt() {
-      throw new Error("telegram down")
+      throw makeBoundaryError({ source: "telegram", operation: "sendMessage", kind: "network", outcome: "retryable", message: "telegram down" })
     },
     async sendBlocksToThread() {},
     async sendCurrentQuestionStep() {},
@@ -676,6 +769,201 @@ test("restorePendingPromptState leaves permission recovery retryable when Telegr
   assert.equal(summary.permissions.retryable, 1)
   assert.equal(prompted.demo.permission.has("perm_restore"), false)
   assert.deepEqual(pendingPrompts.permissions["demo:perm_restore"].permissionId, "perm_restore")
+})
+
+test("restorePendingPromptState records fatal Telegram delivery failures distinctly", async () => {
+  const prompted = {
+    demo: { permission: new FakeLruSet(), question: new FakeLruSet() },
+  }
+  const recorded = []
+  const pendingPrompts = {
+    permissions: {
+      "demo:perm_fatal": {
+        projectAlias: "demo",
+        permissionId: "perm_fatal",
+        sessionID: "ses_1",
+        permission: "shell",
+        patterns: ["npm test"],
+        ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+      },
+    },
+    rejectNotes: {},
+    customAnswers: {},
+    questionWizards: {},
+  }
+  const recovery = createPromptRecovery({
+    store: {
+      getPendingPrompts: () => pendingPrompts,
+      getBinding: () => ({ projectAlias: "demo", sessionId: "ses_1" }),
+    },
+    ocByAlias: {
+      demo: {
+        async listPermissions() {
+          return [{ id: "perm_fatal", sessionID: "ses_1" }]
+        },
+        async listQuestions() {
+          return []
+        },
+      },
+    },
+    prompted,
+    questionWizards: new Map(),
+    wizardKey: (projectAlias, requestId, sessionID = "") => (sessionID ? `${projectAlias}:${sessionID}:${requestId}` : `${projectAlias}:${requestId}`),
+    parseCtxKey: () => null,
+    async sendPermissionPrompt() {
+      throw makeBoundaryError({ source: "telegram", operation: "sendMessage", status: 403, outcome: "fatal", message: "bot was blocked" })
+    },
+    async sendBlocksToThread() {},
+    async sendCurrentQuestionStep() {},
+    async sendRejectNotePrompt() {},
+    async sendQuestionCustomAnswerPrompt() {},
+    clearPersistedQuestionWizard() {},
+    setRejectNoteAwaitingState() {},
+    setAwaitingCustomAnswerState() {},
+    markProjectUp() {},
+    recordPromptRecovery: (projectAlias, outcome) => recorded.push({ projectAlias, outcome }),
+  })
+
+  const summary = await recovery.restorePendingPromptState()
+
+  assert.equal(summary.permissions.retryable, 0)
+  assert.equal(summary.permissions.fatal, 1)
+  assert.equal(summary.permissions.restored, 0)
+  assert.equal(prompted.demo.permission.has("ses_1:perm_fatal"), false)
+  assert.deepEqual(recorded, [{ projectAlias: "demo", outcome: "fatal" }])
+  assert.deepEqual(pendingPrompts.permissions["demo:perm_fatal"].permissionId, "perm_fatal")
+})
+
+test("restorePendingPromptState does not suppress later question delivery after retryable live snapshot", async () => {
+  const request = {
+    id: "q_retry_live_snapshot",
+    sessionID: "ses_1",
+    questions: [{ header: "Reason", question: "Why?", options: [{ label: "A" }] }],
+  }
+  const pendingPrompts = {
+    permissions: {},
+    rejectNotes: {},
+    customAnswers: {},
+    questionWizards: {
+      "demo:ses_1:q_retry_live_snapshot": {
+        projectAlias: "demo",
+        id: "q_retry_live_snapshot",
+        sessionID: "ses_1",
+        request,
+        index: 0,
+        answers: [[]],
+        selectedByIndex: {},
+        ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+      },
+    },
+  }
+  const { calls, runtime, handlers } = makePromptRuntime({
+    store: {
+      getPendingPrompts: () => pendingPrompts,
+      getBinding: () => ({ projectAlias: "demo", sessionId: "ses_1" }),
+    },
+    ocByAlias: {
+      demo: {
+        async listPermissions() {
+          return []
+        },
+        async listQuestions() {
+          throw makeBoundaryError({ source: "opencode", operation: "GET /question", status: 503, outcome: "retryable", message: "questions unavailable" })
+        },
+      },
+    },
+  })
+  const recovery = createPromptRecovery({
+    ...runtime,
+    sendPermissionPrompt: handlers.sendPermissionPrompt,
+    sendCurrentQuestionStep: handlers.sendCurrentQuestionStep,
+    sendRejectNotePrompt: handlers.sendRejectNotePrompt,
+    sendQuestionCustomAnswerPrompt: handlers.sendQuestionCustomAnswerPrompt,
+    clearPersistedQuestionWizard: handlers.clearPersistedQuestionWizard,
+    setRejectNoteAwaitingState: handlers.setRejectNoteAwaitingState,
+    setAwaitingCustomAnswerState: handlers.setAwaitingCustomAnswerState,
+    wizardKey: handlers.wizardKey,
+  })
+
+  const summary = await recovery.restorePendingPromptState()
+
+  assert.equal(summary.questionWizards.retryable, 1)
+  assert.equal(runtime.prompted.demo.question.has("ses_1:q_retry_live_snapshot"), false)
+  assert.equal(runtime.questionWizards.has("demo:ses_1:q_retry_live_snapshot"), true)
+  assert.equal(calls.sendBlocksToThread.length, 0)
+  assert.equal(calls.sendMessage.length, 0)
+
+  const delivered = await handlers.handleQuestionAsked({ projectAlias: "demo", props: request, resolveBoundRoute: routeResolver, logSseDebug })
+
+  assert.equal(delivered, true)
+  assert.equal(calls.sendBlocksToThread.length, 1)
+  assert.equal(calls.sendMessage.length, 1)
+  assert.equal(runtime.prompted.demo.question.has("ses_1:q_retry_live_snapshot"), true)
+})
+
+test("restorePendingPromptState surfaces durability failures during recovery cleanup", async () => {
+  const pendingPrompts = {
+    permissions: {
+      "demo:ses_1:perm_stale": {
+        projectAlias: "demo",
+        permissionId: "perm_stale",
+        sessionID: "ses_1",
+        permission: "shell",
+        patterns: [],
+        ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+      },
+    },
+    rejectNotes: {},
+    customAnswers: {},
+    questionWizards: {},
+  }
+  let deleted = false
+  const recovery = createPromptRecovery({
+    store: {
+      getPendingPrompts: () => pendingPrompts,
+      getBinding: () => ({ projectAlias: "demo", sessionId: "ses_other" }),
+      deletePendingPermission(projectAlias, permissionId, sessionID) {
+        assert.deepEqual({ projectAlias, permissionId, sessionID }, { projectAlias: "demo", permissionId: "perm_stale", sessionID: "ses_1" })
+        deleted = true
+      },
+      async flush() {
+        throw new Error("disk full")
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async listPermissions() {
+          throw new Error("should not inspect permissions")
+        },
+        async listQuestions() {
+          throw new Error("should not inspect questions")
+        },
+      },
+    },
+    prompted: { demo: { permission: new FakeLruSet(), question: new FakeLruSet() } },
+    questionWizards: new Map(),
+    wizardKey: (projectAlias, requestId, sessionID = "") => (sessionID ? `${projectAlias}:${sessionID}:${requestId}` : `${projectAlias}:${requestId}`),
+    parseCtxKey: () => null,
+    async sendPermissionPrompt() {},
+    async sendBlocksToThread() {},
+    async sendCurrentQuestionStep() {},
+    async sendRejectNotePrompt() {},
+    async sendQuestionCustomAnswerPrompt() {},
+    clearPersistedQuestionWizard() {},
+    setRejectNoteAwaitingState() {},
+    setAwaitingCustomAnswerState() {},
+    markProjectUp() {},
+  })
+
+  await assert.rejects(() => recovery.restorePendingPromptState(), (err) => {
+    assert.equal(err.isBoundaryError, true)
+    assert.equal(err.source, "state")
+    assert.equal(err.kind, "durability")
+    assert.equal(err.outcome, "fatal")
+    assert.match(err.message, /persist pending prompt recovery state failed: disk full/)
+    return true
+  })
+  assert.equal(deleted, true)
 })
 
 test("restorePendingPromptState keeps child permission recovery retryable when parent route lookup fails", async () => {

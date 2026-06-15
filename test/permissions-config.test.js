@@ -1064,6 +1064,11 @@ test("OpenCode permission config reader reports unavailable and disabled project
   assert.equal(disabled.ok, false)
   assert.equal(disabled.editable, false)
   assert.equal(disabled.status, "disabled")
+
+  const rawDisabled = await readOpenCodePermissionConfig({ directory: await makeTempDir(), permissionControl: false })
+  assert.equal(rawDisabled.ok, false)
+  assert.equal(rawDisabled.editable, false)
+  assert.equal(rawDisabled.status, "disabled")
 })
 
 test("OpenCode permission config reader does not probe files for disabled projects", async () => {
@@ -1079,7 +1084,7 @@ test("OpenCode permission config reader does not probe files for disabled projec
 
   const disabled = await readOpenCodePermissionConfig({
     directory: "C:/blocked",
-    permissionControl: { enabled: false },
+    permissionControl: false,
   }, { fsImpl })
 
   assert.equal(disabled.ok, false)
@@ -1100,7 +1105,7 @@ test("OpenCode permission config writer does not probe or write disabled project
   const disabled = await writeOpenCodePermissionProfile({
     directory: process.platform === "win32" ? "C:/blocked" : "/blocked",
     permissionConfigPath: process.platform === "win32" ? "C:/blocked/opencode.json" : "/blocked/opencode.json",
-    permissionControl: { enabled: false },
+    permissionControl: false,
   }, "suggest", { fsImpl })
 
   assert.equal(disabled.ok, false)

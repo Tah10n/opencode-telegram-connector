@@ -2,11 +2,13 @@ import path from "node:path"
 
 const WINDOWS_DRIVE_ABSOLUTE_RE = /^[A-Za-z]:[\\/]/
 
+/** @param {unknown} value */
 function rawDirectory(value) {
   const raw = String(value ?? "").trim()
   return raw || ""
 }
 
+/** @param {string} value */
 function isWindowsUncAbsolutePath(value) {
   const normalized = value.replace(/\\/g, "/")
   if (!normalized.startsWith("//")) return false
@@ -14,20 +16,27 @@ function isWindowsUncAbsolutePath(value) {
   return parts.length >= 2
 }
 
+/** @param {string} value */
 function isWindowsDriveAbsolutePath(value) {
   return WINDOWS_DRIVE_ABSOLUTE_RE.test(value)
 }
 
+/** @param {string} value */
 function isPosixAbsolutePath(value) {
   return value.startsWith("/") && !isWindowsUncAbsolutePath(value)
 }
 
+/**
+ * @param {string} value
+ * @param {number} rootLength
+ */
 function stripTrailingDirectorySlashes(value, rootLength) {
   let end = value.length
   while (end > rootLength && value[end - 1] === "/") end -= 1
   return value.slice(0, end)
 }
 
+/** @param {string} value */
 function uncRootLength(value) {
   if (!value.startsWith("//")) return 0
   const serverEnd = value.indexOf("/", 2)
@@ -36,12 +45,14 @@ function uncRootLength(value) {
   return shareEnd === -1 ? value.length : shareEnd
 }
 
+/** @param {string} value */
 function normalizeWindowsAbsolutePath(value) {
   const normalized = path.win32.normalize(value).replace(/\\/g, "/")
   const rootLength = normalized.startsWith("//") ? uncRootLength(normalized) : 3
   return stripTrailingDirectorySlashes(normalized, rootLength)
 }
 
+/** @param {string} value */
 function normalizePosixAbsolutePath(value) {
   return stripTrailingDirectorySlashes(path.posix.normalize(value), 1)
 }

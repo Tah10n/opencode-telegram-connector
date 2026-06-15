@@ -413,8 +413,7 @@ export function createCallbackHandlers(runtime) {
       if (classification.retryable) {
         recordCallbackOutcome?.(callbackProjectAlias, "retryable")
         await answerCallbackQuery(callbackQuery.id, "Temporarily unavailable")
-        await sendToThread(ctxMeta, t(ctxMeta, "callbacks.actionTemporarilyUnavailable")).catch(ignoreError)
-        return
+        throw classification.error
       }
       recordCallbackOutcome?.(callbackProjectAlias, "fatal")
       await answerCallbackQuery(callbackQuery.id, "Action failed")

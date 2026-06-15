@@ -1,9 +1,34 @@
-import { isRetryableBoundaryError, isStaleBoundaryError } from "../../boundary-errors.js"
-import { promptSubmissionIdempotencyKey } from "../idempotency.js"
+import { classifyBoundaryError, isStaleBoundaryError, makeBoundaryError } from "../../boundary-errors.js"
+import { promptScopedSubmissionIdempotencyKey, promptSubmissionIdempotencyKey } from "../idempotency.js"
 import { liveQuestionPromptStatus, shouldRetrySubmittedPrompt } from "../prompt-submission.js"
 import { hasHandledQuestion, questionRejectIdempotencyKey } from "./question-state.js"
 
 function ignoreError() {}
+
+function promptSubmissionScopeMetadata({ projectAlias, ctxKey, sessionID, promptId, promptType, operation, finalKey }) {
+  return {
+    kind: "prompt-submission-scope",
+    projectAlias,
+    ctxKey,
+    sessionId: sessionID,
+    promptId,
+    promptType,
+    operation,
+    finalKey,
+  }
+}
+
+function makeQuestionSubmissionInFlightError() {
+  return makeBoundaryError({
+    source: "opencode",
+    operation: "GET /question",
+    method: "GET",
+    pathname: "/question",
+    kind: "network",
+    outcome: "retryable",
+    message: "Question prompt submission is already in progress",
+  })
+}
 
 async function answerFinishedQuestion({
   callbackQuery,
@@ -50,6 +75,7 @@ export async function handleQuestionRejectAction({
 }) {
   const rejectKey = questionRejectIdempotencyKey(projectAlias, effectiveSessionID, questionId)
   const submittedKey = promptSubmissionIdempotencyKey(rejectKey)
+  const scopedSubmittedKey = promptScopedSubmissionIdempotencyKey(projectAlias, effectiveSessionID, questionId, "question")
   if (hasIdempotencyKey(rejectKey) || hasHandledQuestion(store, projectAlias, effectiveSessionID, questionId)) {
     cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, effectiveSessionID)
     await flushStoreIfAvailable()
@@ -60,10 +86,15 @@ export async function handleQuestionRejectAction({
   if (hasIdempotencyKey(submittedKey)) {
     const liveStatus = await liveQuestionPromptStatus(oc, questionId, effectiveSessionID)
     if (liveStatus === "retryable") {
-      recordCallbackOutcome?.(projectAlias, "retryable")
-      await answerCallbackQuery(callbackQuery.id, "Temporarily unavailable")
-      await sendToThread(ctxMeta, t(ctxMeta, "callbacks.actionTemporarilyUnavailable")).catch(ignoreError)
-      return true
+      throw makeBoundaryError({
+        source: "opencode",
+        operation: "GET /question",
+        method: "GET",
+        pathname: "/question",
+        kind: "network",
+        outcome: "retryable",
+        message: "Question prompt status temporarily unavailable",
+      })
     }
     if (!shouldRetrySubmittedPrompt(liveStatus)) {
       await markIdempotencyKey(rejectKey, {
@@ -78,7 +109,24 @@ export async function handleQuestionRejectAction({
       await deleteInteractiveMessage(ctxMeta, msg?.message_id)
       return true
     }
+  } else if (hasIdempotencyKey(scopedSubmittedKey)) {
+    const liveStatus = await liveQuestionPromptStatus(oc, questionId, effectiveSessionID)
+    if (liveStatus === "retryable" || shouldRetrySubmittedPrompt(liveStatus)) throw makeQuestionSubmissionInFlightError()
+    cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, effectiveSessionID)
+    await flushStoreIfAvailable()
+    await answerCallbackQuery(callbackQuery.id, "Already handled")
+    await deleteInteractiveMessage(ctxMeta, msg?.message_id)
+    return true
   } else {
+    await markIdempotencyKey(scopedSubmittedKey, promptSubmissionScopeMetadata({
+      projectAlias,
+      ctxKey: ctxMeta.ctxKey,
+      sessionID: effectiveSessionID,
+      promptId: questionId,
+      promptType: "question",
+      operation: "rejectQuestion",
+      finalKey: rejectKey,
+    }))
     await markIdempotencyKey(submittedKey, {
       kind: "prompt-submission",
       projectAlias,
@@ -105,11 +153,9 @@ export async function handleQuestionRejectAction({
       await deleteInteractiveMessage(ctxMeta, msg?.message_id)
       return true
     }
-    if (isRetryableBoundaryError(err, { source: "opencode", pathname: `/question/${questionId}/reject`, method: "POST" })) {
-      recordCallbackOutcome?.(projectAlias, "retryable")
-      await answerCallbackQuery(callbackQuery.id, "Temporarily unavailable")
-      await sendToThread(ctxMeta, t(ctxMeta, "callbacks.actionTemporarilyUnavailable")).catch(ignoreError)
-      return true
+    const retryableClassification = classifyBoundaryError(err, { source: "opencode", pathname: `/question/${questionId}/reject`, method: "POST" })
+    if (retryableClassification.retryable) {
+      throw retryableClassification.error
     }
     throw err
   }
@@ -145,14 +191,32 @@ export async function startQuestionCustomAnswer({
 }) {
   setAwaitingCustomAnswerState(ctxMeta.ctxKey, { projectAlias, requestId: questionId, ...(effectiveSessionID ? { sessionID: effectiveSessionID } : {}), qIndex })
   try {
+    await flushStoreIfAvailable()
+  } catch (err) {
+    setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
+    try {
+      await flushStoreIfAvailable()
+    } catch (rollbackErr) {
+      runtime.logger?.error?.("Failed to roll back custom-answer flow state:", rollbackErr?.message || String(rollbackErr))
+    }
+    throw err
+  }
+  try {
     await sendQuestionCustomAnswerPrompt(ctxMeta, projectAlias, questionId, qIndex, q.header || "question", { sessionID: effectiveSessionID })
   } catch (err) {
     setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
     runtime.logger?.error?.("Failed to start custom-answer flow:", err?.message || String(err))
+    try {
+      await flushStoreIfAvailable()
+    } catch (rollbackErr) {
+      runtime.logger?.error?.("Failed to roll back custom-answer flow state:", rollbackErr?.message || String(rollbackErr))
+      throw rollbackErr
+    }
+    const classification = classifyBoundaryError(err, { source: "telegram", operation: "send custom-answer prompt" })
+    if (classification.retryable) throw classification.error
     await answerCallbackQuery(callbackQuery.id, "Unavailable")
     return true
   }
-  await flushStoreIfAvailable()
   await answerCallbackQuery(callbackQuery.id, "Send answer")
   await deleteInteractiveMessage(ctxMeta, msg?.message_id)
   return true
@@ -217,9 +281,15 @@ export async function selectSingleChoiceQuestion({
     return true
   }
   nextWizard.index = nextIndex
-  await runtime.sendCurrentQuestionStep(nextWizard)
   applyWizardState(wizard, nextWizard)
   await persistQuestionWizardDurably(wizard, previousWizard)
+  try {
+    await runtime.sendCurrentQuestionStep(wizard)
+  } catch (err) {
+    applyWizardState(wizard, previousWizard)
+    await persistQuestionWizardDurably(wizard)
+    throw err
+  }
   await deleteInteractiveMessage(ctxMeta, msg?.message_id)
   await answerCallbackQuery(callbackQuery.id, "Selected")
   return true
@@ -293,9 +363,15 @@ export async function finishMultipleChoiceQuestion({
     return true
   }
   nextWizard.index = nextIndex
-  await runtime.sendCurrentQuestionStep(nextWizard)
   applyWizardState(wizard, nextWizard)
   await persistQuestionWizardDurably(wizard, previousWizard)
+  try {
+    await runtime.sendCurrentQuestionStep(wizard)
+  } catch (err) {
+    applyWizardState(wizard, previousWizard)
+    await persistQuestionWizardDurably(wizard)
+    throw err
+  }
   await deleteInteractiveMessage(ctxMeta, msg?.message_id)
   await answerCallbackQuery(callbackQuery.id, "Done")
   return true

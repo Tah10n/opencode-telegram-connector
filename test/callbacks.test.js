@@ -7,6 +7,7 @@ import { encodeCallback } from "../src/connector/callback-data.js"
 import { createPermissionCommandHandlers } from "../src/connector/commands/permissions.js"
 import {
   permissionReplyIdempotencyKey,
+  promptScopedSubmissionIdempotencyKey,
   promptSubmissionIdempotencyKey,
   questionReplyIdempotencyPrefix,
   questionRejectIdempotencyKey,
@@ -1660,6 +1661,7 @@ test("createCallbackHandlers skips duplicate permission callbacks via idempotenc
 test("createCallbackHandlers ignores unscoped permission idempotency keys for scoped callbacks", async () => {
   const legacyReplyKey = permissionReplyIdempotencyKey("demo", "perm_scoped", "once")
   const scopedReplyKey = permissionReplyIdempotencyKey("demo", "ses_current", "perm_scoped", "once")
+  const scopedSubmissionKey = promptScopedSubmissionIdempotencyKey("demo", "ses_current", "perm_scoped", "permission")
   const scopedSubmittedKey = promptSubmissionIdempotencyKey(scopedReplyKey)
   const idempotencyKeys = new Set([legacyReplyKey])
   const markedKeys = []
@@ -1689,7 +1691,7 @@ test("createCallbackHandlers ignores unscoped permission idempotency keys for sc
   await handlers.handleTelegramCallback(makeCallback("p|demo|ses_current|perm_scoped|once"))
 
   assert.deepEqual(replyCalls, [{ permissionId: "perm_scoped", payload: { reply: "once" } }])
-  assert.deepEqual(markedKeys, [scopedSubmittedKey, scopedReplyKey])
+  assert.deepEqual(markedKeys, [scopedSubmissionKey, scopedSubmittedKey, scopedReplyKey])
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["OK"])
 })
 
@@ -1729,8 +1731,94 @@ test("createCallbackHandlers finalizes submitted permission replies without repo
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Already handled"])
 })
 
+test("createCallbackHandlers rethrows retryable submitted permission live-status failures", async () => {
+  const replyKey = permissionReplyIdempotencyKey("demo", "ses_current", "perm_submitted_retry", "once")
+  const submittedKey = promptSubmissionIdempotencyKey(replyKey)
+  const idempotencyKeys = new Set([submittedKey])
+  const replyCalls = []
+  const { runtime, callbackAnswers, sentMessages } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    store: {
+      hasIdempotencyKey: (key) => idempotencyKeys.has(key),
+      markIdempotencyKey: (key) => {
+        idempotencyKeys.add(key)
+        return true
+      },
+      deletePendingPermission: () => true,
+      flush: async () => {},
+    },
+    ocByAlias: {
+      demo: {
+        async listPermissions() {
+          throw makeBoundaryError({ source: "opencode", method: "GET", pathname: "/permission", status: 503, message: "permission list unavailable" })
+        },
+        async replyPermission(permissionId, payload) {
+          replyCalls.push({ permissionId, payload })
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await assert.rejects(() => handlers.handleTelegramCallback(makeCallback("p|demo|ses_current|perm_submitted_retry|once", { id: "cb_submitted_retry" })), (err) => {
+    assert.equal(err.isBoundaryError, true)
+    assert.equal(err.source, "opencode")
+    assert.equal(err.outcome, "retryable")
+    return true
+  })
+
+  assert.deepEqual(replyCalls, [])
+  assert.equal(idempotencyKeys.has(replyKey), false)
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Temporarily unavailable"])
+  assert.deepEqual(sentMessages, [])
+})
+
+test("createCallbackHandlers blocks alternate permission replies while another submission is in flight", async () => {
+  const originalReplyKey = permissionReplyIdempotencyKey("demo", "ses_current", "perm_inflight", "once")
+  const originalSubmittedKey = promptSubmissionIdempotencyKey(originalReplyKey)
+  const scopedSubmissionKey = promptScopedSubmissionIdempotencyKey("demo", "ses_current", "perm_inflight", "permission")
+  const idempotencyKeys = new Set([scopedSubmissionKey, originalSubmittedKey])
+  const replyCalls = []
+  const { runtime, callbackAnswers } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    store: {
+      hasIdempotencyKey: (key) => idempotencyKeys.has(key),
+      markIdempotencyKey: (key) => {
+        idempotencyKeys.add(key)
+        return true
+      },
+      deletePendingPermission: () => true,
+      flush: async () => {},
+    },
+    ocByAlias: {
+      demo: {
+        async listPermissions() {
+          return [{ id: "perm_inflight", sessionID: "ses_current" }]
+        },
+        async replyPermission(permissionId, payload) {
+          replyCalls.push({ permissionId, payload })
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await assert.rejects(() => handlers.handleTelegramCallback(makeCallback("p|demo|ses_current|perm_inflight|always", { id: "cb_alt_permission" })), (err) => {
+    assert.equal(err.isBoundaryError, true)
+    assert.equal(err.source, "opencode")
+    assert.equal(err.outcome, "retryable")
+    return true
+  })
+
+  assert.deepEqual(replyCalls, [])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Temporarily unavailable"])
+})
+
 test("createCallbackHandlers rethrows permission reply durability failures before remote side effects", async () => {
   const idempotencyKeys = new Set()
+  const replyKey = permissionReplyIdempotencyKey("demo", "", "perm_durable", "once")
+  const scopedSubmissionKey = promptScopedSubmissionIdempotencyKey("demo", "", "perm_durable", "permission")
+  const submittedKey = promptSubmissionIdempotencyKey(replyKey)
   const replyCalls = []
   const { runtime, callbackAnswers } = makeRuntime({
     storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
@@ -1763,11 +1851,13 @@ test("createCallbackHandlers rethrows permission reply durability failures befor
   })
 
   assert.deepEqual(replyCalls, [])
-  assert.equal(idempotencyKeys.size, 1)
+  assert.equal(idempotencyKeys.size, 2)
+  assert.equal(idempotencyKeys.has(scopedSubmissionKey), true)
+  assert.equal(idempotencyKeys.has(submittedKey), true)
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Temporarily unavailable"])
 })
 
-test("createCallbackHandlers degrades transient permission callback failures without blocking the user", async () => {
+test("createCallbackHandlers propagates transient permission callback failures without advancing the update", async () => {
   const deletedMessages = []
   const { runtime, callbackAnswers, sentMessages, loggerErrors } = makeRuntime({
     storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
@@ -1794,11 +1884,16 @@ test("createCallbackHandlers degrades transient permission callback failures wit
   })
   const handlers = createCallbackHandlers(runtime)
 
-  await handlers.handleTelegramCallback(makeCallback("p|demo||perm_retry|always"))
+  await assert.rejects(() => handlers.handleTelegramCallback(makeCallback("p|demo||perm_retry|always")), (err) => {
+    assert.equal(err.isBoundaryError, true)
+    assert.equal(err.source, "opencode")
+    assert.equal(err.outcome, "retryable")
+    return true
+  })
 
   assert.equal(callbackAnswers.at(-1)?.text, "Temporarily unavailable")
-  assert.equal(sentMessages.at(-1)?.text, "Action is temporarily unavailable. Please try again.")
-  assert.equal(loggerErrors.length, 0)
+  assert.deepEqual(sentMessages, [])
+  assert.equal(loggerErrors.length, 1)
   assert.deepEqual(deletedMessages, [])
 })
 
@@ -2057,9 +2152,10 @@ test("createCallbackHandlers resolves old-shape question rejects to one scoped w
     { projectAlias: "demo", questionId: "q_done" },
   ])
   assert.equal(flushCount, 5)
-  assert.equal(markedKeys.length, 4)
+  assert.equal(markedKeys.length, 6)
   assert.ok(markedKeys.every((key) => key.includes("ses_current")))
   assert.equal(markedKeys.filter((key) => key.startsWith("prompt-submit:")).length, 2)
+  assert.equal(markedKeys.filter((key) => key.startsWith("prompt-submit-scope:")).length, 2)
 })
 
 test("createCallbackHandlers treats question callbacks for changed bindings as stale", async () => {
@@ -2147,6 +2243,7 @@ test("createCallbackHandlers ignores unscoped question idempotency keys for scop
   const legacyReplyPrefix = questionReplyIdempotencyPrefix("demo", "", "q_scoped")
   const scopedRejectKey = questionRejectIdempotencyKey("demo", "ses_current", "q_scoped")
   const scopedReplyPrefix = questionReplyIdempotencyPrefix("demo", "ses_current", "q_scoped")
+  const scopedSubmissionKey = promptScopedSubmissionIdempotencyKey("demo", "ses_current", "q_scoped", "question")
   const scopedSubmittedKey = promptSubmissionIdempotencyKey(scopedRejectKey)
   const idempotencyKeys = new Set([legacyRejectKey])
   const replyPrefixes = new Set([legacyReplyPrefix])
@@ -2186,7 +2283,7 @@ test("createCallbackHandlers ignores unscoped question idempotency keys for scop
 
   assert.deepEqual(rejectCalls, [{ questionId: "q_scoped" }])
   assert.deepEqual(checkedPrefixes, [scopedReplyPrefix])
-  assert.deepEqual(markedKeys, [scopedSubmittedKey, scopedRejectKey])
+  assert.deepEqual(markedKeys, [scopedSubmissionKey, scopedSubmittedKey, scopedRejectKey])
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Rejected"])
 })
 
@@ -2226,6 +2323,136 @@ test("createCallbackHandlers finalizes submitted question rejects without repost
   assert.deepEqual(rejectCalls, [])
   assert.equal(idempotencyKeys.has(rejectKey), true)
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Already handled"])
+})
+
+test("createCallbackHandlers propagates transient question reject failures without advancing the update", async () => {
+  const wizard = { ...makeWizard({ id: "q_reject_retry" }), sessionID: "ses_current" }
+  const deletedMessages = []
+  const { runtime, callbackAnswers, sentMessages, loggerErrors } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    questionWizards: new Map([["demo:ses_current:q_reject_retry", wizard]]),
+    getWizard: () => wizard,
+    tg: {
+      deleteMessage: async (chatId, messageId) => {
+        deletedMessages.push({ chatId, messageId })
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async rejectQuestion() {
+          throw makeBoundaryError({
+            source: "opencode",
+            operation: "POST /question/q_reject_retry/reject",
+            method: "POST",
+            pathname: "/question/q_reject_retry/reject",
+            kind: "network",
+            outcome: "retryable",
+            message: "temporary failure",
+          })
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await assert.rejects(() => handlers.handleTelegramCallback(makeCallback("q|demo|ses_current|q_reject_retry|reject")), (err) => {
+    assert.equal(err.isBoundaryError, true)
+    assert.equal(err.source, "opencode")
+    assert.equal(err.outcome, "retryable")
+    return true
+  })
+
+  assert.equal(callbackAnswers.at(-1)?.text, "Temporarily unavailable")
+  assert.deepEqual(sentMessages, [])
+  assert.equal(loggerErrors.length, 1)
+  assert.deepEqual(deletedMessages, [])
+})
+
+test("createCallbackHandlers rethrows retryable submitted question live-status failures", async () => {
+  const wizard = { ...makeWizard({ id: "q_submitted_retry" }), sessionID: "ses_current" }
+  const rejectKey = questionRejectIdempotencyKey("demo", "ses_current", "q_submitted_retry")
+  const submittedKey = promptSubmissionIdempotencyKey(rejectKey)
+  const idempotencyKeys = new Set([submittedKey])
+  const rejectCalls = []
+  const { runtime, callbackAnswers, sentMessages } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    questionWizards: new Map([["demo:ses_current:q_submitted_retry", wizard]]),
+    getWizard: () => wizard,
+    store: {
+      hasIdempotencyKey: (key) => idempotencyKeys.has(key),
+      markIdempotencyKey: (key) => {
+        idempotencyKeys.add(key)
+        return true
+      },
+      flush: async () => {},
+    },
+    ocByAlias: {
+      demo: {
+        async listQuestions() {
+          throw makeBoundaryError({ source: "opencode", method: "GET", pathname: "/question", status: 503, message: "question list unavailable" })
+        },
+        async rejectQuestion(questionId) {
+          rejectCalls.push({ questionId })
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await assert.rejects(() => handlers.handleTelegramCallback(makeCallback("q|demo|ses_current|q_submitted_retry|reject", { id: "cb_q_submitted_retry" })), (err) => {
+    assert.equal(err.isBoundaryError, true)
+    assert.equal(err.source, "opencode")
+    assert.equal(err.outcome, "retryable")
+    return true
+  })
+
+  assert.deepEqual(rejectCalls, [])
+  assert.equal(idempotencyKeys.has(rejectKey), false)
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Temporarily unavailable"])
+  assert.deepEqual(sentMessages, [])
+})
+
+test("createCallbackHandlers blocks question reject while another question reply is in flight", async () => {
+  const wizard = { ...makeWizard({ id: "q_inflight" }), sessionID: "ses_current" }
+  const answerKey = "question-reply:demo:ses_current~3Aq_inflight:existing"
+  const originalSubmittedKey = promptSubmissionIdempotencyKey(answerKey)
+  const scopedSubmissionKey = promptScopedSubmissionIdempotencyKey("demo", "ses_current", "q_inflight", "question")
+  const idempotencyKeys = new Set([scopedSubmissionKey, originalSubmittedKey])
+  const rejectCalls = []
+  const { runtime, callbackAnswers } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    questionWizards: new Map([["demo:ses_current:q_inflight", wizard]]),
+    getWizard: () => wizard,
+    store: {
+      hasIdempotencyKey: (key) => idempotencyKeys.has(key),
+      markIdempotencyKey: (key) => {
+        idempotencyKeys.add(key)
+        return true
+      },
+      flush: async () => {},
+    },
+    ocByAlias: {
+      demo: {
+        async listQuestions() {
+          return [{ id: "q_inflight", sessionID: "ses_current" }]
+        },
+        async rejectQuestion(questionId) {
+          rejectCalls.push({ questionId })
+        },
+      },
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await assert.rejects(() => handlers.handleTelegramCallback(makeCallback("q|demo|ses_current|q_inflight|reject", { id: "cb_q_alt" })), (err) => {
+    assert.equal(err.isBoundaryError, true)
+    assert.equal(err.source, "opencode")
+    assert.equal(err.outcome, "retryable")
+    return true
+  })
+
+  assert.deepEqual(rejectCalls, [])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Temporarily unavailable"])
 })
 
 test("createCallbackHandlers rejects sessionless question rejects without an in-memory wizard", async () => {
@@ -2345,6 +2572,197 @@ test("createCallbackHandlers reports prompt bootstrap failures for reject-note a
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Unavailable", "Unavailable"])
 })
 
+test("createCallbackHandlers flushes continuation state before prompting", async () => {
+  const order = []
+  const wizard = makeWizard({ questions: [{ header: "Reason", question: "Why?", custom: true, options: [] }] })
+  const { runtime, callbackAnswers } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    store: {
+      flush: async () => {
+        order.push("flush")
+      },
+    },
+    getWizard: () => wizard,
+    ocByAlias: { demo: {} },
+    setRejectNoteAwaitingState: (_ctxKey, value) => order.push(value ? "reject:set" : "reject:clear"),
+    sendRejectNotePrompt: async () => order.push("reject:send"),
+    setAwaitingCustomAnswerState: (_ctxKey, value) => order.push(value ? "custom:set" : "custom:clear"),
+    sendQuestionCustomAnswerPrompt: async () => order.push("custom:send"),
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("p|demo||perm_note|reject_note"))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_1|0|custom"))
+
+  assert.deepEqual(order, [
+    "reject:set",
+    "flush",
+    "reject:send",
+    "custom:set",
+    "flush",
+    "custom:send",
+  ])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Send note", "Send answer"])
+})
+
+test("createCallbackHandlers rolls back continuation state when prompt delivery fails", async () => {
+  const order = []
+  const wizard = makeWizard({ questions: [{ header: "Reason", question: "Why?", custom: true, options: [] }] })
+  const { runtime, callbackAnswers } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    store: {
+      flush: async () => {
+        order.push("flush")
+      },
+    },
+    getWizard: () => wizard,
+    ocByAlias: { demo: {} },
+    setRejectNoteAwaitingState: (_ctxKey, value) => order.push(value ? "reject:set" : "reject:clear"),
+    sendRejectNotePrompt: async () => {
+      order.push("reject:send")
+      throw new Error("send failed")
+    },
+    setAwaitingCustomAnswerState: (_ctxKey, value) => order.push(value ? "custom:set" : "custom:clear"),
+    sendQuestionCustomAnswerPrompt: async () => {
+      order.push("custom:send")
+      throw new Error("send failed")
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("p|demo||perm_note|reject_note"))
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_1|0|custom"))
+
+  assert.deepEqual(order, [
+    "reject:set",
+    "flush",
+    "reject:send",
+    "reject:clear",
+    "flush",
+    "custom:set",
+    "flush",
+    "custom:send",
+    "custom:clear",
+    "flush",
+  ])
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Unavailable", "Unavailable"])
+})
+
+test("createCallbackHandlers propagates retryable continuation prompt delivery failures", async () => {
+  const cases = [
+    {
+      data: "p|demo||perm_note|reject_note",
+      setup: {
+        setRejectNoteAwaitingState: (_ctxKey, value) => value ? "reject:set" : "reject:clear",
+        sendRejectNotePrompt: "reject:send",
+      },
+      expectedOrder: ["reject:set", "flush", "reject:send", "reject:clear", "flush"],
+    },
+    {
+      data: "q|demo||q_1|0|custom",
+      setup: {
+        setAwaitingCustomAnswerState: (_ctxKey, value) => value ? "custom:set" : "custom:clear",
+        sendQuestionCustomAnswerPrompt: "custom:send",
+      },
+      expectedOrder: ["custom:set", "flush", "custom:send", "custom:clear", "flush"],
+    },
+  ]
+
+  for (const { data, setup, expectedOrder } of cases) {
+    const order = []
+    const wizard = makeWizard({ questions: [{ header: "Reason", question: "Why?", custom: true, options: [] }] })
+    const deliveryError = makeBoundaryError({
+      source: "telegram",
+      operation: "sendMessage",
+      kind: "network",
+      outcome: "retryable",
+      message: "telegram temporarily unavailable",
+    })
+    const { runtime, callbackAnswers, sentMessages } = makeRuntime({
+      storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+      store: {
+        flush: async () => {
+          order.push("flush")
+        },
+      },
+      getWizard: () => wizard,
+      ocByAlias: { demo: {} },
+      ...(setup.setRejectNoteAwaitingState ? { setRejectNoteAwaitingState: (...args) => order.push(setup.setRejectNoteAwaitingState(...args)) } : {}),
+      ...(setup.sendRejectNotePrompt ? { sendRejectNotePrompt: async () => {
+        order.push(setup.sendRejectNotePrompt)
+        throw deliveryError
+      } } : {}),
+      ...(setup.setAwaitingCustomAnswerState ? { setAwaitingCustomAnswerState: (...args) => order.push(setup.setAwaitingCustomAnswerState(...args)) } : {}),
+      ...(setup.sendQuestionCustomAnswerPrompt ? { sendQuestionCustomAnswerPrompt: async () => {
+        order.push(setup.sendQuestionCustomAnswerPrompt)
+        throw deliveryError
+      } } : {}),
+    })
+    const handlers = createCallbackHandlers(runtime)
+
+    await assert.rejects(() => handlers.handleTelegramCallback(makeCallback(data)), (err) => {
+      assert.equal(err.isBoundaryError, true)
+      assert.equal(err.source, "telegram")
+      assert.equal(err.outcome, "retryable")
+      return true
+    })
+
+    assert.deepEqual(order, expectedOrder)
+    assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Temporarily unavailable"])
+    assert.deepEqual(sentMessages, [])
+  }
+})
+
+test("createCallbackHandlers rolls back continuation state when durable flush fails", async () => {
+  const cases = [
+    {
+      data: "p|demo||perm_note_flush|reject_note",
+      setup: {
+        setRejectNoteAwaitingState: (_ctxKey, value) => value ? "reject:set" : "reject:clear",
+        sendRejectNotePrompt: "reject:send",
+      },
+    },
+    {
+      data: "q|demo||q_1|0|custom",
+      setup: {
+        setAwaitingCustomAnswerState: (_ctxKey, value) => value ? "custom:set" : "custom:clear",
+        sendQuestionCustomAnswerPrompt: "custom:send",
+      },
+    },
+  ]
+
+  for (const { data, setup } of cases) {
+    const order = []
+    const wizard = makeWizard({ questions: [{ header: "Reason", question: "Why?", custom: true, options: [] }] })
+    const { runtime, callbackAnswers } = makeRuntime({
+      storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+      store: {
+        flush: async () => {
+          order.push("flush")
+          throw new Error("state write failed")
+        },
+      },
+      getWizard: () => wizard,
+      ocByAlias: { demo: {} },
+      ...(setup.setRejectNoteAwaitingState ? { setRejectNoteAwaitingState: (...args) => order.push(setup.setRejectNoteAwaitingState(...args)) } : {}),
+      ...(setup.sendRejectNotePrompt ? { sendRejectNotePrompt: async () => order.push(setup.sendRejectNotePrompt) } : {}),
+      ...(setup.setAwaitingCustomAnswerState ? { setAwaitingCustomAnswerState: (...args) => order.push(setup.setAwaitingCustomAnswerState(...args)) } : {}),
+      ...(setup.sendQuestionCustomAnswerPrompt ? { sendQuestionCustomAnswerPrompt: async () => order.push(setup.sendQuestionCustomAnswerPrompt) } : {}),
+    })
+    const handlers = createCallbackHandlers(runtime)
+
+    await assert.rejects(() => handlers.handleTelegramCallback(makeCallback(data)), (err) => {
+      assert.equal(err.isBoundaryError, true)
+      assert.equal(err.source, "state")
+      assert.equal(err.kind, "durability")
+      return true
+    })
+
+    assert.deepEqual(order, [setup.sendRejectNotePrompt ? "reject:set" : "custom:set", "flush", setup.sendRejectNotePrompt ? "reject:clear" : "custom:clear", "flush"])
+    assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Temporarily unavailable"])
+  }
+})
+
 test("createCallbackHandlers handles single-choice and multi-choice question steps", async () => {
   const singleWizard = makeWizard({ questions: [{ header: "Pick one", question: "Pick", options: [{ label: "lint" }] }] })
   const multiWizard = makeWizard({
@@ -2454,18 +2872,18 @@ test("createCallbackHandlers flushes question wizard progression state before de
   await handlers.handleTelegramCallback(makeCallback("q|demo||q_multi_done_next|0|done", { id: "cb_3", messageId: 913 }))
 
   assert.deepEqual(order, [
-    "send:q_single_next:1:new",
     "persist:q_single_next:1",
     "flush:1",
+    "send:q_single_next:1:new",
     "delete:911",
     "answer:Selected",
     "send:q_multi_toggle:0:912",
     "persist:q_multi_toggle:0",
     "flush:2",
     "answer:",
-    "send:q_multi_done_next:1:new",
     "persist:q_multi_done_next:1",
     "flush:3",
+    "send:q_multi_done_next:1:new",
     "delete:913",
     "answer:Done",
   ])
@@ -2484,7 +2902,7 @@ test("createCallbackHandlers rolls back and rethrows durability failures during 
         ],
       }),
       assertProgress: ({ sendQuestionStepCalls, persistedWizards }) => {
-        assert.equal(sendQuestionStepCalls[0]?.wizard.index, 1)
+        assert.equal(sendQuestionStepCalls.length, 0)
         assert.equal(persistedWizards[0]?.index, 1)
       },
     },
@@ -2514,7 +2932,7 @@ test("createCallbackHandlers rolls back and rethrows durability failures during 
         selectedByIndex: { 0: ["lint", "test"] },
       }),
       assertProgress: ({ sendQuestionStepCalls, persistedWizards }) => {
-        assert.equal(sendQuestionStepCalls[0]?.wizard.index, 1)
+        assert.equal(sendQuestionStepCalls.length, 0)
         assert.equal(persistedWizards[0]?.index, 1)
         assert.equal(persistedWizards[0]?.answers[0].join(","), "lint,test")
       },
@@ -2552,7 +2970,7 @@ test("createCallbackHandlers rolls back and rethrows durability failures during 
 
     assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Temporarily unavailable"])
     assert.deepEqual(flushCalls, [true])
-    assert.equal(sendQuestionStepCalls.length, 1)
+    assert.equal(sendQuestionStepCalls.length, callbackData.includes("toggle") ? 1 : 0)
     assert.equal(persistedWizards.length, 2)
     assert.deepEqual(deletedMessages, [])
     assertProgress({ sendQuestionStepCalls, persistedWizards })
@@ -2582,6 +3000,40 @@ test("createCallbackHandlers does not persist multi-choice toggles when step edi
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Action failed"])
   assert.deepEqual(persistedWizards, [])
   assert.deepEqual(wizard.selectedByIndex, { 0: ["test"] })
+})
+
+test("createCallbackHandlers rolls back persisted next-step state when question prompt delivery fails", async () => {
+  const wizard = makeWizard({
+    id: "q_single_next_send_fail",
+    questions: [
+      { header: "Pick one", question: "Pick", options: [{ label: "lint" }] },
+      { header: "Reason", question: "Why?", custom: true, options: [] },
+    ],
+  })
+  const initialWizard = cloneWizardState(wizard)
+  const deletedMessages = []
+  const { runtime, callbackAnswers, persistedWizards } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    tg: {
+      deleteMessage: async (chatId, messageId) => {
+        deletedMessages.push({ chatId, messageId })
+      },
+    },
+    getWizard: () => wizard,
+    ocByAlias: { demo: {} },
+    sendCurrentQuestionStep: async () => {
+      throw new Error("send failed")
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("q|demo||q_single_next_send_fail|0|o|0", { messageId: 917 }))
+
+  assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["Action failed"])
+  assert.equal(persistedWizards[0]?.index, 1)
+  assert.deepEqual(persistedWizards[1], initialWizard)
+  assert.deepEqual(cloneWizardState(wizard), initialWizard)
+  assert.deepEqual(deletedMessages, [])
 })
 
 test("createCallbackHandlers rejects invalid question callback shapes and options", async () => {
@@ -2678,12 +3130,15 @@ test("createCallbackHandlers maps stale, retryable, and fatal outer callback err
   const handlers = createCallbackHandlers(runtime)
 
   await handlers.handleTelegramCallback(makeCallback("m|set|inherit"))
-  await handlers.handleTelegramCallback(makeCallback("m|apply|openai/gpt-5|xhigh"))
+  await assert.rejects(() => handlers.handleTelegramCallback(makeCallback("m|apply|openai/gpt-5|xhigh")), (err) => {
+    assert.equal(err.isBoundaryError, true)
+    assert.equal(err.outcome, "retryable")
+    return true
+  })
   await handlers.handleTelegramCallback(makeCallback("m|set|project-default"))
 
   assert.deepEqual(callbackAnswers.map((entry) => entry.text), ["No longer active", "Temporarily unavailable", "Action failed"])
   assert.deepEqual(sentMessages.map((entry) => entry.text), [
-    "Action is temporarily unavailable. Please try again.",
     "Action failed. Please try again.",
   ])
   assert.equal(loggerErrors.length, 3)
