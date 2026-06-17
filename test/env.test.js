@@ -34,6 +34,10 @@ PLAIN=value
 SPACED =  trimmed value   # comment
 DOUBLE="two words" # trailing comment
 SINGLE='keep # inside quotes'
+export EXPORTED=from-export
+HASH_SECRET=abc#def
+QUOTED_SECRET="abc#def"
+ESCAPED="say \\"hello\\" # still secret"
 EMPTY=
 `)
 
@@ -42,8 +46,30 @@ EMPTY=
     SPACED: "trimmed value",
     DOUBLE: "two words",
     SINGLE: "keep # inside quotes",
+    EXPORTED: "from-export",
+    HASH_SECRET: "abc#def",
+    QUOTED_SECRET: "abc#def",
+    ESCAPED: 'say "hello" # still secret',
     EMPTY: "",
   })
+})
+
+test("parseDotEnv preserves single-quoted secrets literally", () => {
+  const parsed = parseDotEnv(`
+SINGLE_SECRET='abc\\def#ghi'
+WINDOWS_PATH='C:\\Users\\service\\connector'
+DOUBLE_ESCAPE="line\\nnext"
+DOUBLE_WINDOWS_PATH="C:\\Users\\service\\connector"
+DOUBLE_SECRET="abc\\def\\xyz"
+DOUBLE_BACKSLASH="abc\\\\def"
+`)
+
+  assert.equal(parsed.SINGLE_SECRET, "abc\\def#ghi")
+  assert.equal(parsed.WINDOWS_PATH, "C:\\Users\\service\\connector")
+  assert.equal(parsed.DOUBLE_ESCAPE, "line\nnext")
+  assert.equal(parsed.DOUBLE_WINDOWS_PATH, "C:\\Users\\service\\connector")
+  assert.equal(parsed.DOUBLE_SECRET, "abc\\def\\xyz")
+  assert.equal(parsed.DOUBLE_BACKSLASH, "abc\\def")
 })
 
 test("loadEnvFromFile loads missing variables without overriding existing ones", async (t) => {
@@ -69,6 +95,7 @@ test("env helpers validate required, integer, and boolean values", (t) => {
     BAD_PORT_VALUE: "3.14",
     BOOL_TRUE: "yes",
     BOOL_FALSE: "off",
+    BAD_BOOL: "treu",
     EMPTY_VALUE: "",
     MISSING_VALUE: undefined,
   })
@@ -82,4 +109,5 @@ test("env helpers validate required, integer, and boolean values", (t) => {
   assert.equal(envBool("BOOL_TRUE"), true)
   assert.equal(envBool("BOOL_FALSE", true), false)
   assert.equal(envBool("MISSING_VALUE", true), true)
+  assert.throws(() => envBool("BAD_BOOL"), /Invalid boolean for BAD_BOOL: treu/)
 })

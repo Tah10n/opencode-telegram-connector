@@ -51,17 +51,53 @@ export function parseCliArgs(argv) {
   const takeValue = (flag, i) => {
     const v = argv[i + 1]
     if (!v || v.startsWith("-")) throw new Error(`Missing value for ${flag}`)
-    return v
+    return { value: v, nextIndex: i + 1 }
   }
   for (let i = 0; i < argv.length; i++) {
-    const a = argv[i]
-    if (a === "check" || a === "--check") out.check = true
-    if (a === "--env-file") out.envFile = takeValue(a, i++)
-    else if (a === "--config-file") out.configFile = takeValue(a, i++)
-    else if (a === "--projects-file") out.projectsFile = takeValue(a, i++)
-    else if (a === "--projects-json") out.projectsJson = takeValue(a, i++)
-    else if (a === "--state-file") out.stateFile = takeValue(a, i++)
-    else if (a === "--help" || a === "-h") out.help = true
+    const raw = argv[i]
+    if (raw === "--") throw new Error("Unsupported argument terminator: --")
+    const eqIndex = raw.startsWith("--") ? raw.indexOf("=") : -1
+    const a = eqIndex > 0 ? raw.slice(0, eqIndex) : raw
+    const inlineValue = eqIndex > 0 ? raw.slice(eqIndex + 1) : undefined
+    const readRequiredValue = (flag) => {
+      if (inlineValue != null) {
+        if (inlineValue === "") throw new Error(`Missing value for ${flag}`)
+        return inlineValue
+      }
+      const result = takeValue(flag, i)
+      i = result.nextIndex
+      return result.value
+    }
+
+    switch (a) {
+      case "check":
+      case "--check":
+        if (inlineValue != null) throw new Error(`Unknown argument: ${raw}`)
+        out.check = true
+        break
+      case "--env-file":
+        out.envFile = readRequiredValue(a)
+        break
+      case "--config-file":
+        out.configFile = readRequiredValue(a)
+        break
+      case "--projects-file":
+        out.projectsFile = readRequiredValue(a)
+        break
+      case "--projects-json":
+        out.projectsJson = readRequiredValue(a)
+        break
+      case "--state-file":
+        out.stateFile = readRequiredValue(a)
+        break
+      case "--help":
+      case "-h":
+        if (inlineValue != null) throw new Error(`Unknown argument: ${raw}`)
+        out.help = true
+        break
+      default:
+        throw new Error(`Unknown argument: ${raw}`)
+    }
   }
   return out
 }
