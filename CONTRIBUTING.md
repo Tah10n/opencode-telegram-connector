@@ -46,7 +46,7 @@ npm run test:coverage
 - Telegram HTML output must remain valid when split into multiple messages.
 - Keep SSE retryable disconnects and fatal protocol/size failures distinct. The default opencode event source is `/global/event`; preserve payload unwrapping, fail-closed directory metadata checks for global events, and the `OPENCODE_SSE_EVENT_PATH=/event` legacy override.
 - Encode dynamic OpenCode URL path segments and validate persisted/user-entered session IDs before routing.
-- `npm run check` includes `scripts/verify-architecture.mjs`. If a change intentionally moves a facade boundary or grows an entry file, update that guard in the same change and keep the new boundary explicit.
+- `npm run check` includes syntax, relative import, CheckJS reference, callback-data, architecture, module-graph, and typed-contract guards. If a change intentionally moves a facade boundary, grows an entry file, or changes allowed module/import/reference patterns, update the relevant guard in the same change and keep the new boundary explicit.
 
 ## Pull requests
 

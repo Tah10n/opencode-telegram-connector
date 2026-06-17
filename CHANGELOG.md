@@ -38,6 +38,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Fatal SSE protocol or size errors stop reconnect loops instead of retrying forever.
 - State load and critical state flush/write failures now fail closed instead of silently losing runtime state.
 - State schema validation now rejects malformed current-schema sections and unknown schema versions with actionable section paths.
+- `.env` parsing now supports optional `export`, quoted values, and `#` inside quoted or unspaced secret values; invalid boolean env values fail fast instead of silently becoming `false`.
+- CLI parsing now rejects unknown flags/positionals, rejects missing inline values, and accepts `--flag=value` for supported value flags.
+- State binding and session-index consistency is now validated for current-schema state and rebuilt during migrations where possible.
+- Threads bound to a project alias that no longer exists in config now get clear `/projects` / `/bind` guidance instead of attempting prompt or attachment delivery.
+- OpenCode auto-start now reports immediate background launcher exits and stops the spawned process when startup observation is aborted.
 
 ### Security
 - Logs now redact bot tokens, Basic Auth credentials, URL userinfo/query/hash values, auth-like command-line flags, and sensitive state/config paths before writing text or JSON output.
@@ -49,6 +54,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - State migrations and invalid parsed state files are preserved in bounded `state.json.backup.*` files before recovery attempts.
 
 ### Added
+- `npm run check` now includes relative import and CheckJS hard-reference guards to catch missing import targets and unresolved runtime/export references earlier.
 - `/permissions` can show and switch Codex-like OpenCode permission profiles (`suggest`, `auto-edit`, `full-auto`, and reset) from Telegram private chats, with read-only group views and backed-up local `opencode.json`/`opencode.jsonc` writes. Built-in profiles deny `.env`/`.env.*` content for both read and grep while allowing `.env.example`. `full-auto` asks on unknown future permissions, explicit permission config paths are constrained to local OpenCode config filenames, local project boundaries, and explicit remote-directory opt-in for same-platform remote paths, and `setup:check` validates permission config targets only after explicit permission-control opt-in or `permissionConfigPath` configuration.
 - Full Telegram UI localization infrastructure with English and Russian catalogs, `/language` per-thread selection, Telegram command menus per locale, and config/env overrides.
 - Update-scoped correlation IDs now flow through Telegram update handling, connector handlers, OpenCode HTTP/SSE requests, mirroring, Telegram delivery logs, and `logger.child()` scoped fields. OpenCode requests include `X-Connector-Correlation` when a context is active.

@@ -78,7 +78,7 @@ npm run check
 
 When you follow the quick start from the connector directory, local runtime files live next to this README:
 
-- `.env` — secrets and env-only overrides; create it from `.env.example` and do not commit it.
+- `.env` — secrets and env-only overrides; create it from `.env.example` and do not commit it. The parser accepts optional `export`, single/double-quoted values, and `#` inside quoted or unspaced secret values; unquoted comments start at whitespace followed by `#`.
 - `connector.config.mjs` — preferred project configuration; create it from `connector.config.example.mjs` and keep secrets in `.env`.
 - `.data/state.json` — default persisted state path; treat it as sensitive because it contains bindings, offsets, pending prompts, and idempotency history.
 
@@ -294,6 +294,8 @@ If the final assistant message cannot be fetched yet and a Telegram preview/plac
 - `activeTurnStaleMs` (`connector.config.mjs` only; milliseconds before a running assistant turn is treated as stale)
 - `cwd` (`connector.config.mjs` only; base directory for relative paths)
 
+Boolean env values accept `1`/`true`/`yes`/`y`/`on` and `0`/`false`/`no`/`n`/`off` case-insensitively. Invalid non-empty values fail fast instead of silently becoming disabled.
+
 ### Telegram workflow limits
 
 Prefer the `limits` object in `connector.config.mjs`; env fallbacks are available for legacy deployments.
@@ -332,6 +334,8 @@ Prefer the `limits` object in `connector.config.mjs`; env fallbacks are availabl
 - `--projects-file <path>`
 - `--projects-json <json>`
 - `--state-file <path>`
+
+Value flags also accept `--flag=value`. Unknown flags, unexpected positional commands, and a bare `--` argument terminator fail fast.
 
 ### Advanced debug env
 
@@ -591,7 +595,8 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 | Duplicate prompts or callbacks | Check `/status` for prompt cleanup/recovery and callback outcome counters. Duplicates after restart should be skipped as already handled. | If duplicates continue, keep the connector single-instance and inspect logs around prompt polling/SSE reconnects. |
 | Stale callbacks | Button presses may answer `No longer active` or `Already handled` after a prompt is completed or rejected. | Prompt messages are removed automatically when possible; otherwise dismiss any remaining old interactive message with Close and wait for the current prompt to be delivered again if it is still live. |
 | Wrong thread/session | Use `/status` in the thread and `/bindings` in a private chat to compare bindings. | Use `/use <sessionId>`, `/bind <projectAlias>`, `/new`, or `/unbind` in the affected thread. |
-| Failed auto-start | `/projects` shows Start only when local launch is supported. Logs include launcher errors without exposing secrets. | Verify `opencode` is on `PATH`, the project `directory` and `port` are configured, and a GUI terminal is available if you configured window/TUI launch. |
+| Bound project is no longer configured | The thread says its persisted project alias is missing from config, usually after removing or renaming a project in `connector.config.mjs`. | Use `/projects` or `/bind` to choose a configured project, or restore the old alias in config if the binding should keep working. |
+| Failed auto-start | `/projects` shows Start only when local launch is supported. Logs include launcher errors and immediate background-process exits without exposing secrets. | Verify `opencode` is on `PATH`, the project `directory` and `port` are configured, and a GUI terminal is available if you configured window/TUI launch. |
 
 ## Important behavior and limits
 
@@ -599,7 +604,7 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 - The connector is designed to run as a **single instance** per bot token.
 - On first start, it drains old Telegram updates to avoid replaying history.
 - State load and critical state flush/write failures fail closed; the connector should not continue as if durability succeeded.
-- Current-schema state is validated on load, unsupported schema versions fail closed, and schema migrations create bounded `state.json.backup.*` files before writing the migrated state.
+- Current-schema state is validated on load, including binding/session-index consistency; unsupported schema versions fail closed, and schema migrations create bounded `state.json.backup.*` files before writing the migrated state.
 - A confirmed `/runtime` Restart stores a short pending online-notice record in state until the next startup sends and clears it.
 - Feed mode is stored per Telegram thread/topic; the default is `Main + changes`.
 - Large assistant replies may be delivered as `.txt` attachments, and large changed-file diffs may be delivered as `.patch` attachments instead of many chat messages.
