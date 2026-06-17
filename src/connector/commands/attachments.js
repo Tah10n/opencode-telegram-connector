@@ -217,7 +217,7 @@ export function createAttachmentHandlers({
   }
 
   async function sendAttachmentPromptToOpenCode(ctxMeta, binding, record, loaded) {
-    const oc = ocByAlias[binding.projectAlias]
+    const oc = binding.oc || ocByAlias[binding.projectAlias]
     const prefix = config.tgPrefix ?? "[TG] "
     const promptText = formatAttachmentPrompt({
       prefix,
@@ -368,6 +368,16 @@ export function createAttachmentHandlers({
         closeOnlyKeyboard(locale),
       )
       return { callbackText: "Binding changed" }
+    }
+    if (!ocByAlias[currentBinding.projectAlias]) {
+      pendingAttachmentConfirmations.delete(token)
+      await safeEditMessage(
+        ctxMeta,
+        editMessageId,
+        translate(locale, "commands.boundProjectMissing", { project: currentBinding.projectAlias || "unknown" }),
+        closeOnlyKeyboard(locale),
+      )
+      return { callbackText: "Project missing" }
     }
 
     if (await staleActiveTurnGuard?.(ctxMeta, currentBinding)) {

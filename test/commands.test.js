@@ -2960,6 +2960,61 @@ test("createCommandHandlers handleTelegramMessage rethrows retryable promptAsync
   assert.match(sent[0].text, /Project 'demo' is unavailable/)
 })
 
+test("createCommandHandlers reports stale configured bindings before prompt handling", async () => {
+  const cases = [
+    { name: "text", message: { text: "hello after config change" } },
+    { name: "document", message: { document: { file_id: "file_1", file_name: "notes.txt", mime_type: "text/plain", file_size: 10 } } },
+    { name: "media", message: { photo: [{ file_id: "photo_1" }] } },
+  ]
+
+  for (const entry of cases) {
+    const marked = []
+    const promptCalls = []
+    const { runtime, sent } = makeRuntime({
+      projects: { demo: { baseUrl: "http://127.0.0.1:4312" } },
+      storeState: {
+        bindings: { "100:7": { projectAlias: "old-project", sessionId: "ses_old" } },
+      },
+      store: {
+        markIdempotencyKey(key, metadata) {
+          marked.push({ key, metadata })
+          return true
+        },
+        async flush() {},
+      },
+      tg: {
+        async downloadFile() {
+          throw new Error("stale binding should not download attachments")
+        },
+      },
+      ocByAlias: {
+        demo: {
+          async promptAsync(...args) {
+            promptCalls.push(args)
+          },
+        },
+      },
+    })
+    const handlers = createCommandHandlers(runtime)
+
+    await handlers.handleTelegramMessage({
+      chat: { id: 100, type: "supergroup" },
+      from: { id: 42 },
+      message_id: 4000 + cases.indexOf(entry),
+      message_thread_id: 7,
+      ...entry.message,
+    })
+
+    assert.equal(promptCalls.length, 0, entry.name)
+    assert.equal(sent.length, 1, entry.name)
+    assert.match(sent[0].text, /old-project/, entry.name)
+    assert.equal(marked.length, 1, entry.name)
+    assert.equal(marked[0].metadata.operation, "missingProjectBinding", entry.name)
+    assert.equal(marked[0].metadata.projectAlias, "old-project", entry.name)
+    assert.equal(marked[0].metadata.sessionId, "ses_old", entry.name)
+  }
+})
+
 test("createCommandHandlers delegates retryable promptAsync failure notices to the throttled notifier", async () => {
   const notices = []
   const err = makeBoundaryError({
@@ -3564,6 +3619,56 @@ test("createCommandHandlers requires confirmation for large text documents and c
   assert.deepEqual(result, { callbackText: "Cancelled" })
   assert.equal(promptCalls.length, 0)
   assert.equal(editCalls[0][2], "Attachment sending cancelled.")
+})
+
+test("createCommandHandlers refuses confirmed attachment when bound project is no longer configured", async () => {
+  const editCalls = []
+  const tgCalls = []
+  const promptCalls = []
+  const ocByAlias = {
+    demo: {
+      async promptAsync(...args) {
+        promptCalls.push(args)
+      },
+    },
+  }
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    tg: {
+      async getFile(...args) {
+        tgCalls.push(["getFile", args])
+        return { file_path: "files/large.log", file_size: USER_ATTACHMENT_LIMITS.confirmBytes }
+      },
+      async downloadFile(...args) {
+        tgCalls.push(["downloadFile", args])
+        return new TextEncoder().encode("log line")
+      },
+      async editMessageText(...args) {
+        editCalls.push(args)
+        return true
+      },
+    },
+    ocByAlias,
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 12,
+    message_thread_id: 7,
+    document: { file_id: "file_large", file_name: "large.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
+  })
+  const sendButton = sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file")
+  const token = attachmentTokenFromButton(sendButton)
+
+  delete ocByAlias.demo
+  const result = await handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", token, { editMessageId: 78 })
+
+  assert.deepEqual(result, { callbackText: "Project missing" })
+  assert.match(editCalls[0][2], /project 'demo'.*no longer configured/)
+  assert.deepEqual(tgCalls, [])
+  assert.deepEqual(promptCalls, [])
 })
 
 test("createCommandHandlers does not mark large attachment handled when confirmation send fails", async () => {

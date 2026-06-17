@@ -102,6 +102,7 @@ export default {
     rejectionNoteSent: "Комментарий отказа отправлен.",
     bindTextExpected: "Для привязки нужен alias проекта текстом. Отправьте alias или /cancel.",
     bindAliasPrompt: "Отправьте alias проекта (например, 'myproj') или /cancel.",
+    boundProjectMissing: "Этот тред привязан к проекту '{project}', но такого проекта больше нет в config. Используйте /projects или /bind, чтобы выбрать другой проект.",
   },
   attachments: {
     confirmationTitle: "Подтвердите отправку файла в OpenCode:",

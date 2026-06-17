@@ -102,6 +102,7 @@ export default {
     rejectionNoteSent: "Rejection note sent.",
     bindTextExpected: "This bind flow expects a project alias as text. Send an alias or /cancel.",
     bindAliasPrompt: "Send project alias (e.g. 'myproj') or /cancel.",
+    boundProjectMissing: "This thread is bound to project '{project}', but that project is no longer configured. Use /projects or /bind to choose another project.",
   },
   attachments: {
     confirmationTitle: "Confirm sending this file to OpenCode:",

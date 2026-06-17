@@ -268,8 +268,34 @@ export function createCommandHandlers(runtime) {
     return makeInlineKeyboard([[{ text: translate(localeForCtx(ctxMeta), "common.close"), callback_data: packCallback("s", "close") }]])
   }
 
+  function resolveConfiguredBinding(binding) {
+    const alias = String(binding?.projectAlias || "").trim()
+    const sessionId = String(binding?.sessionId || "").trim()
+    if (!alias || !sessionId || !projects?.[alias] || !ocByAlias?.[alias]) return null
+    return {
+      ...binding,
+      alias,
+      projectAlias: alias,
+      project: projects[alias],
+      oc: ocByAlias[alias],
+      sessionId,
+    }
+  }
+
+  async function sendMissingProjectBindingNotice(ctxMeta, binding, markMessageHandled) {
+    await sendToThread(
+      ctxMeta,
+      t(ctxMeta, "commands.boundProjectMissing", { project: binding?.projectAlias || "unknown" }),
+      unboundGuidanceKeyboard(ctxMeta),
+    )
+    await markMessageHandled("missingProjectBinding", {
+      projectAlias: binding?.projectAlias,
+      sessionId: binding?.sessionId,
+    })
+  }
+
   async function maybeBlockStaleActiveTurn(ctxMeta, binding) {
-    const oc = ocByAlias[binding?.projectAlias]
+    const oc = binding?.oc || ocByAlias[binding?.projectAlias]
     if (!oc?.listMessages || !binding?.sessionId) return false
     let status
     try {
@@ -939,39 +965,44 @@ export function createCommandHandlers(runtime) {
       await markMessageHandled("unbound")
       return
     }
+    const resolvedBinding = resolveConfiguredBinding(binding)
+    if (!resolvedBinding) {
+      await sendMissingProjectBindingNotice(ctxMeta, binding, markMessageHandled)
+      return
+    }
 
     if (hasDocument) {
-      await handleAttachmentDocumentMessage(ctxMeta, msg, binding, messageKey, markMessageHandled, options)
+      await handleAttachmentDocumentMessage(ctxMeta, msg, resolvedBinding, messageKey, markMessageHandled, options)
       return
     }
 
     if (mediaKind) {
       await sendToThread(ctxMeta, unsupportedMediaText(mediaKind, { limits: userAttachmentLimits, locale: ctxMeta.locale }), closeOnlyKeyboard(ctxMeta))
-      await markMessageHandled("unsupportedMedia", { projectAlias: binding.projectAlias, sessionId: binding.sessionId, action: mediaKind })
+      await markMessageHandled("unsupportedMedia", { projectAlias: resolvedBinding.projectAlias, sessionId: resolvedBinding.sessionId, action: mediaKind })
       return
     }
 
     if (!hasText) return
 
-    const oc = ocByAlias[binding.projectAlias]
-    if (await maybeBlockStaleActiveTurn(ctxMeta, binding)) {
-      await markMessageHandled("staleActiveTurn", { projectAlias: binding.projectAlias, sessionId: binding.sessionId })
+    const oc = resolvedBinding.oc
+    if (await maybeBlockStaleActiveTurn(ctxMeta, resolvedBinding)) {
+      await markMessageHandled("staleActiveTurn", { projectAlias: resolvedBinding.projectAlias, sessionId: resolvedBinding.sessionId })
       return
     }
     const prefix = config.tgPrefix ?? "[TG] "
     const promptText = `${prefix}${text}`
-    const sk = sessionKey(binding.projectAlias, binding.sessionId)
+    const sk = sessionKey(resolvedBinding.projectAlias, resolvedBinding.sessionId)
     ensureRecentPromptSet(sk).add(hashTextForEcho(promptText))
-    const promptOverride = await resolvePromptOverride(ctxMeta.ctxKey, binding)
+    const promptOverride = await resolvePromptOverride(ctxMeta.ctxKey, resolvedBinding)
     // Persist message idempotency before the external side effect. If opencode
     // accepts the prompt and the process crashes immediately after, replayed
     // Telegram updates will skip instead of sending a duplicate prompt.
-    await markIdempotencyEntries([messageIdempotencyEntry("promptAsync", { projectAlias: binding.projectAlias, sessionId: binding.sessionId })], {
+    await markIdempotencyEntries([messageIdempotencyEntry("promptAsync", { projectAlias: resolvedBinding.projectAlias, sessionId: resolvedBinding.sessionId })], {
       rollbackOnFlushFailure: true,
     })
     try {
-      await oc.promptAsync(binding.sessionId, promptText, promptOverride || undefined)
-      markProjectUp?.(binding.projectAlias)
+      await oc.promptAsync(resolvedBinding.sessionId, promptText, promptOverride || undefined)
+      markProjectUp?.(resolvedBinding.projectAlias)
     } catch (err) {
       let cleanupErr = null
       try {
@@ -979,11 +1010,11 @@ export function createCommandHandlers(runtime) {
       } catch (deleteErr) {
         cleanupErr = deleteErr
       }
-      const alias = binding.projectAlias
+      const alias = resolvedBinding.projectAlias
       recordRetryableOpenCodeFailure(alias, err, {
         operation: "POST /session/:id/prompt_async",
         method: "POST",
-        pathname: `/session/${binding.sessionId}/prompt_async`,
+        pathname: `/session/${resolvedBinding.sessionId}/prompt_async`,
       })
       await notifyUnavailableForThread(ctxMeta, alias, err)
       if (cleanupErr) throw cleanupErr
