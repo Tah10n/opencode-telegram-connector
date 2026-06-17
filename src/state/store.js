@@ -44,6 +44,7 @@ function migrationOptionsForLoad(filePath) {
     createSchemaValidationError: schemaValidationError,
     normalizeBindings,
     normalizeSessionIndex,
+    normalizeBindingSections,
     normalizeFeedByContext,
     normalizeLocaleByContext,
     normalizeModelPrefsByContext,
@@ -761,6 +762,7 @@ function validateCurrentState(state) {
   if (!(state.updateOffset === null || Number.isInteger(state.updateOffset))) errors.push("state.updateOffset must be null or an integer")
   validateBindingsSection(state.bindings, errors)
   validateSessionIndexSection(state.sessionIndex, errors)
+  validateBindingIndexConsistency(state.bindings, state.sessionIndex, errors)
   validateFeedByContextSection(state.feedByContext, errors)
   validateLocaleByContextSection(state.localeByContext, errors)
   validateModelPrefsByContextSection(state.modelPrefsByContext, errors)
@@ -795,6 +797,43 @@ function validateSessionIndexSection(value, errors) {
     if (!pushRecordError(errors, route, `state.sessionIndex${pathKey(key)}`)) continue
     if (!Number.isInteger(route.chatId)) errors.push(`state.sessionIndex${pathKey(key)}.chatId must be an integer`)
     if (!Number.isInteger(route.threadIdOr0) || route.threadIdOr0 < 0) errors.push(`state.sessionIndex${pathKey(key)}.threadIdOr0 must be a non-negative integer`)
+  }
+}
+
+function validateBindingIndexConsistency(bindings, sessionIndex, errors) {
+  if (!isRecord(bindings) || !isRecord(sessionIndex)) return
+
+  const expectedBySession = new Map()
+  for (const [ctxKey, binding] of Object.entries(bindings)) {
+    const ctx = parseStoredCtxKey(ctxKey)
+    if (!ctx || !isSafeProjectAlias(binding?.projectAlias) || !isStoredOpenCodeId(binding?.sessionId)) continue
+    const sk = sessionKey(binding.projectAlias, binding.sessionId)
+    const previous = expectedBySession.get(sk)
+    if (previous) {
+      errors.push(`state.bindings${pathKey(ctxKey)} duplicates session key ${JSON.stringify(sk)} already bound at state.bindings${pathKey(previous.ctxKey)}`)
+      continue
+    }
+    expectedBySession.set(sk, { ctxKey, ctx })
+
+    const route = sessionIndex[sk]
+    if (!route || typeof route !== "object") {
+      errors.push(`state.sessionIndex${pathKey(sk)} is missing for state.bindings${pathKey(ctxKey)}`)
+      continue
+    }
+    if (Number.isInteger(route.chatId) && Number.isInteger(route.threadIdOr0) && route.threadIdOr0 >= 0 && (route.chatId !== ctx.chatId || route.threadIdOr0 !== ctx.threadIdOr0)) {
+      errors.push(`state.sessionIndex${pathKey(sk)} must route to state.bindings${pathKey(ctxKey)}`)
+    }
+  }
+
+  for (const [sk, route] of Object.entries(sessionIndex)) {
+    const parsed = parseStoredSessionKey(sk)
+    if (!parsed || !route || typeof route !== "object") continue
+    if (!Number.isInteger(route.chatId) || !Number.isInteger(route.threadIdOr0) || route.threadIdOr0 < 0) continue
+    const ctxKey = `${route.chatId}:${route.threadIdOr0}`
+    const binding = bindings[ctxKey]
+    if (binding?.projectAlias !== parsed.projectAlias || binding?.sessionId !== parsed.sessionId) {
+      errors.push(`state.sessionIndex${pathKey(sk)} must reference a matching state.bindings${pathKey(ctxKey)}`)
+    }
   }
 }
 
@@ -969,7 +1008,7 @@ function normalizeBindings(value) {
   return Object.fromEntries(
     Object.entries(value)
       .filter(([ctxKey, binding]) => {
-        if (typeof ctxKey !== "string" || !ctxKey) return false
+        if (!parseStoredCtxKey(ctxKey)) return false
         if (!binding || typeof binding !== "object") return false
         return isSafeProjectAlias(binding.projectAlias) && isStoredOpenCodeId(binding.sessionId)
       })
@@ -990,10 +1029,39 @@ function normalizeSessionIndex(value) {
       .filter(([key, route]) => {
         if (!parseStoredSessionKey(key)) return false
         if (!route || typeof route !== "object") return false
-        return Number.isFinite(route.chatId) && Number.isInteger(route.threadIdOr0)
+        return Number.isInteger(route.chatId) && Number.isInteger(route.threadIdOr0) && route.threadIdOr0 >= 0
       })
       .map(([key, route]) => [key, { chatId: route.chatId, threadIdOr0: route.threadIdOr0 }]),
   )
+}
+
+function normalizeBindingSections(bindingsValue, sessionIndexValue) {
+  const normalizedBindings = normalizeBindings(bindingsValue)
+  const normalizedSessionIndex = normalizeSessionIndex(sessionIndexValue)
+  const bindingsBySession = new Map()
+
+  for (const [ctxKey, binding] of Object.entries(normalizedBindings).sort(([a], [b]) => a.localeCompare(b))) {
+    const ctx = parseStoredCtxKey(ctxKey)
+    const sk = sessionKey(binding.projectAlias, binding.sessionId)
+    const entries = bindingsBySession.get(sk) || []
+    entries.push({ ctxKey, binding, ctx })
+    bindingsBySession.set(sk, entries)
+  }
+
+  const bindings = {}
+  const sessionIndex = {}
+  for (const [sk, entries] of bindingsBySession.entries()) {
+    const existingRoute = normalizedSessionIndex[sk]
+    const existingCtxKey = existingRoute ? `${existingRoute.chatId}:${existingRoute.threadIdOr0}` : ""
+    const kept = entries.find((entry) => entry.ctxKey === existingCtxKey) || entries[0]
+    bindings[kept.ctxKey] = {
+      projectAlias: kept.binding.projectAlias,
+      sessionId: kept.binding.sessionId,
+    }
+    sessionIndex[sk] = { chatId: kept.ctx.chatId, threadIdOr0: kept.ctx.threadIdOr0 }
+  }
+
+  return { bindings, sessionIndex }
 }
 
 function findPromptRecord(records, projectAlias, promptId, sessionID = "") {
@@ -1033,7 +1101,7 @@ function normalizeCtxPromptRecords(value, idField) {
   if (!value || typeof value !== "object") return {}
   return Object.fromEntries(
     Object.entries(value)
-      .filter(([ctxKey, entry]) => typeof ctxKey === "string" && ctxKey && isSafeProjectAlias(entry?.projectAlias) && entry?.[idField] && isOptionalStoredOpenCodeId(entry?.sessionID))
+      .filter(([ctxKey, entry]) => parseStoredCtxKey(ctxKey) && isSafeProjectAlias(entry?.projectAlias) && entry?.[idField] && isOptionalStoredOpenCodeId(entry?.sessionID))
       .map(([ctxKey, entry]) => [ctxKey, { ...entry, sessionID: entry.sessionID || "" }]),
   )
 }
@@ -1113,7 +1181,7 @@ function normalizeFeedByContext(value) {
   if (!value || typeof value !== "object") return defaultFeedByContext()
   return Object.fromEntries(
     Object.entries(value)
-      .filter(([ctxKey]) => typeof ctxKey === "string" && ctxKey)
+      .filter(([ctxKey]) => parseStoredCtxKey(ctxKey))
       .map(([ctxKey, settings]) => [ctxKey, { mode: normalizeFeedMode(settings?.mode) }]),
   )
 }
@@ -1122,7 +1190,7 @@ function normalizeLocaleByContext(value) {
   if (!value || typeof value !== "object") return defaultLocaleByContext()
   return Object.fromEntries(
     Object.entries(value)
-      .filter(([ctxKey, record]) => typeof ctxKey === "string" && ctxKey && !!matchSupportedLocale(record?.locale))
+      .filter(([ctxKey, record]) => parseStoredCtxKey(ctxKey) && !!matchSupportedLocale(record?.locale))
       .map(([ctxKey, record]) => [ctxKey, { locale: matchSupportedLocale(record.locale), source: record.source === "manual" ? "manual" : "telegram" }]),
   )
 }
@@ -1131,7 +1199,7 @@ function normalizeModelPrefsByContext(value) {
   if (!value || typeof value !== "object") return defaultModelPrefsByContext()
   return Object.fromEntries(
     Object.entries(value)
-      .filter(([ctxKey]) => typeof ctxKey === "string" && ctxKey)
+      .filter(([ctxKey]) => parseStoredCtxKey(ctxKey))
       .map(([ctxKey, pref]) => [ctxKey, storedModelPreference(pref)])
       .filter(([, pref]) => !!pref),
   )

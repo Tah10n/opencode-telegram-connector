@@ -679,6 +679,112 @@ test("StateStore migrates schema version 5 state to version 6", async () => {
   assert.deepEqual(loaded.modelPrefsByContext, { "100:7": { mode: "project-default" } })
 })
 
+test("StateStore migration rebuilds binding routes and drops context sections that fail current validation", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  await fs.writeFile(
+    filePath,
+    JSON.stringify(
+      {
+        schemaVersion: 4,
+        updateOffset: 112,
+        bindings: {
+          "bad-key": { projectAlias: "demo", sessionId: "ses_bad" },
+          "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+          "200:0": { projectAlias: "demo", sessionId: "ses_rebuild" },
+        },
+        sessionIndex: {
+          "demo:ses_bad": { chatId: 999, threadIdOr0: 9 },
+          "demo:ses_1": { chatId: 999, threadIdOr0: 9 },
+          "demo:ses_rebuild": { chatId: 200, threadIdOr0: -1 },
+          "demo:ses_orphan": { chatId: 300, threadIdOr0: 0 },
+          "demo:ses_float": { chatId: 1.5, threadIdOr0: 0 },
+          "demo:ses_negative": { chatId: 100, threadIdOr0: -1 },
+        },
+        feedByContext: {
+          "bad-key": { mode: "verbose" },
+          "100:7": { mode: "main" },
+        },
+        modelPrefsByContext: {
+          "bad-key": { mode: "project-default" },
+          "100:7": { mode: "custom", model: { providerID: "openai", modelID: "gpt-5" }, variant: "xhigh" },
+        },
+        pendingPrompts: {
+          permissions: {},
+          rejectNotes: { "bad-key": { projectAlias: "demo", permissionId: "perm_1" } },
+          customAnswers: { "bad-key": { projectAlias: "demo", requestId: "q_1", qIndex: 0 } },
+          questionWizards: {},
+        },
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  )
+
+  const store = new StateStore({ filePath, logger: makeLogger() })
+  const loaded = await store.load()
+
+  assert.equal(loaded.schemaVersion, STATE_SCHEMA_VERSION)
+  assert.deepEqual(loaded.bindings, {
+    "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+    "200:0": { projectAlias: "demo", sessionId: "ses_rebuild" },
+  })
+  assert.deepEqual(loaded.sessionIndex, {
+    "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+    "demo:ses_rebuild": { chatId: 200, threadIdOr0: 0 },
+  })
+  assert.deepEqual(loaded.feedByContext, { "100:7": { mode: "main" } })
+  assert.deepEqual(loaded.modelPrefsByContext, {
+    "100:7": { mode: "custom", model: { providerID: "openai", modelID: "gpt-5" }, variant: "xhigh" },
+  })
+  assert.deepEqual(loaded.pendingPrompts.rejectNotes, {})
+  assert.deepEqual(loaded.pendingPrompts.customAnswers, {})
+})
+
+test("StateStore rejects schema version 6 state with inconsistent binding routes", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  await fs.writeFile(
+    filePath,
+    JSON.stringify(
+      {
+        schemaVersion: 6,
+        updateOffset: 113,
+        bindings: {
+          "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+          "200:0": { projectAlias: "demo", sessionId: "ses_2" },
+        },
+        sessionIndex: {
+          "demo:ses_1": { chatId: 100, threadIdOr0: 8 },
+          "demo:ses_orphan": { chatId: 300, threadIdOr0: 0 },
+        },
+        feedByContext: {},
+        localeByContext: {},
+        modelPrefsByContext: {},
+        pendingPrompts: { permissions: {}, rejectNotes: {}, customAnswers: {}, questionWizards: {} },
+        pendingRuntimeOnlineNotice: null,
+        idempotency: { keys: {} },
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  )
+
+  const store = new StateStore({ filePath, logger: makeLogger() })
+
+  await assert.rejects(() => store.load(), (err) => {
+    assert.equal(err.code, "STATE_SCHEMA_INVALID")
+    assert.ok(err.errors.some((entry) => entry.includes('state.sessionIndex["demo:ses_1"] must route to state.bindings["100:7"]')), err.errors.join("\n"))
+    assert.ok(err.errors.some((entry) => entry.includes('state.sessionIndex["demo:ses_2"] is missing for state.bindings["200:0"]')), err.errors.join("\n"))
+    assert.ok(err.errors.some((entry) => entry.includes('state.sessionIndex["demo:ses_orphan"] must reference a matching state.bindings["300:0"]')), err.errors.join("\n"))
+    return true
+  })
+  const backups = (await fs.readdir(dir)).filter((name) => name.startsWith("state.json.backup.") && name.includes(".invalid."))
+  assert.equal(backups.length, 1)
+})
+
 test("StateStore rejects malformed schema version 6 sections with actionable paths", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
@@ -802,7 +908,7 @@ test("StateStore rejects unsafe persisted session identities", async () => {
     assert.match(err.message, /state\.bindings\["100:1"\]\.projectAlias/)
     assert.match(err.message, /pipe/)
     assert.match(err.message, /state\.sessionIndex\["demo:prod:ses_2"\] key/)
-    assert.match(err.message, /state\.pendingPrompts\.permissions\["unsafe"\]\.sessionID/)
+    assert.ok(err.errors.some((entry) => /state\.pendingPrompts\.permissions\["unsafe"\]\.sessionID/.test(entry)), err.errors.join("\n"))
     return true
   })
   const backups = (await fs.readdir(dir)).filter((name) => name.startsWith("state.json.backup.") && name.includes(".invalid."))
