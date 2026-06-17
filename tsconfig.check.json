@@ -7,7 +7,15 @@
     "noEmit": true,
     "strict": false,
     "target": "ES2022",
-    "types": ["node"]
+    "lib": ["ES2022", "DOM"],
+    "types": ["node"],
+    "skipLibCheck": true
   },
-  "include": ["index.mjs", "scripts/**/*.mjs", "src/**/*.js"]
+  "include": [
+    "src/**/*.js",
+    "test/**/*.js",
+    "scripts/**/*.mjs",
+    "index.mjs",
+    "connector.config.example.mjs"
+  ]
 }

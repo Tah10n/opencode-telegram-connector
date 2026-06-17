@@ -14,6 +14,8 @@
   "files": [
     "src",
     "scripts/check-syntax.mjs",
+    "scripts/verify-imports.mjs",
+    "scripts/verify-checkjs-references.mjs",
     "scripts/verify-callback-data.mjs",
     "scripts/verify-architecture.mjs",
     "test",
@@ -39,7 +41,8 @@
   },
   "scripts": {
     "start": "node src/cli.js",
-    "check": "node scripts/check-syntax.mjs && node scripts/verify-callback-data.mjs && npm run check:architecture && npm run check:module-graph && npm run check:typed-contracts",
+    "check": "node scripts/check-syntax.mjs && node scripts/verify-imports.mjs && npm run check:references && node scripts/verify-callback-data.mjs && npm run check:architecture && npm run check:module-graph && npm run check:typed-contracts",
+    "check:references": "node scripts/verify-checkjs-references.mjs",
     "check:architecture": "node scripts/verify-architecture.mjs",
     "check:module-graph": "tsc -p tsconfig.check.json",
     "check:typed-contracts": "tsc -p tsconfig.typed-contracts.json",

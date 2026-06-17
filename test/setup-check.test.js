@@ -4,6 +4,8 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import crypto from "node:crypto"
+import { checkCheckJsReferences } from "../scripts/verify-checkjs-references.mjs"
+import { checkRelativeImports } from "../scripts/verify-imports.mjs"
 import { runSetupCheck } from "../src/setup/check.js"
 
 async function makeTempDir() {
@@ -47,6 +49,37 @@ function swapEnv(t, patch) {
 
 function regexEscape(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+async function writeCheckJsReferenceProject(dir) {
+  await fs.mkdir(path.join(dir, "src"), { recursive: true })
+  await fs.writeFile(
+    path.join(dir, "tsconfig.check.json"),
+    JSON.stringify(
+      {
+        compilerOptions: {
+          allowJs: true,
+          checkJs: false,
+          module: "NodeNext",
+          moduleResolution: "NodeNext",
+          noEmit: true,
+          strict: false,
+          target: "ES2022",
+          types: [],
+          skipLibCheck: true,
+        },
+        include: ["src/**/*.js"],
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  )
+}
+
+async function writeImportGuardProject(dir) {
+  await fs.mkdir(path.join(dir, "src"), { recursive: true })
+  await fs.writeFile(path.join(dir, "src", "existing.js"), "export const value = 1\n", "utf8")
 }
 
 test("runSetupCheck reports successful probes and cleans temp state files", async () => {
@@ -968,21 +1001,126 @@ test("runSetupCheck fails on shipped Telegram placeholders", async () => {
 test("package scripts keep syntax check, cover starter config, and add setup check", async () => {
   const pkg = JSON.parse(await fs.readFile(new URL("../package.json", import.meta.url), "utf8"))
   const syntaxCheckScript = await fs.readFile(new URL("../scripts/check-syntax.mjs", import.meta.url), "utf8")
+  const importGuardScript = await fs.readFile(new URL("../scripts/verify-imports.mjs", import.meta.url), "utf8")
+  const checkJsReferenceGuardScript = await fs.readFile(new URL("../scripts/verify-checkjs-references.mjs", import.meta.url), "utf8")
   const callbackGuardScript = await fs.readFile(new URL("../scripts/verify-callback-data.mjs", import.meta.url), "utf8")
   const architectureGuardScript = await fs.readFile(new URL("../scripts/verify-architecture.mjs", import.meta.url), "utf8")
 
   assert.equal(pkg.private, true)
-  assert.equal(pkg.scripts.check, "node scripts/check-syntax.mjs && node scripts/verify-callback-data.mjs && npm run check:architecture && npm run check:module-graph && npm run check:typed-contracts")
+  assert.equal(pkg.scripts.check, "node scripts/check-syntax.mjs && node scripts/verify-imports.mjs && npm run check:references && node scripts/verify-callback-data.mjs && npm run check:architecture && npm run check:module-graph && npm run check:typed-contracts")
+  assert.equal(pkg.scripts["check:references"], "node scripts/verify-checkjs-references.mjs")
   assert.equal(pkg.scripts["check:architecture"], "node scripts/verify-architecture.mjs")
   assert.equal(pkg.scripts["check:module-graph"], "tsc -p tsconfig.check.json")
   assert.equal(pkg.scripts["check:typed-contracts"], "tsc -p tsconfig.typed-contracts.json")
+  assert.ok(pkg.files.includes("scripts/verify-imports.mjs"))
+  assert.ok(pkg.files.includes("scripts/verify-checkjs-references.mjs"))
   assert.ok(pkg.files.includes("scripts/verify-callback-data.mjs"))
   assert.ok(pkg.files.includes("scripts/verify-architecture.mjs"))
   assert.ok(pkg.files.includes("test"))
   assert.ok(pkg.files.includes("tsconfig.check.json"))
   assert.ok(pkg.files.includes("tsconfig.typed-contracts.json"))
   assert.match(syntaxCheckScript, /connector\.config\.example\.mjs/)
+  assert.match(importGuardScript, /Import guard failed/)
+  assert.match(checkJsReferenceGuardScript, /CheckJS reference guard failed/)
   assert.match(callbackGuardScript, /raw callback payload literal/)
   assert.match(architectureGuardScript, /Architecture guard failed/)
   assert.equal(pkg.scripts["setup:check"], "node src/cli.js check")
+})
+
+test("checkJs reference guard fails unresolved runtime references", async () => {
+  const dir = await makeTempDir()
+  await writeCheckJsReferenceProject(dir)
+  await fs.writeFile(path.join(dir, "src", "bad.js"), "console.log(missingRuntimeValue)\n", "utf8")
+
+  const result = checkCheckJsReferences({ rootDir: dir })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.fileCount, 1)
+  assert.ok(
+    result.diagnostics.some((diagnostic) => diagnostic.includes("TS2304") && diagnostic.includes("missingRuntimeValue")),
+    result.diagnostics.join("\n"),
+  )
+})
+
+test("checkJs reference guard fails missing named imports from existing modules", async () => {
+  const dir = await makeTempDir()
+  await writeCheckJsReferenceProject(dir)
+  await fs.writeFile(path.join(dir, "src", "existing.js"), "export const present = 1\n", "utf8")
+  const existingSpecifier = "." + "/existing.js"
+  await fs.writeFile(path.join(dir, "src", "bad-import.js"), `import { missing } from ${JSON.stringify(existingSpecifier)}\nconsole.log(missing)\n`, "utf8")
+
+  const result = checkCheckJsReferences({ rootDir: dir })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.fileCount, 2)
+  assert.ok(
+    result.diagnostics.some((diagnostic) => diagnostic.includes("TS2305") && diagnostic.includes("missing")),
+    result.diagnostics.join("\n"),
+  )
+})
+
+test("checkJs reference guard fails missing default imports from existing modules", async () => {
+  const dir = await makeTempDir()
+  await writeCheckJsReferenceProject(dir)
+  await fs.writeFile(path.join(dir, "src", "existing.js"), "export const present = 1\n", "utf8")
+  const existingSpecifier = "." + "/existing.js"
+  await fs.writeFile(path.join(dir, "src", "bad-default.js"), `import missingDefault from ${JSON.stringify(existingSpecifier)}\nconsole.log(missingDefault)\n`, "utf8")
+
+  const result = checkCheckJsReferences({ rootDir: dir })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.fileCount, 2)
+  assert.ok(
+    result.diagnostics.some((diagnostic) => (diagnostic.includes("TS1192") || diagnostic.includes("TS2613")) && diagnostic.includes("default")),
+    result.diagnostics.join("\n"),
+  )
+})
+
+test("relative import guard ignores comments and string literals", async () => {
+  const dir = await makeTempDir()
+  await writeImportGuardProject(dir)
+  await fs.writeFile(
+    path.join(dir, "src", "good.js"),
+    `
+// copied from "./missing-comment.js"
+/*
+import "./missing-block.js"
+export { value } from "./missing-export.js"
+*/
+const text = "dynamic import(\"./missing-string.js\") should stay a string"
+import "./existing.js"
+export { value } from "./existing.js"
+export const loaded = () => import("./existing.js")
+console.log(text, loaded)
+`,
+    "utf8",
+  )
+
+  const result = await checkRelativeImports({ rootDir: dir })
+
+  assert.equal(result.ok, true)
+  assert.equal(result.fileCount, 2)
+  assert.deepEqual(result.violations, [])
+})
+
+test("relative import guard fails real missing static, export, and dynamic imports", async () => {
+  const dir = await makeTempDir()
+  await writeImportGuardProject(dir)
+  await fs.writeFile(
+    path.join(dir, "src", "bad.js"),
+    `
+import "./missing-static.js"
+export { value } from "./missing-export.js"
+export const loaded = () => import("./missing-dynamic.js")
+`,
+    "utf8",
+  )
+
+  const result = await checkRelativeImports({ rootDir: dir })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.fileCount, 2)
+  assert.ok(result.violations.some((violation) => violation.includes('bad.js: missing relative import target "./missing-static.js"')), result.violations.join("\n"))
+  assert.ok(result.violations.some((violation) => violation.includes('bad.js: missing relative import target "./missing-export.js"')), result.violations.join("\n"))
+  assert.ok(result.violations.some((violation) => violation.includes('bad.js: missing relative import target "./missing-dynamic.js"')), result.violations.join("\n"))
 })
