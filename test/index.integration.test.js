@@ -2674,7 +2674,8 @@ test("startConnector /bindings lists all active bindings in a private chat", asy
   }
 })
 
-test("startConnector repairs a stale binding index from private binding controls", async () => {
+test("startConnector repairs an in-memory stale binding index from private binding controls", async () => {
+  let store
   const harness = await createHarness({
     statePatch: {
       updateOffset: 310,
@@ -2683,13 +2684,21 @@ test("startConnector repairs a stale binding index from private binding controls
         "200:0": { projectAlias: "demo", sessionId: "ses_other" },
       },
       sessionIndex: {
-        "demo:ses_topic": { chatId: 999, threadIdOr0: 0 },
-        "demo:ghost": { chatId: 1, threadIdOr0: 1 },
+        "demo:ses_topic": { chatId: 100, threadIdOr0: 7 },
+        "demo:ses_other": { chatId: 200, threadIdOr0: 0 },
       },
+    },
+    createStateStoreImpl: (options) => {
+      store = new StateStore(options)
+      return store
     },
   })
 
   try {
+    store.state.sessionIndex = {
+      "demo:ses_topic": { chatId: 999, threadIdOr0: 0 },
+      "demo:ghost": { chatId: 1, threadIdOr0: 1 },
+    }
     harness.tg.enqueue(makeMessageUpdate(311, "/bindings", { chatId: 42, chatType: "private", threadIdOr0: 0 }))
 
     await waitFor(() => harness.tg.sentMessages.some((entry) => /Index repair available/.test(entry.text)))
@@ -3892,6 +3901,9 @@ test("startConnector suppresses watchdog restarts while initial auto-start retry
       bindings: {
         "100:7": { projectAlias: "demo", sessionId: "ses_current" },
       },
+      sessionIndex: {
+        "demo:ses_current": { chatId: 100, threadIdOr0: 7 },
+      },
     },
     projectPatch: {
       autoStart: true,
@@ -4256,6 +4268,9 @@ test("startConnector fails closed when pending prompt recovery cleanup is not du
         updateOffset: 700,
         bindings: {
           "100:7": { projectAlias: "demo", sessionId: "ses_other" },
+        },
+        sessionIndex: {
+          "demo:ses_other": { chatId: 100, threadIdOr0: 7 },
         },
         pendingPrompts: {
           permissions: {
