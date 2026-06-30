@@ -151,7 +151,6 @@ export function launchDetachedProcess(command, args, { cwd, errorPrefix, success
 
     child.on("spawn", () => {
       successTimer = setTimeout(() => finish(), Math.max(10, Number(successDelayMs) || 40))
-      successTimer.unref?.()
     })
     child.on("error", (err) => finish(new Error(`${errorPrefix}: ${err?.message || String(err)}`)))
     child.on("close", (code) => {
@@ -199,7 +198,6 @@ export function observeSpawnError(child, { successDelayMs = 750, errorPrefix = "
     const onExit = (code, signal) => onImmediateExit("exit", code, signal)
     const onSpawn = () => {
       successTimer = setTimeout(() => finish(null), Math.max(10, Number(successDelayMs) || 75))
-      successTimer.unref?.()
     }
     child.once?.("error", onError)
     child.once?.("spawn", onSpawn)
