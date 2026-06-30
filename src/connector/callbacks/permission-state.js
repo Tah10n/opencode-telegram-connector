@@ -12,9 +12,7 @@ export function parsePermissionParts(parts) {
 export function hasHandledPermission(store, projectAlias, sessionID, permissionId) {
   if (typeof store?.hasIdempotencyKeyPrefix !== "function") return false
   return store.hasIdempotencyKeyPrefix(permissionReplyIdempotencyPrefix(projectAlias, sessionID, permissionId)) ||
-    store.hasIdempotencyKeyPrefix(permissionNoteIdempotencyPrefix(projectAlias, sessionID, permissionId)) ||
-    store.hasIdempotencyKeyPrefix(permissionReplyIdempotencyPrefix(projectAlias, "", permissionId)) ||
-    store.hasIdempotencyKeyPrefix(permissionNoteIdempotencyPrefix(projectAlias, "", permissionId))
+    store.hasIdempotencyKeyPrefix(permissionNoteIdempotencyPrefix(projectAlias, sessionID, permissionId))
 }
 
 export { permissionReplyIdempotencyKey }

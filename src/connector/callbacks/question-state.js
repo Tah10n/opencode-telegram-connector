@@ -23,10 +23,8 @@ export function parseQuestionParts(parts) {
 
 export function hasHandledQuestion(store, projectAlias, sessionID, questionId) {
   return (typeof store?.hasIdempotencyKeyPrefix === "function" &&
-      (store.hasIdempotencyKeyPrefix(questionReplyIdempotencyPrefix(projectAlias, sessionID, questionId)) ||
-        store.hasIdempotencyKeyPrefix(questionReplyIdempotencyPrefix(projectAlias, "", questionId)))) ||
-    store.hasIdempotencyKey?.(questionRejectIdempotencyKey(projectAlias, sessionID, questionId)) ||
-    store.hasIdempotencyKey?.(questionRejectIdempotencyKey(projectAlias, "", questionId))
+      store.hasIdempotencyKeyPrefix(questionReplyIdempotencyPrefix(projectAlias, sessionID, questionId))) ||
+    store.hasIdempotencyKey?.(questionRejectIdempotencyKey(projectAlias, sessionID, questionId))
 }
 
 export { questionRejectIdempotencyKey }

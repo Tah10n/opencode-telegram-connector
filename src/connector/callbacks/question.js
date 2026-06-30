@@ -24,6 +24,7 @@ export async function handleQuestionCallback({
   isPromptBindingCurrent,
   answerStalePromptCallback,
   getWizard,
+  getUniqueWizard,
   setAwaitingCustomAnswerState,
   sendQuestionCustomAnswerPrompt,
   cloneWizardState,
@@ -44,12 +45,32 @@ export async function handleQuestionCallback({
     return true
   }
 
-  const wizard = getWizard(projectAlias, questionId, sessionID)
-  const effectiveSessionID = sessionID || wizard?.sessionID || ""
+  const callbackSessionID = String(sessionID || "").trim()
+  let wizard = getWizard(projectAlias, questionId, callbackSessionID)
+  if (!wizard && !callbackSessionID && typeof getUniqueWizard === "function") {
+    wizard = getUniqueWizard(projectAlias, questionId)
+  }
+  if (wizard && String(wizard.sessionID || "").trim() !== callbackSessionID) {
+    if (callbackSessionID || !String(wizard.sessionID || "").trim()) wizard = null
+  }
+  const effectiveSessionID = callbackSessionID || wizard?.sessionID || ""
   if (!(await isPromptBindingCurrent(ctxMeta.ctxKey, projectAlias, sessionID, { isOldShape, stateSessionID: wizard?.sessionID || "" }))) {
     cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, effectiveSessionID)
     await answerStalePromptCallback(callbackQuery, ctxMeta, msg?.message_id, projectAlias)
     return true
+  }
+  if (!wizard) {
+    if (hasHandledQuestion(store, projectAlias, effectiveSessionID, questionId)) {
+      cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, effectiveSessionID)
+      await flushStoreIfAvailable()
+      await answerCallbackQuery(callbackQuery.id, "Already handled")
+      await deleteInteractiveMessage(ctxMeta, msg?.message_id)
+      return true
+    }
+    if (!(rest.length === 1 && rest[0] === "reject" && effectiveSessionID)) {
+      await answerCallbackQuery(callbackQuery.id, "Not found")
+      return true
+    }
   }
   if (rest.length === 1 && rest[0] === "reject") {
     return handleQuestionRejectAction({
@@ -72,18 +93,6 @@ export async function handleQuestionCallback({
       recordPromptAnswered,
       t,
     })
-  }
-
-  if (!wizard) {
-    if (hasHandledQuestion(store, projectAlias, effectiveSessionID, questionId)) {
-      cleanupQuestionState(ctxMeta.ctxKey, projectAlias, questionId, effectiveSessionID)
-      await flushStoreIfAvailable()
-      await answerCallbackQuery(callbackQuery.id, "Already handled")
-      await deleteInteractiveMessage(ctxMeta, msg?.message_id)
-      return true
-    }
-    await answerCallbackQuery(callbackQuery.id, "Not found")
-    return true
   }
   if (rest.length < 2) {
     await answerCallbackQuery(callbackQuery.id, "Invalid")

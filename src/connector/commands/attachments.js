@@ -40,6 +40,8 @@ export function createAttachmentHandlers({
   canAutoStartProject,
   platform,
   startServerKeyboard,
+  notifyProjectUnavailableForThread,
+  markProjectUp,
   formatProjectUnavailable,
   ensureRecentPromptSet,
   hashTextForEcho,
@@ -70,6 +72,16 @@ export function createAttachmentHandlers({
 
   async function safeInformThread(ctxMeta, text, replyMarkup, options) {
     await sendToThread(ctxMeta, text, replyMarkup, options).catch(() => {})
+  }
+
+  async function notifyUnavailableForThread(ctxMeta, alias, err, { locale = localeForCtx(ctxMeta), fallbackReplyMarkup = null } = {}) {
+    if (typeof notifyProjectUnavailableForThread === "function") {
+      return notifyProjectUnavailableForThread(ctxMeta, alias, err, { locale, platform, fallbackReplyMarkup })
+    }
+    const withButton = isRetryableProjectError?.(err) && canAutoStartProject?.(alias, { platform })
+    const replyMarkup = withButton ? startServerKeyboard?.(alias, { locale }) : fallbackReplyMarkup
+    await safeInformThread(ctxMeta, formatProjectUnavailable(alias, err, { locale }), replyMarkup)
+    return true
   }
 
   async function safeEditMessage(ctxMeta, messageId, text, replyMarkup, options) {
@@ -205,7 +217,7 @@ export function createAttachmentHandlers({
   }
 
   async function sendAttachmentPromptToOpenCode(ctxMeta, binding, record, loaded) {
-    const oc = ocByAlias[binding.projectAlias]
+    const oc = binding.oc || ocByAlias[binding.projectAlias]
     const prefix = config.tgPrefix ?? "[TG] "
     const promptText = formatAttachmentPrompt({
       prefix,
@@ -305,6 +317,7 @@ export function createAttachmentHandlers({
     )
     try {
       await sendAttachmentPromptToOpenCode(ctxMeta, binding, record, loaded)
+      markProjectUp?.(binding.projectAlias)
       await safeInformThread(ctxMeta, attachmentSentText(loaded.documentInfo, binding, { locale }), closeOnlyKeyboard(locale))
     } catch (err) {
       let cleanupErr = null
@@ -314,7 +327,6 @@ export function createAttachmentHandlers({
         cleanupErr = deleteErr
       }
       const alias = binding.projectAlias
-      const withButton = isRetryableProjectError?.(err) && canAutoStartProject?.(alias, { platform })
       if (recordRetryableOpenCodeFailure) {
         recordRetryableOpenCodeFailure(alias, err, {
           operation: "POST /session/:id/prompt_async",
@@ -322,7 +334,7 @@ export function createAttachmentHandlers({
           pathname: `/session/${binding.sessionId}/prompt_async`,
         })
       }
-      await safeInformThread(ctxMeta, formatProjectUnavailable(alias, err, { locale }), withButton ? startServerKeyboard?.(alias, { locale }) : closeOnlyKeyboard(locale))
+      await notifyUnavailableForThread(ctxMeta, alias, err, { locale, fallbackReplyMarkup: closeOnlyKeyboard(locale) })
       if (cleanupErr) throw cleanupErr
       if (isRetryableProjectError?.(err)) throw err
     }
@@ -356,6 +368,16 @@ export function createAttachmentHandlers({
         closeOnlyKeyboard(locale),
       )
       return { callbackText: "Binding changed" }
+    }
+    if (!ocByAlias[currentBinding.projectAlias]) {
+      pendingAttachmentConfirmations.delete(token)
+      await safeEditMessage(
+        ctxMeta,
+        editMessageId,
+        translate(locale, "commands.boundProjectMissing", { project: currentBinding.projectAlias || "unknown" }),
+        closeOnlyKeyboard(locale),
+      )
+      return { callbackText: "Project missing" }
     }
 
     if (await staleActiveTurnGuard?.(ctxMeta, currentBinding)) {
@@ -419,6 +441,7 @@ export function createAttachmentHandlers({
 
       try {
         await sendAttachmentPromptToOpenCode(ctxMeta, currentBinding, record, loaded)
+        markProjectUp?.(currentBinding.projectAlias)
       } catch (err) {
         let cleanupErr = null
         try {
@@ -427,7 +450,6 @@ export function createAttachmentHandlers({
           cleanupErr = deleteErr
         }
         const alias = currentBinding.projectAlias
-        const withButton = isRetryableProjectError?.(err) && canAutoStartProject?.(alias, { platform })
         if (recordRetryableOpenCodeFailure) {
           recordRetryableOpenCodeFailure(alias, err, {
             operation: "POST /session/:id/prompt_async",
@@ -435,7 +457,7 @@ export function createAttachmentHandlers({
             pathname: `/session/${currentBinding.sessionId}/prompt_async`,
           })
         }
-        await safeInformThread(ctxMeta, formatProjectUnavailable(alias, err, { locale }), withButton ? startServerKeyboard?.(alias, { locale }) : closeOnlyKeyboard(locale))
+        await notifyUnavailableForThread(ctxMeta, alias, err, { locale, fallbackReplyMarkup: closeOnlyKeyboard(locale) })
         if (cleanupErr) throw cleanupErr
         if (isRetryableProjectError?.(err)) return { callbackText: "Temporarily unavailable" }
         throw err

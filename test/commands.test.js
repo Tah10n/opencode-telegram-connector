@@ -2,7 +2,13 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { makeBoundaryError } from "../src/boundary-errors.js"
 import { createCommandHandlers } from "../src/connector/commands.js"
-import { hashIdempotencyValue, telegramMessageIdempotencyKey } from "../src/connector/idempotency.js"
+import {
+  hashIdempotencyValue,
+  permissionNoteIdempotencyKey,
+  promptScopedSubmissionIdempotencyKey,
+  promptSubmissionIdempotencyKey,
+  telegramMessageIdempotencyKey,
+} from "../src/connector/idempotency.js"
 import { buildProjectsOverviewText as buildProjectsOverviewTextBase } from "../src/connector/overview.js"
 import { USER_ATTACHMENT_LIMITS } from "../src/connector/incoming-attachments.js"
 import { decodeCallbackData } from "../src/connector/callback-data.js"
@@ -454,6 +460,646 @@ test("createCommandHandlers handleFeed delegates to feed renderer", async () => 
   assert.deepEqual(feedCalls, [{ ctxMeta: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, options: { editMessageId: 123 } }])
 })
 
+test("createCommandHandlers handlePermissions renders bound project read-only outside private chat", async () => {
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    readPermissionConfig: async () => ({
+      ok: true,
+      editable: true,
+      status: "ok",
+      filePath: "C:/repo/demo/opencode.json",
+      profile: "suggest",
+      permission: {},
+    }),
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" }, [])
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /OpenCode permissions:/)
+  assert.match(sent[0].text, /Project: demo/)
+  assert.match(sent[0].text, /Profile: Suggest/)
+  assert.doesNotMatch(sent[0].text, /C:\/repo\/demo\/opencode\.json|Config:/)
+  assert.match(sent[0].text, /read-only here/)
+  assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text), ["Close"])
+})
+
+test("createCommandHandlers handlePermissions renders Russian permission UI without English profile terms", async () => {
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    readPermissionConfig: async () => ({
+      ok: true,
+      editable: true,
+      status: "ok",
+      filePath: "C:/repo/demo/opencode.json",
+      profile: "auto-edit",
+      permission: {},
+    }),
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0", locale: "ru" }, [])
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Права OpenCode:/)
+  assert.match(sent[0].text, /Профиль: Автоправки/)
+  assert.match(sent[0].text, /С подтверждением:/)
+  assert.match(sent[0].text, /Полный авто:/)
+  assert.doesNotMatch(sent[0].text, /Suggest|Auto Edit|Full Auto|Custom|OpenCode default|subagents|skills|todo writes|Web search|catch-all|clone\/overview|loop/)
+  assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text), [
+    "С подтверждением",
+    "Автоправки",
+    "Полный авто",
+    "Дефолт OpenCode",
+    "Показать текущие",
+    "Закрыть",
+  ])
+})
+
+test("createCommandHandlers renderPermissionDetails is private-chat only", async () => {
+  let readCalls = 0
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    readPermissionConfig: async () => {
+      readCalls += 1
+      return {
+        ok: true,
+        editable: true,
+        status: "ok",
+        filePath: "C:/repo/demo/opencode.json",
+        profile: "suggest",
+        permission: { edit: "ask" },
+      }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderPermissionDetails({ chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" }, "demo")
+
+  assert.equal(sent.length, 1)
+  assert.equal(readCalls, 0)
+  assert.match(sent[0].text, /Raw OpenCode permission config is available only in a private chat/)
+  assert.doesNotMatch(sent[0].text, /C:\/repo\/demo\/opencode\.json|Config:|"edit"|ask/)
+})
+
+test("createCommandHandlers permission renderers edit existing messages for unknown projects", async () => {
+  const editCalls = []
+  const { runtime, sent } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    tg: {
+      editMessageText: async (...args) => {
+        editCalls.push(args)
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+  const ctxMeta = { chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }
+
+  await handlers.renderPermissionSettings(ctxMeta, { projectAlias: "missing", editMessageId: 321 })
+  await handlers.renderPermissionDetails(ctxMeta, "missing", { editMessageId: 322 })
+
+  assert.deepEqual(sent, [])
+  assert.equal(editCalls.length, 2)
+  assert.deepEqual(editCalls[0].slice(0, 2), [100, 321])
+  assert.match(editCalls[0][2], /Unknown project\./)
+  assert.deepEqual(editCalls[0][3].inline_keyboard.flat().map((button) => button.text), ["Close"])
+  assert.deepEqual(editCalls[1].slice(0, 2), [100, 322])
+  assert.match(editCalls[1][2], /Unknown project\./)
+})
+
+test("createCommandHandlers renderPermissionSettings requires a binding in unbound group chats", async () => {
+  let readCalls = 0
+  const { runtime, sent } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    readPermissionConfig: async () => {
+      readCalls += 1
+      return { ok: true, editable: true, status: "ok", profile: "suggest", permission: {} }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderPermissionSettings({ chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" })
+
+  assert.equal(readCalls, 0)
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Permissions need a bound thread/)
+})
+
+test("createCommandHandlers applyPermissionProfile rejects missing projects and group writes", async () => {
+  const writes = []
+  const { runtime, sent } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    writePermissionProfile: async (project, profileId) => {
+      writes.push({ project, profileId })
+      return { ok: true }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.applyPermissionProfile({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, "missing", "auto-edit")
+  await handlers.applyPermissionProfile({ chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" }, "demo", "auto-edit")
+
+  assert.deepEqual(writes, [])
+  assert.equal(sent.length, 2)
+  assert.match(sent[0].text, /Unknown project\./)
+  assert.match(sent[1].text, /Profile changes are private-chat only/)
+})
+
+test("createCommandHandlers handlePermissions explains unavailable permission config paths", async () => {
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", permissionConfigPath: "C:/repo/demo/opencode.remote.json" } },
+    readPermissionConfig: async () => ({
+      ok: false,
+      editable: false,
+      status: "unavailable",
+      filePath: "",
+      profile: "custom",
+      permission: undefined,
+    }),
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, [])
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /No valid local opencode\.json\/opencode\.jsonc permission config path is available/)
+})
+
+test("createCommandHandlers handlePermissions explains access-denied permission configs", async () => {
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    readPermissionConfig: async () => ({
+      ok: false,
+      editable: false,
+      status: "unavailable",
+      reason: "access-denied",
+      filePath: "C:/repo/demo/opencode.json",
+      profile: "custom",
+      permission: undefined,
+    }),
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, [])
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /cannot be read or written by this connector process/)
+  assert.doesNotMatch(sent[0].text, /No valid local opencode\.json/)
+})
+
+test("createCommandHandlers handlePermissions explains unavailable write paths", async () => {
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", permissionConfigPath: "C:/repo/demo/opencode.remote.json" } },
+    writePermissionProfile: async () => ({ ok: false, editable: false, status: "unavailable" }),
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, ["auto-edit"])
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Permission config cannot be changed for this project\./)
+  assert.match(sent[0].text, /No valid local opencode\.json\/opencode\.jsonc permission config path is available/)
+})
+
+test("createCommandHandlers handlePermissions explains concurrent write conflicts", async () => {
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    writePermissionProfile: async () => ({ ok: false, editable: false, status: "conflict", reason: "changed" }),
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, ["auto-edit"])
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Permission config cannot be changed for this project\./)
+  assert.match(sent[0].text, /changed while applying the profile/)
+})
+
+test("createCommandHandlers handlePermissions applies non-dangerous profiles in private chat", async () => {
+  const writes = []
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    readPermissionConfig: async () => ({
+      ok: true,
+      editable: true,
+      status: "ok",
+      filePath: "C:/repo/demo/opencode.json",
+      profile: "auto-edit",
+      permission: {},
+    }),
+    writePermissionProfile: async (project, profileId) => {
+      writes.push({ project, profileId })
+      return { ok: true, profile: profileId, filePath: "C:/repo/demo/opencode.json" }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, ["auto-edit"])
+
+  assert.deepEqual(writes, [{ project: runtime.projects.demo, profileId: "auto-edit" }])
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Changed: permissions profile is now Auto Edit\./)
+  assert.match(sent[0].text, /Config: C:\/repo\/demo\/opencode\.json/)
+  assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text), ["Suggest", "Auto Edit", "Full Auto", "OpenCode default", "View current", "Close"])
+})
+
+test("createCommandHandlers handleTelegramMessage routes /permissions and records the command", async () => {
+  const writes = []
+  const marked = []
+  const flushes = []
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    store: {
+      markIdempotencyKey: (key, metadata) => {
+        marked.push({ key, metadata })
+        return true
+      },
+      flush: async () => {
+        flushes.push(true)
+      },
+    },
+    ctxMetaFromMessage: (msg) => ({
+      chatId: msg?.chat?.id,
+      chatType: msg?.chat?.type,
+      threadIdOr0: msg?.message_thread_id || 0,
+      ctxKey: `${msg?.chat?.id}:${msg?.message_thread_id || 0}`,
+    }),
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    readPermissionConfig: async () => ({
+      ok: true,
+      editable: true,
+      status: "ok",
+      filePath: "C:/repo/demo/opencode.json",
+      profile: "auto-edit",
+      permission: {},
+    }),
+    writePermissionProfile: async (project, profileId) => {
+      writes.push({ project, profileId })
+      return { ok: true, profile: profileId, filePath: "C:/repo/demo/opencode.json" }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    message_id: 55,
+    chat: { id: 100, type: "private" },
+    from: { id: 42 },
+    text: "/permissions auto-edit",
+  }, { updateId: 77 })
+
+  assert.deepEqual(writes, [{ project: runtime.projects.demo, profileId: "auto-edit" }])
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Changed: permissions profile is now Auto Edit\./)
+  assert.equal(marked.length, 1)
+  assert.equal(marked[0].metadata.operation, "permissions")
+  assert.equal(marked[0].metadata.updateId, 77)
+  assert.equal(marked[0].metadata.messageId, 55)
+  assert.equal(flushes.length, 1)
+})
+
+test("createCommandHandlers handlePermissions reports no-op profile writes without changed notice", async () => {
+  const writes = []
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    readPermissionConfig: async () => ({
+      ok: true,
+      editable: true,
+      status: "ok",
+      filePath: "C:/repo/demo/opencode.json",
+      profile: "auto-edit",
+      permission: {},
+    }),
+    writePermissionProfile: async (project, profileId) => {
+      writes.push({ project, profileId })
+      return { ok: true, changed: false, profile: profileId, filePath: "C:/repo/demo/opencode.json" }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, ["auto-edit"])
+
+  assert.deepEqual(writes, [{ project: runtime.projects.demo, profileId: "auto-edit" }])
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /No permission changes were needed\./)
+  assert.doesNotMatch(sent[0].text, /Changed: permissions profile is now/)
+})
+
+test("createCommandHandlers handlePermissions applies reset profile in private chat", async () => {
+  const writes = []
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    readPermissionConfig: async () => ({
+      ok: true,
+      editable: true,
+      status: "ok",
+      filePath: "C:/repo/demo/opencode.json",
+      profile: "opencode-default",
+      permission: undefined,
+    }),
+    writePermissionProfile: async (project, profileId) => {
+      writes.push({ project, profileId })
+      return { ok: true, profile: "opencode-default", filePath: "C:/repo/demo/opencode.json" }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, ["reset"])
+
+  assert.deepEqual(writes, [{ project: runtime.projects.demo, profileId: "reset" }])
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Changed: OpenCode permission config reset to default\./)
+  assert.match(sent[0].text, /Profile: OpenCode default/)
+  assert.match(sent[0].text, /Config: C:\/repo\/demo\/opencode\.json/)
+})
+
+test("createCommandHandlers handlePermissions reports no-op reset without reset-changed notice", async () => {
+  const writes = []
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    readPermissionConfig: async () => ({
+      ok: true,
+      editable: true,
+      status: "ok",
+      filePath: "C:/repo/demo/opencode.json",
+      profile: "opencode-default",
+      permission: undefined,
+    }),
+    writePermissionProfile: async (project, profileId) => {
+      writes.push({ project, profileId })
+      return { ok: true, changed: false, profile: "opencode-default", filePath: "C:/repo/demo/opencode.json" }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, ["reset"])
+
+  assert.deepEqual(writes, [{ project: runtime.projects.demo, profileId: "reset" }])
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /No permission changes were needed\./)
+  assert.doesNotMatch(sent[0].text, /Changed: OpenCode permission config reset to default\./)
+})
+
+test("createCommandHandlers applyPermissionProfile keeps successful write when post-write render fails", async () => {
+  const loggerErrors = []
+  const writes = []
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    tg: {
+      editMessageText: async () => {
+        throw new Error("edit failed")
+      },
+    },
+    logger: {
+      error: (...args) => loggerErrors.push(args.map((arg) => String(arg)).join(" ")),
+    },
+    readPermissionConfig: async () => ({
+      ok: true,
+      editable: true,
+      status: "ok",
+      filePath: "C:/repo/demo/opencode.json",
+      profile: "auto-edit",
+      permission: {},
+    }),
+    writePermissionProfile: async (project, profileId) => {
+      writes.push({ project, profileId })
+      return { ok: true, profile: profileId, filePath: "C:/repo/demo/opencode.json" }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  const result = await handlers.applyPermissionProfile(
+    { chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" },
+    "demo",
+    "auto-edit",
+    { editMessageId: 321 },
+  )
+
+  assert.deepEqual(writes, [{ project: runtime.projects.demo, profileId: "auto-edit" }])
+  assert.deepEqual(result, { ok: true, profile: "auto-edit", filePath: "C:/repo/demo/opencode.json", renderOk: false })
+  assert.equal(loggerErrors.length, 1)
+  assert.match(loggerErrors[0], /Failed to render permission settings after profile write: demo edit failed/)
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Permissions changed, but I could not refresh this view/)
+})
+
+test("createCommandHandlers handlePermissions targets explicit project aliases before profile shorthand", async () => {
+  const writes = []
+  const { runtime } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: {
+      demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" },
+      suggest: { baseUrl: "http://127.0.0.1:4313", directory: "C:/repo/suggest" },
+    },
+    readPermissionConfig: async () => ({
+      ok: true,
+      editable: true,
+      status: "ok",
+      filePath: "C:/repo/suggest/opencode.json",
+      profile: "auto-edit",
+      permission: {},
+    }),
+    writePermissionProfile: async (project, profileId) => {
+      writes.push({ project, profileId })
+      return { ok: true, profile: profileId, filePath: "C:/repo/suggest/opencode.json" }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, ["suggest", "auto-edit"])
+
+  assert.deepEqual(writes, [{ project: runtime.projects.suggest, profileId: "auto-edit" }])
+})
+
+test("createCommandHandlers handlePermissions renders one-arg project alias before bound profile shorthand", async () => {
+  const reads = []
+  const writes = []
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: {
+      demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" },
+      suggest: { baseUrl: "http://127.0.0.1:4313", directory: "C:/repo/suggest" },
+    },
+    readPermissionConfig: async (project) => {
+      reads.push(project)
+      return {
+        ok: true,
+        editable: true,
+        status: "ok",
+        filePath: "C:/repo/suggest/opencode.json",
+        profile: "auto-edit",
+        permission: {},
+      }
+    },
+    writePermissionProfile: async (project, profileId) => {
+      writes.push({ project, profileId })
+      return { ok: true, profile: profileId, filePath: "C:/repo/demo/opencode.json" }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, ["suggest"])
+
+  assert.deepEqual(writes, [])
+  assert.deepEqual(reads, [runtime.projects.suggest])
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Project: suggest/)
+  assert.match(sent[0].text, /Profile: Auto Edit/)
+})
+
+test("createCommandHandlers handlePermissions rejects invalid profile arguments", async () => {
+  const writes = []
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: {
+      demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" },
+      other: { baseUrl: "http://127.0.0.1:4313", directory: "C:/repo/other" },
+    },
+    writePermissionProfile: async (project, profileId) => {
+      writes.push({ project, profileId })
+      return { ok: true, profile: profileId }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, ["other", "ful-auto"])
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, ["auto-edit", "extra"])
+
+  assert.deepEqual(writes, [])
+  assert.equal(sent.length, 2)
+  assert.match(sent[0].text, /^Usage: \/permissions/)
+  assert.match(sent[1].text, /^Usage: \/permissions/)
+})
+
+test("createCommandHandlers handlePermissions asks confirmation for full-auto", async () => {
+  const writes = []
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    writePermissionProfile: async (project, profileId) => {
+      writes.push({ project, profileId })
+      return { ok: true }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, ["full-auto"])
+
+  assert.deepEqual(writes, [])
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Confirm Full Auto permissions:/)
+  assert.match(sent[0].text, /Shell commands still ask for approval\./)
+  assert.deepEqual(callbackParts(sent[0].replyMarkup.inline_keyboard[0][0].callback_data), ["pc", "apply", "demo", "full-auto"])
+})
+
+test("createCommandHandlers handlePermissions shows project picker in unbound private chat", async () => {
+  const { runtime, sent } = makeRuntime({
+    projects: {
+      demo: { baseUrl: "http://127.0.0.1:4312" },
+      other: { baseUrl: "http://127.0.0.1:4313", displayName: "Other project" },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "private", threadIdOr0: 0, ctxKey: "100:0" }, [])
+
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Choose a project for permissions:/)
+  assert.deepEqual(sent[0].replyMarkup.inline_keyboard.flat().map((button) => button.text), ["demo", "other (Other project)", "Close"])
+})
+
+test("createCommandHandlers handlePermissions does not target arbitrary projects from unbound groups", async () => {
+  let readCalls = 0
+  const { runtime, sent } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    readPermissionConfig: async () => {
+      readCalls += 1
+      return { ok: true, editable: true, status: "ok", profile: "suggest", permission: {} }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handlePermissionsCommand({ chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" }, ["demo"])
+
+  assert.equal(readCalls, 0)
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Permissions need a bound thread/)
+})
+
+test("createCommandHandlers permission renderers do not read forged group callback project aliases", async () => {
+  const reads = []
+  const { runtime, sent } = makeRuntime({
+    storeState: {
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } },
+    },
+    projects: {
+      demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" },
+      other: { baseUrl: "http://127.0.0.1:4313", directory: "C:/repo/other" },
+    },
+    readPermissionConfig: async (project) => {
+      reads.push(project)
+      return { ok: true, editable: true, status: "ok", filePath: "C:/repo/other/opencode.json", profile: "suggest", permission: {} }
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+  const ctxMeta = { chatId: 100, chatType: "supergroup", threadIdOr0: 7, ctxKey: "100:7" }
+
+  await handlers.renderPermissionSettings(ctxMeta, { projectAlias: "other", editMessageId: 901 })
+  await handlers.renderPermissionDetails(ctxMeta, "other")
+
+  assert.deepEqual(reads, [])
+  assert.equal(sent.length, 2)
+  assert.match(sent[0].text, /Permissions need a bound thread/)
+  assert.match(sent[1].text, /Raw OpenCode permission config is available only in a private chat/)
+  assert.doesNotMatch(sent.map((entry) => entry.text).join("\n"), /Project: other|C:\/repo\/other/)
+})
+
 test("createCommandHandlers handleBindings renders sorted bindings in private chat", async () => {
   const { runtime, sent } = makeRuntime({
     storeState: {
@@ -679,6 +1325,71 @@ test("createCommandHandlers clears stale awaiting custom-answer state", async ()
   assert.match(sent[1].text, /Use \/projects to see available aliases\./)
 })
 
+test("createCommandHandlers continues sessionless awaiting custom answers when one scoped wizard matches", async () => {
+  const awaitingCustomAnswer = new Map([
+    ["100:7", { projectAlias: "demo", requestId: "q_same", qIndex: 0 }],
+  ])
+  const wizard = {
+    projectAlias: "demo",
+    id: "q_same",
+    sessionID: "ses_scoped",
+    index: 0,
+    request: { id: "q_same", questions: [{ header: "First", question: "one" }, { header: "Second", question: "two" }] },
+    answers: [[], []],
+    selectedByIndex: {},
+    messageIdByIndex: {},
+    ctx: { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+  }
+  const cleared = []
+  const progressCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_scoped" } } },
+    awaitingCustomAnswer,
+    getWizard: (projectAlias, requestId, sessionID) => {
+      assert.equal(projectAlias, "demo")
+      assert.equal(requestId, "q_same")
+      assert.equal(sessionID || "", "")
+      return null
+    },
+    getUniqueWizard: (projectAlias, requestId) => {
+      assert.equal(projectAlias, "demo")
+      assert.equal(requestId, "q_same")
+      return wizard
+    },
+    applyWizardState: (target, source) => {
+      progressCalls.push(["applyWizardState", source.index, source.answers])
+      target.index = source.index
+      target.answers = source.answers
+      target.selectedByIndex = source.selectedByIndex
+      target.messageIdByIndex = source.messageIdByIndex
+    },
+    persistQuestionWizard: (...args) => progressCalls.push(["persistQuestionWizard", args]),
+    finishQuestionWizard: async (...args) => progressCalls.push(["finishQuestionWizard", args]),
+    sendCurrentQuestionStep: async (...args) => progressCalls.push(["sendCurrentQuestionStep", args]),
+    setAwaitingCustomAnswerState: (ctxKey, value) => {
+      cleared.push({ ctxKey, value })
+      if (value) awaitingCustomAnswer.set(ctxKey, value)
+      else awaitingCustomAnswer.delete(ctxKey)
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_thread_id: 7,
+    text: "first answer",
+  })
+
+  assert.deepEqual(cleared, [{ ctxKey: "100:7", value: null }])
+  assert.equal(awaitingCustomAnswer.has("100:7"), false)
+  assert.ok(progressCalls.findIndex((entry) => entry[0] === "persistQuestionWizard") < progressCalls.findIndex((entry) => entry[0] === "sendCurrentQuestionStep"))
+  assert.equal(progressCalls.some((entry) => entry[0] === "finishQuestionWizard"), false)
+  assert.equal(wizard.index, 1)
+  assert.deepEqual(wizard.answers, [["first answer"], []])
+  assert.equal(sent.length, 0)
+})
+
 test("createCommandHandlers handleBindCommand validates arguments and current bindings", async () => {
   const { runtime, sent } = makeRuntime({
     storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
@@ -818,6 +1529,7 @@ test("createCommandHandlers handleUseCommand rejects unsafe raw session ids", as
   const bindCalls = []
   const { runtime, sent } = makeRuntime({
     storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312" } },
     ocByAlias: {
       demo: {
         async getSession(sessionId) {
@@ -837,6 +1549,57 @@ test("createCommandHandlers handleUseCommand rejects unsafe raw session ids", as
   assert.deepEqual(getSessionCalls, [])
   assert.deepEqual(bindCalls, [])
   assert.match(sent[0].text, /Invalid session id/)
+})
+
+test("createCommandHandlers handleUseCommand rejects raw sessions outside the bound project directory", async () => {
+  const bindCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    ocByAlias: {
+      demo: {
+        async getSession(sessionId) {
+          return { id: sessionId, directory: "C:/repo/other" }
+        },
+      },
+    },
+    bindCtxToSession: async (...args) => {
+      bindCalls.push(args)
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleUseCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "ses_other")
+
+  assert.deepEqual(bindCalls, [])
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /cannot be used for project 'demo'/)
+  assert.match(sent[0].text, /different project directory/)
+  assert.doesNotMatch(sent[0].text, /C:\/repo\/other/)
+})
+
+test("createCommandHandlers handleUseCommand rejects directoryless raw sessions by default", async () => {
+  const bindCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    ocByAlias: {
+      demo: {
+        async getSession(sessionId) {
+          return { id: sessionId }
+        },
+      },
+    },
+    bindCtxToSession: async (...args) => {
+      bindCalls.push(args)
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleUseCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "ses_hidden")
+
+  assert.deepEqual(bindCalls, [])
+  assert.match(sent[0].text, /did not return project directory evidence/)
 })
 
 test("createCommandHandlers handleUnbind asks for confirmation before removing a binding", async () => {
@@ -1001,6 +1764,67 @@ test("createCommandHandlers handleNewCommand refuses invalid created session ids
   assert.match(sent[0].text, /Project 'demo' is unavailable/)
 })
 
+test("createCommandHandlers handleBindCommand rejects created scoped sessions without directory evidence", async () => {
+  const bindCalls = []
+  const createCalls = []
+  const startupSessionByProject = {}
+  const { runtime, sent } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/demo" } },
+    startupSessionByProject,
+    getStartupSession: async () => null,
+    ocByAlias: {
+      demo: {
+        async createSession(options) {
+          createCalls.push(options)
+          return { id: "ses_new" }
+        },
+      },
+    },
+    bindCtxToSession: async (...args) => {
+      bindCalls.push(args)
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleBindCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, ["demo"])
+
+  assert.deepEqual(createCalls, [{ directory: "C:/demo" }])
+  assert.deepEqual(bindCalls, [])
+  assert.deepEqual(startupSessionByProject, {})
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Project 'demo' is unavailable/)
+})
+
+test("createCommandHandlers handleNewCommand rejects created scoped sessions from another directory", async () => {
+  const bindCalls = []
+  const selectCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/demo", openAttachOnNewMode: "same-window" } },
+    ocByAlias: {
+      demo: {
+        async createSession() {
+          return { id: "ses_new", directory: "C:/other" }
+        },
+        async selectTuiSession(sessionId) {
+          selectCalls.push(sessionId)
+        },
+      },
+    },
+    bindCtxToSession: async (...args) => {
+      bindCalls.push(args)
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleNewCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "Demo title")
+
+  assert.deepEqual(selectCalls, [])
+  assert.deepEqual(bindCalls, [])
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Project 'demo' is unavailable/)
+})
+
 test("createCommandHandlers handleNewCommand binds immediately in same-window mode after requesting TUI switch", async () => {
   const bindCalls = []
   const primeCalls = []
@@ -1145,6 +1969,421 @@ test("createCommandHandlers renderSessionsList shows the current model when avai
   assert.match(sent[0].text, /Current: ses_current/)
   assert.match(sent[0].text, /Current model: openai\/gpt-5 xhigh \(Inherited from session history\)/)
   assert.deepEqual(sent[0].replyMarkup.inline_keyboard.at(-1)?.map((button) => button.text), ["Refresh", "New", "Close"])
+})
+
+test("createCommandHandlers renderSessionsList hides subagent sessions", async () => {
+  const { runtime, sent } = makeRuntime({
+    ocByAlias: {
+      demo: {
+        async listSessions() {
+          return [
+            { id: "ses_root", title: "Root session" },
+            { id: "ses_child", title: "Child agent", parentID: "ses_root" },
+            { id: "ses_child_alt", title: "Child agent alt", parentId: "ses_root" },
+          ]
+        },
+        async listMessages() {
+          return []
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderSessionsList(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    { binding: { projectAlias: "demo", sessionId: "ses_root" } },
+  )
+
+  const buttons = sent[0].replyMarkup.inline_keyboard.flat()
+  assert.match(sent[0].text, /ses_root.*Root session/)
+  assert.doesNotMatch(sent[0].text, /ses_child/)
+  assert.doesNotMatch(sent[0].text, /Child agent/)
+  assert.deepEqual(buttons.map((button) => button.text), ["✅ Root session", "Refresh", "New", "Close"])
+})
+
+test("createCommandHandlers renderSessionsList applies display limit after hiding subagent sessions", async () => {
+  const calls = []
+  const subagents = Array.from({ length: 10 }, (_, index) => ({ id: `ses_child_${index}`, title: `Child ${index}`, parentID: "ses_root" }))
+  const roots = Array.from({ length: 11 }, (_, index) => ({ id: `ses_root_${index}`, title: `Root ${index}` }))
+  const { runtime, sent } = makeRuntime({
+    ocByAlias: {
+      demo: {
+        async listSessions(input = {}) {
+          calls.push(input)
+          return [...subagents, ...roots]
+        },
+        async listMessages() {
+          return []
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderSessionsList(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    { binding: { projectAlias: "demo", sessionId: "ses_root_0" } },
+  )
+
+  const buttons = sent[0].replyMarkup.inline_keyboard.flat()
+  assert.deepEqual(calls, [{}])
+  assert.match(sent[0].text, /ses_root_0.*Root 0/)
+  assert.match(sent[0].text, /ses_root_9.*Root 9/)
+  assert.match(sent[0].text, /1 more/)
+  assert.doesNotMatch(sent[0].text, /ses_root_10/)
+  assert.doesNotMatch(sent[0].text, /ses_child_/)
+  assert.equal(buttons.some((button) => /Child/.test(button.text)), false)
+  assert.equal(buttons.filter((button) => /^Root /.test(button.text) || /^✅ Root /.test(button.text)).length, 10)
+})
+
+test("createCommandHandlers renderSessionsList hides scoped directoryless sessions by default", async () => {
+  const calls = []
+  const { runtime, sent } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    ocByAlias: {
+      demo: {
+        async listSessions(input = {}) {
+          calls.push(input)
+          return [{ id: "ses_hidden", title: "Hidden session" }]
+        },
+        async listMessages() {
+          return []
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderSessionsList(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    { binding: { projectAlias: "demo", sessionId: "ses_current" } },
+  )
+
+  assert.deepEqual(calls, [{ directory: "C:/repo/demo" }])
+  assert.match(sent[0].text, /No sessions found/)
+  assert.doesNotMatch(sent[0].text, /ses_hidden/)
+  assert.equal(sent[0].replyMarkup.inline_keyboard.flat().some((button) => button.text === "Hidden session"), false)
+})
+
+test("createCommandHandlers renderSessionsList allows scoped directoryless sessions with explicit legacy fallback", async () => {
+  const calls = []
+  const { runtime, sent } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo", allowUnscopedSessionListFallback: true } },
+    ocByAlias: {
+      demo: {
+        async listSessions(input = {}) {
+          calls.push(input)
+          return [{ id: "ses_legacy", title: "Legacy session" }]
+        },
+        async listMessages() {
+          return []
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderSessionsList(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    { binding: { projectAlias: "demo", sessionId: "ses_current" } },
+  )
+
+  assert.deepEqual(calls, [{ directory: "C:/repo/demo" }])
+  assert.match(sent[0].text, /ses_legacy.*Legacy session/)
+  assert.ok(sent[0].replyMarkup.inline_keyboard.flat().some((button) => button.text === "Legacy session"))
+})
+
+test("createCommandHandlers handleUseCommand does not bind hidden directoryless share-link sessions by default", async () => {
+  const listCalls = []
+  const getSessionCalls = []
+  const bindCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    ocByAlias: {
+      demo: {
+        async listSessions(input = {}) {
+          listCalls.push(input)
+          return [{ id: "ses_hidden", title: "Hidden session", share: { url: "https://opncd.ai/share/hidden" } }]
+        },
+        async getSession(sessionId) {
+          getSessionCalls.push(sessionId)
+          return { id: sessionId }
+        },
+      },
+    },
+    bindCtxToSession: async (...args) => {
+      bindCalls.push(args)
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleUseCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "https://opncd.ai/share/hidden")
+
+  assert.deepEqual(listCalls, [{ directory: "C:/repo/demo" }])
+  assert.deepEqual(getSessionCalls, [])
+  assert.deepEqual(bindCalls, [])
+  assert.match(sent[0].text, /Share link not found in project 'demo'/)
+})
+
+test("createCommandHandlers handleUseCommand does not bind subagent share-link sessions", async () => {
+  const bindCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312" } },
+    ocByAlias: {
+      demo: {
+        async listSessions() {
+          return [
+            { id: "ses_child", title: "Child agent", parentID: "ses_root", share: { url: "https://opncd.ai/share/child" } },
+          ]
+        },
+        async getSession(sessionId) {
+          return { id: sessionId, parentID: "ses_root" }
+        },
+      },
+    },
+    bindCtxToSession: async (...args) => {
+      bindCalls.push(args)
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleUseCommand({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "https://opncd.ai/share/child")
+
+  assert.deepEqual(bindCalls, [])
+  assert.match(sent[0].text, /Share link not found in project 'demo'/)
+  assert.doesNotMatch(sent[0].text, /ses_child/)
+})
+
+test("createCommandHandlers renderSessionsList hides unscoped fallback sessions by default", async () => {
+  const calls = []
+  const { runtime, sent } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" } },
+    ocByAlias: {
+      demo: {
+        async listSessions(input = {}) {
+          calls.push(input)
+          if (input.directory) return []
+          return [{ id: "ses_unscoped", title: "Unscoped session" }]
+        },
+        async listMessages() {
+          return []
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderSessionsList(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    { binding: { projectAlias: "demo", sessionId: "ses_current" } },
+  )
+
+  assert.deepEqual(calls, [{ directory: "C:/repo/demo" }, {}])
+  assert.match(sent[0].text, /No sessions found/)
+  assert.doesNotMatch(sent[0].text, /ses_unscoped/)
+  assert.equal(sent[0].replyMarkup.inline_keyboard.flat().some((button) => button.text === "Unscoped session"), false)
+})
+
+test("createCommandHandlers renderSessionsList allows explicit legacy unscoped fallback without directory evidence", async () => {
+  const calls = []
+  const { runtime, sent } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo", allowUnscopedSessionListFallback: true } },
+    ocByAlias: {
+      demo: {
+        async listSessions(input = {}) {
+          calls.push(input)
+          if (input.directory) return []
+          return [{ id: "ses_unscoped", title: "Unscoped session" }]
+        },
+        async listMessages() {
+          return []
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderSessionsList(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    { binding: { projectAlias: "demo", sessionId: "ses_current" } },
+  )
+
+  assert.deepEqual(calls, [{ directory: "C:/repo/demo" }, {}])
+  assert.match(sent[0].text, /ses_unscoped.*Unscoped session/)
+  assert.ok(sent[0].replyMarkup.inline_keyboard.flat().some((button) => button.text === "Unscoped session"))
+})
+
+test("createCommandHandlers renderSessionsList treats hidden subagent directories as fallback-blocking evidence", async () => {
+  const calls = []
+  const { runtime, sent } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo", allowUnscopedSessionListFallback: true } },
+    ocByAlias: {
+      demo: {
+        async listSessions(input = {}) {
+          calls.push(input)
+          if (input.directory) return []
+          return [
+            { id: "ses_unscoped", title: "Directoryless root" },
+            { id: "ses_child_other", title: "Hidden other child", parentID: "ses_root", directory: "C:/repo/other" },
+          ]
+        },
+        async listMessages() {
+          return []
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderSessionsList(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    { binding: { projectAlias: "demo", sessionId: "ses_current" } },
+  )
+
+  assert.deepEqual(calls, [{ directory: "C:/repo/demo" }, {}])
+  assert.match(sent[0].text, /No sessions found/)
+  assert.doesNotMatch(sent[0].text, /ses_unscoped/)
+  assert.doesNotMatch(sent[0].text, /ses_child_other|Hidden other child/)
+  assert.equal(sent[0].replyMarkup.inline_keyboard.flat().some((button) => button.text === "Directoryless root"), false)
+})
+
+test("createCommandHandlers does not display or bind hidden subagents that match project directory", async () => {
+  const getSessionCalls = []
+  const bindCalls = []
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo", allowUnscopedSessionListFallback: true } },
+    ocByAlias: {
+      demo: {
+        async listSessions(input = {}) {
+          if (input.directory) return []
+          return [
+            {
+              id: "ses_child_demo",
+              title: "Hidden demo child",
+              parentID: "ses_root",
+              directory: "C:/repo/demo",
+              share: { url: "https://opncd.ai/share/child-demo" },
+            },
+          ]
+        },
+        async listMessages() {
+          return []
+        },
+        async getSession(sessionId) {
+          getSessionCalls.push(sessionId)
+          return { id: sessionId, directory: "C:/repo/demo", parentID: "ses_root" }
+        },
+      },
+    },
+    bindCtxToSession: async (...args) => {
+      bindCalls.push(args)
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+  const ctxMeta = { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }
+
+  await handlers.renderSessionsList(ctxMeta, { binding: { projectAlias: "demo", sessionId: "ses_current" } })
+  await handlers.handleUseCommand(ctxMeta, "https://opncd.ai/share/child-demo")
+
+  assert.match(sent[0].text, /No sessions found/)
+  assert.doesNotMatch(sent[0].text, /ses_child_demo|Hidden demo child/)
+  assert.equal(sent[0].replyMarkup.inline_keyboard.flat().some((button) => button.text === "Hidden demo child"), false)
+  assert.deepEqual(getSessionCalls, [])
+  assert.deepEqual(bindCalls, [])
+  assert.match(sent[1].text, /Share link not found in project 'demo'/)
+  assert.doesNotMatch(sent[1].text, /ses_child_demo/)
+})
+
+test("createCommandHandlers renderSessionsList ignores unscoped fallback opt-in when directory evidence mismatches", async () => {
+  const { runtime, sent } = makeRuntime({
+    projects: { demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo", allowUnscopedSessionListFallback: true } },
+    ocByAlias: {
+      demo: {
+        async listSessions(input = {}) {
+          if (input.directory) return []
+          return [{ id: "ses_other", title: "Other project", directory: "C:/repo/other" }]
+        },
+        async listMessages() {
+          return []
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderSessionsList(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    { binding: { projectAlias: "demo", sessionId: "ses_current" } },
+  )
+
+  assert.match(sent[0].text, /No sessions found/)
+  assert.doesNotMatch(sent[0].text, /ses_other/)
+})
+
+test("createCommandHandlers renderSessionsList keeps shared-client unscoped sessions hidden without directory evidence", async () => {
+  const sharedClient = {
+    async listSessions(input = {}) {
+      if (input.directory) return []
+      return [{ id: "ses_other", title: "Other project" }]
+    },
+    async listMessages() {
+      return []
+    },
+  }
+  const { runtime, sent } = makeRuntime({
+    projects: {
+      demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo", allowUnscopedSessionListFallback: true },
+      other: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/other" },
+    },
+    ocByAlias: { demo: sharedClient, other: sharedClient },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderSessionsList(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    { binding: { projectAlias: "demo", sessionId: "ses_current" } },
+  )
+
+  assert.match(sent[0].text, /No sessions found/)
+  assert.doesNotMatch(sent[0].text, /ses_other/)
+})
+
+test("createCommandHandlers renderSessionsList filters scoped shared-client sessions by directory evidence", async () => {
+  const sharedClient = {
+    async listSessions(input = {}) {
+      assert.deepEqual(input, { directory: "C:/repo/demo" })
+      return [
+        { id: "ses_missing_dir", title: "Missing directory" },
+        { id: "ses_other", title: "Other project", directory: "C:/repo/other" },
+        { id: "ses_demo", title: "Demo project", directory: "C:/repo/demo" },
+      ]
+    },
+    async listMessages() {
+      return []
+    },
+  }
+  const { runtime, sent } = makeRuntime({
+    projects: {
+      demo: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/demo" },
+      other: { baseUrl: "http://127.0.0.1:4312", directory: "C:/repo/other" },
+    },
+    ocByAlias: { demo: sharedClient, other: sharedClient },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.renderSessionsList(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    { binding: { projectAlias: "demo", sessionId: "ses_current" } },
+  )
+
+  assert.match(sent[0].text, /ses_demo.*Demo project/)
+  assert.doesNotMatch(sent[0].text, /ses_other/)
+  assert.doesNotMatch(sent[0].text, /ses_missing_dir/)
+  assert.ok(sent[0].replyMarkup.inline_keyboard.flat().some((button) => button.text === "Demo project"))
 })
 
 test("createCommandHandlers renderSessionsList omits buttons for unsafe session ids", async () => {
@@ -1464,8 +2703,7 @@ test("createCommandHandlers rolls back custom-answer wizard progress when flush 
     },
   )
 
-  assert.equal(stepCalls.length, 1)
-  assert.equal(stepCalls[0].index, 1)
+  assert.equal(stepCalls.length, 0)
   assert.deepEqual(persistCalls.map((entry) => ({ index: entry.index, answers: entry.answers })), [
     { index: 1, answers: [["next answer"], []] },
     { index: 0, answers: [[], []] },
@@ -1601,6 +2839,7 @@ test("createCommandHandlers handleModelCommand refuses project default when none
 
 test("createCommandHandlers handleTelegramMessage forwards the custom model override", async () => {
   const promptCalls = []
+  const markProjectUpCalls = []
   const { runtime } = makeRuntime({
     config: { tgPrefix: "[TG] " },
     storeState: {
@@ -1617,6 +2856,7 @@ test("createCommandHandlers handleTelegramMessage forwards the custom model over
         },
       },
     },
+    markProjectUp: (alias) => markProjectUpCalls.push(alias),
   })
   const handlers = createCommandHandlers(runtime)
 
@@ -1634,6 +2874,7 @@ test("createCommandHandlers handleTelegramMessage forwards the custom model over
       options: { model: { providerID: "openai", modelID: "gpt-5" }, variant: "xhigh" },
     },
   ])
+  assert.deepEqual(markProjectUpCalls, ["demo"])
 })
 
 test("createCommandHandlers handleTelegramMessage blocks prompts behind stale active turns", async () => {
@@ -1717,6 +2958,104 @@ test("createCommandHandlers handleTelegramMessage rethrows retryable promptAsync
 
   assert.deepEqual(promptCalls, [{ sessionId: "ses_current", text: "[TG] retry me" }])
   assert.match(sent[0].text, /Project 'demo' is unavailable/)
+})
+
+test("createCommandHandlers reports stale configured bindings before prompt handling", async () => {
+  const cases = [
+    { name: "text", message: { text: "hello after config change" } },
+    { name: "document", message: { document: { file_id: "file_1", file_name: "notes.txt", mime_type: "text/plain", file_size: 10 } } },
+    { name: "media", message: { photo: [{ file_id: "photo_1" }] } },
+  ]
+
+  for (const entry of cases) {
+    const marked = []
+    const promptCalls = []
+    const { runtime, sent } = makeRuntime({
+      projects: { demo: { baseUrl: "http://127.0.0.1:4312" } },
+      storeState: {
+        bindings: { "100:7": { projectAlias: "old-project", sessionId: "ses_old" } },
+      },
+      store: {
+        markIdempotencyKey(key, metadata) {
+          marked.push({ key, metadata })
+          return true
+        },
+        async flush() {},
+      },
+      tg: {
+        async downloadFile() {
+          throw new Error("stale binding should not download attachments")
+        },
+      },
+      ocByAlias: {
+        demo: {
+          async promptAsync(...args) {
+            promptCalls.push(args)
+          },
+        },
+      },
+    })
+    const handlers = createCommandHandlers(runtime)
+
+    await handlers.handleTelegramMessage({
+      chat: { id: 100, type: "supergroup" },
+      from: { id: 42 },
+      message_id: 4000 + cases.indexOf(entry),
+      message_thread_id: 7,
+      ...entry.message,
+    })
+
+    assert.equal(promptCalls.length, 0, entry.name)
+    assert.equal(sent.length, 1, entry.name)
+    assert.match(sent[0].text, /old-project/, entry.name)
+    assert.equal(marked.length, 1, entry.name)
+    assert.equal(marked[0].metadata.operation, "missingProjectBinding", entry.name)
+    assert.equal(marked[0].metadata.projectAlias, "old-project", entry.name)
+    assert.equal(marked[0].metadata.sessionId, "ses_old", entry.name)
+  }
+})
+
+test("createCommandHandlers delegates retryable promptAsync failure notices to the throttled notifier", async () => {
+  const notices = []
+  const err = makeBoundaryError({
+    source: "opencode",
+    operation: "POST /session/ses_current/prompt_async",
+    method: "POST",
+    pathname: "/session/ses_current/prompt_async",
+    status: 503,
+    message: "opencode unavailable",
+  })
+  const { runtime, sent } = makeRuntime({
+    config: { tgPrefix: "[TG] " },
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    ocByAlias: {
+      demo: {
+        async promptAsync() {
+          throw err
+        },
+      },
+    },
+    isRetryableProjectError: () => true,
+    notifyProjectUnavailableForThread: async (ctxMeta, alias, error, options) => {
+      notices.push({ ctxMeta, alias, error, options })
+      return true
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await assert.rejects(() => handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_thread_id: 7,
+    text: "retry me",
+  }), /opencode unavailable/)
+
+  assert.equal(sent.length, 0)
+  assert.equal(notices.length, 1)
+  assert.equal(notices[0].ctxMeta.ctxKey, "100:7")
+  assert.equal(notices[0].alias, "demo")
+  assert.equal(notices[0].error, err)
+  assert.equal(notices[0].options.platform, "win32")
 })
 
 test("createCommandHandlers clears preflight prompt idempotency after promptAsync failure", async () => {
@@ -1855,7 +3194,7 @@ test("createCommandHandlers retries replayed message idempotency until it is dur
   assert.deepEqual(promptCalls, [])
 })
 
-test("createCommandHandlers rethrows reject-note durability failures after accepted replies", async () => {
+test("createCommandHandlers rethrows reject-note durability failures before remote side effects", async () => {
   const replyCalls = []
   const marked = []
   const rejectNoteAwaiting = new Map([
@@ -1900,13 +3239,117 @@ test("createCommandHandlers rethrows reject-note durability failures after accep
     },
   )
 
-  assert.deepEqual(replyCalls, [{ permissionId: "perm_1", payload: { reply: "reject", message: "no, thanks" } }])
-  assert.equal(marked.length, 2)
+  assert.deepEqual(replyCalls, [])
+  assert.deepEqual(marked.map((entry) => entry.metadata.kind), ["prompt-submission-scope", "prompt-submission"])
+})
+
+test("createCommandHandlers finalizes submitted reject notes without reposting inactive prompts", async () => {
+  const noteText = "no, thanks"
+  const noteKey = permissionNoteIdempotencyKey("demo", "ses_1", "perm_1", noteText)
+  const submittedKey = promptSubmissionIdempotencyKey(noteKey)
+  const idempotencyKeys = new Set([submittedKey])
+  const replyCalls = []
+  const rejectNoteAwaiting = new Map([
+    ["100:7", { projectAlias: "demo", permissionId: "perm_1", sessionID: "ses_1" }],
+  ])
+  const { runtime, sent } = makeRuntime({
+    rejectNoteAwaiting,
+    store: {
+      hasIdempotencyKey: (key) => idempotencyKeys.has(key),
+      markIdempotencyKey(key) {
+        idempotencyKeys.add(key)
+        return true
+      },
+      deletePendingPermission: () => true,
+      async flush() {},
+    },
+    setRejectNoteAwaitingState(ctxKey, value) {
+      if (value) rejectNoteAwaiting.set(ctxKey, value)
+      else rejectNoteAwaiting.delete(ctxKey)
+    },
+    ocByAlias: {
+      demo: {
+        async listPermissions() {
+          return []
+        },
+        async replyPermission(permissionId, payload) {
+          replyCalls.push({ permissionId, payload })
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 322,
+    message_thread_id: 7,
+    text: noteText,
+  })
+
+  assert.deepEqual(replyCalls, [])
+  assert.equal(idempotencyKeys.has(noteKey), true)
+  assert.equal(rejectNoteAwaiting.has("100:7"), false)
+  assert.equal(sent.at(-1)?.text, "Rejection note already sent.")
+})
+
+test("createCommandHandlers blocks alternate reject notes while another permission submission is in flight", async () => {
+  const originalNoteKey = permissionNoteIdempotencyKey("demo", "ses_1", "perm_1", "first note")
+  const scopedSubmissionKey = promptScopedSubmissionIdempotencyKey("demo", "ses_1", "perm_1", "permission")
+  const idempotencyKeys = new Set([scopedSubmissionKey, promptSubmissionIdempotencyKey(originalNoteKey)])
+  const replyCalls = []
+  const marked = []
+  const rejectNoteAwaiting = new Map([
+    ["100:7", { projectAlias: "demo", permissionId: "perm_1", sessionID: "ses_1" }],
+  ])
+  const { runtime, sent } = makeRuntime({
+    rejectNoteAwaiting,
+    store: {
+      hasIdempotencyKey: (key) => idempotencyKeys.has(key),
+      markIdempotencyKey(key, metadata) {
+        marked.push({ key, metadata })
+        idempotencyKeys.add(key)
+        return true
+      },
+      deletePendingPermission: () => true,
+      async flush() {},
+    },
+    setRejectNoteAwaitingState(ctxKey, value) {
+      if (value) rejectNoteAwaiting.set(ctxKey, value)
+      else rejectNoteAwaiting.delete(ctxKey)
+    },
+    ocByAlias: {
+      demo: {
+        async listPermissions() {
+          return [{ id: "perm_1", sessionID: "ses_1" }]
+        },
+        async replyPermission(permissionId, payload) {
+          replyCalls.push({ permissionId, payload })
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 323,
+    message_thread_id: 7,
+    text: "different note",
+  })
+
+  assert.deepEqual(replyCalls, [])
+  assert.deepEqual(marked, [])
+  assert.equal(rejectNoteAwaiting.has("100:7"), true)
+  assert.equal(sent.at(-1)?.text, "Permission reply is temporarily unavailable. Send the note again or /cancel.")
 })
 
 test("createCommandHandlers handleTelegramMessage forwards small text documents as attachment prompts", async () => {
   const promptCalls = []
   const events = []
+  const markProjectUpCalls = []
   const idempotencyKeys = new Set()
   const { runtime, sent } = makeRuntime({
     config: { tgPrefix: "[TG] " },
@@ -1942,6 +3385,7 @@ test("createCommandHandlers handleTelegramMessage forwards small text documents 
         },
       },
     },
+    markProjectUp: (alias) => markProjectUpCalls.push(alias),
   })
   const handlers = createCommandHandlers(runtime)
 
@@ -1960,6 +3404,7 @@ test("createCommandHandlers handleTelegramMessage forwards small text documents 
   assert.match(promptCalls[0].text, /Filename: app\.js/)
   assert.match(promptCalls[0].text, /console\.log\(1\)/)
   assert.deepEqual(events.slice(0, 3), ["mark:promptAsyncAttachment", "flush", "prompt"])
+  assert.deepEqual(markProjectUpCalls, ["demo"])
   assert.match(sent.at(-1).text, /Attachment sent to demo\/ses_current: app\.js/)
 })
 
@@ -2174,6 +3619,56 @@ test("createCommandHandlers requires confirmation for large text documents and c
   assert.deepEqual(result, { callbackText: "Cancelled" })
   assert.equal(promptCalls.length, 0)
   assert.equal(editCalls[0][2], "Attachment sending cancelled.")
+})
+
+test("createCommandHandlers refuses confirmed attachment when bound project is no longer configured", async () => {
+  const editCalls = []
+  const tgCalls = []
+  const promptCalls = []
+  const ocByAlias = {
+    demo: {
+      async promptAsync(...args) {
+        promptCalls.push(args)
+      },
+    },
+  }
+  const { runtime, sent } = makeRuntime({
+    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    tg: {
+      async getFile(...args) {
+        tgCalls.push(["getFile", args])
+        return { file_path: "files/large.log", file_size: USER_ATTACHMENT_LIMITS.confirmBytes }
+      },
+      async downloadFile(...args) {
+        tgCalls.push(["downloadFile", args])
+        return new TextEncoder().encode("log line")
+      },
+      async editMessageText(...args) {
+        editCalls.push(args)
+        return true
+      },
+    },
+    ocByAlias,
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 12,
+    message_thread_id: 7,
+    document: { file_id: "file_large", file_name: "large.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
+  })
+  const sendButton = sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file")
+  const token = attachmentTokenFromButton(sendButton)
+
+  delete ocByAlias.demo
+  const result = await handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", token, { editMessageId: 78 })
+
+  assert.deepEqual(result, { callbackText: "Project missing" })
+  assert.match(editCalls[0][2], /project 'demo'.*no longer configured/)
+  assert.deepEqual(tgCalls, [])
+  assert.deepEqual(promptCalls, [])
 })
 
 test("createCommandHandlers does not mark large attachment handled when confirmation send fails", async () => {
@@ -2735,6 +4230,7 @@ test("createCommandHandlers rethrows retryable Telegram attachment download fail
 })
 
 test("createCommandHandlers rethrows retryable OpenCode send failures for attachments", async () => {
+  const notices = []
   const err = makeBoundaryError({
     source: "opencode",
     operation: "POST /session/ses_current/prompt_async",
@@ -2761,6 +4257,10 @@ test("createCommandHandlers rethrows retryable OpenCode send failures for attach
       },
     },
     isRetryableProjectError: () => true,
+    notifyProjectUnavailableForThread: async (ctxMeta, alias, error, options) => {
+      notices.push({ ctxMeta, alias, error, options })
+      return true
+    },
   })
   const handlers = createCommandHandlers(runtime)
 
@@ -2774,7 +4274,12 @@ test("createCommandHandlers rethrows retryable OpenCode send failures for attach
     }),
     /opencode unavailable/,
   )
-  assert.match(sent[0].text, /Project 'demo' is unavailable/)
+  assert.equal(sent.length, 0)
+  assert.equal(notices.length, 1)
+  assert.equal(notices[0].ctxMeta.ctxKey, "100:7")
+  assert.equal(notices[0].alias, "demo")
+  assert.equal(notices[0].error, err)
+  assert.ok(notices[0].options.fallbackReplyMarkup)
 })
 
 test("createCommandHandlers handleTelegramMessage serves help and unknown commands", async () => {

@@ -1,9 +1,11 @@
 import process from "node:process"
-import { setTimeout as delay } from "node:timers/promises"
 import { redactCmdlineSecrets, sanitizeBaseUrlForCli } from "../url-utils.js"
 import {
+  awaitWithAbort,
+  delayWithAbort,
   getLaunchSupport,
   isPidAlive,
+  makeAbortError,
   startOpenCodeServeDetached,
   waitForHealth,
 } from "./launcher/shared.js"
@@ -126,6 +128,7 @@ export async function ensureOpenCodeRunning({ projectAlias, project, ocClient, l
   let pid = null
   let stop = async () => {}
   let startedMode = `${serverLaunchMode}+${launchSupport.openTuiOnAutoStart ? "tui" : "serve"}`
+  let launchObservation = Promise.resolve(null)
 
   if (platform === "win32") {
     // If a UI is already running for this port, it may be in the middle of bringing the server up.
@@ -168,16 +171,7 @@ export async function ensureOpenCodeRunning({ projectAlias, project, ocClient, l
     pid = res.pid
     if (!pid && proc?.pid) pid = proc.pid
     startedMode = `${serverLaunchMode}+${launchSupport.openTuiOnAutoStart ? "tui" : "serve"}`
-
-    const launchError = await Promise.race([res.spawnError || Promise.resolve(null), delay(750).then(() => null)])
-    if (launchError) throw new Error(`Failed to start opencode serve: ${launchError?.message || String(launchError)}`)
-
-    // If it immediately exited (e.g. port conflict), don't block: health wait below will surface details.
-    await delay(750)
-    if (pid && !isPidAlive(pid)) {
-      logger?.error?.(`[${projectAlias}] opencode serve exited immediately (port=${project.port})`)
-    }
-
+    launchObservation = res.spawnError || Promise.resolve(null)
     stop = async () => {
       await killProcessWindows(pid)
     }
@@ -189,8 +183,7 @@ export async function ensureOpenCodeRunning({ projectAlias, project, ocClient, l
     const child = res.child || null
     pid = res.pid ?? child?.pid ?? null
     startedMode = `${serverLaunchMode}+${launchSupport.openTuiOnAutoStart ? "tui" : "serve"}`
-    const launchError = await Promise.race([res.spawnError || Promise.resolve(null), delay(750).then(() => null)])
-    if (launchError) throw new Error(`Failed to start opencode serve: ${launchError?.message || String(launchError)}`)
+    launchObservation = res.spawnError || Promise.resolve(null)
     stop = async () => {
       try {
         if (pid) process.kill(pid, "SIGTERM")
@@ -198,14 +191,23 @@ export async function ensureOpenCodeRunning({ projectAlias, project, ocClient, l
     }
   }
 
-  logger?.info?.(`[${projectAlias}] started opencode (${startedMode}) pid=${pid || "?"} port=${project.port}`)
   try {
+    const launchError = await awaitWithAbort(launchObservation, abortSignal)
+    if (launchError) throw new Error(`Failed to start opencode serve: ${launchError?.message || String(launchError)}`)
+
+    if (platform === "win32") {
+      // If it immediately exited (e.g. port conflict), don't block: health wait below will surface details.
+      await delayWithAbort(750, abortSignal)
+      if (pid && !isPidAlive(pid)) {
+        logger?.error?.(`[${projectAlias}] opencode serve exited immediately (port=${project.port})`)
+      }
+    }
+
+    logger?.info?.(`[${projectAlias}] started opencode (${startedMode}) pid=${pid || "?"} port=${project.port}`)
     await waitForHealth(ocClient, { timeoutMs: 180_000, logger, projectAlias, abortSignal })
 
     if (abortSignal?.aborted) {
-      const err = new Error("Auto-start aborted")
-      err.name = "AbortError"
-      throw err
+      throw makeAbortError()
     }
 
     await maybeOpenAttachUi()

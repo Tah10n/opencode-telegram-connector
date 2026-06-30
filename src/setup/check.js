@@ -2,8 +2,10 @@ import crypto from "node:crypto"
 import fs from "node:fs/promises"
 import path from "node:path"
 import { buildRuntimeConfig } from "../config/runtime.js"
+import { canonicalDirectoryPath } from "../directory-paths.js"
 import { OpenCodeClient } from "../opencode/client.js"
 import { commandExistsOnPath, getLaunchSupport } from "../opencode/launcher.js"
+import { readOpenCodePermissionConfig, resolvePermissionConfigPath } from "../opencode/permissions-config.js"
 import { effectiveOpenCodeSseEventPath, getOpenCodeSseProjectRoutingIssue, openCodeSseEventPathRequiresDirectoryRouting } from "../opencode/sse.js"
 import { resolveDefaultStatePath } from "../state/store.js"
 import { TelegramClient } from "../telegram/client.js"
@@ -156,6 +158,153 @@ function describeSseRouting(project, { eventPath }) {
   return `${eventPath} does not require project directory routing`
 }
 
+function shouldInspectPermissionConfig(project) {
+  if (project?.permissionControl === false || project?.permissionControl?.enabled === false) return false
+  if (hasExplicitPermissionConfigPath(project)) return true
+  return Object.hasOwn(project || {}, "permissionControl") && project.permissionControl != null
+}
+
+function hasExplicitPermissionConfigPath(project) {
+  return String(project?.permissionConfigPath || "").trim() !== ""
+}
+
+function isExpectedPermissionConfigPathError(err) {
+  return ["EACCES", "EINVAL", "ELOOP", "ENAMETOOLONG", "ENOENT", "ENOTDIR", "EPERM"].includes(err?.code)
+}
+
+function isAccessDeniedError(err) {
+  return ["EACCES", "EPERM"].includes(err?.code)
+}
+
+function isMissingPathError(err) {
+  return ["ENOENT", "ENOTDIR"].includes(err?.code)
+}
+
+function isHostLocalPermissionDirectory(directory) {
+  const canonical = canonicalDirectoryPath(directory)
+  if (!canonical) return false
+  if (process.platform === "win32") return canonical.flavor === "windows-drive" || canonical.flavor === "windows-unc"
+  return canonical.flavor === "posix"
+}
+
+function describeUnavailableDefaultPermissionConfigTarget(reason) {
+  return `default permission config target cannot be resolved because project directory is ${reason}; set explicit local permissionConfigPath with permissionControl: { remoteDirectory: true } (or add remoteDirectory: true to existing permissionControl), or disable permissionControl`
+}
+
+async function inspectExplicitPermissionConfigPath(project, { fsImpl, safeText }) {
+  try {
+    const resolvedPath = await resolvePermissionConfigPath(project, { fsImpl })
+    if (resolvedPath) return { ok: true, label: "explicit permissionConfigPath target is valid" }
+    return {
+      ok: false,
+      label: "explicit permissionConfigPath is not a valid local opencode.json/opencode.jsonc target",
+    }
+  } catch (err) {
+    const prefix = isExpectedPermissionConfigPathError(err)
+      ? "cannot access explicit permissionConfigPath"
+      : "could not validate explicit permissionConfigPath"
+    const code = err?.code ? ` (${safeText(err.code)})` : ""
+    return { ok: false, label: `${prefix}${code}` }
+  }
+}
+
+function isRegularFileStat(stat) {
+  if (typeof stat?.isDirectory === "function" && stat.isDirectory()) return false
+  return typeof stat?.isFile !== "function" || stat.isFile()
+}
+
+async function inspectDefaultPermissionConfigTarget(project, { fsImpl, safeText }) {
+  const directory = String(project?.directory || "").trim()
+  if (!directory) return null
+  if (!isHostLocalPermissionDirectory(directory)) {
+    return { ok: false, label: describeUnavailableDefaultPermissionConfigTarget("non-local for local permission config") }
+  }
+
+  try {
+    const stat = await fsImpl.stat(directory)
+    if (typeof stat?.isDirectory === "function" && !stat.isDirectory()) {
+      return { ok: false, label: "default permission config directory is not a directory" }
+    }
+  } catch (err) {
+    if (isMissingPathError(err)) return { ok: false, label: describeUnavailableDefaultPermissionConfigTarget("missing") }
+    if (isAccessDeniedError(err)) return { ok: false, label: "permission config access-denied" }
+    const code = err?.code ? ` (${safeText(err.code)})` : ""
+    return { ok: false, label: `could not validate default permission config target${code}` }
+  }
+
+  const statFile = typeof fsImpl?.lstat === "function"
+    ? (targetPath) => fsImpl.lstat(targetPath)
+    : (targetPath) => fsImpl.stat(targetPath)
+  for (const filename of ["opencode.jsonc", "opencode.json"]) {
+    const targetPath = path.join(directory, filename)
+    let stat
+    try {
+      stat = await statFile(targetPath)
+    } catch (err) {
+      if (isMissingPathError(err)) continue
+      if (isAccessDeniedError(err)) return { ok: false, label: "permission config access-denied" }
+      const code = err?.code ? ` (${safeText(err.code)})` : ""
+      return { ok: false, label: `could not validate default permission config target${code}` }
+    }
+    if ((typeof stat?.isSymbolicLink === "function" && stat.isSymbolicLink()) || !isRegularFileStat(stat)) {
+      return { ok: false, label: "default permission config target is unsafe; expected a regular opencode.json/opencode.jsonc file" }
+    }
+  }
+  return null
+}
+
+function describePermissionConfigReadResult(result, { explicit }) {
+  if (result?.ok === true) {
+    if (result.status === "missing") {
+      return {
+        ok: true,
+        label: `${explicit ? "explicit" : "default"} permission config target is valid and can be created`,
+      }
+    }
+    return {
+      ok: true,
+      label: `${explicit ? "explicit" : "default"} permission config is readable and valid`,
+    }
+  }
+
+  if (result?.status === "invalid") {
+    return {
+      ok: false,
+      label: "invalid opencode permission config; fix JSON/JSONC syntax before using permission controls",
+    }
+  }
+  if (result?.reason === "access-denied") {
+    return { ok: false, label: "permission config access-denied" }
+  }
+  if (result?.status === "conflict" && result?.reason === "emergency-backup") {
+    return { ok: false, label: "permission config emergency backup exists; restore or remove it before using permission controls" }
+  }
+  if (result?.status === "conflict") {
+    return { ok: false, label: "permission config changed during validation; retry setup check" }
+  }
+  return { ok: false, label: "permission config unavailable" }
+}
+
+async function inspectPermissionConfig(project, { fsImpl, safeText }) {
+  const explicit = hasExplicitPermissionConfigPath(project)
+  if (explicit) {
+    const targetStatus = await inspectExplicitPermissionConfigPath(project, { fsImpl, safeText })
+    if (!targetStatus.ok) return targetStatus
+  }
+
+  try {
+    const result = await readOpenCodePermissionConfig(project, { fsImpl })
+    if (!explicit && result?.status === "unavailable" && !result?.filePath && !result?.reason) {
+      return inspectDefaultPermissionConfigTarget(project, { fsImpl, safeText })
+    }
+    return describePermissionConfigReadResult(result, { explicit })
+  } catch (err) {
+    if (isAccessDeniedError(err)) return { ok: false, label: "permission config access-denied" }
+    const code = err?.code ? ` (${safeText(err.code)})` : ""
+    return { ok: false, label: `could not validate permission config${code}` }
+  }
+}
+
 async function pathExists(fsImpl, targetPath) {
   try {
     await fsImpl.stat(targetPath)
@@ -300,6 +449,18 @@ export async function runSetupCheck({
       `SSE routing ${alias}`,
       describeSseRouting(project, { eventPath: sseEventPath }),
     )
+
+    if (shouldInspectPermissionConfig(project)) {
+      const permissionConfigStatus = await inspectPermissionConfig(project, { fsImpl, safeText })
+      if (permissionConfigStatus) {
+        addFinding(
+          findings,
+          permissionConfigStatus.ok ? "pass" : "fail",
+          `Permission config ${alias}`,
+          permissionConfigStatus.label,
+        )
+      }
+    }
 
     const autoStartSupport = project.autoStart === true
       ? getLaunchSupportImpl({ project, platform })

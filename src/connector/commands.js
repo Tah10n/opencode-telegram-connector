@@ -1,12 +1,14 @@
 import { makeInlineKeyboard } from "../telegram/client.js"
 import { sessionKey } from "../state/store.js"
-import { permissionNoteIdempotencyKey, telegramMessageIdempotencyKey } from "./idempotency.js"
+import { permissionNoteIdempotencyKey, promptScopedSubmissionIdempotencyKey, promptSubmissionIdempotencyKey, telegramMessageIdempotencyKey } from "./idempotency.js"
 import { classifyBoundaryError, isRetryableBoundaryError, isStaleBoundaryError, makeBoundaryError } from "../boundary-errors.js"
+import { livePermissionPromptStatus, shouldRetrySubmittedPrompt } from "./prompt-submission.js"
 import { userAttachmentLimitsFromConfig } from "../limits.js"
 import { createAttachmentHandlers } from "./commands/attachments.js"
 import { createLanguageCommandHandler } from "./commands/language.js"
 import { createModelCommandHandlers } from "./commands/model.js"
 import { createOperatorCommandHandlers } from "./commands/operator.js"
+import { createPermissionCommandHandlers } from "./commands/permissions.js"
 import { createSessionCommandHandlers } from "./commands/sessions.js"
 import { formatModelUiChoices, resolveModelProviderCatalog } from "./model-ui.js"
 import { unsupportedMediaKind, unsupportedMediaText } from "./incoming-attachments.js"
@@ -32,6 +34,7 @@ function helpText({ scopeLabel = "this thread", defaultProject = "", isBound = f
     t(locale, "commands.help.sessions"),
     t(locale, "commands.help.model"),
     t(locale, "commands.help.feed"),
+    t(locale, "commands.help.permissions"),
     t(locale, "commands.help.language"),
     t(locale, "commands.help.status"),
     t(locale, "commands.help.unbind"),
@@ -74,6 +77,8 @@ export function createCommandHandlers(runtime) {
     canAutoStartProject,
     isRetryableProjectError,
     startServerKeyboard,
+    notifyProjectUnavailableForThread: notifyProjectUnavailableForThreadRuntime,
+    markProjectUp,
     ensureRecentPromptSet,
     hashTextForEcho,
     formatProjectUnavailable,
@@ -85,6 +90,7 @@ export function createCommandHandlers(runtime) {
     awaitingCustomAnswer,
     bindAliasAwaiting,
     getWizard,
+    getUniqueWizard,
     cloneWizardState,
     applyWizardState,
     persistQuestionWizard,
@@ -175,6 +181,8 @@ export function createCommandHandlers(runtime) {
     platform,
     formatProjectUnavailable,
     startServerKeyboard,
+    notifyProjectUnavailableForThread: notifyUnavailableForThread,
+    markProjectUp,
     ensureRecentPromptSet,
     hashTextForEcho,
     staleActiveTurnGuard: maybeBlockStaleActiveTurn,
@@ -187,6 +195,17 @@ export function createCommandHandlers(runtime) {
 
   async function safeInformThread(ctxMeta, text, replyMarkup, options) {
     await sendToThread(ctxMeta, text, replyMarkup, options).catch(() => {})
+  }
+
+  async function notifyUnavailableForThread(ctxMeta, alias, err, { locale = ctxMeta?.locale, fallbackReplyMarkup = null } = {}) {
+    if (typeof notifyProjectUnavailableForThreadRuntime === "function") {
+      return notifyProjectUnavailableForThreadRuntime(ctxMeta, alias, err, { locale, platform, fallbackReplyMarkup })
+    }
+    const noticeLocale = locale || ctxMeta?.locale || "en"
+    const withButton = isRetryableProjectError(err) && canAutoStartProject(alias, { platform })
+    const replyMarkup = withButton ? startServerKeyboard(alias, { locale: noticeLocale }) : fallbackReplyMarkup
+    await sendToThread(ctxMeta, formatProjectUnavailable(alias, err, { locale: noticeLocale }), replyMarkup).catch(() => {})
+    return true
   }
 
   async function safeEditMessage(ctxMeta, messageId, text, replyMarkup, options) {
@@ -249,8 +268,34 @@ export function createCommandHandlers(runtime) {
     return makeInlineKeyboard([[{ text: translate(localeForCtx(ctxMeta), "common.close"), callback_data: packCallback("s", "close") }]])
   }
 
+  function resolveConfiguredBinding(binding) {
+    const alias = String(binding?.projectAlias || "").trim()
+    const sessionId = String(binding?.sessionId || "").trim()
+    if (!alias || !sessionId || !projects?.[alias] || !ocByAlias?.[alias]) return null
+    return {
+      ...binding,
+      alias,
+      projectAlias: alias,
+      project: projects[alias],
+      oc: ocByAlias[alias],
+      sessionId,
+    }
+  }
+
+  async function sendMissingProjectBindingNotice(ctxMeta, binding, markMessageHandled) {
+    await sendToThread(
+      ctxMeta,
+      t(ctxMeta, "commands.boundProjectMissing", { project: binding?.projectAlias || "unknown" }),
+      unboundGuidanceKeyboard(ctxMeta),
+    )
+    await markMessageHandled("missingProjectBinding", {
+      projectAlias: binding?.projectAlias,
+      sessionId: binding?.sessionId,
+    })
+  }
+
   async function maybeBlockStaleActiveTurn(ctxMeta, binding) {
-    const oc = ocByAlias[binding?.projectAlias]
+    const oc = binding?.oc || ocByAlias[binding?.projectAlias]
     if (!oc?.listMessages || !binding?.sessionId) return false
     let status
     try {
@@ -273,6 +318,19 @@ export function createCommandHandlers(runtime) {
 
   function hasIdempotencyKey(key) {
     return !!key && typeof store?.hasIdempotencyKey === "function" && store.hasIdempotencyKey(key)
+  }
+
+  function promptSubmissionScopeMetadata({ projectAlias, ctxKey, sessionID, promptId, promptType, operation, finalKey }) {
+    return {
+      kind: "prompt-submission-scope",
+      projectAlias,
+      ctxKey,
+      sessionId: sessionID,
+      promptId,
+      promptType,
+      operation,
+      finalKey,
+    }
   }
 
   async function flushDurableState(operation) {
@@ -439,6 +497,26 @@ export function createCommandHandlers(runtime) {
     t,
   })
 
+  const {
+    applyPermissionProfile,
+    renderPermissionDetails,
+    renderPermissionSettings,
+    renderFullAutoConfirmation,
+    handlePermissionsCommand,
+  } = createPermissionCommandHandlers({
+    store,
+    projects,
+    sendToThread,
+    tg,
+    cb: runtime.cb,
+    unboundGuidanceText,
+    unboundGuidanceKeyboard,
+    readPermissionConfig: runtime.readPermissionConfig,
+    writePermissionProfile: runtime.writePermissionProfile,
+    logger,
+    t,
+  })
+
   async function handleFeed(ctxMeta, { editMessageId } = {}) {
     await renderFeedSettings(ctxMeta, { editMessageId })
   }
@@ -508,7 +586,13 @@ export function createCommandHandlers(runtime) {
 
     const awaitingQ = awaitingCustomAnswer.get(ctxMeta.ctxKey)
     if (awaitingQ) {
-      const bindingStatus = await promptContinuationBindingStatus(ctxMeta.ctxKey, awaitingQ.projectAlias, awaitingQ.sessionID)
+      let expectedSessionID = String(awaitingQ.sessionID || "").trim()
+      let wizard = getWizard(awaitingQ.projectAlias, awaitingQ.requestId, expectedSessionID)
+      if (!wizard && !expectedSessionID && typeof getUniqueWizard === "function") {
+        wizard = getUniqueWizard(awaitingQ.projectAlias, awaitingQ.requestId)
+        expectedSessionID = String(wizard?.sessionID || "").trim()
+      }
+      const bindingStatus = await promptContinuationBindingStatus(ctxMeta.ctxKey, awaitingQ.projectAlias, expectedSessionID)
       if (bindingStatus === "retryable") {
         await sendToThread(ctxMeta, t(ctxMeta, "commands.questionRetry")).catch(() => {})
         return
@@ -524,8 +608,7 @@ export function createCommandHandlers(runtime) {
         await markMessageHandled("questionNonText", { projectAlias: awaitingQ.projectAlias })
         return
       }
-      const wizard = getWizard(awaitingQ.projectAlias, awaitingQ.requestId, awaitingQ.sessionID)
-      if (!wizard || wizard.index !== awaitingQ.qIndex) {
+      if (!wizard || String(wizard.sessionID || "").trim() !== expectedSessionID || wizard.index !== awaitingQ.qIndex) {
         setAwaitingCustomAnswerState(ctxMeta.ctxKey, null)
         await sendToThread(ctxMeta, t(ctxMeta, "prompts.questionInactive"))
         await markMessageHandled("customAnswerStale", { projectAlias: awaitingQ.projectAlias })
@@ -546,11 +629,23 @@ export function createCommandHandlers(runtime) {
         }
       } else {
         const previousWizard = cloneWizardState(wizard)
-        const previousAwaiting = { ...awaitingQ }
+        const previousAwaiting = { ...awaitingQ, ...(expectedSessionID ? { sessionID: expectedSessionID } : {}) }
         nextWizard.index = nextIndex
-        await sendCurrentQuestionStep(nextWizard)
         applyWizardState(wizard, nextWizard)
         await persistCustomAnswerProgressDurably(wizard, previousWizard, previousAwaiting)
+        try {
+          await sendCurrentQuestionStep(wizard)
+        } catch (err) {
+          try {
+            applyWizardState(wizard, previousWizard)
+            persistQuestionWizard(wizard)
+            setAwaitingCustomAnswerState(ctxMeta.ctxKey, previousAwaiting)
+            await flushDurableState("roll back question wizard state after delivery failure")
+          } catch (rollbackErr) {
+            logger?.error?.("Failed to roll back custom-answer delivery state:", rollbackErr?.message || String(rollbackErr))
+          }
+          throw err
+        }
         await markMessageHandled("questionNextStep", { projectAlias: awaitingQ.projectAlias, sessionId: wizard.sessionID })
       }
       return
@@ -577,12 +672,81 @@ export function createCommandHandlers(runtime) {
       }
       const oc = ocByAlias[awaiting.projectAlias]
       const noteKey = permissionNoteIdempotencyKey(awaiting.projectAlias, awaiting.sessionID, awaiting.permissionId, text)
+      const submittedKey = promptSubmissionIdempotencyKey(noteKey)
+      const scopedSubmittedKey = promptScopedSubmissionIdempotencyKey(awaiting.projectAlias, awaiting.sessionID, awaiting.permissionId, "permission")
       if (hasIdempotencyKey(noteKey)) {
         store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId, awaiting.sessionID)
         setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
         await markMessageHandled("replyPermissionNote", { projectAlias: awaiting.projectAlias })
         await sendToThread(ctxMeta, t(ctxMeta, "commands.rejectionNoteAlreadySent")).catch(() => {})
         return
+      }
+      if (hasIdempotencyKey(submittedKey)) {
+        const liveStatus = await livePermissionPromptStatus(oc, awaiting.permissionId, awaiting.sessionID)
+        if (liveStatus === "retryable") {
+          await sendToThread(ctxMeta, t(ctxMeta, "commands.permissionRetry")).catch(() => {})
+          return
+        }
+        if (!shouldRetrySubmittedPrompt(liveStatus)) {
+          await markIdempotencyEntries([
+            {
+              key: noteKey,
+              metadata: {
+                kind: "permission-note",
+                projectAlias: awaiting.projectAlias,
+                ctxKey: ctxMeta.ctxKey,
+                operation: "replyPermission",
+                action: "reject_note",
+              },
+            },
+            messageIdempotencyEntry("replyPermissionNote", { projectAlias: awaiting.projectAlias }),
+          ], { flush: false })
+          store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId, awaiting.sessionID)
+          setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
+          await flushDurableState("persist submitted permission note state")
+          await sendToThread(ctxMeta, t(ctxMeta, "commands.rejectionNoteAlreadySent")).catch(() => {})
+          return
+        }
+      } else if (hasIdempotencyKey(scopedSubmittedKey)) {
+        const liveStatus = await livePermissionPromptStatus(oc, awaiting.permissionId, awaiting.sessionID)
+        if (liveStatus === "retryable" || shouldRetrySubmittedPrompt(liveStatus)) {
+          await sendToThread(ctxMeta, t(ctxMeta, "commands.permissionRetry")).catch(() => {})
+          return
+        }
+        await markIdempotencyEntries([
+          messageIdempotencyEntry("replyPermissionNote", { projectAlias: awaiting.projectAlias }),
+        ], { flush: false })
+        store.deletePendingPermission(awaiting.projectAlias, awaiting.permissionId, awaiting.sessionID)
+        setRejectNoteAwaitingState(ctxMeta.ctxKey, null)
+        await flushDurableState("persist submitted permission note state")
+        await sendToThread(ctxMeta, t(ctxMeta, "commands.rejectionNoteAlreadySent")).catch(() => {})
+        return
+      } else {
+        await markIdempotencyEntries([
+          {
+            key: scopedSubmittedKey,
+            metadata: promptSubmissionScopeMetadata({
+              projectAlias: awaiting.projectAlias,
+              ctxKey: ctxMeta.ctxKey,
+              sessionID: awaiting.sessionID,
+              promptId: awaiting.permissionId,
+              promptType: "permission",
+              operation: "replyPermission",
+              finalKey: noteKey,
+            }),
+          },
+          {
+            key: submittedKey,
+            metadata: {
+              kind: "prompt-submission",
+              projectAlias: awaiting.projectAlias,
+              ctxKey: ctxMeta.ctxKey,
+              sessionId: awaiting.sessionID,
+              operation: "replyPermission",
+              action: "reject_note",
+            },
+          },
+        ], { rollbackOnFlushFailure: true })
       }
       try {
         await oc.replyPermission(awaiting.permissionId, { reply: "reject", message: text })
@@ -745,6 +909,11 @@ export function createCommandHandlers(runtime) {
         await markMessageHandled("feed")
         return
       }
+      if (cmd === "/permissions") {
+        await handlePermissionsCommand(ctxMeta, argv)
+        await markMessageHandled("permissions")
+        return
+      }
       if (cmd === "/language") {
         await handleLanguage(ctxMeta, argv)
         await markMessageHandled("language")
@@ -796,38 +965,44 @@ export function createCommandHandlers(runtime) {
       await markMessageHandled("unbound")
       return
     }
+    const resolvedBinding = resolveConfiguredBinding(binding)
+    if (!resolvedBinding) {
+      await sendMissingProjectBindingNotice(ctxMeta, binding, markMessageHandled)
+      return
+    }
 
     if (hasDocument) {
-      await handleAttachmentDocumentMessage(ctxMeta, msg, binding, messageKey, markMessageHandled, options)
+      await handleAttachmentDocumentMessage(ctxMeta, msg, resolvedBinding, messageKey, markMessageHandled, options)
       return
     }
 
     if (mediaKind) {
       await sendToThread(ctxMeta, unsupportedMediaText(mediaKind, { limits: userAttachmentLimits, locale: ctxMeta.locale }), closeOnlyKeyboard(ctxMeta))
-      await markMessageHandled("unsupportedMedia", { projectAlias: binding.projectAlias, sessionId: binding.sessionId, action: mediaKind })
+      await markMessageHandled("unsupportedMedia", { projectAlias: resolvedBinding.projectAlias, sessionId: resolvedBinding.sessionId, action: mediaKind })
       return
     }
 
     if (!hasText) return
 
-    const oc = ocByAlias[binding.projectAlias]
-    if (await maybeBlockStaleActiveTurn(ctxMeta, binding)) {
-      await markMessageHandled("staleActiveTurn", { projectAlias: binding.projectAlias, sessionId: binding.sessionId })
+    const oc = resolvedBinding.oc
+    if (await maybeBlockStaleActiveTurn(ctxMeta, resolvedBinding)) {
+      await markMessageHandled("staleActiveTurn", { projectAlias: resolvedBinding.projectAlias, sessionId: resolvedBinding.sessionId })
       return
     }
     const prefix = config.tgPrefix ?? "[TG] "
     const promptText = `${prefix}${text}`
-    const sk = sessionKey(binding.projectAlias, binding.sessionId)
+    const sk = sessionKey(resolvedBinding.projectAlias, resolvedBinding.sessionId)
     ensureRecentPromptSet(sk).add(hashTextForEcho(promptText))
-    const promptOverride = await resolvePromptOverride(ctxMeta.ctxKey, binding)
+    const promptOverride = await resolvePromptOverride(ctxMeta.ctxKey, resolvedBinding)
     // Persist message idempotency before the external side effect. If opencode
     // accepts the prompt and the process crashes immediately after, replayed
     // Telegram updates will skip instead of sending a duplicate prompt.
-    await markIdempotencyEntries([messageIdempotencyEntry("promptAsync", { projectAlias: binding.projectAlias, sessionId: binding.sessionId })], {
+    await markIdempotencyEntries([messageIdempotencyEntry("promptAsync", { projectAlias: resolvedBinding.projectAlias, sessionId: resolvedBinding.sessionId })], {
       rollbackOnFlushFailure: true,
     })
     try {
-      await oc.promptAsync(binding.sessionId, promptText, promptOverride || undefined)
+      await oc.promptAsync(resolvedBinding.sessionId, promptText, promptOverride || undefined)
+      markProjectUp?.(resolvedBinding.projectAlias)
     } catch (err) {
       let cleanupErr = null
       try {
@@ -835,14 +1010,13 @@ export function createCommandHandlers(runtime) {
       } catch (deleteErr) {
         cleanupErr = deleteErr
       }
-      const alias = binding.projectAlias
-      const withButton = isRetryableProjectError(err) && canAutoStartProject(alias, { platform })
+      const alias = resolvedBinding.projectAlias
       recordRetryableOpenCodeFailure(alias, err, {
         operation: "POST /session/:id/prompt_async",
         method: "POST",
-        pathname: `/session/${binding.sessionId}/prompt_async`,
+        pathname: `/session/${resolvedBinding.sessionId}/prompt_async`,
       })
-      await sendToThread(ctxMeta, formatProjectUnavailable(alias, err, { locale: ctxMeta.locale }), withButton ? startServerKeyboard(alias, { locale: ctxMeta.locale }) : null).catch(() => {})
+      await notifyUnavailableForThread(ctxMeta, alias, err)
       if (cleanupErr) throw cleanupErr
       if (isRetryableProjectError(err)) throw err
       return
@@ -852,11 +1026,15 @@ export function createCommandHandlers(runtime) {
   return {
     renderSessionsList,
     renderModelSettings,
+    renderPermissionDetails,
+    renderPermissionSettings,
+    renderFullAutoConfirmation,
     handleBindCommand,
     handleNewCommand,
     handleUseCommand,
     handleSessions,
     handleModelCommand,
+    handlePermissionsCommand,
     handleAbort,
     handleWhere,
     handleRuntime,
@@ -870,5 +1048,6 @@ export function createCommandHandlers(runtime) {
     handleTelegramMessage,
     buildSessionSwitchText,
     setThreadModelPreference,
+    applyPermissionProfile,
   }
 }

@@ -33,10 +33,10 @@ function makeTempPidFile(prefix) {
 function buildPosixServeWindowCommand({ directory, port, pidFile }) {
   const steps = []
   const serveCmd = ["opencode", ...buildServeArgs(port)].map((part) => shQuote(part)).join(" ")
-  if (directory) steps.push(`cd ${shQuote(directory)}`)
+  if (directory) steps.push(`cd ${shQuote(directory)} || exit $?`)
   steps.push(`${serveCmd} & pid=$!; printf '%s' "$pid" > ${shQuote(pidFile)}; wait "$pid"`)
   return [
-    steps.join(" && "),
+    steps.join("; "),
     'status=$?',
     'rm -f ' + shQuote(pidFile),
     'if [ "$status" -ne 0 ]; then',

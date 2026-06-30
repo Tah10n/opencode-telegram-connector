@@ -1,6 +1,15 @@
 import { requireSafeOpenCodeId } from "../../opencode/ids.js"
+import { sessionItemsFromResponse } from "../../session-response.js"
+import { sessionProjectScopeDecision, sessionProjectScopeDecisionWithFallback, sessionProjectScopeErrorText } from "../../session-project-scope.js"
 
 function ignoreError() {}
+
+async function matchingSessionListEvidence(oc, project, sessionId) {
+  const directory = String(project?.directory ?? "").trim()
+  if (!directory || typeof oc?.listSessions !== "function") return null
+  const sessions = sessionItemsFromResponse(await oc.listSessions({ directory }))
+  return sessions.find((session) => String(session?.id ?? "").trim() === sessionId && sessionProjectScopeDecision(session, project).ok) || null
+}
 
 export async function handleSessionCallback({
   parts,
@@ -8,6 +17,7 @@ export async function handleSessionCallback({
   ctxMeta,
   msg,
   store,
+  projects,
   ocByAlias,
   answerCallbackQuery,
   closeInteractiveMessage,
@@ -84,7 +94,18 @@ export async function handleSessionCallback({
     return true
   }
   try {
-    await oc.getSession(safeTargetSessionId)
+    const targetSession = await oc.getSession(safeTargetSessionId)
+    const project = projects?.[projectAlias]
+    const initialScopeDecision = sessionProjectScopeDecision(targetSession, project)
+    const fallbackEvidence = initialScopeDecision.reason === "missing-directory"
+      ? await matchingSessionListEvidence(oc, project, safeTargetSessionId)
+      : null
+    const scopeDecision = sessionProjectScopeDecisionWithFallback(targetSession, project, fallbackEvidence)
+    if (!scopeDecision.ok) {
+      await answerCallbackQuery(callbackQuery.id, "Wrong project")
+      await sendToThread(ctxMeta, sessionProjectScopeErrorText(projectAlias, safeTargetSessionId, scopeDecision)).catch(ignoreError)
+      return true
+    }
   } catch (err) {
     await answerCallbackQuery(callbackQuery.id, "Unavailable")
     await sendToThread(ctxMeta, formatProjectUnavailable(projectAlias, err, { locale: ctxMeta.locale })).catch(ignoreError)

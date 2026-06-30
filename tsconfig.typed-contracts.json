@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "noEmit": true,
+    "strict": true,
+    "target": "ES2022",
+    "types": ["node"]
+  },
+  "files": [
+    "src/connector/callback-data.js",
+    "src/directory-paths.js",
+    "src/opencode/ids.js",
+    "src/opencode/permissions-profile.js",
+    "src/opencode/startup-session.js",
+    "src/session-project-scope.js",
+    "src/session-response.js"
+  ]
+}

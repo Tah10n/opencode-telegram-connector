@@ -56,6 +56,13 @@ export default {
       serverLaunchMode: "background",
       openTuiOnAutoStart: true,
       openAttachOnNewMode: "new-window",
+      // Off by default: only set true for a dedicated legacy backend whose
+      // session list cannot filter by directory and never contains other workspaces.
+      // allowUnscopedSessionListFallback: true,
+      // Optional: /permissions edits this OpenCode config file.
+      // Defaults to <directory>/opencode.json, or existing opencode.jsonc.
+      // permissionConfigPath: "./project-a/opencode.json",
+      // permissionControl: { enabled: true, maxBackups: 5 },
     },
 
     remoteTeam: {
@@ -67,6 +74,12 @@ export default {
       directory: "/srv/workspaces/team-project",
       usernameEnv: "REMOTE_OPENCODE_USERNAME",
       passwordEnv: "REMOTE_OPENCODE_PASSWORD",
+      // If this same-platform directory is remote/non-local but you still want
+      // /permissions, point permissionConfigPath at opencode.json/jsonc inside
+      // an existing local directory and opt in explicitly. setup:check skips
+      // permission config validation for this project until you opt in here.
+      // permissionConfigPath: "./remote-team/opencode.json",
+      // permissionControl: { remoteDirectory: true },
     },
 
     serverOnly: {

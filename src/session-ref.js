@@ -1,3 +1,5 @@
+import { sessionItemsFromResponse } from "./session-response.js"
+
 function normalizePathname(pathname) {
   const trimmed = String(pathname || "").replace(/\/+$/, "")
   return trimmed || "/"
@@ -43,9 +45,9 @@ export function parseSessionReference(input) {
 
 export function findSessionByShareUrl(sessions, shareUrl) {
   const normalizedShareUrl = normalizeShareUrl(shareUrl)
-  if (!normalizedShareUrl || !Array.isArray(sessions)) return null
+  if (!normalizedShareUrl) return null
 
-  for (const session of sessions) {
+  for (const session of sessionItemsFromResponse(sessions)) {
     const id = typeof session?.id === "string" ? session.id.trim() : ""
     const candidate = normalizeShareUrl(session?.share?.url)
     if (id && candidate && candidate === normalizedShareUrl) return session

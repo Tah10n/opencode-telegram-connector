@@ -9,6 +9,7 @@ import { handleFeedCallback } from "./callbacks/feed.js"
 import { handleLanguageCallback } from "./callbacks/language.js"
 import { handleModelCallback } from "./callbacks/model.js"
 import { handlePermissionCallback } from "./callbacks/permission.js"
+import { handlePermissionsControlCallback } from "./callbacks/permissions-control.js"
 import { handleProjectCallback } from "./callbacks/project.js"
 import { handleQuestionCallback } from "./callbacks/question.js"
 import { handleRuntimeCallback } from "./callbacks/runtime.js"
@@ -40,6 +41,9 @@ export function createCallbackHandlers(runtime) {
     getStartupSession,
     renderFeedSettings,
     renderModelSettings,
+    renderPermissionDetails,
+    renderPermissionSettings,
+    renderFullAutoConfirmation,
     renderChangedFilesView,
     renderSessionsList,
     renderProjectSessions,
@@ -51,6 +55,7 @@ export function createCallbackHandlers(runtime) {
     setRejectNoteAwaitingState,
     sendRejectNotePrompt,
     getWizard,
+    getUniqueWizard,
     clearPersistedQuestionWizard,
     setAwaitingCustomAnswerState,
     sendQuestionCustomAnswerPrompt,
@@ -60,6 +65,7 @@ export function createCallbackHandlers(runtime) {
     finishQuestionWizard,
     buildSessionSwitchText = defaultBuildSessionSwitchText,
     setThreadModelPreference,
+    applyPermissionProfile,
     formatProjectUnavailable,
     canAutoStartProject,
     startServerKeyboard,
@@ -128,7 +134,8 @@ export function createCallbackHandlers(runtime) {
       return
     }
     const kind = parts[0]
-    const callbackProjectAlias = projects?.[parts[1]] ? parts[1] : store.getBinding(ctxMeta.ctxKey)?.projectAlias || null
+    const callbackProjectAliasPart = kind === "pc" ? parts[2] : parts[1]
+    const callbackProjectAlias = projects?.[callbackProjectAliasPart] ? callbackProjectAliasPart : store.getBinding(ctxMeta.ctxKey)?.projectAlias || null
     recordLegacyCallback(legacyPrefix, callbackProjectAlias)
 
     try {
@@ -179,6 +186,7 @@ export function createCallbackHandlers(runtime) {
           ctxMeta,
           msg,
           store,
+          projects,
           ocByAlias,
           answerCallbackQuery,
           closeInteractiveMessage,
@@ -284,6 +292,22 @@ export function createCallbackHandlers(runtime) {
         return
       }
 
+      if (kind === "pc") {
+        await handlePermissionsControlCallback({
+          parts,
+          callbackQuery,
+          ctxMeta,
+          msg,
+          answerCallbackQuery,
+          closeInteractiveMessage,
+          renderPermissionSettings,
+          renderPermissionDetails,
+          renderFullAutoConfirmation,
+          applyPermissionProfile,
+        })
+        return
+      }
+
       if (kind === "cf") {
         await handleChangedFilesCallback({
           parts,
@@ -355,6 +379,7 @@ export function createCallbackHandlers(runtime) {
           isPromptBindingCurrent,
           answerStalePromptCallback,
           getWizard,
+          getUniqueWizard,
           setAwaitingCustomAnswerState,
           sendQuestionCustomAnswerPrompt,
           cloneWizardState,
@@ -388,8 +413,7 @@ export function createCallbackHandlers(runtime) {
       if (classification.retryable) {
         recordCallbackOutcome?.(callbackProjectAlias, "retryable")
         await answerCallbackQuery(callbackQuery.id, "Temporarily unavailable")
-        await sendToThread(ctxMeta, t(ctxMeta, "callbacks.actionTemporarilyUnavailable")).catch(ignoreError)
-        return
+        throw classification.error
       }
       recordCallbackOutcome?.(callbackProjectAlias, "fatal")
       await answerCallbackQuery(callbackQuery.id, "Action failed")

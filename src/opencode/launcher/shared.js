@@ -151,7 +151,6 @@ export function launchDetachedProcess(command, args, { cwd, errorPrefix, success
 
     child.on("spawn", () => {
       successTimer = setTimeout(() => finish(), Math.max(10, Number(successDelayMs) || 40))
-      successTimer.unref?.()
     })
     child.on("error", (err) => finish(new Error(`${errorPrefix}: ${err?.message || String(err)}`)))
     child.on("close", (code) => {
@@ -165,22 +164,75 @@ export function launchDetachedProcess(command, args, { cwd, errorPrefix, success
   })
 }
 
-export function observeSpawnError(child) {
+export function observeSpawnError(child, { successDelayMs = 750, errorPrefix = "Process exited immediately" } = {}) {
   if (!child) return Promise.resolve(null)
   return new Promise((resolve) => {
     let settled = false
+    let successTimer = null
+    const cleanup = () => {
+      if (successTimer) clearTimeout(successTimer)
+      child.off?.("spawn", onSpawn)
+      child.off?.("error", onError)
+      child.off?.("close", onClose)
+      child.off?.("exit", onExit)
+    }
     const finish = (err = null) => {
       if (settled) return
       settled = true
-      child.off?.("spawn", onSpawn)
-      if (err) child.off?.("error", onError)
+      cleanup()
       resolve(err)
     }
+    const immediateExitError = (eventName, code, signal) => {
+      const signalText = signal ? ` signal=${signal}` : ""
+      return new Error(`${errorPrefix} (${eventName}: code=${code ?? "?"}${signalText})`)
+    }
     const onError = (err) => finish(err)
-    const onSpawn = () => finish(null)
+    const onImmediateExit = (eventName, code, signal) => {
+      if (code === 0 && !signal) {
+        finish(null)
+        return
+      }
+      finish(immediateExitError(eventName, code, signal))
+    }
+    const onClose = (code, signal) => onImmediateExit("close", code, signal)
+    const onExit = (code, signal) => onImmediateExit("exit", code, signal)
+    const onSpawn = () => {
+      successTimer = setTimeout(() => finish(null), Math.max(10, Number(successDelayMs) || 75))
+    }
     child.once?.("error", onError)
     child.once?.("spawn", onSpawn)
+    child.once?.("close", onClose)
+    child.once?.("exit", onExit)
   })
+}
+
+export function makeAbortError(message = "Auto-start aborted") {
+  const err = new Error(message)
+  err.name = "AbortError"
+  return err
+}
+
+export async function awaitWithAbort(promise, abortSignal, { abortMessage } = {}) {
+  if (!abortSignal) return promise
+  if (abortSignal.aborted) throw makeAbortError(abortMessage)
+  let onAbort = null
+  const abortPromise = new Promise((_, reject) => {
+    onAbort = () => reject(makeAbortError(abortMessage))
+    abortSignal.addEventListener("abort", onAbort, { once: true })
+  })
+  try {
+    return await Promise.race([promise, abortPromise])
+  } finally {
+    if (onAbort) abortSignal.removeEventListener("abort", onAbort)
+  }
+}
+
+export async function delayWithAbort(ms, abortSignal) {
+  if (!abortSignal) {
+    await delay(ms)
+    return
+  }
+  await delay(ms, undefined, { signal: abortSignal })
 }
 
 export async function waitForHealth(ocClient, { timeoutMs = 30_000, logger, projectAlias, abortSignal } = {}) {

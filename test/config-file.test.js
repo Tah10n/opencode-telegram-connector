@@ -468,7 +468,6 @@ test("parseCliArgs parses supported flags and help aliases", () => {
     "./.data/state.json",
     "--check",
     "-h",
-    "--unknown",
   ])
 
   assert.deepEqual(parsed, {
@@ -484,12 +483,23 @@ test("parseCliArgs parses supported flags and help aliases", () => {
   assert.deepEqual(parseCliArgs(["check"]), { check: true })
   assert.deepEqual(parseCliArgs(["--check"]), { check: true })
   assert.deepEqual(parseCliArgs(["--help"]), { help: true })
+  assert.deepEqual(parseCliArgs(["--state-file=tmp/state.json"]), { stateFile: "tmp/state.json" })
+  assert.deepEqual(parseCliArgs(["check", "--config-file=config.mjs"]), { check: true, configFile: "config.mjs" })
   assert.deepEqual(parseCliArgs([]), {})
 })
 
 test("parseCliArgs rejects missing flag values", () => {
   assert.throws(() => parseCliArgs(["--env-file"]), /Missing value for --env-file/)
+  assert.throws(() => parseCliArgs(["--env-file="]), /Missing value for --env-file/)
   assert.throws(() => parseCliArgs(["--projects-file", "--state-file", "state.json"]), /Missing value for --projects-file/)
+  assert.throws(() => parseCliArgs(["--env-file", "--config-file"]), /Missing value for --env-file/)
+})
+
+test("parseCliArgs rejects unknown flags and positionals", () => {
+  assert.throws(() => parseCliArgs(["--unknown"]), /Unknown argument: --unknown/)
+  assert.throws(() => parseCliArgs(["--state-fil", "state.json"]), /Unknown argument: --state-fil/)
+  assert.throws(() => parseCliArgs(["serve"]), /Unknown argument: serve/)
+  assert.throws(() => parseCliArgs(["--"]), /Unsupported argument terminator: --/)
 })
 
 test("buildRuntimeConfig resolves explicit CLI env, config, projects, and state paths from cwd", async (t) => {

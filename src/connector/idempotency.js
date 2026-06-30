@@ -17,6 +17,18 @@ export function hashIdempotencyValue(value) {
   return hashValue(value)
 }
 
+export function promptSubmissionIdempotencyKey(finalKey) {
+  const normalized = typeof finalKey === "string" ? finalKey.trim() : ""
+  if (!normalized) return null
+  return key("prompt-submit", normalized)
+}
+
+export function promptScopedSubmissionIdempotencyKey(projectAlias, sessionOrPromptId, promptOrType, maybeType) {
+  const { sessionID, id: promptId, tail: promptType } = unpackSessionScopedArgs(sessionOrPromptId, promptOrType, maybeType)
+  if (!projectAlias || !promptId || !promptType) return null
+  return key("prompt-submit-scope", projectAlias, promptIdentity(promptId, sessionID), promptType)
+}
+
 export function telegramUpdateIdempotencyKey(updateId) {
   if (!Number.isInteger(updateId)) return null
   return key("tg-update", updateId)

@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer"
 import { boundaryErrorFromException, boundaryErrorFromHttpResponse } from "../boundary-errors.js"
 import { appendPathToBaseUrl, isLoopbackHostname, normalizeEndpointBaseUrl } from "../url-utils.js"
 import { getRequestContext, normalizeCorrelationId } from "../runtime/request-context.js"
+import { sessionItemsFromResponse } from "../session-response.js"
 import { encodeOpenCodePathSegment, normalizeOpenCodeId } from "./ids.js"
 
 export const OPENCODE_CORRELATION_HEADER = "X-Connector-Correlation"
@@ -142,8 +143,9 @@ export class OpenCodeClient {
     return this.request(`/config/providers`)
   }
 
-  listSessions({ directory, limit, signal } = {}) {
-    return this.request("/session", { query: { directory, limit }, ...(signal ? { signal } : {}) })
+  async listSessions({ directory, limit, signal } = {}) {
+    const response = await this.request("/session", { query: { directory, limit }, ...(signal ? { signal } : {}) })
+    return sessionItemsFromResponse(response)
   }
 
   getSession(sessionId) {

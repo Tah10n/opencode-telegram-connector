@@ -114,15 +114,21 @@ export function assistantAttachmentName(projectAlias, sessionId, messageId) {
 export function buildAssistantStreamPreviewHtml(text, { maxChars } = {}) {
   const body = String(text || "").trim()
   if (!body) return ""
-  const maxLen = Math.min(Number.isFinite(maxChars) ? maxChars : 3900, 3900)
+  const maxLen = Math.max(0, Math.min(Number.isFinite(maxChars) ? maxChars : 3900, 3900))
+  if (maxLen <= 0) return ""
   let escaped = ""
-  for (const ch of body) {
-    const next = escapeHtml(ch)
-    if (escaped.length + next.length > maxLen) {
-      escaped = `${escaped.slice(0, Math.max(0, maxLen - 1))}…`
+  const chars = body[Symbol.iterator]()
+  let current = chars.next()
+  while (!current.done) {
+    const next = escapeHtml(current.value)
+    const following = chars.next()
+    const hasMore = !following.done
+    if (escaped.length + next.length + (hasMore ? 1 : 0) > maxLen) {
+      if (escaped.length < maxLen) escaped += "…"
       break
     }
     escaped += next
+    current = following
   }
   return escaped
 }

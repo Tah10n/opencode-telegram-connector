@@ -1,12 +1,21 @@
 {
   "compilerOptions": {
     "allowJs": true,
-    "checkJs": true,
+    "checkJs": false,
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "noEmit": true,
-    "strict": true,
-    "target": "ES2022"
+    "strict": false,
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "types": ["node"],
+    "skipLibCheck": true
   },
-  "files": ["src/connector/callback-data.js", "src/opencode/ids.js"]
+  "include": [
+    "src/**/*.js",
+    "test/**/*.js",
+    "scripts/**/*.mjs",
+    "index.mjs",
+    "connector.config.example.mjs"
+  ]
 }

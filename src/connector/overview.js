@@ -87,6 +87,9 @@ export function buildProjectsOverviewKeyboard({
 
 export function createOverviewHelpers({ projects, store, config, startInProgress, parseCtxKey, sendToThread, cb }) {
   const projectLastUnavailableNoticeAt = new Map()
+  const threadLastUnavailableNoticeAt = new Map()
+  const threadUnavailableNoticeInFlight = new Set()
+  const projectUnavailableNoticeCtxKeys = new Map()
   const projectIsDown = new Map()
   const projectSseState = new Map(Object.keys(projects).map((alias) => [alias, "unknown"]))
 
@@ -126,8 +129,11 @@ export function createOverviewHelpers({ projects, store, config, startInProgress
   async function notifyProjectRecovered(projectAlias) {
     const st = store.get()
     const baseUrl = sanitizeBaseUrlForDisplay(projects?.[projectAlias]?.baseUrl) || "unknown"
+    const notifiedCtxKeys = new Set(projectUnavailableNoticeCtxKeys.get(projectAlias) || [])
+    if (!notifiedCtxKeys.size) return
     for (const [ctxKey, binding] of Object.entries(st.bindings || {})) {
       if (binding?.projectAlias !== projectAlias) continue
+      if (!notifiedCtxKeys.has(ctxKey)) continue
       const ctx = parseCtxKey(ctxKey)
       if (!ctx) continue
       const locale = storedLocaleForCtx(ctxKey) || config?.i18n?.defaultLocale || "en"
@@ -136,12 +142,47 @@ export function createOverviewHelpers({ projects, store, config, startInProgress
     }
   }
 
+  async function notifyProjectRecoveredForThread(projectAlias, ctxMeta) {
+    if (!ctxMeta?.chatId) return
+    const baseUrl = sanitizeBaseUrlForDisplay(projects?.[projectAlias]?.baseUrl) || "unknown"
+    const locale = ctxMeta.locale || storedLocaleForCtx(ctxMeta.ctxKey) || config?.i18n?.defaultLocale || "en"
+    const message = translate(locale, "overview.recovered", { project: projectAlias, baseUrl })
+    await sendToThread(ctxMeta, message).catch(() => {})
+  }
+
   function markProjectUp(projectAlias) {
-    if (projectIsDown.get(projectAlias)) {
+    const wasDown = projectIsDown.get(projectAlias) === true
+    if (wasDown) {
       projectIsDown.set(projectAlias, false)
       projectLastUnavailableNoticeAt.set(projectAlias, 0)
-      void notifyProjectRecovered(projectAlias).catch(() => {})
+      const recovered = notifyProjectRecovered(projectAlias)
+      clearThreadUnavailableNoticeState(projectAlias)
+      void recovered.catch(() => {})
+    } else {
+      clearThreadUnavailableNoticeState(projectAlias)
+      projectIsDown.set(projectAlias, false)
     }
+  }
+
+  function clearThreadUnavailableNoticeState(projectAlias) {
+    const prefix = `${projectAlias}:`
+    for (const key of threadLastUnavailableNoticeAt.keys()) {
+      if (key.startsWith(prefix)) threadLastUnavailableNoticeAt.delete(key)
+    }
+    for (const key of threadUnavailableNoticeInFlight.keys()) {
+      if (key.startsWith(prefix)) threadUnavailableNoticeInFlight.delete(key)
+    }
+    projectUnavailableNoticeCtxKeys.delete(projectAlias)
+  }
+
+  function rememberUnavailableNotice(projectAlias, ctxKey) {
+    if (!ctxKey) return
+    let ctxKeys = projectUnavailableNoticeCtxKeys.get(projectAlias)
+    if (!ctxKeys) {
+      ctxKeys = new Set()
+      projectUnavailableNoticeCtxKeys.set(projectAlias, ctxKeys)
+    }
+    ctxKeys.add(ctxKey)
   }
 
   function markProjectSseConnected(projectAlias) {
@@ -162,26 +203,109 @@ export function createOverviewHelpers({ projects, store, config, startInProgress
     return projectSseState.get(projectAlias) || "unknown"
   }
 
-  async function notifyProjectUnavailable(projectAlias, err, { force = false, platform } = {}) {
+  function reserveProjectUnavailableNotice(projectAlias, { force = false } = {}) {
     if (!force && startInProgress.has(projectAlias)) return
     const nowMs = Date.now()
     const last = projectLastUnavailableNoticeAt.get(projectAlias) || 0
     const isDown = projectIsDown.get(projectAlias) === true
     const minIntervalMs = isDown ? 10 * 60_000 : 60_000
-    if (nowMs - last < minIntervalMs) return
+    if (!force && nowMs - last < minIntervalMs) return
     projectLastUnavailableNoticeAt.set(projectAlias, nowMs)
     projectIsDown.set(projectAlias, true)
+    return true
+  }
+
+  function threadUnavailableNoticeKey(projectAlias, ctxKey) {
+    return `${projectAlias}:${ctxKey}`
+  }
+
+  function ctxKeyForThreadNotice(ctxMeta) {
+    return ctxMeta?.ctxKey || `${ctxMeta?.chatId ?? "unknown"}:${ctxMeta?.threadIdOr0 || 0}`
+  }
+
+  function canReserveThreadUnavailableNoticeAt(projectAlias, ctxKey, nowMs, { force = false } = {}) {
+    if (!ctxKey) return false
+    const key = `${projectAlias}:${ctxKey}`
+    const last = threadLastUnavailableNoticeAt.get(key) || 0
+    const isDown = projectIsDown.get(projectAlias) === true
+    const minIntervalMs = isDown ? 10 * 60_000 : 60_000
+    return !!(force || nowMs - last >= minIntervalMs)
+  }
+
+  function reserveThreadUnavailableNoticeAt(projectAlias, ctxKey, nowMs, { force = false } = {}) {
+    if (!canReserveThreadUnavailableNoticeAt(projectAlias, ctxKey, nowMs, { force })) return
+    const key = threadUnavailableNoticeKey(projectAlias, ctxKey)
+    threadLastUnavailableNoticeAt.set(key, nowMs)
+    return true
+  }
+
+  function beginThreadUnavailableNoticeDelivery(projectAlias, ctxMeta, { force = false, nowMs = Date.now() } = {}) {
+    if (!force && startInProgress.has(projectAlias)) return
+    const ctxKey = ctxKeyForThreadNotice(ctxMeta)
+    const key = threadUnavailableNoticeKey(projectAlias, ctxKey)
+    if (!canReserveThreadUnavailableNoticeAt(projectAlias, ctxKey, nowMs, { force })) return
+    if (!force && threadUnavailableNoticeInFlight.has(key)) return
+    threadUnavailableNoticeInFlight.add(key)
+    return { key, ctxKey, ctxMeta, nowMs }
+  }
+
+  async function finishThreadUnavailableNoticeDelivery(projectAlias, reservation, { delivered = false } = {}) {
+    if (!reservation) return
+    const stillReserved = threadUnavailableNoticeInFlight.delete(reservation.key)
+    if (!delivered) return
+    if (!stillReserved) {
+      if (projectIsDown.get(projectAlias) !== true) await notifyProjectRecoveredForThread(projectAlias, reservation.ctxMeta)
+      return
+    }
+    threadLastUnavailableNoticeAt.set(reservation.key, reservation.nowMs)
+    projectIsDown.set(projectAlias, true)
+    rememberUnavailableNotice(projectAlias, reservation.ctxKey)
+  }
+
+  async function notifyProjectUnavailable(projectAlias, err, { force = false, platform } = {}) {
+    if (!reserveProjectUnavailableNotice(projectAlias, { force })) return false
 
     const st = store.get()
+    const nowMs = projectLastUnavailableNoticeAt.get(projectAlias) || Date.now()
+    const deliveries = []
     for (const [ctxKey, binding] of Object.entries(st.bindings || {})) {
       if (binding?.projectAlias !== projectAlias) continue
       const ctx = parseCtxKey(ctxKey)
       if (!ctx) continue
+      const reservation = beginThreadUnavailableNoticeDelivery(projectAlias, ctx, { force, nowMs })
+      if (!reservation) continue
       const locale = storedLocaleForCtx(ctxKey) || config?.i18n?.defaultLocale || "en"
       const message = formatProjectUnavailable(projectAlias, err, { locale })
       const replyMarkup = canAutoStartProject(projectAlias, { platform }) ? startServerKeyboard(projectAlias, { locale }) : null
-      await sendToThread(ctx, message, replyMarkup).catch(() => {})
+      deliveries.push({ ctx, message, replyMarkup, reservation })
     }
+
+    for (const { ctx, message, replyMarkup, reservation } of deliveries) {
+      try {
+        await sendToThread(ctx, message, replyMarkup)
+        await finishThreadUnavailableNoticeDelivery(projectAlias, reservation, { delivered: true })
+      } catch {
+        await finishThreadUnavailableNoticeDelivery(projectAlias, reservation, { delivered: false })
+      }
+    }
+    return true
+  }
+
+  async function notifyProjectUnavailableForThread(ctxMeta, projectAlias, err, { force = false, locale, platform, fallbackReplyMarkup = null } = {}) {
+    if (!ctxMeta?.chatId) return false
+    const retryable = isRetryableProjectError(err)
+    const reservation = retryable ? beginThreadUnavailableNoticeDelivery(projectAlias, ctxMeta, { force }) : null
+    if (retryable && !reservation) return false
+    const noticeLocale = locale || ctxMeta.locale || config?.i18n?.defaultLocale || "en"
+    const message = formatProjectUnavailable(projectAlias, err, { locale: noticeLocale })
+    const replyMarkup = retryable && canAutoStartProject(projectAlias, { platform }) ? startServerKeyboard(projectAlias, { locale: noticeLocale }) : fallbackReplyMarkup
+    try {
+      await sendToThread(ctxMeta, message, replyMarkup)
+      if (retryable) await finishThreadUnavailableNoticeDelivery(projectAlias, reservation, { delivered: true })
+    } catch {
+      if (retryable) await finishThreadUnavailableNoticeDelivery(projectAlias, reservation, { delivered: false })
+    }
+    return true
   }
 
   return {
@@ -216,12 +340,13 @@ export function createOverviewHelpers({ projects, store, config, startInProgress
     formatProjectUnavailable,
     startServerKeyboard,
     notifyProjectUnavailable,
+    notifyProjectUnavailableForThread,
     notifyProjectRecovered,
     markProjectUp,
     markProjectSseConnected,
     markProjectSseDown,
     markProjectSseUnavailable,
     getProjectSseStatus,
-    _state: { projectLastUnavailableNoticeAt, projectIsDown, projectSseState },
+    _state: { projectLastUnavailableNoticeAt, threadLastUnavailableNoticeAt, projectUnavailableNoticeCtxKeys, projectIsDown, projectSseState },
   }
 }

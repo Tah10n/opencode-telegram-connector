@@ -51,6 +51,15 @@ test("findSessionByShareUrl matches normalized shared session urls", () => {
   assert.deepEqual(match, { id: "ses_2", share: { url: "https://opncd.ai/s/abc123/" } })
 })
 
+test("findSessionByShareUrl accepts paginated session envelopes", () => {
+  const match = findSessionByShareUrl(
+    { items: [{ id: "ses_2", share: { url: "https://opncd.ai/s/abc123/" } }] },
+    "https://opncd.ai/share/abc123?from=telegram",
+  )
+
+  assert.deepEqual(match, { id: "ses_2", share: { url: "https://opncd.ai/s/abc123/" } })
+})
+
 test("findSessionByShareUrl returns null when there is no matching shared session", () => {
   const match = findSessionByShareUrl([{ id: "ses_1", share: { url: "https://opncd.ai/share/abc123" } }], "https://opncd.ai/s/missing")
 

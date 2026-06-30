@@ -13,6 +13,7 @@ import {
   openAttachWindowWindows,
   startOpenCodeInNewWindowWindows,
   startOpenCodeServeDetached,
+  startOpenCodeServeDetachedWindows,
   startOpenCodeServeInNewWindowWindows,
   stopOpenCodeServeOnPort,
   stopOpenCodeUiOnPort,
@@ -118,7 +119,11 @@ function useSpawnPlans(t, plans) {
         child.emit("error", plan.error)
         return
       }
-      if (plan.close !== false) child.emit("close", plan.code ?? 0)
+      if (plan.close !== false) {
+        const emitClose = () => child.emit("close", plan.code ?? 0)
+        if (plan.closeDelayMs != null) setTimeout(emitClose, plan.closeDelayMs)
+        else emitClose()
+      }
     })
 
     return child
@@ -631,10 +636,11 @@ test("stopOpenCodeUiOnPort stops legacy Windows TUI commands only", async (t) =>
   assert.deepEqual(calls[1].args, ["/PID", "111", "/T", "/F"])
 })
 
-test("startOpenCodeServeDetached spawns a detached server process and unreferences it", (t) => {
+test("startOpenCodeServeDetached spawns a detached server process and unreferences it", async (t) => {
   const calls = useSpawnPlans(t, [{ pid: 222, close: false }])
 
-  const { child } = startOpenCodeServeDetached({ directory: "C:\\repo", port: 4312 })
+  const { child, spawnError } = startOpenCodeServeDetached({ directory: "C:\\repo", port: 4312 })
+  await spawnError
 
   assert.equal(child.pid, 222)
   assert.equal(calls[0].command, "opencode")
@@ -642,6 +648,25 @@ test("startOpenCodeServeDetached spawns a detached server process and unreferenc
   assert.equal(calls[0].options.cwd, "C:\\repo")
   assert.equal(calls[0].options.detached, true)
   assert.equal(calls[0].child.unrefCalled, true)
+  assert.equal(calls[0].child.listenerCount("error"), 0)
+  assert.equal(calls[0].child.listenerCount("close"), 0)
+  assert.equal(calls[0].child.listenerCount("exit"), 0)
+})
+
+test("startOpenCodeServeDetachedWindows reports immediate non-zero command exits", async (t) => {
+  const calls = useSpawnPlans(t, [{ pid: 333, code: 1 }])
+
+  const { child, spawnError } = startOpenCodeServeDetachedWindows({ directory: "C:\\repo", port: 4312 })
+  const err = await spawnError
+
+  assert.match(err?.message || "", /Process exited immediately \(close: code=1\)/)
+  assert.equal(child.pid, 333)
+  assert.equal(calls[0].command, "cmd.exe")
+  assert.deepEqual(calls[0].args, ["/c", "opencode", "serve", "--port", "4312"])
+  assert.equal(calls[0].child.unrefCalled, true)
+  assert.equal(calls[0].child.listenerCount("error"), 0)
+  assert.equal(calls[0].child.listenerCount("close"), 0)
+  assert.equal(calls[0].child.listenerCount("exit"), 0)
 })
 
 test("ensureOpenCodeRunning reports detached spawn failures without an unhandled child error", async (t) => {
@@ -670,6 +695,118 @@ test("ensureOpenCodeRunning reports detached spawn failures without an unhandled
 
   assert.equal(calls[0].command, "opencode")
   assert.equal(calls[0].child.unrefCalled, true)
+})
+
+test("ensureOpenCodeRunning reports immediate Windows background launch exits", async (t) => {
+  const calls = useSpawnPlans(t, [
+    { stdout: "[]" },
+    { pid: 444, code: 1, closeDelayMs: 125 },
+  ])
+
+  await assert.rejects(
+    ensureOpenCodeRunning({
+      projectAlias: "demo",
+      platform: "win32",
+      project: {
+        autoStart: true,
+        openTuiOnAutoStart: false,
+        serverLaunchMode: "background",
+        directory: "C:\\repo",
+        port: 4312,
+        baseUrl: "http://127.0.0.1:4312",
+      },
+      ocClient: {
+        async health() {
+          throw new Error("down")
+        },
+      },
+      logger: makeLogger(),
+    }),
+    /Failed to start opencode serve: Process exited immediately \(close: code=1\)/,
+  )
+
+  assert.equal(calls[0].command, "powershell")
+  assert.equal(calls[1].command, "cmd.exe")
+  assert.deepEqual(calls[1].args, ["/c", "opencode", "serve", "--port", "4312"])
+  assert.equal(calls[1].child.unrefCalled, true)
+})
+
+test("ensureOpenCodeRunning stops Windows background process when aborted during launch observation", async (t) => {
+  const calls = useSpawnPlans(t, [
+    { stdout: "[]" },
+    { pid: 445, close: false },
+    { code: 0 },
+  ])
+  const abortController = new AbortController()
+
+  const promise = ensureOpenCodeRunning({
+    projectAlias: "demo",
+    platform: "win32",
+    project: {
+      autoStart: true,
+      openTuiOnAutoStart: false,
+      serverLaunchMode: "background",
+      directory: "C:\\repo",
+      port: 4312,
+      baseUrl: "http://127.0.0.1:4312",
+    },
+    ocClient: {
+      async health() {
+        throw new Error("down")
+      },
+    },
+    logger: makeLogger(),
+    abortSignal: abortController.signal,
+  })
+
+  while (calls.length < 2) await new Promise((resolve) => setImmediate(resolve))
+  abortController.abort()
+
+  await assert.rejects(promise, (err) => {
+    assert.equal(err?.name, "AbortError")
+    return true
+  })
+  assert.equal(calls[1].command, "cmd.exe")
+  assert.equal(calls[2].command, "taskkill")
+  assert.deepEqual(calls[2].args, ["/PID", "445", "/T", "/F"])
+})
+
+test("ensureOpenCodeRunning stops POSIX background process when aborted during launch observation", async (t) => {
+  const calls = useSpawnPlans(t, [{ pid: 778, close: false }])
+  const killCalls = []
+  usePatchedProcessKill(t, (...args) => {
+    killCalls.push(args)
+  })
+  const abortController = new AbortController()
+
+  const promise = ensureOpenCodeRunning({
+    projectAlias: "demo",
+    platform: "linux",
+    project: {
+      autoStart: true,
+      openTuiOnAutoStart: false,
+      directory: "/repo",
+      port: 4312,
+      baseUrl: "http://127.0.0.1:4312",
+    },
+    ocClient: {
+      async health() {
+        throw new Error("down")
+      },
+    },
+    logger: makeLogger(),
+    abortSignal: abortController.signal,
+  })
+
+  while (calls.length < 1) await new Promise((resolve) => setImmediate(resolve))
+  abortController.abort()
+
+  await assert.rejects(promise, (err) => {
+    assert.equal(err?.name, "AbortError")
+    return true
+  })
+  assert.equal(calls[0].command, "opencode")
+  assert.deepEqual(killCalls, [[778, "SIGTERM"]])
 })
 
 test("ensureOpenCodeRunning returns early when the project is already healthy", async () => {
@@ -954,7 +1091,9 @@ test("ensureOpenCodeRunning starts a visible server window on Linux when configu
   assert.equal(result.started, true)
   assert.equal(result.pid, 812)
   assert.equal(calls[0].command, "x-terminal-emulator")
-  assert.match(calls[0].args[3], /opencode' 'serve'/)
+  assert.match(calls[0].args[3], /cd '\/repo' \|\| exit \$\?; 'opencode' 'serve'/)
+  assert.match(calls[0].args[3], /'opencode' 'serve' '--port' '4312' & pid=\$!;/)
+  assert.doesNotMatch(calls[0].args[3], /cd '\/repo' && 'opencode' 'serve'.*& pid=\$!/)
   await result.stop()
   assert.deepEqual(killCalls, [[812, "SIGTERM"]])
 })

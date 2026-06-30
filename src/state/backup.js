@@ -14,6 +14,16 @@ function defaultSchemaValidationError(errors, { filePath } = {}) {
   return err
 }
 
+function normalizeBindingState(loaded, { normalizeBindings, normalizeSessionIndex, normalizeBindingSections } = {}) {
+  if (typeof normalizeBindingSections === "function") {
+    return normalizeBindingSections(loaded?.bindings, loaded?.sessionIndex)
+  }
+  return {
+    bindings: normalizeBindings(loaded?.bindings),
+    sessionIndex: normalizeSessionIndex(loaded?.sessionIndex),
+  }
+}
+
 export async function preserveStateBeforeRecovery(
   filePath,
   loaded,
@@ -23,12 +33,14 @@ export async function preserveStateBeforeRecovery(
     maxBackups,
     createStateFileBackupImpl = createStateFileBackup,
     logger,
+    mode,
   } = {},
 ) {
   const backupPath = await createStateFileBackupImpl(filePath, {
     reason,
     schemaVersion,
     maxBackups,
+    mode,
   })
   logger?.warn?.(`Preserved ${reason} state file before recovery:`, backupPath)
   return backupPath
@@ -48,6 +60,7 @@ export function migrateStateIfNeeded(
     createSchemaValidationError = defaultSchemaValidationError,
     normalizeBindings,
     normalizeSessionIndex,
+    normalizeBindingSections,
     normalizeFeedByContext,
     normalizeLocaleByContext,
     normalizeModelPrefsByContext,
@@ -64,13 +77,14 @@ export function migrateStateIfNeeded(
   // New schema.
   if (loaded && typeof loaded === "object" && loaded.schemaVersion === schemaVersion) {
     assertValidCurrentState(loaded, { filePath })
+    const bindingState = normalizeBindingState(loaded, { normalizeBindings, normalizeSessionIndex, normalizeBindingSections })
     return {
       migrated: false,
       state: {
         schemaVersion,
         updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
-        bindings: normalizeBindings(loaded.bindings),
-        sessionIndex: normalizeSessionIndex(loaded.sessionIndex),
+        bindings: bindingState.bindings,
+        sessionIndex: bindingState.sessionIndex,
         feedByContext: normalizeFeedByContext(loaded.feedByContext),
         localeByContext: normalizeLocaleByContext(loaded.localeByContext),
         modelPrefsByContext: normalizeModelPrefsByContext(loaded.modelPrefsByContext),
@@ -82,12 +96,13 @@ export function migrateStateIfNeeded(
   }
 
   if (loaded && typeof loaded === "object" && loaded.schemaVersion === 5) {
+    const bindingState = normalizeBindingState(loaded, { normalizeBindings, normalizeSessionIndex, normalizeBindingSections })
     return migratedState(
       {
         schemaVersion,
         updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
-        bindings: normalizeBindings(loaded.bindings),
-        sessionIndex: normalizeSessionIndex(loaded.sessionIndex),
+        bindings: bindingState.bindings,
+        sessionIndex: bindingState.sessionIndex,
         feedByContext: normalizeFeedByContext(loaded.feedByContext),
         localeByContext: defaultLocaleByContext(),
         modelPrefsByContext: normalizeModelPrefsByContext(loaded.modelPrefsByContext),
@@ -100,12 +115,13 @@ export function migrateStateIfNeeded(
   }
 
   if (loaded && typeof loaded === "object" && loaded.schemaVersion === 4) {
+    const bindingState = normalizeBindingState(loaded, { normalizeBindings, normalizeSessionIndex, normalizeBindingSections })
     return migratedState(
       {
         schemaVersion,
         updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
-        bindings: normalizeBindings(loaded.bindings),
-        sessionIndex: normalizeSessionIndex(loaded.sessionIndex),
+        bindings: bindingState.bindings,
+        sessionIndex: bindingState.sessionIndex,
         feedByContext: normalizeFeedByContext(loaded.feedByContext),
         localeByContext: defaultLocaleByContext(),
         modelPrefsByContext: normalizeModelPrefsByContext(loaded.modelPrefsByContext),
@@ -118,12 +134,13 @@ export function migrateStateIfNeeded(
   }
 
   if (loaded && typeof loaded === "object" && loaded.schemaVersion === 3) {
+    const bindingState = normalizeBindingState(loaded, { normalizeBindings, normalizeSessionIndex, normalizeBindingSections })
     return migratedState(
       {
         schemaVersion,
         updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
-        bindings: normalizeBindings(loaded.bindings),
-        sessionIndex: normalizeSessionIndex(loaded.sessionIndex),
+        bindings: bindingState.bindings,
+        sessionIndex: bindingState.sessionIndex,
         feedByContext: normalizeFeedByContext(loaded.feedByContext),
         localeByContext: defaultLocaleByContext(),
         modelPrefsByContext: defaultModelPrefsByContext(),
@@ -136,12 +153,13 @@ export function migrateStateIfNeeded(
   }
 
   if (loaded && typeof loaded === "object" && loaded.schemaVersion === 2) {
+    const bindingState = normalizeBindingState(loaded, { normalizeBindings, normalizeSessionIndex, normalizeBindingSections })
     return migratedState(
       {
         schemaVersion,
         updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
-        bindings: normalizeBindings(loaded.bindings),
-        sessionIndex: normalizeSessionIndex(loaded.sessionIndex),
+        bindings: bindingState.bindings,
+        sessionIndex: bindingState.sessionIndex,
         feedByContext: defaultFeedByContext(),
         localeByContext: defaultLocaleByContext(),
         modelPrefsByContext: defaultModelPrefsByContext(),
@@ -154,12 +172,13 @@ export function migrateStateIfNeeded(
   }
 
   if (loaded && typeof loaded === "object" && loaded.schemaVersion === 1) {
+    const bindingState = normalizeBindingState(loaded, { normalizeBindings, normalizeSessionIndex, normalizeBindingSections })
     return migratedState(
       {
         schemaVersion,
         updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
-        bindings: normalizeBindings(loaded.bindings),
-        sessionIndex: normalizeSessionIndex(loaded.sessionIndex),
+        bindings: bindingState.bindings,
+        sessionIndex: bindingState.sessionIndex,
         feedByContext: defaultFeedByContext(),
         localeByContext: defaultLocaleByContext(),
         modelPrefsByContext: defaultModelPrefsByContext(),
@@ -205,6 +224,7 @@ export async function loadStateWithMigration({
   createStateFileBackupImpl = createStateFileBackup,
   schemaVersion,
   cloneState = cloneStateForWrite,
+  mode,
 }) {
   let result
   try {
@@ -217,6 +237,7 @@ export async function loadStateWithMigration({
         maxBackups: backupMaxFiles,
         createStateFileBackupImpl,
         logger,
+        mode,
       }).catch((backupErr) => {
         logger?.error?.("Failed to preserve invalid state file:", backupErr?.message || String(backupErr))
       })
@@ -231,10 +252,11 @@ export async function loadStateWithMigration({
       maxBackups: backupMaxFiles,
       createStateFileBackupImpl,
       logger,
+      mode,
     })
     const snapshot = cloneState(result.state)
     try {
-      await writeJsonFileAtomicImpl(filePath, snapshot)
+      await writeJsonFileAtomicImpl(filePath, snapshot, { mode })
     } catch (err) {
       logger?.error?.(
         "Failed to persist migrated state; original state file was preserved before migration:",

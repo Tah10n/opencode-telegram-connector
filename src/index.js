@@ -77,6 +77,9 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const wizardTtlMs = Number.isFinite(deps?.wizardTtlMs) ? Math.max(0, Number(deps.wizardTtlMs)) : 2 * 60 * 60 * 1000
   const wizardGcIntervalMs = Number.isFinite(deps?.wizardGcIntervalMs) ? Math.max(1, Number(deps.wizardGcIntervalMs)) : 10 * 60 * 1000
   const assistantDrainTimeoutMs = Number.isFinite(deps?.assistantDrainTimeoutMs) ? Math.max(1, Number(deps.assistantDrainTimeoutMs)) : 5000
+  const autoStartStaggerMs = Number.isFinite(deps?.autoStartStaggerMs) ? Math.max(0, Number(deps.autoStartStaggerMs)) : 1000
+  const autoStartRetryDelayMs = Number.isFinite(deps?.autoStartRetryDelayMs) ? Math.max(0, Number(deps.autoStartRetryDelayMs)) : 5000
+  const autoStartRetryAttempts = Number.isInteger(deps?.autoStartRetryAttempts) ? Math.max(0, Number(deps.autoStartRetryAttempts)) : 1
   const openCodeWatchdog = normalizeOpenCodeWatchdogOptions(deps?.opencodeWatchdog ?? config?.opencodeWatchdog ?? {})
   const startedAt = Date.now()
   const sseDebugFilter = parseSseDebugFilter(process.env.DEBUG_SSE_ROUTING)
@@ -91,10 +94,16 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const projects = config.projects
   const runtimeObservability = createRuntimeObservability({ projectAliases: Object.keys(projects) })
 
+  function hasPendingPromptRecoveryState(pendingPrompts) {
+    if (!pendingPrompts || typeof pendingPrompts !== "object") return false
+    return ["permissions", "rejectNotes", "customAnswers", "questionWizards"].some((section) => !!pendingPrompts[section] && typeof pendingPrompts[section] === "object" && Object.keys(pendingPrompts[section]).length > 0)
+  }
   const stateFile = config?.stateFile || resolveDefaultStatePath({ cwd: config?.cwd })
   const store = createStateStore({ filePath: stateFile, logger })
   await store.load()
-  const recoverPendingPromptsOnStartup = Number.isInteger(store.get().updateOffset)
+  const startupState = store.get()
+  const hasPendingPromptsOnStartup = hasPendingPromptRecoveryState(startupState.pendingPrompts)
+  const recoverPendingPromptsOnStartup = Number.isInteger(startupState.updateOffset) || hasPendingPromptsOnStartup
 
   async function flushCriticalState(operation) {
     if (typeof store?.flush !== "function") return
@@ -110,6 +119,12 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         cause: err,
       })
     }
+  }
+
+  if (hasPendingPromptsOnStartup && !Number.isInteger(store.get().updateOffset)) {
+    logger.warn("Pending prompts found without Telegram offset; processing queued updates instead of draining backlog.")
+    store.setUpdateOffset(0)
+    await flushCriticalState("persist Telegram pending prompt recovery offset")
   }
 
   // Log only aggregate persisted-state info; bindings themselves are sensitive.
@@ -234,6 +249,8 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   // Auto-start opencode servers (best-effort) and pick a startup session per project.
   // Important: do not block connector startup on auto-start (Telegram should stay responsive).
   const startInProgress = new Map() // alias -> Promise
+  const initialAutoStartSettledByProject = new Map() // alias -> Promise resolved after queued/retried initial auto-start settles
+  const initialAutoStartResolvers = new Map() // alias -> resolve fn for initialAutoStartSettledByProject
   const autoStartHandleByProject = new Map() // alias -> latest auto-start handle
   const watchdogStateByProject = new Map() // alias -> { count, firstFailureAt, lastFailureAt, lastRestartAt }
   const watchdogRestartInProgress = new Map() // alias -> Promise
@@ -255,6 +272,10 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   function shouldWatchProjectHealth(projectAlias) {
     const project = projects?.[projectAlias]
     return !!(project?.autoStart && project?.directory && project?.port)
+  }
+
+  function hasPendingProjectStart(projectAlias) {
+    return startInProgress.has(projectAlias) || initialAutoStartSettledByProject.has(projectAlias) || watchdogRestartInProgress.has(projectAlias)
   }
 
   async function stopTrackedAutoStartHandle(projectAlias, reason) {
@@ -334,7 +355,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
 
   function scheduleProjectWatchdogRestart(projectAlias, reason) {
     if (!shouldWatchProjectHealth(projectAlias) || abortController.signal.aborted) return
-    if (startInProgress.has(projectAlias) || watchdogRestartInProgress.has(projectAlias)) return
+    if (hasPendingProjectStart(projectAlias)) return
 
     const state = watchdogStateByProject.get(projectAlias) || {}
     const elapsedSinceRestart = Date.now() - (state.lastRestartAt || 0)
@@ -378,7 +399,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       pathname: context.pathname,
     })
     if (!classification.retryable) return
-    if (startInProgress.has(projectAlias) || watchdogRestartInProgress.has(projectAlias)) return
+    if (hasPendingProjectStart(projectAlias)) return
 
     const nowMs = Date.now()
     const previous = watchdogStateByProject.get(projectAlias) || {}
@@ -408,6 +429,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         ocByAlias,
         logger,
         directory: projects?.[alias]?.directory,
+        allowUnscopedSessionListFallback: projects?.[alias]?.allowUnscopedSessionListFallback === true,
         abortSignal: abortController.signal,
         ...(options || {}),
       })
@@ -460,7 +482,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
         resetProjectHealthFailures(alias)
         runtimeObservability.recordLoopSuccess("autoStart", { projectAlias: alias })
         markProjectUp(alias)
-        await getStartupSession(alias, { waitForStart: false })
+        await getStartupSession(alias, { waitForStart: false, ignoreStartInProgress: true, forceRefresh: true }).catch(() => null)
         return handle
       } catch (err) {
         if (abortController.signal.aborted) return null
@@ -493,15 +515,59 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     return promise
   }
 
-  startManagedTask(
-    "autoStart-kickoff",
-    async () => {
-      const aliases = Object.keys(projects).filter((a) => projects?.[a]?.autoStart)
-      if (aliases.length) logger.info("Auto-start projects:", aliases.join(", "))
-      await Promise.allSettled(aliases.map((alias) => startProjectInBackground(alias, { notifyOnFailure: true })))
-    },
-    { kind: "task", metadata: { source: "runtime", operation: "autoStart kickoff" } },
-  )
+  function prepareInitialAutoStartWait(alias) {
+    if (initialAutoStartSettledByProject.has(alias)) return
+    let resolveInitialAutoStart = () => {}
+    const promise = new Promise((resolve) => { resolveInitialAutoStart = resolve })
+    initialAutoStartSettledByProject.set(alias, promise)
+    initialAutoStartResolvers.set(alias, resolveInitialAutoStart)
+  }
+
+  function markInitialAutoStartSettled(alias) {
+    const resolveInitialAutoStart = initialAutoStartResolvers.get(alias)
+    if (!resolveInitialAutoStart) return
+    initialAutoStartResolvers.delete(alias)
+    initialAutoStartSettledByProject.delete(alias)
+    resolveInitialAutoStart()
+  }
+
+  async function runAutoStartPass(aliases, { finalAttempt = false } = {}) {
+    const failed = []
+    for (let i = 0; i < aliases.length; i += 1) {
+      const alias = aliases[i]
+      if (abortController.signal.aborted) break
+      const handle = await startProjectInBackground(alias, { notifyOnFailure: finalAttempt })
+      if (handle) markInitialAutoStartSettled(alias)
+      else failed.push(alias)
+      if (!abortController.signal.aborted && autoStartStaggerMs > 0 && i < aliases.length - 1) await sleepWithAbort(autoStartStaggerMs)
+    }
+    return failed
+  }
+
+  async function runInitialAutoStart(aliases) {
+    for (const alias of aliases) prepareInitialAutoStartWait(alias)
+    let failed = []
+    try {
+      failed = await runAutoStartPass(aliases, { finalAttempt: autoStartRetryAttempts <= 0 })
+      for (let retry = 1; retry <= autoStartRetryAttempts && failed.length && !abortController.signal.aborted; retry += 1) {
+        logger.warn(`[autoStart] retrying failed projects (${retry}/${autoStartRetryAttempts}): ${failed.join(", ")}`)
+        if (autoStartRetryDelayMs > 0) await sleepWithAbort(autoStartRetryDelayMs)
+        failed = await runAutoStartPass(failed, { finalAttempt: retry >= autoStartRetryAttempts })
+      }
+    } finally { for (const alias of aliases) markInitialAutoStartSettled(alias) }
+  }
+
+  function scheduleInitialAutoStart() {
+    startManagedTask(
+      "autoStart-kickoff",
+      async () => {
+        const aliases = Object.keys(projects).filter((a) => projects?.[a]?.autoStart)
+        if (aliases.length) logger.info("Auto-start projects:", aliases.join(", "))
+        await runInitialAutoStart(aliases)
+      },
+      { kind: "task", metadata: { source: "runtime", operation: "autoStart kickoff" } },
+    )
+  }
 
   async function ensureProjectStarted(alias, ctxMeta) {
     if (!canAutoStartProject(alias, { platform })) {
@@ -535,11 +601,15 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     return task
   }
 
-  for (const alias of Object.keys(projects)) {
-    trackManagedPromise(`startupSession-prefetch:${alias}`, getStartupSession(alias, { waitForStart: false }).catch(() => null), {
-      kind: "task",
-      metadata: { projectAlias: alias },
-    })
+  function scheduleStartupSessionPrefetch() {
+    for (const alias of Object.keys(projects)) {
+      const pendingInitialAutoStart = initialAutoStartSettledByProject.get(alias)
+      const prefetch = (pendingInitialAutoStart ? waitForPromiseOrAbort(pendingInitialAutoStart) : Promise.resolve()).then(() => abortController.signal.aborted ? null : getStartupSession(alias, { waitForStart: false })).catch(() => null)
+      trackManagedPromise(`startupSession-prefetch:${alias}`, prefetch, {
+        kind: "task",
+        metadata: { projectAlias: alias },
+      })
+    }
   }
 
   const cb = makeCallbackStore()
@@ -983,12 +1053,18 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
           `retryable=${totals.retryable || 0}`,
           `fatal=${totals.fatal || 0}`,
         )
-        if ((totals.restored || 0) > 0 || (totals.stale || 0) > 0) await store.flush?.()
+        if ((totals.restored || 0) > 0 || (totals.stale || 0) > 0) await flushCriticalState("persist pending prompt recovery summary")
       }
     } catch (err) {
       logger.error("Failed to restore pending prompts:", err?.message || String(err))
+      abortController.abort()
+      await lifecycle.stopAll()
+      throw err
     }
   }
+
+  scheduleInitialAutoStart()
+  scheduleStartupSessionPrefetch()
 
   await Promise.all(Object.keys(projects).map((alias) => ensureBaselineLoaded(alias)))
 
@@ -996,7 +1072,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     startManagedTask(
       `sseStarter:${alias}`,
       async () => {
-        await waitForPromiseOrAbort(startInProgress.get(alias))
+        await waitForPromiseOrAbort(initialAutoStartSettledByProject.get(alias) || startInProgress.get(alias))
         if (abortController.signal.aborted) return null
         const routingIssue = getOpenCodeSseProjectRoutingIssue(projects?.[alias])
         if (routingIssue) {
@@ -1074,7 +1150,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     while (!abortController.signal.aborted) {
       for (const alias of Object.keys(projects)) {
         try {
-          await ensureBaselineLoaded(alias, { populateInitialSnapshot: false })
+          await ensureBaselineLoaded(alias, { populateInitialSnapshot: false, signal: abortController.signal })
           if (!promptBaseline[alias]?.loaded) continue
           const oc = ocByAlias[alias]
           const [permsResult, questionsResult] = await Promise.allSettled([

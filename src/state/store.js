@@ -1,6 +1,6 @@
 import path from "node:path"
 import fs from "node:fs/promises"
-import { createStateFileBackup, readJsonFile, writeJsonFileAtomic } from "./fileStore.js"
+import { DEFAULT_STATE_FILE_MODE, createStateFileBackup, readJsonFile, writeJsonFileAtomic } from "./fileStore.js"
 import { loadStateWithMigration, migrateStateIfNeeded, preserveStateBeforeRecovery } from "./backup.js"
 import { normalizeModelPreference, storedModelPreference } from "../model-selection.js"
 import { isSafeOpenCodeId } from "../opencode/ids.js"
@@ -12,6 +12,7 @@ export const DEFAULT_FEED_MODE = "main+changes"
 export const DEFAULT_IDEMPOTENCY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 export const DEFAULT_IDEMPOTENCY_MAX_ENTRIES = 5000
 export const DEFAULT_STATE_MIGRATION_BACKUP_MAX_FILES = 5
+export { DEFAULT_STATE_FILE_MODE }
 
 export class StateSchemaValidationError extends Error {
   constructor(errors, { filePath } = {}) {
@@ -43,6 +44,7 @@ function migrationOptionsForLoad(filePath) {
     createSchemaValidationError: schemaValidationError,
     normalizeBindings,
     normalizeSessionIndex,
+    normalizeBindingSections,
     normalizeFeedByContext,
     normalizeLocaleByContext,
     normalizeModelPrefsByContext,
@@ -117,10 +119,11 @@ export function promptKey(projectAlias, promptId, sessionID = "") {
 }
 
 export class StateStore {
-  constructor({ filePath, logger, backupMaxFiles = DEFAULT_STATE_MIGRATION_BACKUP_MAX_FILES, writeJsonFileAtomicImpl = writeJsonFileAtomic, createStateFileBackupImpl = createStateFileBackup }) {
+  constructor({ filePath, logger, backupMaxFiles = DEFAULT_STATE_MIGRATION_BACKUP_MAX_FILES, stateFileMode = DEFAULT_STATE_FILE_MODE, writeJsonFileAtomicImpl = writeJsonFileAtomic, createStateFileBackupImpl = createStateFileBackup }) {
     this.filePath = filePath
     this.logger = logger
     this.backupMaxFiles = backupMaxFiles
+    this.stateFileMode = stateFileMode
     this._writeJsonFileAtomic = writeJsonFileAtomicImpl
     this._createStateFileBackup = createStateFileBackupImpl
     this.state = defaultState()
@@ -167,7 +170,7 @@ export class StateStore {
   async load() {
     let loaded
     try {
-      loaded = await readJsonFile(this.filePath)
+      loaded = await readJsonFile(this.filePath, { mode: this.stateFileMode })
     } catch (err) {
       this._markLoadError(err)
       this.logger?.error?.("Failed to read state file:", err?.message || String(err))
@@ -197,6 +200,7 @@ export class StateStore {
         writeJsonFileAtomicImpl: this._writeJsonFileAtomic,
         createStateFileBackupImpl: this._createStateFileBackup,
         schemaVersion: STATE_SCHEMA_VERSION,
+        mode: this.stateFileMode,
       })
     } catch (err) {
       this._markLoadError(err)
@@ -215,6 +219,7 @@ export class StateStore {
       maxBackups: this.backupMaxFiles,
       createStateFileBackupImpl: this._createStateFileBackup,
       logger: this.logger,
+      mode: this.stateFileMode,
     })
   }
 
@@ -406,7 +411,7 @@ export class StateStore {
     }
     const snapshot = cloneStateForWrite(this.state)
     this._flushInFlight += 1
-    const write = this._writeChain.then(() => this._writeJsonFileAtomic(this.filePath, snapshot))
+    const write = this._writeChain.then(() => this._writeJsonFileAtomic(this.filePath, snapshot, { mode: this.stateFileMode }))
     this._writeChain = write.catch(() => {})
     try {
       await write
@@ -451,15 +456,14 @@ export class StateStore {
   deletePendingPermission(projectAlias, permissionId, sessionID = "") {
     if (!projectAlias || !permissionId) return false
     const key = promptKey(projectAlias, permissionId, sessionID)
-    let existed = delete this.state.pendingPrompts.permissions[key]
+    const records = this.state.pendingPrompts.permissions
+    let existed = Object.prototype.hasOwnProperty.call(records, key)
+    if (existed) delete records[key]
     if (!sessionID) {
       const legacyKey = sessionKey(projectAlias, permissionId)
-      existed = delete this.state.pendingPrompts.permissions[legacyKey] || existed
-      for (const [entryKey, entry] of Object.entries(this.state.pendingPrompts.permissions)) {
-        if (entry?.projectAlias === projectAlias && entry?.permissionId === permissionId) {
-          delete this.state.pendingPrompts.permissions[entryKey]
-          existed = true
-        }
+      if (legacyKey !== key && Object.prototype.hasOwnProperty.call(records, legacyKey)) {
+        delete records[legacyKey]
+        existed = true
       }
     }
     if (existed) this.scheduleSave()
@@ -758,6 +762,7 @@ function validateCurrentState(state) {
   if (!(state.updateOffset === null || Number.isInteger(state.updateOffset))) errors.push("state.updateOffset must be null or an integer")
   validateBindingsSection(state.bindings, errors)
   validateSessionIndexSection(state.sessionIndex, errors)
+  validateBindingIndexConsistency(state.bindings, state.sessionIndex, errors)
   validateFeedByContextSection(state.feedByContext, errors)
   validateLocaleByContextSection(state.localeByContext, errors)
   validateModelPrefsByContextSection(state.modelPrefsByContext, errors)
@@ -792,6 +797,43 @@ function validateSessionIndexSection(value, errors) {
     if (!pushRecordError(errors, route, `state.sessionIndex${pathKey(key)}`)) continue
     if (!Number.isInteger(route.chatId)) errors.push(`state.sessionIndex${pathKey(key)}.chatId must be an integer`)
     if (!Number.isInteger(route.threadIdOr0) || route.threadIdOr0 < 0) errors.push(`state.sessionIndex${pathKey(key)}.threadIdOr0 must be a non-negative integer`)
+  }
+}
+
+function validateBindingIndexConsistency(bindings, sessionIndex, errors) {
+  if (!isRecord(bindings) || !isRecord(sessionIndex)) return
+
+  const expectedBySession = new Map()
+  for (const [ctxKey, binding] of Object.entries(bindings)) {
+    const ctx = parseStoredCtxKey(ctxKey)
+    if (!ctx || !isSafeProjectAlias(binding?.projectAlias) || !isStoredOpenCodeId(binding?.sessionId)) continue
+    const sk = sessionKey(binding.projectAlias, binding.sessionId)
+    const previous = expectedBySession.get(sk)
+    if (previous) {
+      errors.push(`state.bindings${pathKey(ctxKey)} duplicates session key ${JSON.stringify(sk)} already bound at state.bindings${pathKey(previous.ctxKey)}`)
+      continue
+    }
+    expectedBySession.set(sk, { ctxKey, ctx })
+
+    const route = sessionIndex[sk]
+    if (!route || typeof route !== "object") {
+      errors.push(`state.sessionIndex${pathKey(sk)} is missing for state.bindings${pathKey(ctxKey)}`)
+      continue
+    }
+    if (Number.isInteger(route.chatId) && Number.isInteger(route.threadIdOr0) && route.threadIdOr0 >= 0 && (route.chatId !== ctx.chatId || route.threadIdOr0 !== ctx.threadIdOr0)) {
+      errors.push(`state.sessionIndex${pathKey(sk)} must route to state.bindings${pathKey(ctxKey)}`)
+    }
+  }
+
+  for (const [sk, route] of Object.entries(sessionIndex)) {
+    const parsed = parseStoredSessionKey(sk)
+    if (!parsed || !route || typeof route !== "object") continue
+    if (!Number.isInteger(route.chatId) || !Number.isInteger(route.threadIdOr0) || route.threadIdOr0 < 0) continue
+    const ctxKey = `${route.chatId}:${route.threadIdOr0}`
+    const binding = bindings[ctxKey]
+    if (binding?.projectAlias !== parsed.projectAlias || binding?.sessionId !== parsed.sessionId) {
+      errors.push(`state.sessionIndex${pathKey(sk)} must reference a matching state.bindings${pathKey(ctxKey)}`)
+    }
   }
 }
 
@@ -966,7 +1008,7 @@ function normalizeBindings(value) {
   return Object.fromEntries(
     Object.entries(value)
       .filter(([ctxKey, binding]) => {
-        if (typeof ctxKey !== "string" || !ctxKey) return false
+        if (!parseStoredCtxKey(ctxKey)) return false
         if (!binding || typeof binding !== "object") return false
         return isSafeProjectAlias(binding.projectAlias) && isStoredOpenCodeId(binding.sessionId)
       })
@@ -987,10 +1029,39 @@ function normalizeSessionIndex(value) {
       .filter(([key, route]) => {
         if (!parseStoredSessionKey(key)) return false
         if (!route || typeof route !== "object") return false
-        return Number.isFinite(route.chatId) && Number.isInteger(route.threadIdOr0)
+        return Number.isInteger(route.chatId) && Number.isInteger(route.threadIdOr0) && route.threadIdOr0 >= 0
       })
       .map(([key, route]) => [key, { chatId: route.chatId, threadIdOr0: route.threadIdOr0 }]),
   )
+}
+
+function normalizeBindingSections(bindingsValue, sessionIndexValue) {
+  const normalizedBindings = normalizeBindings(bindingsValue)
+  const normalizedSessionIndex = normalizeSessionIndex(sessionIndexValue)
+  const bindingsBySession = new Map()
+
+  for (const [ctxKey, binding] of Object.entries(normalizedBindings).sort(([a], [b]) => a.localeCompare(b))) {
+    const ctx = parseStoredCtxKey(ctxKey)
+    const sk = sessionKey(binding.projectAlias, binding.sessionId)
+    const entries = bindingsBySession.get(sk) || []
+    entries.push({ ctxKey, binding, ctx })
+    bindingsBySession.set(sk, entries)
+  }
+
+  const bindings = {}
+  const sessionIndex = {}
+  for (const [sk, entries] of bindingsBySession.entries()) {
+    const existingRoute = normalizedSessionIndex[sk]
+    const existingCtxKey = existingRoute ? `${existingRoute.chatId}:${existingRoute.threadIdOr0}` : ""
+    const kept = entries.find((entry) => entry.ctxKey === existingCtxKey) || entries[0]
+    bindings[kept.ctxKey] = {
+      projectAlias: kept.binding.projectAlias,
+      sessionId: kept.binding.sessionId,
+    }
+    sessionIndex[sk] = { chatId: kept.ctx.chatId, threadIdOr0: kept.ctx.threadIdOr0 }
+  }
+
+  return { bindings, sessionIndex }
 }
 
 function findPromptRecord(records, projectAlias, promptId, sessionID = "") {
@@ -1000,12 +1071,13 @@ function findPromptRecord(records, projectAlias, promptId, sessionID = "") {
   if (!sessionID) {
     const legacy = records[sessionKey(projectAlias, promptId)]
     if (legacy) return legacy
+    return null
   }
   return Object.values(records).find((entry) => {
     if (entry?.projectAlias !== projectAlias) return false
     const entryId = entry?.permissionId || entry?.id || entry?.request?.id
     if (entryId !== promptId) return false
-    return sessionID ? entry?.sessionID === sessionID : true
+    return entry?.sessionID === sessionID
   }) || null
 }
 
@@ -1029,7 +1101,7 @@ function normalizeCtxPromptRecords(value, idField) {
   if (!value || typeof value !== "object") return {}
   return Object.fromEntries(
     Object.entries(value)
-      .filter(([ctxKey, entry]) => typeof ctxKey === "string" && ctxKey && isSafeProjectAlias(entry?.projectAlias) && entry?.[idField] && isOptionalStoredOpenCodeId(entry?.sessionID))
+      .filter(([ctxKey, entry]) => parseStoredCtxKey(ctxKey) && isSafeProjectAlias(entry?.projectAlias) && entry?.[idField] && isOptionalStoredOpenCodeId(entry?.sessionID))
       .map(([ctxKey, entry]) => [ctxKey, { ...entry, sessionID: entry.sessionID || "" }]),
   )
 }
@@ -1109,7 +1181,7 @@ function normalizeFeedByContext(value) {
   if (!value || typeof value !== "object") return defaultFeedByContext()
   return Object.fromEntries(
     Object.entries(value)
-      .filter(([ctxKey]) => typeof ctxKey === "string" && ctxKey)
+      .filter(([ctxKey]) => parseStoredCtxKey(ctxKey))
       .map(([ctxKey, settings]) => [ctxKey, { mode: normalizeFeedMode(settings?.mode) }]),
   )
 }
@@ -1118,7 +1190,7 @@ function normalizeLocaleByContext(value) {
   if (!value || typeof value !== "object") return defaultLocaleByContext()
   return Object.fromEntries(
     Object.entries(value)
-      .filter(([ctxKey, record]) => typeof ctxKey === "string" && ctxKey && !!matchSupportedLocale(record?.locale))
+      .filter(([ctxKey, record]) => parseStoredCtxKey(ctxKey) && !!matchSupportedLocale(record?.locale))
       .map(([ctxKey, record]) => [ctxKey, { locale: matchSupportedLocale(record.locale), source: record.source === "manual" ? "manual" : "telegram" }]),
   )
 }
@@ -1127,7 +1199,7 @@ function normalizeModelPrefsByContext(value) {
   if (!value || typeof value !== "object") return defaultModelPrefsByContext()
   return Object.fromEntries(
     Object.entries(value)
-      .filter(([ctxKey]) => typeof ctxKey === "string" && ctxKey)
+      .filter(([ctxKey]) => parseStoredCtxKey(ctxKey))
       .map(([ctxKey, pref]) => [ctxKey, storedModelPreference(pref)])
       .filter(([, pref]) => !!pref),
   )

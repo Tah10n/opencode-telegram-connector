@@ -178,6 +178,17 @@ test("OpenCodeClient convenience methods call the expected endpoints", async () 
   ])
 })
 
+test("OpenCodeClient listSessions accepts paginated session envelopes", async () => {
+  const client = new OpenCodeClient({ baseUrl: "https://example.com/api" })
+  client.request = async (pathname, options) => {
+    assert.equal(pathname, "/session")
+    assert.deepEqual(options, { query: { directory: "C:/repo", limit: 10 } })
+    return { items: [{ id: "ses_1", title: "One" }], cursor: null }
+  }
+
+  assert.deepEqual(await client.listSessions({ directory: "C:/repo", limit: 10 }), [{ id: "ses_1", title: "One" }])
+})
+
 test("OpenCodeClient encodes dynamic path segments", async () => {
   const client = new OpenCodeClient({ baseUrl: "https://example.com" })
   const calls = []

@@ -1,5 +1,6 @@
 import { isSafeOpenCodeId } from "./opencode/ids.js"
 import { t as translate } from "./i18n/index.js"
+import { sessionItemsFromResponse } from "./session-response.js"
 
 function clampString(value, max) {
   const str = String(value ?? "").trim()
@@ -26,18 +27,16 @@ function sessionMarkers(sessionId, { currentSessionId, startupSessionId } = {}) 
 }
 
 export function normalizeSessionsList(sessions) {
-  return Array.isArray(sessions)
-    ? sessions
-        .map((session) => {
-          const id = sessionIdOf(session)
-          if (!id) return null
-          return {
-            id,
-            title: sessionTitleOf(session),
-          }
-        })
-        .filter(Boolean)
-    : []
+  return sessionItemsFromResponse(sessions)
+    .map((session) => {
+      const id = sessionIdOf(session)
+      if (!id) return null
+      return {
+        id,
+        title: sessionTitleOf(session),
+      }
+    })
+    .filter(Boolean)
 }
 
 export function formatSessionButtonLabel(session, { currentSessionId, startupSessionId } = {}) {

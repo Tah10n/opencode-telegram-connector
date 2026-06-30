@@ -4,6 +4,7 @@ import { createMirroringHandlers } from "../src/connector/mirroring.js"
 import { NOISY_SKIP_REASONS } from "../src/connector/noisy-skip-reasons.js"
 import { sessionKey } from "../src/state/store.js"
 import { makeBoundaryError } from "../src/boundary-errors.js"
+import { buildAssistantStreamPreviewHtml } from "../src/connector/mirroring/assistant-format.js"
 
 class FakeLruSet {
   constructor() {
@@ -401,6 +402,21 @@ test("deliverAssistantText falls back to a notice message before attaching long 
   assert.equal(calls.sendDocument.length, 1)
   assert.equal(calls.sendDocument[0][2], "demo-ses_1-msg_1-assistant.txt")
   assert.deepEqual(fallbacks, [["demo", "assistant-long-output"]])
+})
+
+test("buildAssistantStreamPreviewHtml keeps Telegram HTML entities whole at truncation boundary", () => {
+  const cases = [
+    { text: "abc&x", maxChars: 8, expected: "abc…" },
+    { text: "abc<x", maxChars: 7, expected: "abc…" },
+    { text: "abc>x", maxChars: 7, expected: "abc…" },
+  ]
+
+  for (const { text, maxChars, expected } of cases) {
+    const html = buildAssistantStreamPreviewHtml(text, { maxChars })
+    assert.equal(html, expected)
+    assert.ok(html.length <= maxChars)
+    assert.doesNotMatch(html, /&(?!amp;|lt;|gt;|quot;|#39;)/)
+  }
 })
 
 test("renderChangedFilesView sends full patch export as a .patch document", async () => {
