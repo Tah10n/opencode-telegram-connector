@@ -9,6 +9,7 @@ import { startConnector } from "../src/index.js"
 import { makeBoundaryError } from "../src/boundary-errors.js"
 import { defaultState, StateStore } from "../src/state/store.js"
 import { permissionReplyIdempotencyKey, questionReplyIdempotencyKey } from "../src/connector/idempotency.js"
+import { makeCallbackStore } from "../src/runtime/connector-bootstrap.js"
 import { getRequestContext } from "../src/runtime/request-context.js"
 import { startHealthServer } from "../src/runtime/health-server.js"
 import { canonicalOpenCodeSseEventPath, openCodeSseEventPathRequiresDirectoryRouting, OPENCODE_SSE_EVENT_META } from "../src/opencode/sse.js"
@@ -505,6 +506,43 @@ test("startConnector publishes localized Telegram command menus", async () => {
     assert.ok(harness.tg.setMyCommandsCalls[0].commands.some((entry) => entry.command === "language" && entry.description === "Choose bot language"))
     assert.equal(harness.tg.setMyCommandsCalls[1].options.language_code, "ru")
     assert.ok(harness.tg.setMyCommandsCalls[1].commands.some((entry) => entry.command === "language" && entry.description === "Выбрать язык бота"))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector validates public API config before runtime startup", async () => {
+  await assert.rejects(
+    () => startConnector({ config: { telegram: { botToken: "x", allowedUserId: 42 } } }),
+    /config\.projects is required/,
+  )
+  await assert.rejects(
+    () => startConnector({ config: { telegram: { botToken: "x", allowedUserId: 42 }, projects: {} } }),
+    /config\.projects must contain at least one project/,
+  )
+  await assert.rejects(
+    () => startConnector({ config: { telegram: { botToken: "x" }, projects: { demo: { baseUrl: "http:\/\/127.0.0.1:4312" } } } }),
+    /config\.telegram\.allowedUserId must be an integer/,
+  )
+  await assert.rejects(
+    () => startConnector({ config: { telegram: { botToken: "x", allowedUserId: 42 }, projects: { demo: {} } } }),
+    /config\.projects\.demo\.baseUrl is required/,
+  )
+})
+
+test("startConnector prunes expired callback payloads from current-schema state on startup", async () => {
+  const harness = await createHarness({
+    statePatch: {
+      callbackPayloads: {
+        expired_token: { data: "expired", createdAt: 1, expiresAt: 2 },
+        live_token: { data: "live", createdAt: 10, expiresAt: Date.now() + 60_000 },
+      },
+    },
+  })
+
+  try {
+    const state = await readState(harness.stateFile)
+    assert.deepEqual(Object.keys(state.callbackPayloads), ["live_token"])
   } finally {
     await harness.connector.stop()
   }
@@ -3873,6 +3911,8 @@ test("startConnector suppresses watchdog restarts while initial auto-start retry
   const stopCalls = []
   const portStopCalls = []
   const uiStopCalls = []
+  const loggerEntries = []
+  let promptFailuresRemaining = 1
   let retryDelayHasStarted = false
   let markRetryDelayStarted = () => {
     retryDelayHasStarted = true
@@ -3912,7 +3952,11 @@ test("startConnector suppresses watchdog restarts while initial auto-start retry
     },
     ocOptions: {
       promptAsyncImpl: async () => {
-        throw retryableErr
+        if (promptFailuresRemaining > 0) {
+          promptFailuresRemaining -= 1
+          throw retryableErr
+        }
+        return { ok: true }
       },
     },
     opencodeWatchdog: { failureThreshold: 1, windowMs: 60_000, cooldownMs: 0 },
@@ -3920,6 +3964,7 @@ test("startConnector suppresses watchdog restarts while initial auto-start retry
     autoStartRetryDelayMs: 100,
     autoStartRetryAttempts: 1,
     delayImpl,
+    logger: makeLogger(loggerEntries),
     ensureOpenCodeRunningImpl: async ({ projectAlias }) => {
       startCalls.push(projectAlias)
       if (startCalls.length === 1) throw retryableErr
@@ -3949,7 +3994,11 @@ test("startConnector suppresses watchdog restarts while initial auto-start retry
 
     harness.tg.enqueue(makeMessageUpdate(411, "hello during initial retry"))
     await waitFor(() => harness.ocCalls.promptAsync.length >= 1)
-    await delay(5)
+    await waitFor(() => loggerEntries.some((entry) =>
+      entry.level === "warn" &&
+      entry.args[0] === "Retryable update handler error" &&
+      entry.args[1]?.updateId === 411,
+    ))
 
     assert.deepEqual(startCalls, ["demo"])
     assert.deepEqual(stopCalls, [])
@@ -3957,7 +4006,7 @@ test("startConnector suppresses watchdog restarts while initial auto-start retry
     assert.deepEqual(uiStopCalls, [])
 
     releaseRetryDelay()
-    await waitFor(() => startCalls.length === 2 && harness.hasSseHandler("demo"))
+    await waitFor(() => startCalls.length >= 2 && harness.hasSseHandler("demo"), { timeoutMs: 5000 })
 
     assert.deepEqual(startCalls, ["demo", "demo"])
     assert.deepEqual(stopCalls, [])
@@ -4437,11 +4486,13 @@ test("startConnector sends one reconnected notice after project recovery", async
 })
 
 test("startConnector drains old backlog before processing live updates and advances offset", async () => {
+  const loggerEntries = []
   const harness = await createHarness({
     statePatch: {
       updateOffset: null,
     },
     initialUpdates: [makeMessageUpdate(10, "/help"), makeMessageUpdate(11, "/help"), makeMessageUpdate(12, "/help")],
+    logger: makeLogger(loggerEntries),
   })
 
   try {
@@ -4457,6 +4508,39 @@ test("startConnector drains old backlog before processing live updates and advan
     assert.ok(harness.tg.getUpdatesCalls.some((call) => call?.timeout === 0 && call?.offset === 0))
     assert.ok(harness.tg.getUpdatesCalls.some((call) => call?.timeout === 30 && call?.offset === 13))
     assert.equal(state.updateOffset, 14)
+    assert.ok(loggerEntries.some((entry) =>
+      entry.level === "info" &&
+      entry.args[0] === "Telegram backlog drained." &&
+      entry.args[1]?.skipped === 3 &&
+      entry.args[1]?.offset === 13,
+    ))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector processes first-run backlog when drain policy is disabled", async () => {
+  const loggerEntries = []
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: null,
+    },
+    configPatch: {
+      drainTelegramBacklogOnFirstRun: false,
+    },
+    initialUpdates: [makeMessageUpdate(20, "/help"), makeMessageUpdate(21, "/help")],
+    logger: makeLogger(loggerEntries),
+  })
+
+  try {
+    await waitFor(() => harness.tg.sentMessages.length >= 2)
+    await harness.connector.stop()
+
+    const state = await readState(harness.stateFile)
+    assert.equal(state.updateOffset, 22)
+    assert.equal(harness.tg.getUpdatesCalls.some((call) => call?.timeout === 0), false)
+    assert.ok(harness.tg.getUpdatesCalls.some((call) => call?.timeout === 30 && call?.offset === 0))
+    assert.ok(loggerEntries.some((entry) => entry.level === "info" && entry.args[0] === "Telegram backlog drain disabled on first run. Processing queued updates from offset 0."))
   } finally {
     await harness.connector.stop()
   }
@@ -5049,6 +5133,58 @@ test("startConnector flushes Telegram-side prompt state immediately after delive
   }
 })
 
+test("startConnector flushes packed callback payloads before prompt buttons become visible", async () => {
+  const permissionId = `perm_${"x".repeat(90)}`
+  const questionId = `q_${"y".repeat(90)}`
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 652,
+      bindings: {
+        "100:7": { projectAlias: "demo", sessionId: "ses_1" },
+        "100:9": { projectAlias: "demo", sessionId: "ses_2" },
+      },
+      sessionIndex: {
+        "demo:ses_1": { chatId: 100, threadIdOr0: 7 },
+        "demo:ses_2": { chatId: 100, threadIdOr0: 9 },
+      },
+    },
+  })
+
+  async function assertPackedCallbackWasFlushed(callbackData, expectedFragment) {
+    assert.match(callbackData, /^cb\|/)
+    const token = callbackData.slice(3)
+    const persisted = await readState(harness.stateFile)
+    assert.ok(persisted.callbackPayloads[token], "packed callback payload should be flushed to disk before Telegram delivery")
+
+    const reloaded = new StateStore({ filePath: harness.stateFile, logger: makeLogger() })
+    await reloaded.load()
+    const unpacked = makeCallbackStore({ store: reloaded }).unpack(callbackData)
+    assert.match(unpacked, new RegExp(expectedFragment))
+  }
+
+  try {
+    await harness.emitSse("demo", {
+      type: "permission.asked",
+      properties: { id: permissionId, sessionID: "ses_1", permission: "shell", patterns: ["npm test"] },
+    })
+    const permissionPrompt = await waitFor(() => harness.tg.sentHtmlBlocks.find((entry) => entry.blocks.some((block) => block.html.includes(permissionId))))
+    await assertPackedCallbackWasFlushed(permissionPrompt.replyMarkup.inline_keyboard[0][0].callback_data, permissionId)
+
+    await harness.emitSse("demo", {
+      type: "question.asked",
+      properties: {
+        id: questionId,
+        sessionID: "ses_2",
+        questions: [{ header: "Reason", question: "Why?", options: [{ label: "Run checks" }], custom: true }],
+      },
+    })
+    const questionPrompt = await waitFor(() => harness.tg.sentMessages.find((entry) => /Reason \(1\/1\)/.test(entry.text)))
+    await assertPackedCallbackWasFlushed(questionPrompt.replyMarkup.inline_keyboard[0][0].callback_data, questionId)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
 test("startConnector keeps simultaneous prompts isolated across projects and threads", async () => {
   const harness = await createHarness({
     statePatch: {
@@ -5316,6 +5452,44 @@ test("startConnector reports fatal escaped core-loop errors instead of swallowin
 
     assert.match(fatalErrors[0]?.message || "", /fatal loop crash/)
     assert.equal(harness.tg.getUpdatesCalls.length, getUpdatesCount)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector reports fatal SSE done rejections through lifecycle fatal handling", async () => {
+  const fatalErrors = []
+  let rejectSseDone = () => {}
+  const sseDone = new Promise((_resolve, reject) => {
+    rejectSseDone = reject
+  })
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 667,
+    },
+    startSseLoopImpl: () => ({
+      stop() {},
+      done: sseDone,
+    }),
+    onFatalErrorImpl: (err) => {
+      fatalErrors.push(err)
+    },
+  })
+
+  try {
+    await waitFor(() => harness.hasSseHandler("demo"))
+    rejectSseDone(makeBoundaryError({
+      source: "opencode",
+      operation: "GET /global/event",
+      method: "GET",
+      pathname: "/global/event",
+      kind: "protocol",
+      outcome: "fatal",
+      message: "fatal SSE protocol error",
+    }))
+
+    await waitFor(() => fatalErrors.length === 1)
+    assert.match(fatalErrors[0].message, /fatal SSE protocol error/)
   } finally {
     await harness.connector.stop()
   }

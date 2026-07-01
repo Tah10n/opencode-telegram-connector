@@ -4333,6 +4333,38 @@ test("createCommandHandlers handleTelegramMessage prompts for bind alias and can
   assert.equal(runtime.bindAliasAwaiting.has("100:0"), false)
 })
 
+test("createCommandHandlers ignores expired bind alias prompts", async () => {
+  const bindCalls = []
+  const { runtime, sent } = makeRuntime({
+    bindAliasAwaitingTtlMs: 10,
+    bindCtxToSession: async (...args) => {
+      bindCalls.push(args)
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+  runtime.bindAliasAwaiting.set("100:0", { startedAt: Date.now() - 100 })
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "private" },
+    from: { id: 42 },
+    text: "demo",
+  })
+
+  assert.equal(runtime.bindAliasAwaiting.has("100:0"), false)
+  assert.deepEqual(bindCalls, [])
+  assert.doesNotMatch(sent.map((entry) => entry.text).join("\n"), /Bound to project/)
+
+  runtime.bindAliasAwaiting.set("100:0", { startedAt: Date.now() - 100 })
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "private" },
+    from: { id: 42 },
+    text: "/cancel",
+  })
+
+  assert.equal(sent.at(-1).text, "Nothing to cancel.")
+  assert.equal(runtime.bindAliasAwaiting.has("100:0"), false)
+})
+
 test("createCommandHandlers handleTelegramMessage binds after receiving a plain-text alias", async () => {
   const bindCalls = []
   const { runtime, sent } = makeRuntime({

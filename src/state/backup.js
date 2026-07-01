@@ -67,11 +67,13 @@ export function migrateStateIfNeeded(
     normalizePendingPrompts,
     normalizePendingRuntimeOnlineNotice,
     normalizeIdempotencyLedger,
+    normalizeCallbackPayloads,
     defaultFeedByContext,
     defaultLocaleByContext,
     defaultModelPrefsByContext,
     defaultPendingPrompts,
     defaultIdempotencyLedger,
+    defaultCallbackPayloads,
   } = {},
 ) {
   // New schema.
@@ -91,8 +93,29 @@ export function migrateStateIfNeeded(
         pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
         pendingRuntimeOnlineNotice: normalizePendingRuntimeOnlineNotice(loaded.pendingRuntimeOnlineNotice),
         idempotency: normalizeIdempotencyLedger(loaded.idempotency),
+        callbackPayloads: cloneStateForWrite(loaded.callbackPayloads),
       },
     }
+  }
+
+  if (loaded && typeof loaded === "object" && loaded.schemaVersion === 6) {
+    const bindingState = normalizeBindingState(loaded, { normalizeBindings, normalizeSessionIndex, normalizeBindingSections })
+    return migratedState(
+      {
+        schemaVersion,
+        updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
+        bindings: bindingState.bindings,
+        sessionIndex: bindingState.sessionIndex,
+        feedByContext: normalizeFeedByContext(loaded.feedByContext),
+        localeByContext: normalizeLocaleByContext(loaded.localeByContext),
+        modelPrefsByContext: normalizeModelPrefsByContext(loaded.modelPrefsByContext),
+        pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
+        pendingRuntimeOnlineNotice: normalizePendingRuntimeOnlineNotice(loaded.pendingRuntimeOnlineNotice),
+        idempotency: normalizeIdempotencyLedger(loaded.idempotency),
+        callbackPayloads: normalizeCallbackPayloads(loaded.callbackPayloads),
+      },
+      { filePath, assertValidCurrentState },
+    )
   }
 
   if (loaded && typeof loaded === "object" && loaded.schemaVersion === 5) {
@@ -109,6 +132,7 @@ export function migrateStateIfNeeded(
         pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
         pendingRuntimeOnlineNotice: normalizePendingRuntimeOnlineNotice(loaded.pendingRuntimeOnlineNotice),
         idempotency: normalizeIdempotencyLedger(loaded.idempotency),
+        callbackPayloads: defaultCallbackPayloads(),
       },
       { filePath, assertValidCurrentState },
     )
@@ -128,6 +152,7 @@ export function migrateStateIfNeeded(
         pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
         pendingRuntimeOnlineNotice: normalizePendingRuntimeOnlineNotice(loaded.pendingRuntimeOnlineNotice),
         idempotency: normalizeIdempotencyLedger(loaded.idempotency),
+        callbackPayloads: defaultCallbackPayloads(),
       },
       { filePath, assertValidCurrentState },
     )
@@ -147,6 +172,7 @@ export function migrateStateIfNeeded(
         pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
         pendingRuntimeOnlineNotice: null,
         idempotency: defaultIdempotencyLedger(),
+        callbackPayloads: defaultCallbackPayloads(),
       },
       { filePath, assertValidCurrentState },
     )
@@ -166,6 +192,7 @@ export function migrateStateIfNeeded(
         pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
         pendingRuntimeOnlineNotice: null,
         idempotency: defaultIdempotencyLedger(),
+        callbackPayloads: defaultCallbackPayloads(),
       },
       { filePath, assertValidCurrentState },
     )
@@ -185,6 +212,7 @@ export function migrateStateIfNeeded(
         pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
         pendingRuntimeOnlineNotice: null,
         idempotency: defaultIdempotencyLedger(),
+        callbackPayloads: defaultCallbackPayloads(),
       },
       { filePath, assertValidCurrentState },
     )
@@ -205,6 +233,7 @@ export function migrateStateIfNeeded(
         pendingPrompts: defaultPendingPrompts(),
         pendingRuntimeOnlineNotice: null,
         idempotency: defaultIdempotencyLedger(),
+        callbackPayloads: defaultCallbackPayloads(),
       },
       { filePath, assertValidCurrentState },
     )

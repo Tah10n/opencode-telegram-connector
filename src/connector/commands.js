@@ -89,6 +89,9 @@ export function createCommandHandlers(runtime) {
     rejectNoteAwaiting,
     awaitingCustomAnswer,
     bindAliasAwaiting,
+    bindAliasAwaitingTtlMs = 15 * 60 * 1000,
+    getFreshBindAliasAwaiting,
+    pruneBindAliasAwaiting,
     getWizard,
     getUniqueWizard,
     cloneWizardState,
@@ -112,6 +115,18 @@ export function createCommandHandlers(runtime) {
   const userAttachmentLimits = userAttachmentLimitsFromConfig(config?.limits)
   const activeTurnStaleMs = resolveActiveTurnStaleMs(config?.activeTurnStaleMs)
   const packCallback = callbackPacker(runtime.cb)
+
+  function freshBindAliasAwaiting(ctxKey) {
+    if (typeof getFreshBindAliasAwaiting === "function") return getFreshBindAliasAwaiting(ctxKey)
+    const awaiting = bindAliasAwaiting.get(ctxKey)
+    if (!awaiting) return null
+    const startedAt = Number(awaiting.startedAt)
+    if (Number.isFinite(startedAt) && bindAliasAwaitingTtlMs >= 0 && Date.now() - startedAt > bindAliasAwaitingTtlMs) {
+      bindAliasAwaiting.delete(ctxKey)
+      return null
+    }
+    return awaiting
+  }
 
   function routeCtxKey(route) {
     if (route?.chatId == null) return ""
@@ -818,7 +833,8 @@ export function createCommandHandlers(runtime) {
       return
     }
 
-    const awaitingBind = bindAliasAwaiting.get(ctxMeta.ctxKey)
+    pruneBindAliasAwaiting?.()
+    const awaitingBind = freshBindAliasAwaiting(ctxMeta.ctxKey)
     if (awaitingBind) {
       if (!hasText) {
         await sendToThread(ctxMeta, t(ctxMeta, "commands.bindTextExpected"), closeOnlyKeyboard(ctxMeta))
@@ -852,7 +868,8 @@ export function createCommandHandlers(runtime) {
       const { cmd, args, argv } = parseCommand(text)
       if (!cmd) return
       if (cmd === "/cancel") {
-        const hadBind = bindAliasAwaiting.delete(ctxMeta.ctxKey)
+        const hadBind = !!freshBindAliasAwaiting(ctxMeta.ctxKey)
+        if (hadBind) bindAliasAwaiting.delete(ctxMeta.ctxKey)
         const hadRejectNote = rejectNoteAwaiting.has(ctxMeta.ctxKey)
         const hadCustomAnswer = awaitingCustomAnswer.has(ctxMeta.ctxKey)
         if (hadRejectNote) setRejectNoteAwaitingState(ctxMeta.ctxKey, null)

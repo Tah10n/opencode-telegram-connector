@@ -14,11 +14,19 @@ export function createTelegramUpdateLoop({
   handleTelegramMessage,
   handleTelegramCallback,
   runtimeObservability,
+  drainTelegramBacklogOnFirstRun = true,
 } = {}) {
   async function drainTelegramBacklogIfNeeded() {
     if (store.get().updateOffset != null) return
+    if (drainTelegramBacklogOnFirstRun === false) {
+      logger.info("Telegram backlog drain disabled on first run. Processing queued updates from offset 0.")
+      store.setUpdateOffset(0)
+      await flushCriticalState("persist Telegram first-run offset")
+      return
+    }
     logger.info("Draining Telegram backlog (first run)…")
     let offset = 0
+    let skipped = 0
     let backoff = 1000
     while (true) {
       if (abortController.signal.aborted) {
@@ -60,12 +68,13 @@ export function createTelegramUpdateLoop({
       runtimeObservability.recordLoopSuccess("backlogDrain")
       backoff = 1000
       if (updates.length === 0) break
+      skipped += updates.length
       offset = updates[updates.length - 1].update_id + 1
       await sleepWithAbort(200)
     }
     store.setUpdateOffset(offset)
     await flushCriticalState("persist Telegram backlog offset")
-    logger.info("Telegram backlog drained. Starting from offset:", offset)
+    logger.info("Telegram backlog drained.", { skipped, offset })
   }
 
   async function telegramLoop() {

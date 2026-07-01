@@ -10,6 +10,9 @@ export default {
   defaultProject: "localDesktop",
   // Optional: mirror user messages typed directly in opencode TUI to Telegram.
   // mirrorTuiUserMessages: true,
+  // Optional: default true drains queued Telegram updates on first run without
+  // handling them. Set false to process existing updates from offset 0.
+  // drainTelegramBacklogOnFirstRun: true,
   logFormat: "text", // "text" or "json"
 
   // Optional localization. Supported locales in this release: "en", "ru".

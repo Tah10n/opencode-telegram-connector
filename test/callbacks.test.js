@@ -268,6 +268,19 @@ test("createCallbackHandlers rejects invalid callback payloads", async () => {
   assert.deepEqual(callbackAnswers, [{ callbackQueryId: "cb_1", text: "Invalid" }])
 })
 
+test("createCallbackHandlers reports expired packed callback payloads clearly", async () => {
+  const { runtime, callbackAnswers } = makeRuntime({
+    cb: {
+      unpackDetailed: () => ({ ok: false, reason: "expired", data: null }),
+    },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("cb|missing_token"))
+
+  assert.deepEqual(callbackAnswers, [{ callbackQueryId: "cb_1", text: "Expired" }])
+})
+
 test("createCallbackHandlers rejects unknown callback kinds", async () => {
   const { runtime, callbackAnswers } = makeRuntime()
   const handlers = createCallbackHandlers(runtime)

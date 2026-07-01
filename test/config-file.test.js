@@ -38,6 +38,7 @@ test("buildRuntimeConfig loads connector.config.mjs and resolves relative paths"
     TG_PREFIX: undefined,
     ECHO_FILTER_MODE: undefined,
     MIRROR_TUI_USER_MESSAGES: undefined,
+    CONNECTOR_DRAIN_BACKLOG_ON_FIRST_RUN: undefined,
     CONNECTOR_LOG_FORMAT: undefined,
     CONNECTOR_HEALTH_ENABLED: undefined,
     CONNECTOR_HEALTH_HOST: undefined,
@@ -55,6 +56,7 @@ test("buildRuntimeConfig loads connector.config.mjs and resolves relative paths"
       tgPrefix: "[TG] ",
       echoFilterMode: "recent",
       mirrorTuiUserMessages: true,
+      drainTelegramBacklogOnFirstRun: false,
       logFormat: "json",
       healthServer: { enabled: true, host: "127.0.0.1", port: 0 },
       i18n: {
@@ -107,6 +109,7 @@ test("buildRuntimeConfig loads connector.config.mjs and resolves relative paths"
     botCommandLocales: ["ru"],
   })
   assert.equal(config.mirrorTuiUserMessages, true)
+  assert.equal(config.drainTelegramBacklogOnFirstRun, false)
   assert.equal(config.activeTurnStaleMs, 60000)
   assert.deepEqual(config.opencodeWatchdog, {
     failureThreshold: 3,
@@ -236,6 +239,30 @@ test("buildRuntimeConfig loads configurable Telegram workflow limits from env", 
     streamPreviewMaxChars: 444,
     textAttachmentThreshold: 555,
   })
+})
+
+test("buildRuntimeConfig loads first-run backlog drain policy from env", async (t) => {
+  const dir = await makeTempDir()
+  swapEnv(t, {
+    TELEGRAM_BOT_TOKEN: undefined,
+    TELEGRAM_ALLOWED_USER_ID: undefined,
+    PROJECTS_JSON: undefined,
+    CONNECTOR_DRAIN_BACKLOG_ON_FIRST_RUN: undefined,
+  })
+  await fs.writeFile(
+    path.join(dir, ".env"),
+    [
+      "TELEGRAM_BOT_TOKEN=env-token",
+      "TELEGRAM_ALLOWED_USER_ID=77",
+      'PROJECTS_JSON={"demo":{"baseUrl":"http://127.0.0.1:4312"}}',
+      "CONNECTOR_DRAIN_BACKLOG_ON_FIRST_RUN=0",
+    ].join("\n"),
+    "utf8",
+  )
+
+  const { config } = await buildRuntimeConfig({ cwd: dir })
+
+  assert.equal(config.drainTelegramBacklogOnFirstRun, false)
 })
 
 test("buildRuntimeConfig loads i18n options from env", async (t) => {
