@@ -80,7 +80,7 @@ When you follow the quick start from the connector directory, local runtime file
 
 - `.env` — secrets and env-only overrides; create it from `.env.example` and do not commit it. The parser accepts optional `export`, single/double-quoted values, and `#` inside quoted or unspaced secret values; unquoted comments start at whitespace followed by `#`.
 - `connector.config.mjs` — preferred project configuration; create it from `connector.config.example.mjs` and keep secrets in `.env`.
-- `.data/state.json` — default persisted state path; treat it as sensitive because it contains bindings, offsets, pending prompts, and idempotency history.
+- `.data/state.json` — default persisted state path; treat it as sensitive because it contains bindings, offsets, pending prompts, packed callback payloads, and idempotency history.
 
 If you launch the connector from another working directory, pass explicit `--env-file`, `--config-file`, and/or `--state-file` paths, or set `cwd` / `stateFile` in `connector.config.mjs` so relative paths resolve where you expect.
 
@@ -287,6 +287,7 @@ If the final assistant message cannot be fetched yet and a Telegram preview/plac
 - `TG_PREFIX` / `tgPrefix`
 - `ECHO_FILTER_MODE` / `echoFilterMode` (`recent` or `prefix`)
 - `MIRROR_TUI_USER_MESSAGES=1` / `mirrorTuiUserMessages` (default `false`)
+- `CONNECTOR_DRAIN_BACKLOG_ON_FIRST_RUN` / `drainTelegramBacklogOnFirstRun` (default `true`; set `false`/`0` to process queued Telegram updates on first run instead of skipping them)
 - `CONNECTOR_LOG_FORMAT` / `logFormat` (`text` or `json`, default `text`)
 - `CONNECTOR_HEALTH_ENABLED`, `CONNECTOR_HEALTH_HOST`, `CONNECTOR_HEALTH_PORT` / `healthServer` (disabled by default; default host `127.0.0.1`, default port `8787`)
 - `OPENCODE_ALLOW_INSECURE_HTTP=1` / `allowInsecureHttp`
@@ -561,7 +562,7 @@ services:
 
 Use `on-failure` if you want `/runtime` Restart (`exit 1`) to relaunch and `/runtime` Stop (`exit 0`) to stay stopped. Use `unless-stopped` only if you want the container runtime to bring the connector back after any process exit.
 
-SSE disconnects reconnect with backoff when they are retryable. The connector listens to opencode's `/global/event` stream by default and mirrors only events whose directory metadata matches the configured project directory; unscoped global events are dropped fail-closed to avoid cross-project routing. Fatal SSE protocol or size errors stop that project's SSE loop instead of reconnecting forever; prompt polling remains available as the fallback path for permission and question prompts while SSE is down.
+SSE disconnects reconnect with backoff when they are retryable. The connector listens to opencode's `/global/event` stream by default and mirrors only events whose directory metadata matches the configured project directory; unscoped global events are dropped fail-closed to avoid cross-project routing. Fatal SSE protocol or size errors trigger a controlled fatal connector shutdown instead of silently stopping mirroring or reconnecting forever.
 
 ### Runtime smoke checks
 
@@ -587,13 +588,13 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 | Telegram polling appears stuck | Use `/runtime` in a private chat and inspect `Telegram poll` retries, `lastErrorAt`, and update retry/skip counts. Ensure only one connector instance is running for the bot token. | Fix the Telegram/API/network issue; restart the connector only if the supervisor reports the process is unhealthy. |
 | OpenCode unavailable | Use `/projects` and the project's Status button. `/status` also shows the current project's SSE and sanitized base URL. | Start opencode manually, or press Start if the project exposes a Start button. Check Status after the server is up. |
 | Windows TUI/attach window appears hung | Check logs for watchdog restarts or repeated retryable SSE/prompt-poll failures. A stale attach window can remain after a server restart. | Let the auto-start watchdog recover the project; it closes matching stale attach windows and opens a fresh one. If needed, close the old TUI window manually and use `/projects` → Start/Status. |
-| State file cannot be read, written, or validated | Startup or runtime logs report a state read/write/schema failure. The connector fails closed instead of silently resetting state. Schema errors include the malformed section path, and migration/invalid-state backups are written next to `state.json` when possible. | Fix permissions/path/corruption, repair the reported section, or restore a known-good `state.json.backup.*` file. Treat backups as sensitive; they contain the same bindings, offset, prompts, and idempotency history as `state.json`. |
+| State file cannot be read, written, or validated | Startup or runtime logs report a state read/write/schema failure. The connector fails closed instead of silently resetting state. Schema errors include the malformed section path, and migration/invalid-state backups are written next to `state.json` when possible. | Fix permissions/path/corruption, repair the reported section, or restore a known-good `state.json.backup.*` file. Treat backups as sensitive; they contain the same bindings, offset, prompts, packed callback payloads, and idempotency history as `state.json`. |
 | Prompt send reports project unavailable | A retryable opencode `prompt_async` failure happened while forwarding a user message. | Restore the project; the Telegram update remains retryable and should be processed again after recovery. |
 | OpenCode works but assistant replies do not appear in Telegram | Check logs for `SSE disabled for project`, rapid `SSE connected` / `SSE disconnected` loops, or `drop=global_directory_missing` SSE debug lines. Current opencode builds expose the long-lived stream at `/global/event` with project directory metadata; older connector versions listening to `/event` may only receive `server.connected` before the stream closes. | Add the project `directory` and run `npm run setup:check`. If you run an older opencode build that lacks `/global/event` or does not send directory metadata there, set `OPENCODE_SSE_EVENT_PATH=/event` and restart. Prompt polling remains available while SSE is disabled or down. |
-| SSE stopped after protocol/size error | Logs show a fatal SSE protocol or size failure for one project. | Inspect upstream event size/protocol, fix the source, then restart the connector or recover the project; prompt polling still handles prompts while SSE is down. |
+| SSE stopped after protocol/size error | Logs show a fatal SSE protocol or size failure for one project followed by a fatal runtime error. | Inspect upstream event size/protocol, fix the source, then let the supervisor restart the connector or restart it manually. |
 | Group command ignored | The command may be addressed to another bot, for example `/start@OtherBot`. | Use `/command@<this bot username>` or an unsuffixed command that Telegram delivers to this bot. |
 | Duplicate prompts or callbacks | Check `/status` for prompt cleanup/recovery and callback outcome counters. Duplicates after restart should be skipped as already handled. | If duplicates continue, keep the connector single-instance and inspect logs around prompt polling/SSE reconnects. |
-| Stale callbacks | Button presses may answer `No longer active` or `Already handled` after a prompt is completed or rejected. | Prompt messages are removed automatically when possible; otherwise dismiss any remaining old interactive message with Close and wait for the current prompt to be delivered again if it is still live. |
+| Stale callbacks | Button presses may answer `Expired`, `No longer active`, or `Already handled` after a packed button payload expires, a prompt is completed, or a prompt is rejected. | Prompt messages are removed automatically when possible; otherwise dismiss any remaining old interactive message with Close and wait for the current prompt to be delivered again if it is still live. |
 | Wrong thread/session | Use `/status` in the thread and `/bindings` in a private chat to compare bindings. | Use `/use <sessionId>`, `/bind <projectAlias>`, `/new`, or `/unbind` in the affected thread. |
 | Bound project is no longer configured | The thread says its persisted project alias is missing from config, usually after removing or renaming a project in `connector.config.mjs`. | Use `/projects` or `/bind` to choose a configured project, or restore the old alias in config if the binding should keep working. |
 | Failed auto-start | `/projects` shows Start only when local launch is supported. Logs include launcher errors and immediate background-process exits without exposing secrets. | Verify `opencode` is on `PATH`, the project `directory` and `port` are configured, and a GUI terminal is available if you configured window/TUI launch. |
@@ -602,9 +603,9 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 
 - The bot accepts messages from a single Telegram user ID only.
 - The connector is designed to run as a **single instance** per bot token.
-- On first start, it drains old Telegram updates to avoid replaying history.
+- On first start, it drains old Telegram updates by default to avoid replaying history. Set `CONNECTOR_DRAIN_BACKLOG_ON_FIRST_RUN=0` or `drainTelegramBacklogOnFirstRun: false` to process queued updates from offset `0` instead.
 - State load and critical state flush/write failures fail closed; the connector should not continue as if durability succeeded.
-- Current-schema state is validated on load, including binding/session-index consistency; unsupported schema versions fail closed, and schema migrations create bounded `state.json.backup.*` files before writing the migrated state.
+- Current-schema state is validated on load, including binding/session-index consistency and persisted callback payload expiry; unsupported schema versions fail closed, and schema migrations create bounded `state.json.backup.*` files before writing the migrated state.
 - A confirmed `/runtime` Restart stores a short pending online-notice record in state until the next startup sends and clears it.
 - Feed mode is stored per Telegram thread/topic; the default is `Main + changes`.
 - Large assistant replies may be delivered as `.txt` attachments, and large changed-file diffs may be delivered as `.patch` attachments instead of many chat messages.

@@ -121,9 +121,12 @@ export function createCallbackHandlers(runtime) {
     const msg = callbackQuery.message
     let ctxMeta = ctxMetaFromMessage(msg, callbackQuery?.from)
     ctxMeta = rememberTelegramLocale?.(ctxMeta) || ctxMeta
-    const data = typeof cb?.unpack === "function" ? cb.unpack(callbackQuery.data) : callbackQuery.data
-    if (!data) {
-      await answerCallbackQuery(callbackQuery.id, "Invalid")
+    const unpacked = typeof cb?.unpackDetailed === "function"
+      ? cb.unpackDetailed(callbackQuery.data)
+      : { ok: true, reason: "inline", data: typeof cb?.unpack === "function" ? cb.unpack(callbackQuery.data) : callbackQuery.data }
+    const data = unpacked?.data
+    if (!unpacked?.ok || !data) {
+      await answerCallbackQuery(callbackQuery.id, unpacked?.reason === "expired" ? "Expired" : "Invalid")
       return
     }
 

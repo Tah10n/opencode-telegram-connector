@@ -4,7 +4,15 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import crypto from "node:crypto"
-import { DEFAULT_FEED_MODE, DEFAULT_STATE_FILE_MODE, STATE_SCHEMA_VERSION, StateStore, resolveDefaultStatePath } from "../src/state/store.js"
+import {
+  DEFAULT_CALLBACK_PAYLOAD_MAX_ENTRIES,
+  DEFAULT_FEED_MODE,
+  DEFAULT_STATE_FILE_MODE,
+  STATE_SCHEMA_VERSION,
+  StateStore,
+  defaultState,
+  resolveDefaultStatePath,
+} from "../src/state/store.js"
 
 function makeLogger() {
   return { info() {}, warn() {}, error() {} }
@@ -502,6 +510,82 @@ test("StateStore persists and prunes idempotency ledger entries", async () => {
   assert.equal(store.hasIdempotencyKey("permission-reply:demo:perm_1:once"), false)
 })
 
+test("StateStore persists and prunes callback payload entries", async () => {
+  const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-state.json"), logger: makeLogger() })
+  store.scheduleSave = () => {}
+
+  assert.equal(store.setCallbackPayload("token_a", "payload-a", { createdAt: 10, expiresAt: 100 }), true)
+  assert.equal(store.getCallbackPayload("token_a", { now: 20 }), "payload-a")
+  assert.deepEqual(store.getCallbackPayloadRecord("token_a", { now: 20 }), {
+    data: "payload-a",
+    createdAt: 10,
+    expiresAt: 100,
+  })
+  assert.equal(store.deleteCallbackPayload("token_a"), true)
+  assert.equal(store.getCallbackPayload("token_a", { now: 20 }), null)
+  assert.equal(store.deleteCallbackPayload("token_a"), false)
+
+  store.setCallbackPayload("token_a", "payload-a", { createdAt: 10, expiresAt: 100 })
+  store.setCallbackPayload("token_b", "payload-b", { createdAt: 20, expiresAt: 30 })
+  assert.equal(store.pruneCallbackPayloads({ now: 40 }), 1)
+  assert.equal(store.getCallbackPayload("token_a", { now: 40 }), "payload-a")
+  assert.equal(store.getCallbackPayload("token_b", { now: 40 }), null)
+
+  store.setCallbackPayload("token_b", "payload-b", { createdAt: 20, expiresAt: 100 })
+  store.setCallbackPayload("token_c", "payload-c", { createdAt: 30, expiresAt: 100 })
+  assert.equal(store.pruneCallbackPayloads({ now: 40, maxEntries: 2 }), 1)
+  assert.deepEqual(Object.keys(store.get().callbackPayloads).sort(), ["token_b", "token_c"])
+})
+
+test("StateStore keeps callback payloads within the cap when inserting at the limit", () => {
+  const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-state.json"), logger: makeLogger() })
+  store.scheduleSave = () => {}
+  for (let i = 0; i < DEFAULT_CALLBACK_PAYLOAD_MAX_ENTRIES; i += 1) {
+    store.get().callbackPayloads[`token_${i}`] = {
+      data: `payload-${i}`,
+      createdAt: i + 1,
+      expiresAt: 100_000,
+    }
+  }
+
+  assert.equal(store.setCallbackPayload("token_new", "payload-new", { createdAt: 50_000, expiresAt: 100_000 }), true)
+
+  assert.equal(Object.keys(store.get().callbackPayloads).length, DEFAULT_CALLBACK_PAYLOAD_MAX_ENTRIES)
+  assert.equal(store.getCallbackPayload("token_new", { now: 50_001 }), "payload-new")
+  assert.equal(store.getCallbackPayload("token_0", { now: 50_001 }), null)
+})
+
+test("StateStore keeps current-schema expired callback payloads visible for prune and flush", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  await fs.writeFile(
+    filePath,
+    JSON.stringify(
+      {
+        ...defaultState(),
+        updateOffset: 1,
+        callbackPayloads: {
+          expired_token: { data: "expired", createdAt: 1, expiresAt: 2 },
+          live_token: { data: "live", createdAt: 10, expiresAt: Date.now() + 60_000 },
+        },
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  )
+
+  const store = new StateStore({ filePath, logger: makeLogger() })
+  const loaded = await store.load()
+
+  assert.deepEqual(Object.keys(loaded.callbackPayloads).sort(), ["expired_token", "live_token"])
+  assert.equal(store.pruneCallbackPayloads({ now: Date.now() }), 1)
+  await store.flush()
+
+  const persisted = JSON.parse(await fs.readFile(filePath, "utf8"))
+  assert.deepEqual(Object.keys(persisted.callbackPayloads), ["live_token"])
+})
+
 test("StateStore persists and clears pending runtime online notices", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
@@ -523,7 +607,7 @@ test("StateStore persists and clears pending runtime online notices", async () =
   assert.equal(cleared.getPendingRuntimeOnlineNotice(), null)
 })
 
-test("StateStore migrates schema version 1 state to version 6", async () => {
+test("StateStore migrates schema version 1 state to version 7", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -548,9 +632,10 @@ test("StateStore migrates schema version 1 state to version 6", async () => {
   })
   assert.equal(loaded.pendingRuntimeOnlineNotice, null)
   assert.deepEqual(loaded.idempotency, { keys: {} })
+  assert.deepEqual(loaded.callbackPayloads, {})
 })
 
-test("StateStore migrates schema version 2 state to version 6", async () => {
+test("StateStore migrates schema version 2 state to version 7", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -580,9 +665,10 @@ test("StateStore migrates schema version 2 state to version 6", async () => {
   assert.deepEqual(loaded.bindings, { "100:7": { projectAlias: "demo", sessionId: "ses_1" } })
   assert.equal(loaded.pendingRuntimeOnlineNotice, null)
   assert.deepEqual(loaded.idempotency, { keys: {} })
+  assert.deepEqual(loaded.callbackPayloads, {})
 })
 
-test("StateStore migrates schema version 3 state to version 6", async () => {
+test("StateStore migrates schema version 3 state to version 7", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -612,9 +698,10 @@ test("StateStore migrates schema version 3 state to version 6", async () => {
   assert.deepEqual(loaded.modelPrefsByContext, {})
   assert.equal(loaded.pendingRuntimeOnlineNotice, null)
   assert.deepEqual(loaded.idempotency, { keys: {} })
+  assert.deepEqual(loaded.callbackPayloads, {})
 })
 
-test("StateStore migrates schema version 4 state to version 6", async () => {
+test("StateStore migrates schema version 4 state to version 7", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -645,9 +732,10 @@ test("StateStore migrates schema version 4 state to version 6", async () => {
   assert.deepEqual(loaded.modelPrefsByContext, { "100:7": { mode: "project-default" } })
   assert.equal(loaded.pendingRuntimeOnlineNotice, null)
   assert.deepEqual(loaded.idempotency, { keys: {} })
+  assert.deepEqual(loaded.callbackPayloads, {})
 })
 
-test("StateStore migrates schema version 5 state to version 6", async () => {
+test("StateStore migrates schema version 5 state to version 7", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -677,6 +765,46 @@ test("StateStore migrates schema version 5 state to version 6", async () => {
   assert.deepEqual(loaded.localeByContext, {})
   assert.deepEqual(loaded.feedByContext, { "100:7": { mode: "main" } })
   assert.deepEqual(loaded.modelPrefsByContext, { "100:7": { mode: "project-default" } })
+  assert.deepEqual(loaded.callbackPayloads, {})
+})
+
+test("StateStore migrates schema version 6 callback payloads to version 7", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  const future = Date.now() + 60_000
+  await fs.writeFile(
+    filePath,
+    JSON.stringify(
+      {
+        schemaVersion: 6,
+        updateOffset: 112,
+        bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+        sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+        feedByContext: { "100:7": { mode: "main" } },
+        localeByContext: { "100:7": { locale: "en", source: "manual" } },
+        modelPrefsByContext: { "100:7": { mode: "project-default" } },
+        pendingPrompts: { permissions: {}, rejectNotes: {}, customAnswers: {}, questionWizards: {} },
+        pendingRuntimeOnlineNotice: null,
+        idempotency: { keys: {} },
+        callbackPayloads: {
+          kept_token: { data: "[\"b\",\"confirm-unbind\",\"100:7\"]", createdAt: 10, expiresAt: future },
+          expired_token: { data: "expired", createdAt: 10, expiresAt: 11 },
+          "bad token": { data: "bad", createdAt: 10, expiresAt: future },
+        },
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  )
+
+  const store = new StateStore({ filePath, logger: makeLogger() })
+  const loaded = await store.load()
+
+  assert.equal(loaded.schemaVersion, STATE_SCHEMA_VERSION)
+  assert.deepEqual(loaded.callbackPayloads, {
+    kept_token: { data: "[\"b\",\"confirm-unbind\",\"100:7\"]", createdAt: 10, expiresAt: future },
+  })
 })
 
 test("StateStore migration rebuilds binding routes and drops context sections that fail current validation", async () => {
@@ -742,14 +870,14 @@ test("StateStore migration rebuilds binding routes and drops context sections th
   assert.deepEqual(loaded.pendingPrompts.customAnswers, {})
 })
 
-test("StateStore rejects schema version 6 state with inconsistent binding routes", async () => {
+test("StateStore rejects schema version 7 state with inconsistent binding routes", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
     filePath,
     JSON.stringify(
       {
-        schemaVersion: 6,
+        schemaVersion: STATE_SCHEMA_VERSION,
         updateOffset: 113,
         bindings: {
           "100:7": { projectAlias: "demo", sessionId: "ses_1" },
@@ -765,6 +893,7 @@ test("StateStore rejects schema version 6 state with inconsistent binding routes
         pendingPrompts: { permissions: {}, rejectNotes: {}, customAnswers: {}, questionWizards: {} },
         pendingRuntimeOnlineNotice: null,
         idempotency: { keys: {} },
+        callbackPayloads: {},
       },
       null,
       2,
@@ -785,14 +914,14 @@ test("StateStore rejects schema version 6 state with inconsistent binding routes
   assert.equal(backups.length, 1)
 })
 
-test("StateStore rejects malformed schema version 6 sections with actionable paths", async () => {
+test("StateStore rejects malformed schema version 7 sections with actionable paths", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
     filePath,
     JSON.stringify(
       {
-        schemaVersion: 6,
+        schemaVersion: STATE_SCHEMA_VERSION,
         updateOffset: 101,
         bindings: {
           "100:7": { projectAlias: "demo", sessionId: "ses_1", extra: true },
@@ -829,6 +958,12 @@ test("StateStore rejects malformed schema version 6 sections with actionable pat
           },
         },
         idempotency: { keys: { "tg-update:1": { createdAt: 10 }, "": { createdAt: 11 } } },
+        callbackPayloads: {
+          valid_token: { data: "payload", createdAt: 10, expiresAt: 20 },
+          "bad token": { data: "payload", createdAt: 10, expiresAt: 20 },
+          " trimmed_token ": { data: "payload", createdAt: 10, expiresAt: 20 },
+          missingData: { createdAt: 10, expiresAt: 20 },
+        },
       },
       null,
       2,
@@ -856,10 +991,39 @@ test("StateStore rejects malformed schema version 6 sections with actionable pat
     pendingPrompts: { permissions: {}, rejectNotes: {}, customAnswers: {}, questionWizards: {} },
     pendingRuntimeOnlineNotice: null,
     idempotency: { keys: {} },
+    callbackPayloads: {},
   })
   const backups = (await fs.readdir(dir)).filter((name) => name.startsWith("state.json.backup.") && name.includes(".invalid."))
   assert.equal(backups.length, 1)
   assert.match(await fs.readFile(path.join(dir, backups[0]), "utf8"), /bad:1/)
+})
+
+test("StateStore rejects callback payload tokens with surrounding whitespace", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  await fs.writeFile(
+    filePath,
+    JSON.stringify(
+      {
+        ...defaultState(),
+        updateOffset: 101,
+        callbackPayloads: {
+          " trimmed_token ": { data: "payload", createdAt: 10, expiresAt: 20 },
+        },
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  )
+
+  const store = new StateStore({ filePath, logger: makeLogger() })
+
+  await assert.rejects(() => store.load(), (err) => {
+    assert.equal(err.code, "STATE_SCHEMA_INVALID")
+    assert.match(err.message, /state\.callbackPayloads\[" trimmed_token "\] key/)
+    return true
+  })
 })
 
 test("StateStore rejects unsafe persisted session identities", async () => {
@@ -869,7 +1033,7 @@ test("StateStore rejects unsafe persisted session identities", async () => {
     filePath,
     JSON.stringify(
       {
-        schemaVersion: 6,
+        schemaVersion: STATE_SCHEMA_VERSION,
         updateOffset: 101,
         bindings: {
           "100:0": { projectAlias: "demo", sessionId: " ses_1 " },
@@ -893,6 +1057,7 @@ test("StateStore rejects unsafe persisted session identities", async () => {
         },
         pendingRuntimeOnlineNotice: null,
         idempotency: { keys: {} },
+        callbackPayloads: {},
       },
       null,
       2,
@@ -1059,6 +1224,7 @@ test("StateStore recovers an emergency bak instead of silently resetting missing
     pendingPrompts: { permissions: {}, rejectNotes: {}, customAnswers: {}, questionWizards: {} },
     pendingRuntimeOnlineNotice: null,
     idempotency: { keys: {} },
+    callbackPayloads: {},
   }
   await fs.writeFile(backupPath, JSON.stringify(saved, null, 2), "utf8")
 

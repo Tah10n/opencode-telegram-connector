@@ -6,6 +6,7 @@ import { createMirroringHandlers } from "./connector/mirroring.js"
 import { createOverviewHelpers } from "./connector/overview.js"
 import { createPromptHandlers } from "./connector/prompts.js"
 import { createPromptRecovery } from "./connector/prompt-recovery.js"
+import { validateRuntimeConfigForStart } from "./config/start-validation.js"
 import { classifyBoundaryError, makeBoundaryError } from "./boundary-errors.js"
 import { TelegramClient } from "./telegram/client.js"
 import { ctxKeyFrom } from "./telegram/routing.js"
@@ -20,6 +21,8 @@ import { createLifecycleManager } from "./runtime/lifecycle.js"
 import { startHealthServer } from "./runtime/health-server.js"
 import { collectLoggerRedactionOptions, createConnectorLogger } from "./runtime/logger.js"
 import { createRuntimeObservability } from "./runtime/observability.js"
+import { publishBotCommandMenus } from "./runtime/bot-command-menus.js"
+import { wrapTelegramClientWithCallbackPayloadFlush } from "./runtime/callback-payload-durability.js"
 import { runWithRequestContext, withRequestContextFields } from "./runtime/request-context.js"
 import {
   clampString,
@@ -32,26 +35,25 @@ import {
   parseCommand,
   parseSseDebugFilter,
 } from "./runtime/connector-bootstrap.js"
-import {
-  createRuntimeFoundation,
-  createRuntimeTelegramLoop,
-  createRuntimeTuiSync,
-} from "./runtime/service-wiring.js"
+import { createRuntimeFoundation, createRuntimeTelegramLoop, createRuntimeTuiSync } from "./runtime/service-wiring.js"
 import {
   makeSseProjectRoutingError,
+  observeFatalSseHandleDone,
   sseErrorContext,
   sseEventDirectoryRoutingDecision,
   sseRequestContextFields,
 } from "./runtime/sse-runtime.js"
+import { createBindAliasAwaitingState } from "./runtime/bind-alias-awaiting.js"
 import { DEFAULT_FEED_MODE, StateStore, normalizeFeedMode, resolveDefaultStatePath } from "./state/store.js"
 import { formatSessionButtonLabel, formatSessionsListText, normalizeSessionsList } from "./session-list.js"
 import { sanitizeBaseUrlForDisplay } from "./url-utils.js"
 import { normalizeLimits } from "./limits.js"
 import { createParentSessionCache, LruMap, LruSet } from "./util/lru.js"
-import { botCommandsForLocale, normalizeI18nConfig } from "./i18n/index.js"
+import { normalizeI18nConfig } from "./i18n/index.js"
 
+export { validateRuntimeConfigForStart }
 export async function startConnector({ config, logger: loggerIn, deps } = {}) {
-  if (!config?.telegram?.botToken) throw new Error("config.telegram.botToken is required")
+  validateRuntimeConfigForStart(config)
   // startConnector is public API too; normalize again for callers that bypass buildRuntimeConfig.
   config = { ...config, i18n: normalizeI18nConfig(config?.i18n || {}) }
   const logger = loggerIn || createConnectorLogger({ format: config?.logFormat, ...collectLoggerRedactionOptions(config) })
@@ -121,6 +123,9 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     }
   }
 
+  const prunedCallbackPayloads = store.pruneCallbackPayloads?.({ now: Date.now() }) || 0
+  if (prunedCallbackPayloads > 0) await flushCriticalState("persist pruned callback payloads")
+
   if (hasPendingPromptsOnStartup && !Number.isInteger(store.get().updateOffset)) {
     logger.warn("Pending prompts found without Telegram offset; processing queued updates instead of draining backlog.")
     store.setUpdateOffset(0)
@@ -145,7 +150,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     return binding?.projectAlias
   }
 
-  const tg = createTelegramClient(config.telegram.botToken, {
+  const tgRaw = createTelegramClient(config.telegram.botToken, {
     logger,
     onApiFailure: ({ method, params, requestContext }) => {
       runtimeObservability.recordTelegramFailure({ projectAlias: projectAliasFromTelegramParams(params), operation: method })
@@ -159,33 +164,13 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
       })
     },
   })
+  const tg = wrapTelegramClientWithCallbackPayloadFlush(tgRaw, { store })
   const me = await tg.getMe().catch(() => null)
   const hasTopicsEnabled = !!me?.has_topics_enabled
   const botUsername = typeof me?.username === "string" ? me.username : ""
   logger.info("Telegram bot:", me?.username ? `@${me.username}` : "(unknown)", "topics:", hasTopicsEnabled)
 
-  // Best-effort: publish Telegram built-in command menus.
-  // Note: Telegram expects command names WITHOUT the leading '/'.
-  async function publishBotCommandMenus() {
-    const i18nConfig = config.i18n
-    const defaultLocale = i18nConfig.defaultLocale
-    async function publishLocale(locale, options = {}) {
-      try {
-        await tg.setMyCommands(botCommandsForLocale(locale), options)
-      } catch (err) {
-        const scope = options.language_code ? `locale ${options.language_code}` : `default locale ${locale}`
-        logger.error(`Failed to set bot commands for ${scope}:`, err?.message || String(err))
-      }
-    }
-
-    await publishLocale(defaultLocale)
-    for (const locale of i18nConfig.botCommandLocales || []) {
-      if (locale === defaultLocale) continue
-      await publishLocale(locale, { language_code: locale })
-    }
-  }
-
-  await publishBotCommandMenus().catch((err) => logger.error("Failed to set bot commands:", err?.message || String(err)))
+  await publishBotCommandMenus({ tg, i18nConfig: config.i18n, logger }).catch((err) => logger.error("Failed to set bot commands:", err?.message || String(err)))
 
   const ocByAlias = {}
   for (const [alias, p] of Object.entries(projects)) {
@@ -215,6 +200,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     recordLoopError,
     logLoopIssue,
     recordLoopAbort,
+    reportFatalRuntimeError,
     startManagedTask,
     sleepWithAbort,
     waitForPromiseOrAbort,
@@ -612,7 +598,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     }
   }
 
-  const cb = makeCallbackStore()
+  const cb = makeCallbackStore({ store })
   const CHANGED_FILES_LIMIT = limits.changedFilesLimit
   const INLINE_DIFF_TEXT_MAX_CHARS = limits.inlineDiffTextMaxChars
   const STREAM_PREVIEW_MAX_CHARS = limits.streamPreviewMaxChars
@@ -641,7 +627,12 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   const awaitingCustomAnswer = new Map() // key ctxKey -> { projectAlias, requestId, qIndex }
   const questionWizards = new Map() // key `${projectAlias}:${requestId}` -> wizard
 
-  const bindAliasAwaiting = new Map() // key ctxKey -> { startedAt }
+  const bindAliasAwaitingState = createBindAliasAwaitingState({
+    ttlMs: deps?.bindAliasAwaitingTtlMs,
+    gcIntervalMs: deps?.bindAliasAwaitingGcIntervalMs,
+    lifecycle,
+  })
+  const { bindAliasAwaiting, bindAliasAwaitingTtlMs, getFreshBindAliasAwaiting, pruneBindAliasAwaiting } = bindAliasAwaitingState
 
   const {
     ctxMetaWithLocale,
@@ -758,6 +749,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   }, wizardGcIntervalMs)
   wizardGcTimer.unref?.()
   lifecycle.registerTimer("questionWizard-gc", wizardGcTimer)
+  bindAliasAwaitingState.registerGc()
 
   const mirroringHandlers = createMirroringHandlers({
     ...promptHandlers,
@@ -934,6 +926,9 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     rejectNoteAwaiting,
     awaitingCustomAnswer,
     bindAliasAwaiting,
+    bindAliasAwaitingTtlMs,
+    getFreshBindAliasAwaiting,
+    pruneBindAliasAwaiting,
     resolveBoundRoute,
     recordPromptAnswered: runtimeObservability.recordPromptAnswered,
     isAllowedUser,
@@ -1039,6 +1034,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     handleTelegramMessage,
     handleTelegramCallback,
     runtimeObservability,
+    drainTelegramBacklogOnFirstRun: config.drainTelegramBacklogOnFirstRun !== false,
   })
 
   if (recoverPendingPromptsOnStartup) {
@@ -1137,6 +1133,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
           abortSignal: abortController.signal,
         })
         trackManagedHandle(`sse:${alias}`, handle, { kind: "loop", metadata: { projectAlias: alias } })
+        observeFatalSseHandleDone({ handle, projectAlias: alias, abortSignal: abortController.signal, reportFatalRuntimeError })
         return handle
       },
       { kind: "task", metadata: { projectAlias: alias, source: "opencode", operation: "SSE start" }, fatalOnError: true },

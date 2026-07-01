@@ -11,26 +11,67 @@ export function parseSseDebugFilter(rawValue) {
   }
 }
 
-export function makeCallbackStore() {
+export const DEFAULT_CALLBACK_PAYLOAD_TTL_MS = 24 * 60 * 60 * 1000
+
+export function makeCallbackStore({ store: persistentStore, ttlMs = DEFAULT_CALLBACK_PAYLOAD_TTL_MS } = {}) {
   const store = new LruMap(4000)
   const token = () => crypto.randomBytes(8).toString("base64url")
+  const now = () => Date.now()
+  const normalizedTtlMs = Number.isFinite(ttlMs) && ttlMs > 0 ? Math.floor(ttlMs) : DEFAULT_CALLBACK_PAYLOAD_TTL_MS
+  const remember = (t, data, { createdAt = now(), expiresAt = createdAt + normalizedTtlMs } = {}) => {
+    store.set(t, { data, createdAt, expiresAt })
+  }
+  const readMemory = (t) => {
+    const entry = store.get(t)
+    if (!entry) return null
+    if (typeof entry.expiresAt === "number" && entry.expiresAt <= now()) {
+      store.delete(t)
+      persistentStore?.deleteCallbackPayload?.(t)
+      return null
+    }
+    return entry.data
+  }
+  const readPersistent = (t) => {
+    if (typeof persistentStore?.getCallbackPayloadRecord === "function") {
+      return persistentStore.getCallbackPayloadRecord(t)
+    }
+    const data = persistentStore?.getCallbackPayload?.(t)
+    if (data == null) return null
+    const createdAt = now()
+    return { data, createdAt, expiresAt: createdAt + normalizedTtlMs }
+  }
   const pack = (data) => {
     if (Buffer.byteLength(data, "utf8") <= 64) return data
     let t = ""
     for (let i = 0; i < 10; i++) {
       t = token()
-      if (store.get(t) == null) break
+      if (readMemory(t) == null && readPersistent(t) == null) break
     }
-    store.set(t, data)
+    const createdAt = now()
+    const expiresAt = createdAt + normalizedTtlMs
+    remember(t, data, { createdAt, expiresAt })
+    persistentStore?.setCallbackPayload?.(t, data, { ttlMs: normalizedTtlMs, createdAt, expiresAt })
     return `cb|${t}`
   }
-  const unpack = (data) => {
-    if (typeof data !== "string") return null
-    if (!data.startsWith("cb|")) return data
+  const unpackDetailed = (data) => {
+    if (typeof data !== "string") return { ok: false, reason: "invalid", data: null }
+    if (!data.startsWith("cb|")) return { ok: true, reason: "inline", data }
     const t = data.slice(3)
-    return store.get(t) ?? null
+    if (!t) return { ok: false, reason: "invalid", data: null }
+    const memoryValue = readMemory(t)
+    if (memoryValue != null) return { ok: true, reason: "packed", data: memoryValue }
+    const persisted = readPersistent(t)
+    if (persisted != null) {
+      remember(t, persisted.data, { createdAt: persisted.createdAt, expiresAt: persisted.expiresAt })
+      return { ok: true, reason: "persisted", data: persisted.data }
+    }
+    return { ok: false, reason: "expired", data: null }
   }
-  return { pack, unpack }
+  const unpack = (data) => {
+    const result = unpackDetailed(data)
+    return result.ok ? result.data : null
+  }
+  return { pack, unpack, unpackDetailed }
 }
 
 export function clampString(s, max) {

@@ -345,6 +345,7 @@ test("startOpenCodeSseLoop rejects one SSE line over the configured limit", asyn
 
   assert.match(err.message, /SSE line buffer exceeded limit/)
   assert.equal(classifyBoundaryError(err).retryable, false)
+  await assert.rejects(loop.done, /SSE line buffer exceeded limit/)
 })
 
 test("startOpenCodeSseLoop appends event path after a base path", async (t) => {

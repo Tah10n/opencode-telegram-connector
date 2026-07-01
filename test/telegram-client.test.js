@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { TelegramClient, makeInlineKeyboard, splitTelegramHtml, splitTelegramText } from "../src/telegram/client.js"
+import { TELEGRAM_SAFE_MESSAGE_MAX_LEN, TelegramClient, makeInlineKeyboard, prepareTelegramEditText, splitTelegramHtml, splitTelegramText } from "../src/telegram/client.js"
 import { classifyBoundaryError, makeBoundaryError } from "../src/boundary-errors.js"
 
 function makeJsonAbortResponse(signal, { ok = true, status = 200, statusText = "OK" } = {}) {
@@ -236,6 +236,14 @@ test("TelegramClient getFile and downloadFile use Telegram file API", async () =
   } finally {
     globalThis.fetch = originalFetch
   }
+})
+
+test("TelegramClient derives fileBaseUrl from bot baseUrl with optional trailing slash", () => {
+  assert.equal(new TelegramClient("TOKEN", { baseUrl: "https://api.telegram.org/botTOKEN" }).fileBaseUrl, "https://api.telegram.org/file/botTOKEN")
+  assert.equal(new TelegramClient("TOKEN", { baseUrl: "https://api.telegram.org/botTOKEN/" }).fileBaseUrl, "https://api.telegram.org/file/botTOKEN")
+  assert.equal(new TelegramClient("TOKEN", { baseUrl: "https://proxy.example/api/botTOKEN" }).fileBaseUrl, "https://proxy.example/api/file/botTOKEN")
+  assert.equal(new TelegramClient("TOKEN", { baseUrl: "https://proxy.example/api/botTOKEN/" }).fileBaseUrl, "https://proxy.example/api/file/botTOKEN")
+  assert.equal(new TelegramClient("TOKEN", { baseUrl: "https://proxy.example/api" }).fileBaseUrl, "https://proxy.example/api/file/botTOKEN")
 })
 
 test("TelegramClient downloadFile rejects oversized downloads", async () => {
@@ -645,6 +653,41 @@ test("TelegramClient sendHtmlBlocks, sendDocument, and edit helpers use the expe
     { method: "editMessageReplyMarkup", params: { chat_id: 100, message_id: 200, reply_markup: replyMarkup } },
     { method: "answerCallbackQuery", params: { callback_query_id: "cb_1", text: "Done" } },
   ])
+})
+
+test("TelegramClient editMessageText truncates oversized plain text edits", async () => {
+  const client = new TelegramClient("token")
+  const calls = []
+  client.call = async (method, params, options) => {
+    calls.push({ method, params, options })
+    return true
+  }
+
+  await client.editMessageText(100, 200, "x".repeat(TELEGRAM_SAFE_MESSAGE_MAX_LEN + 100), null)
+
+  assert.equal(calls[0].method, "editMessageText")
+  assert.ok(calls[0].params.text.length <= TELEGRAM_SAFE_MESSAGE_MAX_LEN)
+  assert.match(calls[0].params.text, /\[truncated\]$/)
+})
+
+test("TelegramClient editMessageText truncates oversized HTML edits with valid bounded HTML", async () => {
+  const html = `<b>${"x".repeat(TELEGRAM_SAFE_MESSAGE_MAX_LEN + 100)}</b>`
+  const prepared = prepareTelegramEditText(html, "HTML")
+  assert.ok(prepared.length <= TELEGRAM_SAFE_MESSAGE_MAX_LEN)
+  assert.match(prepared, /^<b>/)
+  assert.match(prepared, /<\/b>\n<i>\[truncated\]<\/i>$/)
+
+  const client = new TelegramClient("token")
+  const calls = []
+  client.call = async (method, params, options) => {
+    calls.push({ method, params, options })
+    return true
+  }
+
+  await client.editMessageText(100, 200, html, null, { parse_mode: "HTML" })
+
+  assert.equal(calls[0].params.text, prepared)
+  assert.equal(calls[0].params.parse_mode, "HTML")
 })
 
 test("TelegramClient editMessageText treats Telegram unchanged edits as no-ops", async () => {

@@ -1,5 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises"
 import { boundaryErrorFromException, boundaryErrorFromHttpResponse, makeBoundaryError } from "../boundary-errors.js"
+import { escapeHtml } from "./formatter.js"
 import { getRequestContext } from "../runtime/request-context.js"
 
 function makeTimeoutSignal(timeoutMs = 30_000) {
@@ -55,7 +56,9 @@ function telegramRetryAfterMs(json) {
   return Math.min(Math.ceil(seconds * 1000), 60 * 60 * 1000)
 }
 
-export function splitTelegramText(text, maxLen = 3900) {
+export const TELEGRAM_SAFE_MESSAGE_MAX_LEN = 3900
+
+export function splitTelegramText(text, maxLen = TELEGRAM_SAFE_MESSAGE_MAX_LEN) {
   const s = String(text ?? "")
   if (s.length <= maxLen) return [s]
 
@@ -113,7 +116,7 @@ export function splitTelegramText(text, maxLen = 3900) {
   return chunks
 }
 
-export function splitTelegramHtml(text, maxLen = 3900) {
+export function splitTelegramHtml(text, maxLen = TELEGRAM_SAFE_MESSAGE_MAX_LEN) {
   const s = String(text ?? "")
   if (s.length <= maxLen) return [s]
   const chunks = []
@@ -200,6 +203,20 @@ function isMessageNotModifiedError(err) {
     .filter((value) => typeof value === "string" && value)
     .join(" ")
   return /message is not modified/i.test(description)
+}
+
+function firstChunkWithTruncationMarker(text, parseMode, maxLen) {
+  const marker = parseMode === "HTML" ? `\n<i>${escapeHtml("[truncated]")}</i>` : "\n\n[truncated]"
+  const chunkMaxLen = Math.max(1, maxLen - marker.length)
+  const firstChunk = (parseMode === "HTML" ? splitTelegramHtml(text, chunkMaxLen) : splitTelegramText(text, chunkMaxLen))[0] || ""
+  return `${firstChunk}${marker}`
+}
+
+export function prepareTelegramEditText(text, parseMode, maxLen = TELEGRAM_SAFE_MESSAGE_MAX_LEN) {
+  const normalizedParseMode = parseMode === "HTML" ? "HTML" : undefined
+  const chunks = normalizedParseMode === "HTML" ? splitTelegramHtml(text, maxLen) : splitTelegramText(text, maxLen)
+  if (chunks.length <= 1) return chunks[0] ?? String(text ?? "")
+  return firstChunkWithTruncationMarker(text, normalizedParseMode, maxLen)
 }
 
 const MESSAGE_CONTEXT_LIMIT = 2000
@@ -552,10 +569,11 @@ export class TelegramClient {
   }
 
   editMessageText(chatId, messageId, text, replyMarkup, options = {}) {
+    const preparedText = prepareTelegramEditText(text, options.parse_mode)
     const params = {
       chat_id: chatId,
       message_id: messageId,
-      text,
+      text: preparedText,
       ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
       ...(options.parse_mode ? { parse_mode: options.parse_mode } : {}),
       ...(options.disable_web_page_preview != null ? { disable_web_page_preview: options.disable_web_page_preview } : {}),
@@ -592,11 +610,12 @@ function deriveTelegramFileBaseUrl(baseUrl, token) {
   try {
     const url = new URL(baseUrl)
     const marker = `/bot${token}`
-    if (url.pathname.endsWith(marker)) {
-      url.pathname = `${url.pathname.slice(0, -marker.length)}/file/bot${token}`
+    const normalizedPathname = url.pathname.replace(/\/+$/, "")
+    if (normalizedPathname.endsWith(marker)) {
+      url.pathname = `${normalizedPathname.slice(0, -marker.length)}/file/bot${token}`
       return url.toString().replace(/\/+$/, "")
     }
-    url.pathname = `${url.pathname.replace(/\/+$/, "")}/file/bot${token}`
+    url.pathname = `${normalizedPathname}/file/bot${token}`
     return url.toString().replace(/\/+$/, "")
   } catch {
     return `https://api.telegram.org/file/bot${token}`

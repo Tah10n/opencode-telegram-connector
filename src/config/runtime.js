@@ -140,6 +140,7 @@ export async function buildRuntimeConfig({ args = {}, cwd = process.cwd() } = {}
     tgPrefix: configFromFile.tgPrefix ?? envOptional("TG_PREFIX", ""),
     echoFilterMode: normalizeEchoFilterMode(configFromFile.echoFilterMode ?? envOptional("ECHO_FILTER_MODE", "recent")),
     mirrorTuiUserMessages: configFromFile.mirrorTuiUserMessages ?? envBool("MIRROR_TUI_USER_MESSAGES", false),
+    drainTelegramBacklogOnFirstRun: configFromFile.drainTelegramBacklogOnFirstRun ?? envBool("CONNECTOR_DRAIN_BACKLOG_ON_FIRST_RUN", true),
     allowInsecureHttp: configFromFile.allowInsecureHttp ?? envBool("OPENCODE_ALLOW_INSECURE_HTTP", false),
     logFormat: normalizeLogFormat(configFromFile.logFormat ?? envOptional("CONNECTOR_LOG_FORMAT", "text")),
     healthServer: normalizeHealthServerConfig({

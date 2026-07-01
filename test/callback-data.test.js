@@ -1,6 +1,10 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import os from "node:os"
+import path from "node:path"
 import { callbackPacker, decodeCallbackData, encodeCallback, LEGACY_CALLBACK_PREFIXES, legacyCallbackPrefix } from "../src/connector/callback-data.js"
+import { makeCallbackStore } from "../src/runtime/connector-bootstrap.js"
+import { StateStore } from "../src/state/store.js"
 import { chance, createFuzzRng, fuzzIterations, pick, randomInt, randomString } from "./helpers/fuzz.js"
 
 const ITERATIONS = fuzzIterations("CALLBACK_FUZZ_ITERATIONS")
@@ -25,6 +29,57 @@ test("callback packer stores encoded JSON array payloads", () => {
   const pack = callbackPacker({ pack: (value) => `packed:${value}` })
 
   assert.equal(pack("b", "confirm-unbind", "100:7"), `packed:${encodeCallback(["b", "confirm-unbind", "100:7"])}`)
+})
+
+test("runtime callback store persists packed payloads across store instances", () => {
+  const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-state.json"), logger: { error() {} } })
+  store.scheduleSave = () => {}
+  const payload = encodeCallback(["cf", "diff", "demo", "ses_1", "file", "x".repeat(100)])
+  const first = makeCallbackStore({ store, ttlMs: 60_000 })
+
+  const packed = first.pack(payload)
+
+  assert.match(packed, /^cb\|/)
+  assert.equal(first.unpack(packed), payload)
+  const afterRestart = makeCallbackStore({ store, ttlMs: 60_000 })
+  assert.equal(afterRestart.unpack(packed), payload)
+  assert.equal(makeCallbackStore({ store }).pack("short"), "short")
+  assert.deepEqual(Object.keys(store.get().callbackPayloads), [packed.slice(3)])
+})
+
+test("runtime callback store treats missing or expired packed payloads as expired", () => {
+  const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-state.json"), logger: { error() {} } })
+  store.scheduleSave = () => {}
+  const token = "expired_token"
+  store.setCallbackPayload(token, encodeCallback(["b", "confirm-unbind", "100:7"]), { createdAt: 1, expiresAt: 2 })
+
+  const cb = makeCallbackStore({ store, ttlMs: 60_000 })
+  const result = cb.unpackDetailed(`cb|${token}`)
+
+  assert.deepEqual(result, { ok: false, reason: "expired", data: null })
+  assert.equal(store.getCallbackPayload(token), null)
+})
+
+test("runtime callback store preserves persisted expiry when caching restored payloads", () => {
+  const originalNow = Date.now
+  let currentNow = 1000
+  Date.now = () => currentNow
+  try {
+    const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-state.json"), logger: { error() {} } })
+    store.scheduleSave = () => {}
+    const token = "short_lived_token"
+    const payload = encodeCallback(["b", "confirm-unbind", "100:7"])
+    store.setCallbackPayload(token, payload, { createdAt: 900, expiresAt: 1010 })
+    const cb = makeCallbackStore({ store, ttlMs: 60_000 })
+
+    assert.deepEqual(cb.unpackDetailed(`cb|${token}`), { ok: true, reason: "persisted", data: payload })
+
+    currentNow = 1011
+    assert.deepEqual(cb.unpackDetailed(`cb|${token}`), { ok: false, reason: "expired", data: null })
+    assert.equal(store.getCallbackPayload(token, { now: currentNow }), null)
+  } finally {
+    Date.now = originalNow
+  }
 })
 
 test("callback codec fuzzes garbage without throwing", () => {

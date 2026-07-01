@@ -239,6 +239,7 @@ test("startOpenCodeSseLoop aborts oversized SSE events and reports a protocol er
       },
     })
   })
+  await assert.rejects(loop.done, /SSE event exceeded limit/)
 })
 
 test("startOpenCodeSseLoop stops instead of reconnecting after fatal protocol errors", async (t) => {
@@ -260,10 +261,10 @@ test("startOpenCodeSseLoop stops instead of reconnecting after fatal protocol er
     },
   })
 
-  await Promise.race([
+  await assert.rejects(Promise.race([
     loop.done,
     new Promise((_, reject) => originalGlobalSetTimeout(() => reject(new Error("Timed out waiting for fatal SSE stop")), 1000)),
-  ])
+  ]), /SSE event exceeded limit/)
 
   assert.equal(fetchCalls, 1)
   assert.equal(errors.length, 1)
@@ -290,6 +291,7 @@ test("startOpenCodeSseLoop aborts when an SSE line exceeds the buffer limit", as
       },
     })
   })
+  await assert.rejects(loop.done, /SSE line buffer exceeded limit/)
 })
 
 test("startOpenCodeSseLoop aborts an idle connection and logs it as a normal stop", async (t) => {

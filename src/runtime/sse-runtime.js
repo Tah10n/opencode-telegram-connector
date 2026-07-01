@@ -1,4 +1,4 @@
-import { makeBoundaryError } from "../boundary-errors.js"
+import { classifyBoundaryError, makeBoundaryError } from "../boundary-errors.js"
 import { directoriesMatch } from "../directory-paths.js"
 import { effectiveOpenCodeSseEventPath, getOpenCodeSseEventMeta } from "../opencode/sse.js"
 import { createCorrelationId, getRequestContext } from "./request-context.js"
@@ -59,5 +59,14 @@ export function makeSseProjectRoutingError(projectAlias, issue) {
     kind: "configuration",
     outcome: "fatal",
     message: `SSE disabled for project '${projectAlias}': ${pathname} requires project 'directory' for safe routing. Add 'directory' to connector.config.mjs or set OPENCODE_SSE_EVENT_PATH=/event for legacy opencode builds.`,
+  })
+}
+
+export function observeFatalSseHandleDone({ handle, projectAlias, abortSignal, reportFatalRuntimeError } = {}) {
+  Promise.resolve(handle?.done).catch((err) => {
+    if (abortSignal?.aborted) return
+    const context = sseErrorContext(err)
+    const classification = classifyBoundaryError(err, context)
+    reportFatalRuntimeError?.(classification.error, { name: `sse:${projectAlias}`, projectAlias })
   })
 }

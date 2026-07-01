@@ -46,6 +46,10 @@ export class LruMap {
     this.trim()
   }
 
+  delete(key) {
+    return this.map.delete(key)
+  }
+
   trim() {
     while (this.map.size > this.limit) {
       const oldest = this.map.keys().next().value

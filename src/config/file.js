@@ -96,6 +96,7 @@ export function normalizeConnectorConfig(raw, { configFilePath } = {}) {
   if (raw.tgPrefix != null) out.tgPrefix = String(raw.tgPrefix)
   if (raw.echoFilterMode != null && raw.echoFilterMode !== "") out.echoFilterMode = normalizeEchoFilterMode(raw.echoFilterMode)
   if (raw.mirrorTuiUserMessages != null) out.mirrorTuiUserMessages = parseConfigBool("mirrorTuiUserMessages", raw.mirrorTuiUserMessages)
+  if (raw.drainTelegramBacklogOnFirstRun != null) out.drainTelegramBacklogOnFirstRun = parseConfigBool("drainTelegramBacklogOnFirstRun", raw.drainTelegramBacklogOnFirstRun)
   if (raw.logFormat != null && raw.logFormat !== "") out.logFormat = String(raw.logFormat)
   if (raw.allowInsecureHttp != null) out.allowInsecureHttp = parseConfigBool("allowInsecureHttp", raw.allowInsecureHttp)
   if (raw.activeTurnStaleMs != null && raw.activeTurnStaleMs !== "") {

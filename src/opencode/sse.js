@@ -336,17 +336,14 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
               } catch {}
             }
           }
-        } else {
-          if (isRetryableBoundaryError(normalized)) {
-            logger?.info?.("SSE retryable error", { projectAlias, source: "opencode", operation: EVENT_OPERATION, kind: normalized.kind, outcome: normalized.outcome, status: normalized.status, code: normalized.code, retryable: true, error: msg })
-          } else {
-            logger?.error?.("SSE error", { projectAlias, source: "opencode", operation: EVENT_OPERATION, kind: normalized.kind, outcome: normalized.outcome, status: normalized.status, code: normalized.code, retryable: false, error: msg })
-          }
+        } else if (isRetryableBoundaryError(normalized)) {
+          logger?.info?.("SSE retryable error", { projectAlias, source: "opencode", operation: EVENT_OPERATION, kind: normalized.kind, outcome: normalized.outcome, status: normalized.status, code: normalized.code, retryable: true, error: msg })
           try {
             await onError?.({ projectAlias, err: normalized })
           } catch {}
+        } else {
+          throw normalized
         }
-        if (!isAbort && !isTransientDisconnect && !isRetryableBoundaryError(normalized)) break
         await waitForRetryBackoff(backoff)
         backoff = Math.min(30_000, backoff * 2)
       } finally {
@@ -369,6 +366,7 @@ export function startOpenCodeSseLoop({ projectAlias, ocClient, logger, onConnect
       try {
         await onError?.({ projectAlias, err: normalized })
       } catch {}
+      throw normalized
     }
   })
 

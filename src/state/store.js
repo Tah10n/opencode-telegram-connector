@@ -7,10 +7,11 @@ import { isSafeOpenCodeId } from "../opencode/ids.js"
 import { redactSensitiveText } from "../url-utils.js"
 import { matchSupportedLocale } from "../i18n/index.js"
 
-export const STATE_SCHEMA_VERSION = 6
+export const STATE_SCHEMA_VERSION = 7
 export const DEFAULT_FEED_MODE = "main+changes"
 export const DEFAULT_IDEMPOTENCY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 export const DEFAULT_IDEMPOTENCY_MAX_ENTRIES = 5000
+export const DEFAULT_CALLBACK_PAYLOAD_MAX_ENTRIES = 4000
 export const DEFAULT_STATE_MIGRATION_BACKUP_MAX_FILES = 5
 export { DEFAULT_STATE_FILE_MODE }
 
@@ -51,11 +52,13 @@ function migrationOptionsForLoad(filePath) {
     normalizePendingPrompts,
     normalizePendingRuntimeOnlineNotice,
     normalizeIdempotencyLedger,
+    normalizeCallbackPayloads,
     defaultFeedByContext,
     defaultLocaleByContext,
     defaultModelPrefsByContext,
     defaultPendingPrompts,
     defaultIdempotencyLedger,
+    defaultCallbackPayloads,
   }
 }
 
@@ -84,6 +87,10 @@ function defaultIdempotencyLedger() {
   return { keys: {} }
 }
 
+function defaultCallbackPayloads() {
+  return {}
+}
+
 export function defaultState() {
   return {
     schemaVersion: STATE_SCHEMA_VERSION,
@@ -96,6 +103,7 @@ export function defaultState() {
     pendingPrompts: defaultPendingPrompts(),
     pendingRuntimeOnlineNotice: null,
     idempotency: defaultIdempotencyLedger(),
+    callbackPayloads: defaultCallbackPayloads(),
   }
 }
 
@@ -233,6 +241,83 @@ export class StateStore {
 
   getPendingRuntimeOnlineNotice() {
     return this.state.pendingRuntimeOnlineNotice || null
+  }
+
+  setCallbackPayload(token, data, { ttlMs = 24 * 60 * 60 * 1000, createdAt = Date.now(), expiresAt } = {}) {
+    const normalizedToken = normalizeCallbackPayloadToken(token)
+    if (!normalizedToken || typeof data !== "string") return false
+    const safeCreatedAt = isFiniteNumber(createdAt) ? createdAt : Date.now()
+    const safeExpiresAt = isFiniteNumber(expiresAt) ? expiresAt : safeCreatedAt + Math.max(1, Number(ttlMs) || 1)
+    if (safeExpiresAt <= safeCreatedAt) return false
+    this.state.callbackPayloads[normalizedToken] = {
+      data,
+      createdAt: safeCreatedAt,
+      expiresAt: safeExpiresAt,
+    }
+    this.pruneCallbackPayloads({ now: safeCreatedAt })
+    this.scheduleSave()
+    return true
+  }
+
+  getCallbackPayloadRecord(token, { now = Date.now() } = {}) {
+    const normalizedToken = normalizeCallbackPayloadToken(token)
+    if (!normalizedToken) return null
+    const entry = this.state.callbackPayloads?.[normalizedToken]
+    if (!entry || typeof entry.data !== "string" || !isFiniteNumber(entry.createdAt) || !isFiniteNumber(entry.expiresAt)) {
+      this.deleteCallbackPayload(normalizedToken)
+      return null
+    }
+    if (entry.expiresAt <= now) {
+      this.deleteCallbackPayload(normalizedToken)
+      return null
+    }
+    return {
+      data: entry.data,
+      createdAt: entry.createdAt,
+      expiresAt: entry.expiresAt,
+    }
+  }
+
+  getCallbackPayload(token, options = {}) {
+    return this.getCallbackPayloadRecord(token, options)?.data ?? null
+  }
+
+  deleteCallbackPayload(token) {
+    const normalizedToken = normalizeCallbackPayloadToken(token)
+    if (!normalizedToken || !this.state.callbackPayloads?.[normalizedToken]) return false
+    delete this.state.callbackPayloads[normalizedToken]
+    this.scheduleSave()
+    return true
+  }
+
+  pruneCallbackPayloads({ now = Date.now(), maxEntries = DEFAULT_CALLBACK_PAYLOAD_MAX_ENTRIES } = {}) {
+    const records = this.state.callbackPayloads
+    if (!records || typeof records !== "object") return 0
+    let removed = 0
+    for (const [token, entry] of Object.entries(records)) {
+      if (!normalizeCallbackPayloadToken(token) || typeof entry?.data !== "string" || !isFiniteNumber(entry?.expiresAt) || entry.expiresAt <= now) {
+        delete records[token]
+        removed += 1
+      }
+    }
+
+    const entries = Object.entries(records)
+    if (entries.length > maxEntries) {
+      entries
+        .sort((a, b) => {
+          const aCreated = isFiniteNumber(a[1]?.createdAt) ? a[1].createdAt : 0
+          const bCreated = isFiniteNumber(b[1]?.createdAt) ? b[1].createdAt : 0
+          return aCreated - bCreated
+        })
+        .slice(0, entries.length - maxEntries)
+        .forEach(([token]) => {
+          delete records[token]
+          removed += 1
+        })
+    }
+
+    if (removed) this.scheduleSave()
+    return removed
   }
 
   setPendingRuntimeOnlineNotice(record) {
@@ -689,6 +774,13 @@ function isNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0
 }
 
+function normalizeCallbackPayloadToken(value) {
+  const token = typeof value === "string" ? value : ""
+  if (token !== token.trim()) return ""
+  if (!token || token.length > 128 || !/^[A-Za-z0-9_-]+$/.test(token)) return ""
+  return token
+}
+
 function isSafeProjectAlias(value) {
   return typeof value === "string" && value === value.trim() && value.length > 0 && !/[|:]/.test(value)
 }
@@ -769,6 +861,7 @@ function validateCurrentState(state) {
   validatePendingPromptsSection(state.pendingPrompts, errors)
   validatePendingRuntimeOnlineNoticeSection(state.pendingRuntimeOnlineNotice, errors)
   validateIdempotencySection(state.idempotency, errors)
+  validateCallbackPayloadsSection(state.callbackPayloads, errors)
   return errors
 }
 
@@ -974,6 +1067,21 @@ function validateIdempotencySection(value, errors) {
   }
 }
 
+function validateCallbackPayloadsSection(value, errors) {
+  if (!pushRecordError(errors, value, "state.callbackPayloads")) return
+  for (const [token, entry] of Object.entries(value)) {
+    const statePath = `state.callbackPayloads${pathKey(token)}`
+    if (!normalizeCallbackPayloadToken(token)) errors.push(`${statePath} key must be a base64url callback token up to 128 characters`)
+    if (!pushRecordError(errors, entry, statePath)) continue
+    if (typeof entry.data !== "string") errors.push(`${statePath}.data must be a string`)
+    if (!isFiniteNumber(entry.createdAt)) errors.push(`${statePath}.createdAt must be a finite number`)
+    if (!isFiniteNumber(entry.expiresAt)) errors.push(`${statePath}.expiresAt must be a finite number`)
+    if (isFiniteNumber(entry.createdAt) && isFiniteNumber(entry.expiresAt) && entry.expiresAt <= entry.createdAt) {
+      errors.push(`${statePath}.expiresAt must be greater than createdAt`)
+    }
+  }
+}
+
 function validatePendingRuntimeOnlineNoticeSection(value, errors) {
   if (value == null) return
   if (!pushRecordError(errors, value, "state.pendingRuntimeOnlineNotice")) return
@@ -1175,6 +1283,25 @@ function normalizeIdempotencyLedger(value) {
     .sort((a, b) => a[1].createdAt - b[1].createdAt)
     .slice(-DEFAULT_IDEMPOTENCY_MAX_ENTRIES)
   return { keys: Object.fromEntries(entries) }
+}
+
+function normalizeCallbackPayloadEntry(value) {
+  if (!value || typeof value !== "object" || typeof value.data !== "string") return null
+  const createdAt = isFiniteNumber(value.createdAt) ? value.createdAt : Date.now()
+  const expiresAt = isFiniteNumber(value.expiresAt) ? value.expiresAt : createdAt + 24 * 60 * 60 * 1000
+  if (expiresAt <= createdAt) return null
+  return { data: value.data, createdAt, expiresAt }
+}
+
+function normalizeCallbackPayloads(value) {
+  if (!value || typeof value !== "object") return defaultCallbackPayloads()
+  const now = Date.now()
+  const entries = Object.entries(value)
+    .map(([token, entry]) => [normalizeCallbackPayloadToken(token), normalizeCallbackPayloadEntry(entry)])
+    .filter(([token, entry]) => !!token && !!entry && entry.expiresAt > now)
+    .sort((a, b) => a[1].createdAt - b[1].createdAt)
+    .slice(-DEFAULT_CALLBACK_PAYLOAD_MAX_ENTRIES)
+  return Object.fromEntries(entries)
 }
 
 function normalizeFeedByContext(value) {
