@@ -28,6 +28,7 @@ We will try to acknowledge reports promptly and follow up with a fix or mitigati
 
 ## Runtime state and local config
 
-- Treat `.env`, local config files with credentials, and `.data/state.json` as sensitive. State contains chat bindings, session IDs, pending prompt recovery data, and idempotency history.
-- If state is corrupt or unreadable, the connector fails closed instead of silently resetting. Repair permissions/corruption or restore a backup before restarting; deleting state loses bindings, offset, pending prompts, and duplicate-action protection.
+- Treat `.env`, local config files with credentials, and `.data/state.json` as sensitive. State contains chat bindings, session IDs, pending prompt reconciliation, Telegram outbox routes/progress, bounded fallback error text, and idempotency history.
+- If state is corrupt or unreadable, the connector fails closed instead of silently resetting. Repair permissions/corruption or restore a backup before restarting; deleting state loses bindings, offset, pending prompts/deliveries, and duplicate-action protection.
+- Telegram bot authentication failures (`401`/`403`) are fatal and trigger controlled non-zero shutdown. Diagnostics redact the bot token; do not post the token or an unredacted state/log file when reporting the failure.
 - Dynamic OpenCode URL path segments are encoded and user-entered session IDs are validated. Reports involving malformed IDs, routing confusion, or unexpected endpoint access are security-relevant.
