@@ -751,7 +751,10 @@ test("startConnector binds a thread and forwards only allowed-user messages", as
     harness.tg.enqueue(makeMessageUpdate(102, "hello from telegram"))
     harness.tg.enqueue(makeMessageUpdate(103, "blocked", { userId: 999 }))
 
-    await waitFor(() => harness.tg.pendingUpdates === 0 && harness.ocCalls.promptAsync.length === 1)
+    await waitFor(
+      () => harness.tg.pendingUpdates === 0 && harness.ocCalls.promptAsync.length === 1,
+      { timeoutMs: 5000 },
+    )
     await delay(30)
     await harness.connector.stop()
 
