@@ -15,6 +15,7 @@ import { unsupportedMediaKind, unsupportedMediaText } from "./incoming-attachmen
 import { formatStaleActiveTurnNotice, resolveActiveTurnStaleMs, resolveActiveTurnStatus } from "./active-turns.js"
 import { callbackPacker } from "./commands/shared.js"
 import { t as translate } from "../i18n/index.js"
+import { deliverPromptExactlyOnce, promptDeliveryIdentity } from "./prompt-delivery.js"
 
 function helpText({ scopeLabel = "this thread", defaultProject = "", isBound = false, locale = "en", t = translate } = {}) {
   const bindCommand = defaultProject ? `/bind ${defaultProject}` : "/bind <projectAlias>"
@@ -103,6 +104,7 @@ export function createCommandHandlers(runtime) {
     setAwaitingCustomAnswerState,
     resolveBoundRoute,
     recordPromptAnswered,
+    recordPromptDeliveryOutcome,
     buildRuntimeStatusLines,
     buildGlobalRuntimeStatusLines,
     clearAgentActivity,
@@ -201,6 +203,7 @@ export function createCommandHandlers(runtime) {
     ensureRecentPromptSet,
     hashTextForEcho,
     staleActiveTurnGuard: maybeBlockStaleActiveTurn,
+    recordPromptDeliveryOutcome,
     t,
   })
 
@@ -1002,7 +1005,17 @@ export function createCommandHandlers(runtime) {
     if (!hasText) return
 
     const oc = resolvedBinding.oc
-    if (await maybeBlockStaleActiveTurn(ctxMeta, resolvedBinding)) {
+    const deliveryIdentity = promptDeliveryIdentity({
+      kind: "text",
+      projectAlias: resolvedBinding.projectAlias,
+      sessionId: resolvedBinding.sessionId,
+      chatId: ctxMeta.chatId,
+      threadIdOr0: ctxMeta.threadIdOr0,
+      messageId: msg.message_id,
+      updateId: options?.updateId,
+    })
+    const existingDelivery = store.getPromptDelivery?.(deliveryIdentity.key) || store.get?.()?.promptDeliveries?.records?.[deliveryIdentity.key]
+    if (!existingDelivery && await maybeBlockStaleActiveTurn(ctxMeta, resolvedBinding)) {
       await markMessageHandled("staleActiveTurn", { projectAlias: resolvedBinding.projectAlias, sessionId: resolvedBinding.sessionId })
       return
     }
@@ -1011,22 +1024,18 @@ export function createCommandHandlers(runtime) {
     const sk = sessionKey(resolvedBinding.projectAlias, resolvedBinding.sessionId)
     ensureRecentPromptSet(sk).add(hashTextForEcho(promptText))
     const promptOverride = await resolvePromptOverride(ctxMeta.ctxKey, resolvedBinding)
-    // Persist message idempotency before the external side effect. If opencode
-    // accepts the prompt and the process crashes immediately after, replayed
-    // Telegram updates will skip instead of sending a duplicate prompt.
-    await markIdempotencyEntries([messageIdempotencyEntry("promptAsync", { projectAlias: resolvedBinding.projectAlias, sessionId: resolvedBinding.sessionId })], {
-      rollbackOnFlushFailure: true,
-    })
     try {
-      await oc.promptAsync(resolvedBinding.sessionId, promptText, promptOverride || undefined)
+      await deliverPromptExactlyOnce({
+        store,
+        oc,
+        identity: deliveryIdentity,
+        text: promptText,
+        options: promptOverride || undefined,
+        recordPromptDeliveryOutcome,
+      })
       markProjectUp?.(resolvedBinding.projectAlias)
     } catch (err) {
-      let cleanupErr = null
-      try {
-        await deleteIdempotencyEntry(messageKey)
-      } catch (deleteErr) {
-        cleanupErr = deleteErr
-      }
+      if (err?.source === "state") throw err
       const alias = resolvedBinding.projectAlias
       recordRetryableOpenCodeFailure(alias, err, {
         operation: "POST /session/:id/prompt_async",
@@ -1034,10 +1043,12 @@ export function createCommandHandlers(runtime) {
         pathname: `/session/${resolvedBinding.sessionId}/prompt_async`,
       })
       await notifyUnavailableForThread(ctxMeta, alias, err)
-      if (cleanupErr) throw cleanupErr
       if (isRetryableProjectError(err)) throw err
       return
     }
+    await markIdempotencyEntries([messageIdempotencyEntry("promptAsync", { projectAlias: resolvedBinding.projectAlias, sessionId: resolvedBinding.sessionId })], {
+      rollbackOnFlushFailure: true,
+    })
   }
 
   return {

@@ -7,6 +7,10 @@ import crypto from "node:crypto"
 import {
   DEFAULT_CALLBACK_PAYLOAD_MAX_ENTRIES,
   DEFAULT_FEED_MODE,
+  DEFAULT_OUTBOX_MAX_AGE_MS,
+  DEFAULT_OUTBOX_MAX_ENTRIES,
+  DEFAULT_PROMPT_DELIVERY_MAX_AGE_MS,
+  DEFAULT_PROMPT_DELIVERY_MAX_ENTRIES,
   DEFAULT_STATE_FILE_MODE,
   STATE_SCHEMA_VERSION,
   StateStore,
@@ -22,6 +26,45 @@ async function makeTempDir() {
   const dir = path.join(os.tmpdir(), `telegram-connector-${crypto.randomUUID()}`)
   await fs.mkdir(dir, { recursive: true })
   return dir
+}
+
+function makeOutboxItem(index, { createdAt = Date.now(), routeCtxKey = "100:7" } = {}) {
+  const id = `out_${Number(index).toString(16).padStart(40, "0")}`
+  return {
+    id,
+    type: "assistant-final",
+    projectAlias: "demo",
+    sessionId: "ses_1",
+    boundSessionId: "ses_1",
+    messageId: `msg_${index}`,
+    route: { chatId: 100, threadIdOr0: 7, ctxKey: routeCtxKey },
+    progress: {},
+    attemptCount: 0,
+    nextAttemptAt: createdAt,
+    createdAt,
+    updatedAt: createdAt,
+  }
+}
+
+function makePromptDelivery(index, { state = "outcome_unknown", updatedAt = Date.now(), lastError } = {}) {
+  const openCodeMessageId = `msg_tgc_${Number(index).toString(16).padStart(48, "0")}`
+  return {
+    openCodeMessageId,
+    promptHash: "a".repeat(64),
+    state,
+    kind: "text",
+    projectAlias: "demo",
+    sessionId: "ses_1",
+    chatId: 100,
+    threadIdOr0: 7,
+    messageId: index + 1,
+    updateId: index + 1,
+    attemptCount: 1,
+    ...(state === "outcome_unknown" ? { outcomeUnknownSince: updatedAt, reconcileNotFoundCount: 0 } : {}),
+    createdAt: updatedAt,
+    updatedAt,
+    ...(lastError ? { lastError } : {}),
+  }
 }
 
 test("StateStore exposes load and flush health", async () => {
@@ -607,7 +650,59 @@ test("StateStore persists and clears pending runtime online notices", async () =
   assert.equal(cleared.getPendingRuntimeOnlineNotice(), null)
 })
 
-test("StateStore migrates schema version 1 state to version 7", async () => {
+test("StateStore bounds and deterministically expires durable outbox entries", () => {
+  const now = Date.now()
+  const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-outbox-state.json"), logger: makeLogger() })
+  store.scheduleSave = () => {}
+
+  assert.equal(store.setOutboxItem(makeOutboxItem(1, { createdAt: now - 2000 }), { maxEntries: 2 }), true)
+  assert.equal(store.setOutboxItem(makeOutboxItem(2, { createdAt: now }), { maxEntries: 2 }), true)
+  assert.equal(store.setOutboxItem(makeOutboxItem(3, { createdAt: now }), { maxEntries: 2 }), false)
+  assert.equal(Object.keys(store.getOutboxItems()).length, 2)
+
+  assert.equal(store.pruneOutbox({ now, maxAgeMs: 1000 }), 1)
+  assert.deepEqual(Object.keys(store.getOutboxItems()), [makeOutboxItem(2).id])
+  assert.equal(DEFAULT_OUTBOX_MAX_ENTRIES, 2000)
+  assert.equal(DEFAULT_OUTBOX_MAX_AGE_MS, 30 * 24 * 60 * 60 * 1000)
+})
+
+test("StateStore never evicts unresolved prompt markers and applies backpressure at the cap", () => {
+  const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-prompt-state.json"), logger: makeLogger() })
+  store.scheduleSave = () => {}
+  const records = store.get().promptDeliveries.records
+  for (let index = 0; index < DEFAULT_PROMPT_DELIVERY_MAX_ENTRIES; index += 1) {
+    const entry = makePromptDelivery(index, { updatedAt: index + 1 })
+    records[entry.openCodeMessageId] = entry
+  }
+
+  const extra = makePromptDelivery(DEFAULT_PROMPT_DELIVERY_MAX_ENTRIES, { updatedAt: Date.now() })
+  assert.equal(store.setPromptDelivery(extra.openCodeMessageId, extra), false)
+  assert.equal(Object.keys(records).length, DEFAULT_PROMPT_DELIVERY_MAX_ENTRIES)
+  assert.equal(records[extra.openCodeMessageId], undefined)
+
+  assert.equal(store.prunePromptDeliveries({ now: Date.now(), maxAgeMs: 1, maxEntries: 1 }), 0)
+  assert.equal(Object.keys(records).length, DEFAULT_PROMPT_DELIVERY_MAX_ENTRIES)
+})
+
+test("StateStore expires accepted prompt markers on load but retains unresolved markers", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  const updatedAt = Date.now() - DEFAULT_PROMPT_DELIVERY_MAX_AGE_MS - 1
+  const accepted = makePromptDelivery(1, { state: "accepted", updatedAt })
+  const unknown = makePromptDelivery(2, { state: "outcome_unknown", updatedAt })
+  await fs.writeFile(filePath, JSON.stringify({
+    ...defaultState(),
+    promptDeliveries: { records: { [accepted.openCodeMessageId]: accepted, [unknown.openCodeMessageId]: unknown } },
+  }), "utf8")
+
+  const store = new StateStore({ filePath, logger: makeLogger() })
+  const loaded = await store.load()
+
+  assert.equal(loaded.promptDeliveries.records[accepted.openCodeMessageId], undefined)
+  assert.deepEqual(loaded.promptDeliveries.records[unknown.openCodeMessageId], unknown)
+})
+
+test("StateStore migrates schema version 1 state to version 8", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -633,9 +728,11 @@ test("StateStore migrates schema version 1 state to version 7", async () => {
   assert.equal(loaded.pendingRuntimeOnlineNotice, null)
   assert.deepEqual(loaded.idempotency, { keys: {} })
   assert.deepEqual(loaded.callbackPayloads, {})
+  assert.deepEqual(loaded.promptDeliveries, { records: {} })
+  assert.deepEqual(loaded.outbox, { items: {} })
 })
 
-test("StateStore migrates schema version 2 state to version 7", async () => {
+test("StateStore migrates schema version 2 state to version 8", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -668,7 +765,7 @@ test("StateStore migrates schema version 2 state to version 7", async () => {
   assert.deepEqual(loaded.callbackPayloads, {})
 })
 
-test("StateStore migrates schema version 3 state to version 7", async () => {
+test("StateStore migrates schema version 3 state to version 8", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -701,7 +798,7 @@ test("StateStore migrates schema version 3 state to version 7", async () => {
   assert.deepEqual(loaded.callbackPayloads, {})
 })
 
-test("StateStore migrates schema version 4 state to version 7", async () => {
+test("StateStore migrates schema version 4 state to version 8", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -735,7 +832,7 @@ test("StateStore migrates schema version 4 state to version 7", async () => {
   assert.deepEqual(loaded.callbackPayloads, {})
 })
 
-test("StateStore migrates schema version 5 state to version 7", async () => {
+test("StateStore migrates schema version 5 state to version 8", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -768,7 +865,7 @@ test("StateStore migrates schema version 5 state to version 7", async () => {
   assert.deepEqual(loaded.callbackPayloads, {})
 })
 
-test("StateStore migrates schema version 6 callback payloads to version 7", async () => {
+test("StateStore migrates schema version 6 callback payloads to version 8", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   const future = Date.now() + 60_000
@@ -805,6 +902,43 @@ test("StateStore migrates schema version 6 callback payloads to version 7", asyn
   assert.deepEqual(loaded.callbackPayloads, {
     kept_token: { data: "[\"b\",\"confirm-unbind\",\"100:7\"]", createdAt: 10, expiresAt: future },
   })
+})
+
+test("StateStore migrates schema version 7 to version 8 with empty prompt delivery and outbox sections", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  const previous = { ...defaultState(), schemaVersion: 7, updateOffset: 114 }
+  delete previous.promptDeliveries
+  delete previous.outbox
+  await fs.writeFile(filePath, JSON.stringify(previous, null, 2), "utf8")
+
+  const store = new StateStore({ filePath, logger: makeLogger() })
+  const loaded = await store.load()
+
+  assert.equal(loaded.schemaVersion, 8)
+  assert.equal(loaded.updateOffset, 114)
+  assert.deepEqual(loaded.promptDeliveries, { records: {} })
+  assert.deepEqual(loaded.outbox, { items: {} })
+  const persisted = JSON.parse(await fs.readFile(filePath, "utf8"))
+  assert.deepEqual(persisted.outbox, { items: {} })
+})
+
+test("StateStore fails closed on a corrupted current-schema outbox section", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  const item = makeOutboxItem(9, { routeCtxKey: "999:0" })
+  await fs.writeFile(filePath, JSON.stringify({ ...defaultState(), updateOffset: 115, outbox: { items: { [item.id]: item } } }, null, 2), "utf8")
+
+  const store = new StateStore({ filePath, logger: makeLogger() })
+  await assert.rejects(() => store.load(), (err) => {
+    assert.equal(err.code, "STATE_SCHEMA_INVALID")
+    assert.match(err.message, /state\.outbox\.items.*route\.ctxKey must match/)
+    return true
+  })
+
+  assert.deepEqual(store.get().outbox, { items: {} })
+  const backups = (await fs.readdir(dir)).filter((name) => name.startsWith("state.json.backup.") && name.includes(".invalid."))
+  assert.equal(backups.length, 1)
 })
 
 test("StateStore migration rebuilds binding routes and drops context sections that fail current validation", async () => {
@@ -870,7 +1004,7 @@ test("StateStore migration rebuilds binding routes and drops context sections th
   assert.deepEqual(loaded.pendingPrompts.customAnswers, {})
 })
 
-test("StateStore rejects schema version 7 state with inconsistent binding routes", async () => {
+test("StateStore rejects schema version 8 state with inconsistent binding routes", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -914,7 +1048,7 @@ test("StateStore rejects schema version 7 state with inconsistent binding routes
   assert.equal(backups.length, 1)
 })
 
-test("StateStore rejects malformed schema version 7 sections with actionable paths", async () => {
+test("StateStore rejects malformed schema version 8 sections with actionable paths", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -964,6 +1098,8 @@ test("StateStore rejects malformed schema version 7 sections with actionable pat
           " trimmed_token ": { data: "payload", createdAt: 10, expiresAt: 20 },
           missingData: { createdAt: 10, expiresAt: 20 },
         },
+        promptDeliveries: { records: {} },
+        outbox: { items: {} },
       },
       null,
       2,
@@ -980,19 +1116,7 @@ test("StateStore rejects malformed schema version 7 sections with actionable pat
     assert.match(err.message, /Restore a known-good state backup/)
     return true
   })
-  assert.deepEqual(store.get(), {
-    schemaVersion: STATE_SCHEMA_VERSION,
-    updateOffset: null,
-    bindings: {},
-    sessionIndex: {},
-    feedByContext: {},
-    localeByContext: {},
-    modelPrefsByContext: {},
-    pendingPrompts: { permissions: {}, rejectNotes: {}, customAnswers: {}, questionWizards: {} },
-    pendingRuntimeOnlineNotice: null,
-    idempotency: { keys: {} },
-    callbackPayloads: {},
-  })
+  assert.deepEqual(store.get(), defaultState())
   const backups = (await fs.readdir(dir)).filter((name) => name.startsWith("state.json.backup.") && name.includes(".invalid."))
   assert.equal(backups.length, 1)
   assert.match(await fs.readFile(path.join(dir, backups[0]), "utf8"), /bad:1/)
@@ -1214,17 +1338,10 @@ test("StateStore recovers an emergency bak instead of silently resetting missing
   const filePath = path.join(dir, "state.json")
   const backupPath = `${filePath}.bak.123456.abcdef123456`
   const saved = {
-    schemaVersion: STATE_SCHEMA_VERSION,
+    ...defaultState(),
     updateOffset: 777,
     bindings: { "100:0": { projectAlias: "demo", sessionId: "ses_1" } },
     sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 0 } },
-    feedByContext: {},
-    localeByContext: {},
-    modelPrefsByContext: {},
-    pendingPrompts: { permissions: {}, rejectNotes: {}, customAnswers: {}, questionWizards: {} },
-    pendingRuntimeOnlineNotice: null,
-    idempotency: { keys: {} },
-    callbackPayloads: {},
   }
   await fs.writeFile(backupPath, JSON.stringify(saved, null, 2), "utf8")
 

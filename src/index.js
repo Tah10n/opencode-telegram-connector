@@ -21,6 +21,7 @@ import { createLifecycleManager } from "./runtime/lifecycle.js"
 import { startHealthServer } from "./runtime/health-server.js"
 import { collectLoggerRedactionOptions, createConnectorLogger } from "./runtime/logger.js"
 import { createRuntimeObservability } from "./runtime/observability.js"
+import { createDurableOutboxRuntime } from "./runtime/durable-outbox-runtime.js"
 import { publishBotCommandMenus } from "./runtime/bot-command-menus.js"
 import { wrapTelegramClientWithCallbackPayloadFlush } from "./runtime/callback-payload-durability.js"
 import { runWithRequestContext, withRequestContextFields } from "./runtime/request-context.js"
@@ -50,7 +51,6 @@ import { sanitizeBaseUrlForDisplay } from "./url-utils.js"
 import { normalizeLimits } from "./limits.js"
 import { createParentSessionCache, LruMap, LruSet } from "./util/lru.js"
 import { normalizeI18nConfig } from "./i18n/index.js"
-
 export { validateRuntimeConfigForStart }
 export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   validateRuntimeConfigForStart(config)
@@ -165,7 +165,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     },
   })
   const tg = wrapTelegramClientWithCallbackPayloadFlush(tgRaw, { store })
-  const me = await tg.getMe().catch(() => null)
+  const me = await tg.getMe()
   const hasTopicsEnabled = !!me?.has_topics_enabled
   const botUsername = typeof me?.username === "string" ? me.username : ""
   logger.info("Telegram bot:", me?.username ? `@${me.username}` : "(unknown)", "topics:", hasTopicsEnabled)
@@ -750,7 +750,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
   wizardGcTimer.unref?.()
   lifecycle.registerTimer("questionWizard-gc", wizardGcTimer)
   bindAliasAwaitingState.registerGc()
-
+  const outboxRuntime = (deps?.createDurableOutboxRuntime || createDurableOutboxRuntime)({ store, logger, observability: runtimeObservability, abortSignal: abortController.signal, sleep: sleepWithAbort, startManagedTask })
   const mirroringHandlers = createMirroringHandlers({
     ...promptHandlers,
     tg,
@@ -782,6 +782,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     recordAssistantMirrored: runtimeObservability.recordAssistantMirrored,
     recordNoisyEventSkipped: runtimeObservability.recordNoisyEventSkipped,
     recordAttachmentFallback: runtimeObservability.recordAttachmentFallback,
+    outbox: outboxRuntime.outbox,
   })
   const {
     ensureRecentPromptSet,
@@ -794,10 +795,11 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     deliverAssistantText,
     handleMessagePartUpdated,
     handleMessageUpdated,
+    deliverOutboxItem,
     flushPendingAssistantDeliveries: drainPendingAssistantDeliveries,
   } = mirroringHandlers
+  const outboxPromise = outboxRuntime.start(deliverOutboxItem)
   flushPendingAssistantDeliveries = drainPendingAssistantDeliveries
-
   async function deliverPendingRuntimeOnlineNotice() {
     const notice = store.getPendingRuntimeOnlineNotice?.()
     if (notice?.kind !== "restart" || !Number.isInteger(notice.chatId)) return
@@ -931,6 +933,7 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     pruneBindAliasAwaiting,
     resolveBoundRoute,
     recordPromptAnswered: runtimeObservability.recordPromptAnswered,
+    recordPromptDeliveryOutcome: runtimeObservability.recordPromptDeliveryOutcome,
     isAllowedUser,
     ctxMetaFromMessage,
     rememberTelegramLocale,
@@ -1269,19 +1272,20 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     telegramLoop,
     { kind: "loop", metadata: { source: "telegram", operation: "getUpdates", method: "POST", pathname: "/getUpdates" }, fatalOnError: true },
   )
-
   let stopPromise = null
   const stop = async () => {
     if (stopPromise) return stopPromise
     stopPromise = (async () => {
       logger.info("Stopping connector. Managed tasks:", lifecycle.snapshot().map((entry) => `${entry.kind}:${entry.name}`).join(", ") || "none")
       abortController.abort()
+      await Promise.allSettled([outboxPromise])
       await flushPendingAssistantDeliveries({ timeoutMs: assistantDrainTimeoutMs }).catch((err) => {
         logger.error("Failed to drain pending assistant deliveries during shutdown:", err?.message || String(err))
       })
+      await outboxRuntime.drain({ timeoutMs: assistantDrainTimeoutMs }).catch((err) => logger.error("Failed to drain durable outbox during shutdown:", err?.message || String(err)))
       runtimeObservability.recordLoopSuccess("shutdown")
       await lifecycle.stopAll()
-      await Promise.allSettled([telegramLoopPromise, promptPollPromise, tuiActiveSessionSyncPromise])
+      await Promise.allSettled([telegramLoopPromise, promptPollPromise, tuiActiveSessionSyncPromise, outboxPromise])
       try {
         await store.flush()
       } catch (err) {
@@ -1291,6 +1295,5 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     })()
     return stopPromise
   }
-
   return { stop, stateFile }
 }

@@ -13,6 +13,109 @@ async function makeTempDir() {
   return dir
 }
 
+test("writeJsonFileAtomic syncs the temp file before rename and the parent directory after rename on POSIX", async () => {
+  const filePath = path.join("C:\\connector-state", "state.json")
+  const parentPath = path.dirname(filePath)
+  const events = []
+  let tmpPath = null
+
+  const fsImpl = {
+    async mkdir(targetPath) {
+      assert.equal(targetPath, parentPath)
+      events.push("mkdir")
+    },
+    async open(targetPath, flags, mode) {
+      if (flags === "w") {
+        tmpPath = targetPath
+        assert.match(targetPath, /state\.json\.tmp\./)
+        assert.equal(mode, 0o600)
+        events.push("open-temp")
+        return {
+          async writeFile(contents, encoding) {
+            assert.equal(contents, '{\n  "durable": true\n}\n')
+            assert.equal(encoding, "utf8")
+            events.push("write-temp")
+          },
+          async chmod(value) {
+            assert.equal(value, 0o600)
+            events.push("chmod-temp")
+          },
+          async sync() { events.push("sync-temp") },
+          async close() { events.push("close-temp") },
+        }
+      }
+      assert.equal(flags, "r")
+      assert.equal(targetPath, parentPath)
+      events.push("open-dir")
+      return {
+        async sync() { events.push("sync-dir") },
+        async close() { events.push("close-dir") },
+      }
+    },
+    async rename(from, to) {
+      assert.equal(from, tmpPath)
+      assert.equal(to, filePath)
+      events.push("rename")
+    },
+    async chmod(targetPath, mode) {
+      assert.equal(targetPath, filePath)
+      assert.equal(mode, 0o600)
+      events.push("chmod-target")
+    },
+    async unlink(targetPath) {
+      assert.equal(targetPath, tmpPath)
+      events.push("unlink-temp")
+    },
+  }
+
+  await writeJsonFileAtomic(filePath, { durable: true }, { fsImpl, mode: 0o600, platform: "linux" })
+
+  assert.deepEqual(events, [
+    "mkdir",
+    "open-temp",
+    "write-temp",
+    "chmod-temp",
+    "sync-temp",
+    "close-temp",
+    "rename",
+    "chmod-target",
+    "open-dir",
+    "sync-dir",
+    "close-dir",
+    "unlink-temp",
+  ])
+})
+
+test("writeJsonFileAtomic closes and removes the temp file when fsync fails", async () => {
+  const filePath = path.join("C:\\connector-state", "state.json")
+  const events = []
+  let tmpPath = null
+  const syncError = Object.assign(new Error("disk sync failed"), { code: "EIO" })
+  const fsImpl = {
+    async mkdir() {},
+    async open(targetPath, flags) {
+      assert.equal(flags, "w")
+      tmpPath = targetPath
+      return {
+        async writeFile() { events.push("write") },
+        async sync() {
+          events.push("sync")
+          throw syncError
+        },
+        async close() { events.push("close") },
+      }
+    },
+    async rename() { events.push("rename") },
+    async unlink(targetPath) {
+      assert.equal(targetPath, tmpPath)
+      events.push("unlink")
+    },
+  }
+
+  await assert.rejects(() => writeJsonFileAtomic(filePath, { durable: true }, { fsImpl }), syncError)
+  assert.deepEqual(events, ["write", "sync", "close", "unlink"])
+})
+
 test("writeJsonFileAtomic restores the previous file if Windows replacement fails", async () => {
   const filePath = "C:/tmp/state.json"
   const files = new Map([[filePath, '{"old":true}\n']])

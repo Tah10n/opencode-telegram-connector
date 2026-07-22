@@ -13,6 +13,11 @@ import { makeCallbackStore } from "../src/runtime/connector-bootstrap.js"
 import { getRequestContext } from "../src/runtime/request-context.js"
 import { startHealthServer } from "../src/runtime/health-server.js"
 import { canonicalOpenCodeSseEventPath, openCodeSseEventPathRequiresDirectoryRouting, OPENCODE_SSE_EVENT_META } from "../src/opencode/sse.js"
+import { USER_ATTACHMENT_LIMITS } from "../src/connector/incoming-attachments.js"
+import { formatMarkdownToTelegramHtmlBlocks } from "../src/telegram/formatter.js"
+import { formatUserMirrorBlocks } from "../src/connector/mirroring/user-format.js"
+import { formatChangedFilesText } from "../src/message-display.js"
+import { splitTelegramText } from "../src/telegram/client.js"
 
 function makeLogger(entries) {
   const push = (level, args) => entries?.push({ level, args })
@@ -128,7 +133,47 @@ function makeCallbackUpdate(updateId, data, { userId = 42, chatId = 100, chatTyp
   }
 }
 
-function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, setMyCommandsImpl, sendMessageImpl, sendDocumentImpl, editMessageTextImpl } = {}) {
+function makeDocumentUpdate(updateId, document, { userId = 42, chatId = 100, chatType = "supergroup", threadIdOr0 = 7, messageId = updateId, caption = "" } = {}) {
+  return {
+    update_id: updateId,
+    message: {
+      message_id: messageId,
+      chat: { id: chatId, type: chatType },
+      from: { id: userId },
+      ...(threadIdOr0 ? { message_thread_id: threadIdOr0 } : {}),
+      ...(caption ? { caption } : {}),
+      document,
+    },
+  }
+}
+
+function acceptedThenLostOpenCodeOptions() {
+  const accepted = new Map()
+  return {
+    accepted,
+    options: {
+      promptAsyncImpl: async (sessionId, text, options) => {
+        accepted.set(options.messageID, { info: { id: options.messageID, role: "user", sessionID: sessionId }, parts: [{ type: "text", text }] })
+        throw makeBoundaryError({
+          source: "opencode",
+          operation: "POST /session/:id/prompt_async",
+          method: "POST",
+          pathname: `/session/${sessionId}/prompt_async`,
+          status: 503,
+          outcome: "retryable",
+          message: "response lost after accept",
+        })
+      },
+      getMessageImpl: async (_sessionId, messageId) => {
+        const message = accepted.get(messageId)
+        if (message) return message
+        throw makeBoundaryError({ source: "opencode", operation: "GET message", status: 404, outcome: "stale", message: "not found" })
+      },
+    },
+  }
+}
+
+function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, setMyCommandsImpl, sendMessageImpl, sendHtmlBlocksImpl, sendDocumentImpl, editMessageTextImpl, getFileImpl, downloadFileImpl, afterNegativeOffsetSnapshot } = {}) {
   let nextMessageId = 1000
   const updates = []
   const sentMessages = []
@@ -179,6 +224,17 @@ function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, setMyComma
       getUpdatesCalls.push(input)
       if (getUpdatesError) throw getUpdatesError
       if (getUpdatesErrors.length > 0) throw getUpdatesErrors.shift()
+      if (input?.offset < 0) {
+        const pending = updates.splice(0).flatMap((entry) => Array.isArray(entry) ? entry : [entry])
+        const count = Math.max(1, Math.abs(Math.trunc(input.offset)))
+        const result = pending.slice(-count)
+        await afterNegativeOffsetSnapshot?.({
+          input,
+          result,
+          enqueue(update) { updates.push(update) },
+        })
+        return result
+      }
       if (updates.length === 0) {
         await delay(emptyPollDelayMs)
         return []
@@ -197,8 +253,12 @@ function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, setMyComma
     },
     async sendHtmlBlocks(chatId, blocks, replyMarkup, options = {}) {
       const result = { message_id: nextMessageId++ }
-      sentHtmlBlocks.push({ chatId, blocks, replyMarkup, options, result })
-      return result
+      const maybeResult = sendHtmlBlocksImpl
+        ? await sendHtmlBlocksImpl({ chatId, blocks, replyMarkup, options, result, callIndex: sentHtmlBlocks.length + 1 })
+        : undefined
+      const finalResult = maybeResult ?? result
+      sentHtmlBlocks.push({ chatId, blocks, replyMarkup, options, result: finalResult })
+      return finalResult
     },
     async sendDocument(chatId, contents, filename, caption, options = {}) {
       const result = { message_id: nextMessageId++ }
@@ -227,6 +287,14 @@ function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, setMyComma
     async answerCallbackQuery(callbackQueryId, text) {
       callbackAnswers.push({ callbackQueryId, text })
       return true
+    },
+    async getFile(fileId) {
+      if (getFileImpl) return getFileImpl(fileId)
+      return { file_path: `files/${fileId}.txt`, file_size: 16 }
+    },
+    async downloadFile(filePath, options) {
+      if (downloadFileImpl) return downloadFileImpl(filePath, options)
+      return new TextEncoder().encode("attachment text")
     },
   }
 }
@@ -267,6 +335,7 @@ function createFakeOpenCodeClient({
     getActiveTuiSession: [],
     abortSession: [],
     promptAsync: [],
+    promptMessageIDs: [],
     getMessage: [],
     listMessages: [],
     replyPermission: [],
@@ -319,12 +388,27 @@ function createFakeOpenCodeClient({
       return abortSessionImpl ? abortSessionImpl(sessionId) : true
     },
     async promptAsync(sessionId, text, options = undefined) {
-      calls.promptAsync.push(options === undefined ? { sessionId, text } : { sessionId, text, options })
+      const { messageID, ...legacyOptions } = options || {}
+      calls.promptMessageIDs.push(messageID || null)
+      calls.promptAsync.push(Object.keys(legacyOptions).length === 0 ? { sessionId, text } : { sessionId, text, options: legacyOptions })
       return promptAsyncImpl ? promptAsyncImpl(sessionId, text, options) : { ok: true }
     },
     async getMessage(sessionId, messageId, input = {}) {
       calls.getMessage.push({ sessionId, messageId })
-      return getMessageImpl ? getMessageImpl(sessionId, messageId, input) : (messagesById[messageId] ?? null)
+      if (getMessageImpl) return getMessageImpl(sessionId, messageId, input)
+      if (messagesById[messageId] != null) return messagesById[messageId]
+      if (String(messageId).startsWith("msg_tgc_")) {
+        throw makeBoundaryError({
+          source: "opencode",
+          operation: "GET prompt message",
+          method: "GET",
+          pathname: `/session/${sessionId}/message/${messageId}`,
+          status: 404,
+          outcome: "stale",
+          message: "message not found",
+        })
+      }
+      return null
     },
     async listMessages(sessionId, input = {}) {
       calls.listMessages.push({ sessionId, input })
@@ -383,6 +467,7 @@ async function createHarness({
   autoStartRetryAttempts,
   opencodeWatchdog,
   createStateStoreImpl,
+  createDurableOutboxRuntimeImpl,
   configPatch,
   logger = makeLogger(),
 } = {}) {
@@ -442,6 +527,7 @@ async function createHarness({
     deps: {
       createTelegramClient: () => tg,
       ...(createStateStoreImpl ? { createStateStore: createStateStoreImpl } : {}),
+      ...(createDurableOutboxRuntimeImpl ? { createDurableOutboxRuntime: createDurableOutboxRuntimeImpl } : {}),
       createOpenCodeClient: () => ocClientsByAlias[ocAliases.shift()],
       startSseLoop: ({ projectAlias, ...rest }) => {
         sseHandlers.set(projectAlias, rest)
@@ -769,27 +855,29 @@ test("startConnector ignores commands addressed to another bot", async () => {
   }
 })
 
-test("startConnector ignores targeted commands when bot username is unknown", async () => {
-  const harness = await createHarness({
-    tgOptions: {
-      getMeImpl: async () => {
-        throw new Error("getMe unavailable")
-      },
-    },
-  })
-
-  try {
-    harness.tg.enqueue(makeMessageUpdate(111, "/start@OtherBot"))
-    harness.tg.enqueue(makeMessageUpdate(112, "/start"))
-
-    await waitFor(() => harness.tg.pendingUpdates === 0 && harness.tg.sentMessages.length === 1)
-    await harness.connector.stop()
-
-    assert.match(harness.tg.sentMessages[0].text, /^Telegram connector help:/)
-    const state = await readState(harness.stateFile)
-    assert.equal(state.updateOffset, 113)
-  } finally {
-    await harness.connector.stop()
+test("startConnector fails startup when Telegram getMe authentication is rejected", async () => {
+  for (const status of [401, 403]) {
+    const loggerEntries = []
+    await assert.rejects(
+      () => createHarness({
+        tgOptions: {
+          getMeImpl: async () => {
+            throw makeBoundaryError({
+              source: "telegram",
+              operation: "POST getMe",
+              method: "POST",
+              pathname: "/getMe",
+              status,
+              outcome: "fatal",
+              message: `getMe failed: ${status === 401 ? "Unauthorized" : "Forbidden"}`,
+            })
+          },
+        },
+        logger: makeLogger(loggerEntries),
+      }),
+      status === 401 ? /Unauthorized/ : /Forbidden/,
+    )
+    assert.doesNotMatch(JSON.stringify(loggerEntries), /test-token/)
   }
 })
 
@@ -1405,7 +1493,7 @@ test("startConnector retries fetching final assistant content after a transient 
   }
 })
 
-test("startConnector resends the final assistant reply if preview edit fails", async () => {
+test("startConnector resends the final assistant reply when Telegram proves the preview cannot be edited", async () => {
   const updatedAt = new Date(Date.now() + 60_000).toISOString()
   const completedAt = new Date(Date.now() + 61_000).toISOString()
   const messagesById = {
@@ -1432,7 +1520,14 @@ test("startConnector resends the final assistant reply if preview edit fails", a
     tgOptions: {
       editMessageTextImpl: async () => {
         editAttempts += 1
-        throw new Error("message no longer exists")
+        throw makeBoundaryError({
+          source: "telegram",
+          operation: "editMessageText",
+          kind: "http",
+          outcome: "fatal",
+          status: 400,
+          message: "Bad Request: message to edit not found",
+        })
       },
     },
   })
@@ -2143,6 +2238,49 @@ test("startConnector serves optional health endpoints", async () => {
   }
 })
 
+test("startConnector readiness stays false until the first-run backlog cutoff is durably persisted", async () => {
+  let healthAddress = null
+  let releaseSnapshot
+  let markSnapshotStarted
+  const snapshotRelease = new Promise((resolve) => { releaseSnapshot = resolve })
+  const snapshotStarted = new Promise((resolve) => { markSnapshotStarted = resolve })
+  const harness = await createHarness({
+    statePatch: { updateOffset: null },
+    configPatch: { healthServer: { enabled: true, host: "127.0.0.1", port: 0 } },
+    tgOptions: {
+      afterNegativeOffsetSnapshot: async () => {
+        markSnapshotStarted()
+        await snapshotRelease
+      },
+    },
+    startHealthServerImpl: async (options) => {
+      const handle = await startHealthServer(options)
+      healthAddress = handle.address
+      return handle
+    },
+  })
+
+  try {
+    await snapshotStarted
+    const baseUrl = `http://127.0.0.1:${healthAddress.port}`
+    const pending = await fetch(`${baseUrl}/readyz`)
+    assert.equal(pending.status, 503)
+    const pendingBody = await pending.json()
+    assert.equal(pendingBody.status, "not_ready")
+    assert.equal(pendingBody.checks.telegramPoll.ok, false)
+
+    releaseSnapshot()
+    const ready = await waitFor(async () => {
+      const response = await fetch(`${baseUrl}/readyz`)
+      return response.status === 200 ? response : null
+    })
+    assert.equal((await ready.json()).status, "ready")
+  } finally {
+    releaseSnapshot?.()
+    await harness.connector.stop()
+  }
+})
+
 test("startConnector sends pending runtime restart online notice on startup", async () => {
   const harness = await createHarness({
     statePatch: {
@@ -2492,8 +2630,9 @@ test("startConnector applies feed modes per thread for assistant, user, and chan
   }
 })
 
-test("startConnector mirrors TUI user messages when runtime setting is enabled", async () => {
+test("startConnector durably retries TUI user mirroring after a Telegram 503", async () => {
   const completedAt = new Date(Date.now() + 60_000).toISOString()
+  let attempts = 0
   const messagesById = {
     user_main: { info: { id: "user_main", role: "user", time: { created: completedAt, completed: completedAt } }, parts: [{ type: "text", text: "typed in tui" }] },
   }
@@ -2506,14 +2645,25 @@ test("startConnector mirrors TUI user messages when runtime setting is enabled",
       feedByContext: { "100:7": { mode: "main" } },
     },
     messagesById,
+    tgOptions: {
+      sendHtmlBlocksImpl: async () => {
+        attempts += 1
+        if (attempts === 1) throw makeBoundaryError({ source: "telegram", operation: "sendMessage", status: 503, outcome: "retryable", message: "temporarily unavailable" })
+      },
+    },
   })
 
   try {
     await harness.emitSse("demo", { type: "message.updated", properties: { sessionID: "ses_main", info: { id: "user_main", role: "user", time: { completed: completedAt } } } })
 
-    await waitFor(() => harness.tg.sentHtmlBlocks.some((entry) => entry.options.message_thread_id === 7 && entry.blocks[0]?.html === "<i>User:</i>\ntyped in tui"))
+    await waitFor(async () => {
+      const delivered = harness.tg.sentHtmlBlocks.some((entry) => entry.options.message_thread_id === 7 && entry.blocks[0]?.html === "<i>User:</i>\ntyped in tui")
+      return delivered && Object.keys((await readState(harness.stateFile)).outbox.items).length === 0
+    })
     const mirrored = harness.tg.sentHtmlBlocks.find((entry) => entry.options.message_thread_id === 7 && entry.blocks[0]?.html === "<i>User:</i>\ntyped in tui")
     assert.equal(mirrored.blocks.length, 1)
+    assert.equal(attempts, 2)
+    assert.deepEqual((await readState(harness.stateFile)).outbox.items, {})
   } finally {
     await harness.connector.stop()
   }
@@ -4485,7 +4635,7 @@ test("startConnector sends one reconnected notice after project recovery", async
   }
 })
 
-test("startConnector drains old backlog before processing live updates and advances offset", async () => {
+test("startConnector captures an atomic old-backlog cutoff before processing live updates", async () => {
   const loggerEntries = []
   const harness = await createHarness({
     statePatch: {
@@ -4505,15 +4655,69 @@ test("startConnector drains old backlog before processing live updates and advan
     const state = await readState(harness.stateFile)
     assert.equal(harness.tg.sentMessages.length, 1)
     assert.match(harness.tg.sentMessages[0].text, /Telegram connector help:/)
-    assert.ok(harness.tg.getUpdatesCalls.some((call) => call?.timeout === 0 && call?.offset === 0))
+    assert.ok(harness.tg.getUpdatesCalls.some((call) => call?.timeout === 0 && call?.offset === -1 && call?.limit === 1))
     assert.ok(harness.tg.getUpdatesCalls.some((call) => call?.timeout === 30 && call?.offset === 13))
     assert.equal(state.updateOffset, 14)
     assert.ok(loggerEntries.some((entry) =>
       entry.level === "info" &&
-      entry.args[0] === "Telegram backlog drained." &&
-      entry.args[1]?.skipped === 3 &&
+      entry.args[0] === "Telegram backlog cutoff captured." &&
+      entry.args[1]?.cutoffUpdateId === 12 &&
       entry.args[1]?.offset === 13,
     ))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector preserves an update that arrives immediately after the first-run backlog snapshot", async () => {
+  let snapshotCalls = 0
+  const harness = await createHarness({
+    statePatch: { updateOffset: null },
+    initialUpdates: [makeMessageUpdate(30, "/help"), makeMessageUpdate(31, "/help")],
+    tgOptions: {
+      afterNegativeOffsetSnapshot: async ({ enqueue }) => {
+        snapshotCalls += 1
+        enqueue(makeMessageUpdate(32, "/help"))
+      },
+    },
+  })
+
+  try {
+    await waitFor(() => harness.tg.sentMessages.length === 1)
+    const state = await waitFor(async () => {
+      const current = await readState(harness.stateFile)
+      return current.updateOffset === 33 ? current : null
+    })
+
+    assert.equal(snapshotCalls, 1)
+    assert.equal(state.updateOffset, 33)
+    assert.equal(harness.tg.sentMessages.length, 1)
+    assert.ok(harness.tg.getUpdatesCalls.some((call) => call?.offset === -1 && call?.limit === 1))
+    assert.ok(harness.tg.getUpdatesCalls.some((call) => call?.offset === 32 && call?.timeout === 30))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector fails safe after an interrupted backlog cutoff instead of discarding more updates", async () => {
+  const loggerEntries = []
+  const harness = await createHarness({
+    statePatch: { updateOffset: -1 },
+    initialUpdates: [makeMessageUpdate(40, "/help")],
+    logger: makeLogger(loggerEntries),
+  })
+
+  try {
+    await waitFor(() => harness.tg.sentMessages.length === 1)
+    const state = await waitFor(async () => {
+      const current = await readState(harness.stateFile)
+      return current.updateOffset === 41 ? current : null
+    })
+
+    assert.equal(state.updateOffset, 41)
+    assert.equal(harness.tg.getUpdatesCalls.some((call) => call?.offset === -1), false)
+    assert.ok(harness.tg.getUpdatesCalls.some((call) => call?.offset === 0 && call?.timeout === 30))
+    assert.ok(loggerEntries.some((entry) => entry.level === "warn" && entry.args[0] === "Recovering an interrupted Telegram backlog cutoff without discarding queued updates."))
   } finally {
     await harness.connector.stop()
   }
@@ -4736,7 +4940,7 @@ test("startConnector skips replayed Telegram message updates without duplicate p
   }
 })
 
-test("startConnector retries user prompts after retryable promptAsync failure", async () => {
+test("startConnector retries user prompts after a clearly unsent promptAsync failure", async () => {
   let attempts = 0
   const update = makeMessageUpdate(625, "hello retry", { messageId: 5050 })
   const harness = await createHarness({
@@ -4753,14 +4957,9 @@ test("startConnector retries user prompts after retryable promptAsync failure", 
       promptAsyncImpl: async () => {
         attempts += 1
         if (attempts === 1) {
-          throw makeBoundaryError({
-            source: "opencode",
-            operation: "POST /session/ses_1/prompt_async",
-            method: "POST",
-            pathname: "/session/ses_1/prompt_async",
-            status: 503,
-            message: "opencode down",
-          })
+          const err = new Error("OpenCode connection timed out before the request was sent")
+          err.code = "UND_ERR_CONNECT_TIMEOUT"
+          throw err
         }
         return { ok: true }
       },
@@ -4777,6 +4976,121 @@ test("startConnector retries user prompts after retryable promptAsync failure", 
       { sessionId: "ses_1", text: "[TG] hello retry" },
     ])
     assert.match(harness.tg.sentMessages[0].text, /Project 'demo' is unavailable/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector reconciles an accepted text prompt after a lost response without another POST", async () => {
+  const lost = acceptedThenLostOpenCodeOptions()
+  const update = makeMessageUpdate(627, "accepted once", { messageId: 5052 })
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 627,
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+      sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+    },
+    ocOptions: lost.options,
+    initialUpdates: [[update], [update]],
+  })
+
+  try {
+    await waitFor(async () => (await readState(harness.stateFile)).updateOffset === 628)
+    assert.equal(harness.ocCalls.promptAsync.length, 1)
+    assert.equal(harness.ocCalls.getMessage.length, 1)
+    assert.equal(lost.accepted.size, 1)
+    assert.equal(harness.ocCalls.promptMessageIDs[0], harness.ocCalls.getMessage[0].messageId)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector reconciles an accepted direct attachment prompt after a lost response", async () => {
+  const lost = acceptedThenLostOpenCodeOptions()
+  let downloadCalls = 0
+  const update = makeDocumentUpdate(628, {
+    file_id: "direct_file",
+    file_name: "direct.txt",
+    mime_type: "text/plain",
+    file_size: 16,
+  }, { messageId: 5053 })
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 628,
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+      sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+    },
+    ocOptions: lost.options,
+    tgOptions: {
+      downloadFileImpl: async () => {
+        downloadCalls += 1
+        if (downloadCalls > 1) {
+          throw makeBoundaryError({ source: "telegram", operation: "downloadFile", status: 400, outcome: "fatal", message: "file expired" })
+        }
+        return new TextEncoder().encode("attachment text")
+      },
+    },
+    initialUpdates: [[update], [update]],
+  })
+
+  try {
+    await waitFor(async () => (await readState(harness.stateFile)).updateOffset === 629)
+    assert.equal(harness.ocCalls.promptAsync.length, 1)
+    assert.equal(harness.ocCalls.getMessage.length, 1)
+    assert.equal(lost.accepted.size, 1)
+    assert.equal(downloadCalls, 1)
+    assert.equal(harness.ocCalls.promptMessageIDs[0], harness.ocCalls.getMessage[0].messageId)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector replays and reconciles an accepted confirmed attachment callback after a lost response", async () => {
+  const lost = acceptedThenLostOpenCodeOptions()
+  let downloadCalls = 0
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 629,
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+      sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+    },
+    ocOptions: lost.options,
+    tgOptions: {
+      downloadFileImpl: async () => {
+        downloadCalls += 1
+        if (downloadCalls > 1) {
+          throw makeBoundaryError({ source: "telegram", operation: "downloadFile", status: 400, outcome: "fatal", message: "file expired" })
+        }
+        return new TextEncoder().encode("attachment text")
+      },
+    },
+  })
+
+  try {
+    harness.tg.enqueue(makeDocumentUpdate(629, {
+      file_id: "confirmed_file",
+      file_name: "confirmed.txt",
+      mime_type: "text/plain",
+      file_size: USER_ATTACHMENT_LIMITS.confirmBytes,
+    }, { messageId: 5054 }))
+    const confirmation = await waitFor(() => harness.tg.sentMessages.find((entry) => entry.text.includes("Confirm sending this file")))
+    const sendButton = confirmation.replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file")
+    assert.ok(sendButton)
+
+    const callback = makeCallbackUpdate(630, sendButton.callback_data, { messageId: confirmation.result.message_id })
+    harness.tg.enqueueBatch([callback])
+    harness.tg.enqueueBatch([callback])
+    await waitFor(async () => (await readState(harness.stateFile)).updateOffset === 631)
+
+    assert.equal(harness.ocCalls.promptAsync.length, 1)
+    assert.equal(harness.ocCalls.getMessage.length, 1)
+    assert.equal(lost.accepted.size, 1)
+    assert.equal(downloadCalls, 1)
+    assert.equal(harness.ocCalls.promptMessageIDs[0], harness.ocCalls.getMessage[0].messageId)
+    assert.deepEqual(
+      harness.tg.callbackAnswers.filter((entry) => entry.callbackQueryId === "cb_630").map((entry) => entry.text),
+      ["Sending…", "Temporarily unavailable", "Sending…"],
+    )
   } finally {
     await harness.connector.stop()
   }
@@ -5391,6 +5705,422 @@ test("startConnector bounds pending assistant drain during shutdown", async () =
   }
 })
 
+test("startConnector aborts an in-flight durable Telegram send and leaves it queued during shutdown", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  let markSendStarted
+  const sendStarted = new Promise((resolve) => { markSendStarted = resolve })
+  let observedSignal
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 663,
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+      sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+    },
+    messagesById: {
+      msg_outbox_abort: {
+        info: { id: "msg_outbox_abort", role: "assistant", time: { completed: completedAt } },
+        parts: [{ type: "text", text: "send interrupted by shutdown" }],
+      },
+    },
+    tgOptions: {
+      sendHtmlBlocksImpl: async ({ options }) => {
+        observedSignal = options.signal
+        markSendStarted()
+        await new Promise((_resolve, reject) => {
+          const rejectAbort = () => reject(Object.assign(new Error("aborted"), { name: "AbortError" }))
+          if (options.signal?.aborted) rejectAbort()
+          else options.signal?.addEventListener?.("abort", rejectAbort, { once: true })
+        })
+      },
+    },
+    assistantDrainTimeoutMs: 5,
+  })
+
+  try {
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_1", info: { id: "msg_outbox_abort", role: "assistant", time: { completed: completedAt } } },
+    })
+    await sendStarted
+
+    const startedAt = Date.now()
+    await harness.connector.stop()
+
+    assert.ok(Date.now() - startedAt < 500)
+    assert.equal(observedSignal?.aborted, true)
+    assert.equal(harness.tg.sentHtmlBlocks.length, 0)
+    assert.equal(Object.keys((await readState(harness.stateFile)).outbox.items).length, 1)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector retries a durable final assistant delivery after Telegram 503 and removes it only after success", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  let attempts = 0
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 662,
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+      sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+    },
+    messagesById: {
+      msg_durable_503: {
+        info: { id: "msg_durable_503", role: "assistant", time: { completed: completedAt } },
+        parts: [{ type: "text", text: "recover after Telegram outage" }],
+      },
+    },
+    tgOptions: {
+      sendHtmlBlocksImpl: async () => {
+        attempts += 1
+        if (attempts === 1) {
+          throw makeBoundaryError({ source: "telegram", operation: "sendHtmlBlocks", status: 503, outcome: "retryable", message: "temporarily unavailable" })
+        }
+      },
+    },
+  })
+
+  try {
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_1", info: { id: "msg_durable_503", role: "assistant", time: { completed: completedAt } } },
+    })
+    await waitFor(async () => {
+      const state = await readState(harness.stateFile)
+      const item = Object.values(state.outbox.items)[0]
+      return item?.attemptCount === 1 && item.lastError === "http:503" ? item : null
+    }, { timeoutMs: 3000 })
+    await waitFor(async () => {
+      const state = await readState(harness.stateFile)
+      return harness.tg.sentHtmlBlocks.length === 1 && Object.keys(state.outbox.items).length === 0
+    }, { timeoutMs: 4000 })
+
+    assert.equal(attempts, 2)
+    assert.equal(harness.tg.sentHtmlBlocks[0].blocks[0].html, "recover after Telegram outage")
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector checkpoints assistant text before retrying changed-files delivery", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  let changedFilesAttempts = 0
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 662,
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+      sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+    },
+    messagesById: {
+      msg_durable_changes: {
+        info: { id: "msg_durable_changes", role: "assistant", time: { completed: completedAt } },
+        parts: [
+          { type: "text", text: "Patched once" },
+          { type: "patch", files: ["/repo/a.js"], diff: "--- a/a.js\n+++ b/a.js\n@@ -1 +1 @@\n-old\n+new" },
+        ],
+      },
+    },
+    tgOptions: {
+      sendMessageImpl: async () => {
+        changedFilesAttempts += 1
+        if (changedFilesAttempts === 1) {
+          throw makeBoundaryError({ source: "telegram", operation: "sendMessage", status: 503, outcome: "retryable", message: "temporarily unavailable" })
+        }
+      },
+    },
+  })
+
+  try {
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_1", info: { id: "msg_durable_changes", role: "assistant", time: { completed: completedAt } } },
+    })
+    await waitFor(async () => {
+      const item = Object.values((await readState(harness.stateFile)).outbox.items)[0]
+      return item?.attemptCount === 1 && item.progress?.assistantTextDelivered === true && item.progress?.changedFilesDelivered !== true ? item : null
+    }, { timeoutMs: 3000 })
+    await waitFor(async () => {
+      const state = await readState(harness.stateFile)
+      return harness.tg.sentMessages.length === 1 && Object.keys(state.outbox.items).length === 0
+    }, { timeoutMs: 4000 })
+
+    assert.equal(changedFilesAttempts, 2)
+    assert.equal(harness.tg.sentHtmlBlocks.length, 1)
+    assert.equal(harness.tg.sentHtmlBlocks[0].blocks[0].html, "Patched once")
+    assert.match(harness.tg.sentMessages[0].text, /Changed files:/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector durably retries an agent error notice after Telegram 503", async () => {
+  const createdAt = new Date(Date.now() + 60_000).toISOString()
+  let attempts = 0
+  const errorInfo = { id: "msg_durable_error", role: "assistant", time: { created: createdAt }, error: { name: "AgentError", message: "tool failed" } }
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 662,
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+      sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+    },
+    messagesById: {
+      msg_durable_error: { info: errorInfo, parts: [] },
+    },
+    tgOptions: {
+      sendMessageImpl: async () => {
+        attempts += 1
+        if (attempts === 1) {
+          throw makeBoundaryError({ source: "telegram", operation: "sendMessage", status: 503, outcome: "retryable", message: "temporarily unavailable" })
+        }
+      },
+    },
+  })
+
+  try {
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_1", info: errorInfo },
+    })
+    await waitFor(async () => {
+      const item = Object.values((await readState(harness.stateFile)).outbox.items)[0]
+      return item?.type === "agent-error" && item.attemptCount === 1 ? item : null
+    }, { timeoutMs: 3000 })
+    await waitFor(async () => {
+      const state = await readState(harness.stateFile)
+      return harness.tg.sentMessages.length === 1 && Object.keys(state.outbox.items).length === 0
+    }, { timeoutMs: 4000 })
+
+    assert.equal(attempts, 2)
+    assert.match(harness.tg.sentMessages[0].text, /Assistant reply failed/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector resumes durable multipart assistant delivery after restart without resending the first block", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const longText = "A".repeat(5000)
+  const messagesById = {
+    msg_durable_blocks: {
+      info: { id: "msg_durable_blocks", role: "assistant", time: { completed: completedAt } },
+      parts: [{ type: "text", text: longText }],
+    },
+  }
+  const firstHarness = await createHarness({
+    statePatch: {
+      updateOffset: 663,
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+      sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+    },
+    messagesById,
+    tgOptions: {
+      sendMessageImpl: async ({ callIndex }) => {
+        if (callIndex === 2) {
+          throw makeBoundaryError({ source: "telegram", operation: "sendMessage", kind: "network", outcome: "retryable", message: "connection lost" })
+        }
+      },
+    },
+  })
+
+  let persistedState
+  let firstBlock
+  try {
+    await firstHarness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_1", info: { id: "msg_durable_blocks", role: "assistant", time: { completed: completedAt } } },
+    })
+    persistedState = await waitFor(async () => {
+      const state = await readState(firstHarness.stateFile)
+      const item = Object.values(state.outbox.items)[0]
+      return item?.progress?.assistantTextBlockIndex === 1 && item.attemptCount === 1 ? state : null
+    }, { timeoutMs: 3000 })
+    firstBlock = firstHarness.tg.sentMessages[0]?.text
+    assert.equal(firstHarness.tg.sentMessages.length, 1)
+  } finally {
+    await firstHarness.connector.stop()
+  }
+
+  const secondHarness = await createHarness({ statePatch: persistedState, messagesById })
+  try {
+    await waitFor(async () => {
+      const state = await readState(secondHarness.stateFile)
+      return secondHarness.tg.sentMessages.length === 1 && Object.keys(state.outbox.items).length === 0
+    }, { timeoutMs: 4000 })
+
+    const expectedBlocks = formatMarkdownToTelegramHtmlBlocks(longText).map((block) => block.html)
+    assert.deepEqual([firstBlock, secondHarness.tg.sentMessages[0].text], expectedBlocks)
+  } finally {
+    await secondHarness.connector.stop()
+  }
+})
+
+test("startConnector resumes durable multipart TUI user mirroring after restart without resending the first block", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const longText = "U".repeat(5000)
+  const messagesById = {
+    user_durable_blocks: {
+      info: { id: "user_durable_blocks", role: "user", time: { completed: completedAt } },
+      parts: [{ type: "text", text: longText }],
+    },
+  }
+  const firstHarness = await createHarness({
+    configPatch: { mirrorTuiUserMessages: true },
+    statePatch: {
+      updateOffset: 664,
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+      sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+    },
+    messagesById,
+    tgOptions: {
+      sendHtmlBlocksImpl: async ({ callIndex }) => {
+        if (callIndex === 2) {
+          throw makeBoundaryError({ source: "telegram", operation: "sendHtmlBlocks", kind: "network", outcome: "retryable", message: "connection lost" })
+        }
+      },
+    },
+  })
+
+  let persistedState
+  let firstBlock
+  try {
+    await firstHarness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_1", info: { id: "user_durable_blocks", role: "user", time: { completed: completedAt } } },
+    })
+    await waitFor(async () => {
+      const item = Object.values((await readState(firstHarness.stateFile)).outbox.items)[0]
+      return item?.progress?.userBlockIndex === 1 && item.attemptCount >= 1 ? item : null
+    }, { timeoutMs: 3000 })
+    firstBlock = firstHarness.tg.sentHtmlBlocks[0]?.blocks[0]?.html
+    assert.equal(firstHarness.tg.sentHtmlBlocks.length, 1)
+  } finally {
+    await firstHarness.connector.stop()
+    persistedState = await readState(firstHarness.stateFile)
+  }
+
+  const secondHarness = await createHarness({ configPatch: { mirrorTuiUserMessages: true }, statePatch: persistedState, messagesById })
+  try {
+    const expectedBlocks = formatUserMirrorBlocks(longText).map((block) => block.html)
+    await waitFor(async () => {
+      const state = await readState(secondHarness.stateFile)
+      return secondHarness.tg.sentHtmlBlocks.length === expectedBlocks.length - 1 && Object.keys(state.outbox.items).length === 0
+    }, { timeoutMs: 4000 })
+
+    assert.deepEqual(
+      [firstBlock, ...secondHarness.tg.sentHtmlBlocks.map((entry) => entry.blocks[0]?.html)],
+      expectedBlocks,
+    )
+  } finally {
+    await secondHarness.connector.stop()
+  }
+})
+
+test("startConnector resumes multipart changed-files delivery after restart without resending completed chunks", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const files = Array.from({ length: 30 }, (_, index) => `src/${String(index).padStart(2, "0")}-${"nested-path-".repeat(20)}.js`)
+  const expectedChunks = splitTelegramText(formatChangedFilesText(files, { limit: files.length })).filter((chunk) => chunk.trim())
+  assert.ok(expectedChunks.length > 1)
+  const messagesById = {
+    msg_durable_changed_chunks: {
+      info: { id: "msg_durable_changed_chunks", role: "assistant", time: { completed: completedAt } },
+      parts: [{ type: "patch", files }],
+    },
+  }
+  const configPatch = { limits: { changedFilesLimit: files.length } }
+  const firstHarness = await createHarness({
+    configPatch,
+    statePatch: {
+      updateOffset: 665,
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+      sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+    },
+    messagesById,
+    tgOptions: {
+      sendMessageImpl: async ({ callIndex }) => {
+        if (callIndex === 2) {
+          throw makeBoundaryError({ source: "telegram", operation: "sendMessage", kind: "network", outcome: "retryable", message: "connection lost" })
+        }
+      },
+    },
+  })
+
+  let persistedState
+  let firstChunk
+  try {
+    await firstHarness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_1", info: { id: "msg_durable_changed_chunks", role: "assistant", time: { completed: completedAt } } },
+    })
+    await waitFor(async () => {
+      const item = Object.values((await readState(firstHarness.stateFile)).outbox.items)[0]
+      return item?.progress?.changedFilesChunkIndex === 1 && item.attemptCount >= 1 ? item : null
+    }, { timeoutMs: 3000 })
+    firstChunk = firstHarness.tg.sentMessages[0]?.text
+    assert.equal(firstHarness.tg.sentMessages.length, 1)
+  } finally {
+    await firstHarness.connector.stop()
+    persistedState = await readState(firstHarness.stateFile)
+  }
+
+  const secondHarness = await createHarness({ configPatch, statePatch: persistedState, messagesById })
+  try {
+    await waitFor(async () => {
+      const state = await readState(secondHarness.stateFile)
+      return secondHarness.tg.sentMessages.length === expectedChunks.length - 1 && Object.keys(state.outbox.items).length === 0
+    }, { timeoutMs: 4000 })
+
+    assert.deepEqual([firstChunk, ...secondHarness.tg.sentMessages.map((entry) => entry.text)], expectedChunks)
+  } finally {
+    await secondHarness.connector.stop()
+  }
+})
+
+test("startConnector deduplicates repeated assistant SSE completions through the durable outbox", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const messagesById = {
+    msg_durable_dedupe: {
+      info: { id: "msg_durable_dedupe", role: "assistant", time: { completed: completedAt } },
+      parts: [{ type: "text", text: "deliver once" }],
+    },
+  }
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 664,
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+      sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+    },
+    messagesById,
+  })
+  const event = {
+    type: "message.updated",
+    properties: { sessionID: "ses_1", info: { id: "msg_durable_dedupe", role: "assistant", time: { completed: completedAt } } },
+  }
+
+  let persistedState
+  try {
+    await Promise.all([harness.emitSse("demo", event), harness.emitSse("demo", event)])
+    await waitFor(() => harness.tg.sentHtmlBlocks.length === 1)
+    await harness.emitSse("demo", event)
+    await delay(300)
+
+    assert.equal(harness.tg.sentHtmlBlocks.length, 1)
+    assert.equal(harness.tg.sentHtmlBlocks[0].blocks[0].html, "deliver once")
+    persistedState = await readState(harness.stateFile)
+  } finally {
+    await harness.connector.stop()
+  }
+
+  const restarted = await createHarness({ statePatch: persistedState, messagesById })
+  try {
+    await restarted.emitSse("demo", event)
+    await delay(300)
+    assert.equal(restarted.tg.sentHtmlBlocks.length, 0)
+    assert.deepEqual((await readState(restarted.stateFile)).outbox.items, {})
+  } finally {
+    await restarted.connector.stop()
+  }
+})
+
 test("startConnector stop waits for SSE done after synchronous stop request", async () => {
   let resolveSseStop = () => {}
   let stopCalls = 0
@@ -5431,6 +6161,56 @@ test("startConnector stop waits for SSE done after synchronous stop request", as
   }
 })
 
+test("startConnector stop completes managed cleanup and final state flush when outbox drain fails", async () => {
+  const loggerEntries = []
+  let flushCalls = 0
+  let sseStopCalls = 0
+  let healthStopCalls = 0
+  let drainCalls = 0
+  const harness = await createHarness({
+    statePatch: { updateOffset: 665 },
+    configPatch: { healthServer: { enabled: true, host: "127.0.0.1", port: 0 } },
+    logger: makeLogger(loggerEntries),
+    createStateStoreImpl: (options) => {
+      const store = new StateStore(options)
+      const flush = store.flush.bind(store)
+      store.flush = async () => {
+        flushCalls += 1
+        return flush()
+      }
+      return store
+    },
+    createDurableOutboxRuntimeImpl: () => ({
+      outbox: {},
+      start: () => Promise.resolve(),
+      async drain() {
+        drainCalls += 1
+        throw new Error("dedicated drain failed")
+      },
+    }),
+    startSseLoopImpl: () => ({
+      stop() {
+        sseStopCalls += 1
+      },
+    }),
+    startHealthServerImpl: async () => ({
+      address: { address: "127.0.0.1", port: 8787 },
+      async stop() {
+        healthStopCalls += 1
+      },
+    }),
+  })
+
+  const flushCallsBeforeStop = flushCalls
+  await harness.connector.stop()
+
+  assert.equal(drainCalls, 1)
+  assert.equal(sseStopCalls, 1)
+  assert.equal(healthStopCalls, 1)
+  assert.ok(flushCalls > flushCallsBeforeStop)
+  assert.ok(loggerEntries.some((entry) => entry.level === "error" && /dedicated drain failed/.test(entry.args.join(" "))))
+})
+
 test("startConnector reports fatal escaped core-loop errors instead of swallowing them", async () => {
   const fatalErrors = []
   const harness = await createHarness({
@@ -5452,6 +6232,100 @@ test("startConnector reports fatal escaped core-loop errors instead of swallowin
 
     assert.match(fatalErrors[0]?.message || "", /fatal loop crash/)
     assert.equal(harness.tg.getUpdatesCalls.length, getUpdatesCount)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector treats fatal getUpdates authentication failures as one controlled runtime failure", async () => {
+  const fatalErrors = []
+  const loggerEntries = []
+  const harness = await createHarness({
+    statePatch: { updateOffset: 666 },
+    onFatalErrorImpl: (err) => fatalErrors.push(err),
+    logger: makeLogger(loggerEntries),
+  })
+
+  try {
+    harness.tg.setGetUpdatesError(makeBoundaryError({
+      source: "telegram",
+      operation: "POST getUpdates",
+      method: "POST",
+      pathname: "/getUpdates",
+      status: 401,
+      outcome: "fatal",
+      message: "getUpdates failed: Unauthorized",
+    }))
+    await waitFor(() => fatalErrors.length === 1)
+    const pollCount = harness.tg.getUpdatesCalls.length
+    await delay(30)
+
+    assert.equal(fatalErrors.length, 1)
+    assert.equal(harness.tg.getUpdatesCalls.length, pollCount)
+    assert.equal(fatalErrors[0].status, 401)
+    assert.doesNotMatch(JSON.stringify(loggerEntries), /test-token/)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector treats a malformed successful getUpdates response as one controlled runtime failure", async () => {
+  const fatalErrors = []
+  const harness = await createHarness({
+    statePatch: { updateOffset: 666 },
+    onFatalErrorImpl: (err) => fatalErrors.push(err),
+  })
+
+  try {
+    harness.tg.setGetUpdatesError(makeBoundaryError({
+      source: "telegram",
+      operation: "POST getUpdates",
+      method: "POST",
+      pathname: "/getUpdates",
+      status: 200,
+      kind: "protocol",
+      outcome: "fatal",
+      message: "getUpdates returned malformed JSON",
+    }))
+    await waitFor(() => fatalErrors.length === 1)
+    const pollCount = harness.tg.getUpdatesCalls.length
+    await delay(30)
+
+    assert.equal(fatalErrors.length, 1)
+    assert.equal(fatalErrors[0].kind, "protocol")
+    assert.equal(harness.tg.getUpdatesCalls.length, pollCount)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector continues polling after retryable Telegram 429 and 503 responses", async () => {
+  const fatalErrors = []
+  const harness = await createHarness({
+    statePatch: { updateOffset: 666 },
+    onFatalErrorImpl: (err) => fatalErrors.push(err),
+  })
+
+  try {
+    harness.tg.enqueueGetUpdatesError(makeBoundaryError({
+      source: "telegram",
+      operation: "POST getUpdates",
+      status: 429,
+      retryAfterMs: 1,
+      outcome: "retryable",
+      message: "rate limited",
+    }))
+    harness.tg.enqueueGetUpdatesError(makeBoundaryError({
+      source: "telegram",
+      operation: "POST getUpdates",
+      status: 503,
+      outcome: "retryable",
+      message: "temporarily unavailable",
+    }))
+    const initialPolls = harness.tg.getUpdatesCalls.length
+    await waitFor(() => harness.tg.getUpdatesCalls.length >= initialPolls + 3)
+
+    assert.deepEqual(fatalErrors, [])
   } finally {
     await harness.connector.stop()
   }

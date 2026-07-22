@@ -117,7 +117,10 @@ export function createCallbackHandlers(runtime) {
   })
 
   async function handleTelegramCallback(callbackQuery) {
-    if (!isAllowedUser(callbackQuery?.from)) return
+    if (!isAllowedUser(callbackQuery?.from)) {
+      await answerCallbackQuery(callbackQuery?.id)
+      return
+    }
     const msg = callbackQuery.message
     let ctxMeta = ctxMetaFromMessage(msg, callbackQuery?.from)
     ctxMeta = rememberTelegramLocale?.(ctxMeta) || ctxMeta

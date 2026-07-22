@@ -1,4 +1,5 @@
 import { ATTACHMENT_NOTICES, attachmentCaption } from "../attachment-utils.js"
+import { splitTelegramText } from "../../telegram/client.js"
 import { sendChangedFilesExport } from "./changed-files-export.js"
 import {
   changedFilesAttachmentName as formatChangedFilesAttachmentName,
@@ -9,6 +10,7 @@ import {
   renderSelectedFileDiffHtml,
 } from "./changed-files-format.js"
 import { createChangedFilesKeyboards } from "./changed-files-keyboards.js"
+import { editPreviewOrNull } from "./preview-edit.js"
 
 export function createChangedFilesView({
   store,
@@ -49,15 +51,32 @@ export function createChangedFilesView({
     return formatChangedFilesSummary(projectAlias, msg, { projects, limit: changedFilesLimit })
   }
 
-  async function deliverChangedFilesSummary(ctxMeta, projectAlias, sessionId, messageId, msg, { replaceMessageId } = {}) {
+  async function deliverChangedFilesSummary(ctxMeta, projectAlias, sessionId, messageId, msg, { replaceMessageId, deliveryOptions = {} } = {}) {
     const text = extractChangedFilesSummary(projectAlias, msg)
     if (!text) return null
     const replyMarkup = changedFilesSummaryKeyboard(projectAlias, sessionId, messageId, msg)
-    if (replaceMessageId) {
-      const edited = await tg.editMessageText(ctxMeta.chatId, replaceMessageId, text, replyMarkup).catch(() => null)
-      if (edited) return { mode: "edited" }
+    const chunks = splitTelegramText(text).filter((chunk) => chunk.trim())
+    let startIndex = Number.isInteger(deliveryOptions.changedFilesChunkIndex) && deliveryOptions.changedFilesChunkIndex >= 0
+      ? deliveryOptions.changedFilesChunkIndex
+      : 0
+    if (replaceMessageId && startIndex === 0) {
+      const edited = await editPreviewOrNull(() => tg.editMessageText(
+        ctxMeta.chatId,
+        replaceMessageId,
+        chunks[0],
+        chunks.length === 1 ? replyMarkup : null,
+        { signal: deliveryOptions.signal },
+      ))
+      if (edited) {
+        startIndex = 1
+        await deliveryOptions.onProgress?.({ changedFilesChunkIndex: startIndex })
+        if (chunks.length === 1) return { mode: "edited" }
+      }
     }
-    await sendToThread(ctxMeta, text, replyMarkup)
+    for (let index = startIndex; index < chunks.length; index += 1) {
+      await sendToThread(ctxMeta, chunks[index], index === chunks.length - 1 ? replyMarkup : null, { signal: deliveryOptions.signal })
+      await deliveryOptions.onProgress?.({ changedFilesChunkIndex: index + 1 })
+    }
     return { mode: "sent" }
   }
 

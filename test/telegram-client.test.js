@@ -2,6 +2,7 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { TELEGRAM_SAFE_MESSAGE_MAX_LEN, TelegramClient, makeInlineKeyboard, prepareTelegramEditText, splitTelegramHtml, splitTelegramText } from "../src/telegram/client.js"
 import { classifyBoundaryError, makeBoundaryError } from "../src/boundary-errors.js"
+import { TELEGRAM_ERROR_RESPONSE_MAX_BYTES, TELEGRAM_JSON_RESPONSE_MAX_BYTES } from "../src/http-response.js"
 
 function makeJsonAbortResponse(signal, { ok = true, status = 200, statusText = "OK" } = {}) {
   return {
@@ -424,7 +425,9 @@ test("TelegramClient call and callMultipart surface unparsable API responses as 
       assert.equal(err.pathname, "/sendDocument")
       assert.equal(err.status, 200)
       assert.equal(err.details, null)
-      assert.match(err.message, /sendDocument failed: OK/)
+      assert.equal(err.kind, "protocol")
+      assert.equal(err.outcome, "fatal")
+      assert.match(err.message, /malformed JSON/)
       return true
     })
   } finally {
@@ -833,4 +836,130 @@ test("TelegramClient reports edit failures with remembered topic context", async
   assert.equal(failures[0].params.message_thread_id, 7)
   assert.equal(failures[1].method, "editMessageReplyMarkup")
   assert.equal(failures[1].params.message_thread_id, 7)
+})
+
+test("TelegramClient treats malformed successful JSON and oversized success bodies as fatal protocol failures", async () => {
+  const originalFetch = globalThis.fetch
+  const queue = [
+    new Response("not-json", { status: 200 }),
+    new Response("{}", { status: 200, headers: { "content-length": String(TELEGRAM_JSON_RESPONSE_MAX_BYTES + 1) } }),
+  ]
+  globalThis.fetch = async () => queue.shift()
+
+  try {
+    const client = new TelegramClient("token", { baseUrl: "https://api.example.test/bot" })
+    await assert.rejects(() => client.getMe(), (err) => {
+      assert.equal(err.kind, "protocol")
+      assert.equal(err.outcome, "fatal")
+      assert.match(err.message, /malformed JSON/)
+      return true
+    })
+    await assert.rejects(() => client.getMe(), (err) => {
+      assert.equal(err.kind, "response_too_large")
+      assert.equal(err.outcome, "fatal")
+      assert.equal(err.code, "RESPONSE_TOO_LARGE")
+      return true
+    })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("TelegramClient bounds oversized error bodies while preserving retryable status", async () => {
+  const originalFetch = globalThis.fetch
+  const secretTail = "telegram-secret-tail"
+  globalThis.fetch = async () => new Response(
+    `${"x".repeat(TELEGRAM_ERROR_RESPONSE_MAX_BYTES + 1)}${secretTail}`,
+    { status: 503, statusText: "Unavailable" },
+  )
+
+  try {
+    const client = new TelegramClient("token", { baseUrl: "https://api.example.test/bot" })
+    await assert.rejects(() => client.getUpdates({ offset: 0, timeout: 0 }), (err) => {
+      assert.equal(err.status, 503)
+      assert.equal(classifyBoundaryError(err).retryable, true)
+      assert.equal(err.message.includes(secretTail), false)
+      assert.deepEqual(err.details, { errorCode: 503, nonJson: true, responseTruncated: true })
+      return true
+    })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("TelegramClient classifies 401 and 403 as fatal while 503 remains retryable", async () => {
+  const originalFetch = globalThis.fetch
+  const queue = [401, 403, 503].map((status) => new Response(
+    JSON.stringify({ ok: false, description: status === 401 ? "Unauthorized" : status === 403 ? "Forbidden" : "Unavailable" }),
+    { status, statusText: "Error", headers: { "content-type": "application/json" } },
+  ))
+  globalThis.fetch = async () => queue.shift()
+
+  try {
+    const client = new TelegramClient("token", { baseUrl: "https://api.example.test/bot" })
+    for (const status of [401, 403]) {
+      await assert.rejects(() => client.getMe(), (err) => {
+        assert.equal(err.status, status)
+        assert.equal(classifyBoundaryError(err).fatal, true)
+        return true
+      })
+    }
+    await assert.rejects(() => client.getUpdates({ offset: 0, timeout: 0 }), (err) => {
+      assert.equal(err.status, 503)
+      assert.equal(classifyBoundaryError(err).retryable, true)
+      return true
+    })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("TelegramClient preserves retryable HTTP semantics for non-JSON 429 and 503 responses", async () => {
+  const originalFetch = globalThis.fetch
+  const queue = [
+    new Response("rate limit proxy page", { status: 429, statusText: "Too Many Requests" }),
+    new Response("upstream unavailable", { status: 503, statusText: "Unavailable" }),
+  ]
+  globalThis.fetch = async () => queue.shift()
+
+  try {
+    const client = new TelegramClient("token", { baseUrl: "https://api.example.test/bot" })
+    for (const status of [429, 503]) {
+      await assert.rejects(() => client.getUpdates({ offset: 0, timeout: 0 }), (err) => {
+        assert.equal(err.status, status)
+        assert.equal(classifyBoundaryError(err).retryable, true)
+        assert.equal(err.kind, "http")
+        assert.match(err.message, /non-JSON error response/)
+        assert.deepEqual(err.details, { errorCode: status, nonJson: true })
+        return true
+      })
+    }
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("TelegramClient redacts and caps valid Telegram error descriptions at the boundary", async () => {
+  const originalFetch = globalThis.fetch
+  const token = "123456789:AAExampleSecretTokenForRegression"
+  const longDescription = `/bot${token} ${"diagnostic ".repeat(1_000)}`
+  globalThis.fetch = async () => new Response(
+    JSON.stringify({ ok: false, error_code: 401, description: longDescription }),
+    { status: 401, statusText: "Unauthorized", headers: { "content-type": "application/json" } },
+  )
+
+  try {
+    const client = new TelegramClient(token, { baseUrl: "https://api.example.test/bot" })
+    await assert.rejects(() => client.getMe(), (err) => {
+      assert.equal(err.status, 401)
+      assert.equal(classifyBoundaryError(err).fatal, true)
+      assert.ok(err.message.length < 550)
+      assert.equal(err.message.includes(token), false)
+      assert.equal(JSON.stringify(err.details).includes(token), false)
+      assert.deepEqual(err.details, { errorCode: 401 })
+      return true
+    })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })

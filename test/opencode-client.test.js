@@ -3,6 +3,7 @@ import assert from "node:assert/strict"
 import { OpenCodeClient, OPENCODE_CORRELATION_HEADER } from "../src/opencode/client.js"
 import { classifyBoundaryError } from "../src/boundary-errors.js"
 import { runWithRequestContext } from "../src/runtime/request-context.js"
+import { OPENCODE_ERROR_RESPONSE_MAX_BYTES, OPENCODE_SUCCESS_RESPONSE_MAX_BYTES } from "../src/http-response.js"
 
 test("OpenCodeClient request sends query params, auth headers, and JSON bodies", async () => {
   const originalFetch = globalThis.fetch
@@ -137,7 +138,7 @@ test("OpenCodeClient convenience methods call the expected endpoints", async () 
   await client.selectTuiSession("ses_1")
   await client.getActiveTuiSession()
   await client.abortSession("ses_1")
-  await client.promptAsync("ses_1", "hello", { model: { providerID: "openai", modelID: "gpt-5" }, variant: "xhigh" })
+  await client.promptAsync("ses_1", "hello", { messageID: "msg_tgc_stable", model: { providerID: "openai", modelID: "gpt-5" }, variant: "xhigh" })
   await client.getMessage("ses_1", "msg_1")
   await client.listMessages("ses_1", { limit: 20 })
   await client.replyPermission("perm_1", { reply: "reject", message: "no" })
@@ -162,6 +163,7 @@ test("OpenCodeClient convenience methods call the expected endpoints", async () 
       options: {
         method: "POST",
         json: {
+          messageID: "msg_tgc_stable",
           parts: [{ type: "text", text: "hello" }],
           model: { providerID: "openai", modelID: "gpt-5" },
           variant: "xhigh",
@@ -342,6 +344,34 @@ test("OpenCodeClient request keeps timeout active while reading the response bod
     } finally {
       clearTimeout(abortTimer)
     }
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("OpenCodeClient rejects oversized success bodies and bounds oversized error bodies", async () => {
+  const originalFetch = globalThis.fetch
+  const secretTail = "do-not-retain-this-secret"
+  const queue = [
+    new Response("{}", { status: 200, headers: { "content-length": String(OPENCODE_SUCCESS_RESPONSE_MAX_BYTES + 1) } }),
+    new Response(`${"x".repeat(OPENCODE_ERROR_RESPONSE_MAX_BYTES + 1)}${secretTail}`, { status: 503, statusText: "Unavailable" }),
+  ]
+  globalThis.fetch = async () => queue.shift()
+
+  try {
+    const client = new OpenCodeClient({ baseUrl: "https://example.com" })
+    await assert.rejects(() => client.request("/large-success"), (err) => {
+      assert.equal(err.kind, "response_too_large")
+      assert.equal(err.outcome, "fatal")
+      assert.equal(err.code, "RESPONSE_TOO_LARGE")
+      return true
+    })
+    await assert.rejects(() => client.request("/large-error"), (err) => {
+      assert.equal(err.status, 503)
+      assert.equal(classifyBoundaryError(err).retryable, true)
+      assert.equal(err.message.includes(secretTail), false)
+      return true
+    })
   } finally {
     globalThis.fetch = originalFetch
   }

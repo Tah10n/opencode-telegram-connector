@@ -25,10 +25,19 @@ test("createRuntimeObservability records compact privacy-safe counters", () => {
   observability.recordNoisyEventSkipped("demo", "compaction")
   observability.recordPromptDelivered("demo", "permission")
   observability.recordPromptAnswered("demo", "permission", "ok")
+  for (const outcome of ["pending", "accepted", "ambiguous", "reconciled", "retryable", "released"]) {
+    observability.recordPromptDeliveryOutcome("demo", outcome)
+  }
   observability.recordTelegramFailure({ projectAlias: "demo", operation: "sendMessage" })
   observability.recordTelegramFailure({ projectAlias: "demo", operation: "editMessageText" })
   observability.recordAttachmentFallback("demo", "assistant-long-output")
   observability.recordLegacyCallbackFallback("demo")
+  observability.recordOutboxQueued("demo")
+  observability.recordOutboxDelivered("demo")
+  observability.recordOutboxDiscarded("demo")
+  observability.recordOutboxRetry("demo")
+  observability.recordOutboxExpired("demo", 2)
+  observability.recordOutboxBackpressure("demo")
 
   const projectText = observability.buildStatusLines("demo").join("\n")
   const runtimeText = observability.buildRuntimeStatusLines().join("\n")
@@ -36,7 +45,9 @@ test("createRuntimeObservability records compact privacy-safe counters", () => {
   for (const text of [projectText, runtimeText]) {
     assert.match(text, /Messages: assistant=1 skipped=1 attachmentFallbacks=1/)
     assert.match(text, /Prompts: delivered=1 answered=1/)
+    assert.match(text, /Prompt delivery ledger: pending=1 accepted=1 ambiguous=1 reconciled=1 retryable=1 released=1/)
     assert.match(text, /Telegram delivery: sendFailures=1 editFailures=1/)
+    assert.match(text, /Durable outbox: queued=1 delivered=1 discarded=1 retries=1 expired=2 backpressure=1/)
     assert.match(text, /legacyFallback=1|Legacy callbacks: fallback=1/)
     assert.doesNotMatch(text, /chat|session|state\.json|token/i)
   }

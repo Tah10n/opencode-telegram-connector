@@ -15,6 +15,7 @@ import {
 import { hashIdempotencyValue } from "../idempotency.js"
 import { callbackPacker } from "./shared.js"
 import { t as translate } from "../../i18n/index.js"
+import { deliverPromptExactlyOnce, promptDeliveryIdentity, reconcilePromptDeliveryBeforePayload } from "../prompt-delivery.js"
 
 const ATTACHMENT_CONFIRMATION_TTL_MS = 30 * 60 * 1000
 const MAX_PENDING_ATTACHMENT_CONFIRMATIONS = 200
@@ -46,6 +47,7 @@ export function createAttachmentHandlers({
   ensureRecentPromptSet,
   hashTextForEcho,
   staleActiveTurnGuard,
+  recordPromptDeliveryOutcome,
 }) {
   const packCallback = callbackPacker(cb)
   const limits = userAttachmentLimits || userAttachmentLimitsFromConfig(config?.limits)
@@ -216,7 +218,7 @@ export function createAttachmentHandlers({
     return { outcome: "ok", text, byteLength: byteLength || 0, documentInfo: { ...documentInfo, fileSize: byteLength || 0 } }
   }
 
-  async function sendAttachmentPromptToOpenCode(ctxMeta, binding, record, loaded) {
+  async function sendAttachmentPromptToOpenCode(ctxMeta, binding, record, loaded, deliveryIdentity) {
     const oc = binding.oc || ocByAlias[binding.projectAlias]
     const prefix = config.tgPrefix ?? "[TG] "
     const promptText = formatAttachmentPrompt({
@@ -229,7 +231,14 @@ export function createAttachmentHandlers({
     const sk = sessionKey(binding.projectAlias, binding.sessionId)
     ensureRecentPromptSet(sk).add(hashTextForEcho(promptText))
     const promptOverride = resolvePromptOverride ? await resolvePromptOverride(ctxMeta.ctxKey, binding) : null
-    await oc.promptAsync(binding.sessionId, promptText, promptOverride || undefined)
+    await deliverPromptExactlyOnce({
+      store,
+      oc,
+      identity: deliveryIdentity,
+      text: promptText,
+      options: promptOverride || undefined,
+      recordPromptDeliveryOutcome,
+    })
     return promptText
   }
 
@@ -273,9 +282,36 @@ export function createAttachmentHandlers({
       return
     }
 
-    if (await staleActiveTurnGuard?.(ctxMeta, binding)) {
+    const deliveryIdentity = promptDeliveryIdentity({
+      kind: "attachment-direct",
+      projectAlias: binding.projectAlias,
+      sessionId: binding.sessionId,
+      chatId: ctxMeta.chatId,
+      threadIdOr0: ctxMeta.threadIdOr0,
+      messageId: record.messageId,
+      updateId: record.updateId,
+    })
+    const existingDelivery = store.getPromptDelivery?.(deliveryIdentity.key) || store.get?.()?.promptDeliveries?.records?.[deliveryIdentity.key]
+    if (!existingDelivery && await staleActiveTurnGuard?.(ctxMeta, binding)) {
       await markMessageHandled("staleActiveTurnAttachment", { projectAlias: binding.projectAlias, sessionId: binding.sessionId })
       return
+    }
+    if (existingDelivery) {
+      const reconciled = await reconcilePromptDeliveryBeforePayload({
+        store,
+        oc: binding.oc || ocByAlias[binding.projectAlias],
+        identity: deliveryIdentity,
+        recordPromptDeliveryOutcome,
+      })
+      if (reconciled?.accepted) {
+        await markMessageHandled(
+          "promptAsyncAttachment",
+          { projectAlias: binding.projectAlias, sessionId: binding.sessionId },
+          { rollbackOnFlushFailure: true },
+        )
+        await safeInformThread(ctxMeta, attachmentSentText(record.documentInfo, binding, { locale }), closeOnlyKeyboard(locale))
+        return
+      }
     }
 
     let loaded
@@ -308,24 +344,11 @@ export function createAttachmentHandlers({
       return
     }
 
-    // Match text prompt idempotency: prefer at-most-once delivery over a
-    // duplicate OpenCode prompt if Telegram replays after the external side effect.
-    await markMessageHandled(
-      "promptAsyncAttachment",
-      { projectAlias: binding.projectAlias, sessionId: binding.sessionId },
-      { rollbackOnFlushFailure: true },
-    )
     try {
-      await sendAttachmentPromptToOpenCode(ctxMeta, binding, record, loaded)
+      await sendAttachmentPromptToOpenCode(ctxMeta, binding, record, loaded, deliveryIdentity)
       markProjectUp?.(binding.projectAlias)
-      await safeInformThread(ctxMeta, attachmentSentText(loaded.documentInfo, binding, { locale }), closeOnlyKeyboard(locale))
     } catch (err) {
-      let cleanupErr = null
-      try {
-        await deleteIdempotencyEntry(messageKey)
-      } catch (deleteErr) {
-        cleanupErr = deleteErr
-      }
+      if (err?.source === "state") throw err
       const alias = binding.projectAlias
       if (recordRetryableOpenCodeFailure) {
         recordRetryableOpenCodeFailure(alias, err, {
@@ -335,9 +358,15 @@ export function createAttachmentHandlers({
         })
       }
       await notifyUnavailableForThread(ctxMeta, alias, err, { locale, fallbackReplyMarkup: closeOnlyKeyboard(locale) })
-      if (cleanupErr) throw cleanupErr
       if (isRetryableProjectError?.(err)) throw err
+      return
     }
+    await markMessageHandled(
+      "promptAsyncAttachment",
+      { projectAlias: binding.projectAlias, sessionId: binding.sessionId },
+      { rollbackOnFlushFailure: true },
+    )
+    await safeInformThread(ctxMeta, attachmentSentText(loaded.documentInfo, binding, { locale }), closeOnlyKeyboard(locale))
   }
 
   async function handleAttachmentConfirmation(ctxMeta, action, token, { editMessageId } = {}) {
@@ -380,10 +409,6 @@ export function createAttachmentHandlers({
       return { callbackText: "Project missing" }
     }
 
-    if (await staleActiveTurnGuard?.(ctxMeta, currentBinding)) {
-      return { callbackText: "Agent busy" }
-    }
-
     const sendKey = attachmentSendIdempotencyKey(record)
     if (pendingAttachmentSends.has(sendKey)) {
       return { callbackText: "Already sending" }
@@ -392,6 +417,45 @@ export function createAttachmentHandlers({
       pendingAttachmentConfirmations.delete(token)
       await safeEditMessage(ctxMeta, editMessageId, translate(locale, "attachments.alreadySent"), closeOnlyKeyboard(locale))
       return { callbackText: "Already sent" }
+    }
+    const deliveryIdentity = promptDeliveryIdentity({
+      kind: "attachment-confirmed",
+      projectAlias: currentBinding.projectAlias,
+      sessionId: currentBinding.sessionId,
+      chatId: ctxMeta.chatId,
+      threadIdOr0: ctxMeta.threadIdOr0,
+      messageId: record.messageId,
+      updateId: record.updateId,
+    })
+    const existingDelivery = store.getPromptDelivery?.(deliveryIdentity.key) || store.get?.()?.promptDeliveries?.records?.[deliveryIdentity.key]
+    if (!existingDelivery && await staleActiveTurnGuard?.(ctxMeta, currentBinding)) {
+      return { callbackText: "Agent busy" }
+    }
+    if (existingDelivery) {
+      const reconciled = await reconcilePromptDeliveryBeforePayload({
+        store,
+        oc: currentBinding.oc || ocByAlias[currentBinding.projectAlias],
+        identity: deliveryIdentity,
+        recordPromptDeliveryOutcome,
+      })
+      if (reconciled?.accepted) {
+        await markIdempotencyEntries([{
+          key: sendKey,
+          metadata: {
+            kind: "telegram-attachment",
+            ctxKey: ctxMeta.ctxKey,
+            projectAlias: currentBinding.projectAlias,
+            sessionId: currentBinding.sessionId,
+            operation: "promptAsyncAttachment",
+            action: "send-confirmed",
+            updateId: record.updateId,
+            messageId: record.messageId,
+          },
+        }], { rollbackOnFlushFailure: true })
+        pendingAttachmentConfirmations.delete(token)
+        await safeEditMessage(ctxMeta, editMessageId, attachmentSentText(record.documentInfo, currentBinding, { locale }), closeOnlyKeyboard(locale))
+        return { callbackText: "Sent" }
+      }
     }
     pendingAttachmentSends.add(sendKey)
 
@@ -421,8 +485,25 @@ export function createAttachmentHandlers({
         return { callbackText: "Unsupported" }
       }
 
-      // Confirmed attachments use their own send key because the original
-      // Telegram message was already marked when the confirmation UI was sent.
+      try {
+        await sendAttachmentPromptToOpenCode(ctxMeta, currentBinding, record, loaded, deliveryIdentity)
+        markProjectUp?.(currentBinding.projectAlias)
+      } catch (err) {
+        if (err?.source === "state") throw err
+        const alias = currentBinding.projectAlias
+        if (recordRetryableOpenCodeFailure) {
+          recordRetryableOpenCodeFailure(alias, err, {
+            operation: "POST /session/:id/prompt_async",
+            method: "POST",
+            pathname: `/session/${currentBinding.sessionId}/prompt_async`,
+          })
+        }
+        await notifyUnavailableForThread(ctxMeta, alias, err, { locale, fallbackReplyMarkup: closeOnlyKeyboard(locale) })
+        if (isRetryableProjectError?.(err)) throw err
+        throw err
+      }
+      // The original Telegram message was already marked when the confirmation
+      // UI was sent, so the confirmed action keeps its own replay marker.
       await markIdempotencyEntries([
         {
           key: sendKey,
@@ -438,30 +519,6 @@ export function createAttachmentHandlers({
           },
         },
       ], { rollbackOnFlushFailure: true })
-
-      try {
-        await sendAttachmentPromptToOpenCode(ctxMeta, currentBinding, record, loaded)
-        markProjectUp?.(currentBinding.projectAlias)
-      } catch (err) {
-        let cleanupErr = null
-        try {
-          await deleteIdempotencyEntry(sendKey)
-        } catch (deleteErr) {
-          cleanupErr = deleteErr
-        }
-        const alias = currentBinding.projectAlias
-        if (recordRetryableOpenCodeFailure) {
-          recordRetryableOpenCodeFailure(alias, err, {
-            operation: "POST /session/:id/prompt_async",
-            method: "POST",
-            pathname: `/session/${currentBinding.sessionId}/prompt_async`,
-          })
-        }
-        await notifyUnavailableForThread(ctxMeta, alias, err, { locale, fallbackReplyMarkup: closeOnlyKeyboard(locale) })
-        if (cleanupErr) throw cleanupErr
-        if (isRetryableProjectError?.(err)) return { callbackText: "Temporarily unavailable" }
-        throw err
-      }
       pendingAttachmentConfirmations.delete(token)
       await safeEditMessage(ctxMeta, editMessageId, attachmentSentText(loaded.documentInfo, currentBinding, { locale }), closeOnlyKeyboard(locale))
       return { callbackText: "Sent" }

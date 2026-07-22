@@ -26,6 +26,13 @@ function attachmentTokenFromButton(button) {
   return parts[2]
 }
 
+function expectAmbiguousPromptFailure(err, cause) {
+  assert.equal(err?.kind, "ambiguous_delivery")
+  assert.equal(err?.outcome, "retryable")
+  if (cause) assert.equal(err.cause, cause)
+  return true
+}
+
 function makeRuntime(overrides = {}) {
   const { store: storeOverrides, ...runtimeOverrides } = overrides
   const sent = []
@@ -1308,6 +1315,7 @@ test("createCommandHandlers clears stale awaiting custom-answer state", async ()
   await handlers.handleTelegramMessage({
     chat: { id: 100, type: "supergroup" },
     from: { id: 42 },
+    message_id: 319,
     message_thread_id: 7,
     text: "first reply",
   })
@@ -2863,17 +2871,17 @@ test("createCommandHandlers handleTelegramMessage forwards the custom model over
   await handlers.handleTelegramMessage({
     chat: { id: 100, type: "supergroup" },
     from: { id: 42 },
+    message_id: 319,
     message_thread_id: 7,
     text: "hello model",
   })
 
-  assert.deepEqual(promptCalls, [
-    {
-      sessionId: "ses_current",
-      text: "[TG] hello model",
-      options: { model: { providerID: "openai", modelID: "gpt-5" }, variant: "xhigh" },
-    },
-  ])
+  assert.equal(promptCalls.length, 1)
+  assert.equal(promptCalls[0].sessionId, "ses_current")
+  assert.equal(promptCalls[0].text, "[TG] hello model")
+  assert.deepEqual(promptCalls[0].options.model, { providerID: "openai", modelID: "gpt-5" })
+  assert.equal(promptCalls[0].options.variant, "xhigh")
+  assert.match(promptCalls[0].options.messageID, /^msg_tgc_[a-f0-9]{48}$/)
   assert.deepEqual(markProjectUpCalls, ["demo"])
 })
 
@@ -2950,13 +2958,16 @@ test("createCommandHandlers handleTelegramMessage rethrows retryable promptAsync
     () => handlers.handleTelegramMessage({
       chat: { id: 100, type: "supergroup" },
       from: { id: 42 },
+      message_id: 320,
       message_thread_id: 7,
       text: "retry me",
     }),
-    /opencode unavailable/,
+    (actual) => expectAmbiguousPromptFailure(actual, err),
   )
 
-  assert.deepEqual(promptCalls, [{ sessionId: "ses_current", text: "[TG] retry me" }])
+  assert.equal(promptCalls.length, 1)
+  assert.equal(promptCalls[0].sessionId, "ses_current")
+  assert.equal(promptCalls[0].text, "[TG] retry me")
   assert.match(sent[0].text, /Project 'demo' is unavailable/)
 })
 
@@ -3046,19 +3057,20 @@ test("createCommandHandlers delegates retryable promptAsync failure notices to t
   await assert.rejects(() => handlers.handleTelegramMessage({
     chat: { id: 100, type: "supergroup" },
     from: { id: 42 },
+    message_id: 322,
     message_thread_id: 7,
     text: "retry me",
-  }), /opencode unavailable/)
+  }), (actual) => expectAmbiguousPromptFailure(actual, err))
 
   assert.equal(sent.length, 0)
   assert.equal(notices.length, 1)
   assert.equal(notices[0].ctxMeta.ctxKey, "100:7")
   assert.equal(notices[0].alias, "demo")
-  assert.equal(notices[0].error, err)
+  assert.equal(notices[0].error.cause, err)
   assert.equal(notices[0].options.platform, "win32")
 })
 
-test("createCommandHandlers clears preflight prompt idempotency after promptAsync failure", async () => {
+test("createCommandHandlers keeps ambiguous prompt delivery state without a Telegram handled marker", async () => {
   const keys = new Set()
   const deletes = []
   const { runtime } = makeRuntime({
@@ -3092,13 +3104,14 @@ test("createCommandHandlers clears preflight prompt idempotency after promptAsyn
     message_id: 320,
     message_thread_id: 7,
     text: "retry me",
-  }), /down/)
+  }), (actual) => expectAmbiguousPromptFailure(actual))
 
-  assert.equal(deletes.length, 1)
+  assert.equal(deletes.length, 0)
   assert.equal(keys.size, 0)
+  assert.equal(Object.values(runtime.store.get().promptDeliveries.records)[0].state, "outcome_unknown")
 })
 
-test("createCommandHandlers persists prompt idempotency before promptAsync", async () => {
+test("createCommandHandlers persists pending prompt delivery before promptAsync", async () => {
   const promptCalls = []
   const marked = []
   const keys = new Set()
@@ -3147,8 +3160,9 @@ test("createCommandHandlers persists prompt idempotency before promptAsync", asy
   )
 
   assert.deepEqual(promptCalls, [])
-  assert.equal(marked.length, 1)
+  assert.equal(marked.length, 0)
   assert.equal(keys.size, 0)
+  assert.equal(Object.values(runtime.store.get().promptDeliveries.records)[0].state, "pending")
   assert.deepEqual(sent, [])
 })
 
@@ -3403,7 +3417,7 @@ test("createCommandHandlers handleTelegramMessage forwards small text documents 
   assert.match(promptCalls[0].text, /^\[TG\] Review this file/)
   assert.match(promptCalls[0].text, /Filename: app\.js/)
   assert.match(promptCalls[0].text, /console\.log\(1\)/)
-  assert.deepEqual(events.slice(0, 3), ["mark:promptAsyncAttachment", "flush", "prompt"])
+  assert.deepEqual(events, ["flush", "flush", "prompt", "flush", "mark:promptAsyncAttachment", "flush"])
   assert.deepEqual(markProjectUpCalls, ["demo"])
   assert.match(sent.at(-1).text, /Attachment sent to demo\/ses_current: app\.js/)
 })
@@ -3509,11 +3523,12 @@ test("createCommandHandlers rolls back small attachment idempotency when OpenCod
       message_thread_id: 7,
       document: { file_id: "file_1", file_name: "a.txt", mime_type: "text/plain", file_size: 10 },
     }),
-    /opencode unavailable/,
+    (actual) => expectAmbiguousPromptFailure(actual, err),
   )
 
-  assert.deepEqual(events.slice(0, 5), ["mark:promptAsyncAttachment", "flush", "prompt", "delete", "flush"])
+  assert.deepEqual(events, ["flush", "flush", "prompt", "flush"])
   assert.equal(idempotencyKeys.size, 0)
+  assert.equal(Object.values(runtime.store.get().promptDeliveries.records)[0].state, "outcome_unknown")
   assert.match(sent[0].text, /Project 'demo' is unavailable/)
 })
 
@@ -3573,9 +3588,10 @@ test("createCommandHandlers rolls back small attachment idempotency when pre-sen
     },
   )
 
-  assert.deepEqual(events, ["mark:promptAsyncAttachment", "flush", "delete"])
+  assert.deepEqual(events, ["flush"])
   assert.equal(idempotencyKeys.size, 0)
   assert.deepEqual(promptCalls, [])
+  assert.equal(Object.values(runtime.store.get().promptDeliveries.records)[0].state, "pending")
 })
 
 test("createCommandHandlers requires confirmation for large text documents and can cancel", async () => {
@@ -3751,6 +3767,7 @@ test("createCommandHandlers sends confirmed large text documents", async () => {
     document: { file_id: "file_large", file_name: "large.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
   })
   const token = attachmentTokenFromButton(sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file"))
+  events.length = 0
 
   const result = await handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", token, { editMessageId: 78 })
 
@@ -3760,7 +3777,7 @@ test("createCommandHandlers sends confirmed large text documents", async () => {
   assert.match(promptCalls[0].text, /log line/)
   assert.match(editCalls.at(-1)[2], /Attachment sent to demo\/ses_current: large\.log/)
   assert.equal(storeState.marked.some((entry) => entry.metadata.kind === "telegram-attachment"), true)
-  assert.deepEqual(events.slice(-3), ["mark:send-confirmed", "flush", "prompt"])
+  assert.deepEqual(events, ["flush", "flush", "prompt", "flush", "mark:send-confirmed", "flush"])
 })
 
 test("createCommandHandlers rolls back confirmed attachment send idempotency when OpenCode send fails", async () => {
@@ -3826,12 +3843,15 @@ test("createCommandHandlers rolls back confirmed attachment send idempotency whe
     document: { file_id: "file_large", file_name: "large.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
   })
   const token = attachmentTokenFromButton(sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file"))
+  events.length = 0
 
-  const result = await handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", token, { editMessageId: 78 })
-
-  assert.deepEqual(result, { callbackText: "Temporarily unavailable" })
-  assert.deepEqual(events.slice(-5), ["mark:send-confirmed", "flush", "prompt", "delete:send-confirmed", "flush"])
+  await assert.rejects(
+    () => handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", token, { editMessageId: 78 }),
+    (actual) => expectAmbiguousPromptFailure(actual, err),
+  )
+  assert.deepEqual(events, ["flush", "flush", "prompt", "flush"])
   assert.equal([...metadataByKey.values()].some((metadata) => metadata.action === "send-confirmed"), false)
+  assert.equal(Object.values(runtime.store.get().promptDeliveries.records)[0].state, "outcome_unknown")
 })
 
 test("createCommandHandlers suppresses parallel confirmed attachment sends", async () => {
@@ -4272,13 +4292,13 @@ test("createCommandHandlers rethrows retryable OpenCode send failures for attach
       message_thread_id: 7,
       document: { file_id: "file_1", file_name: "a.txt", mime_type: "text/plain", file_size: 10 },
     }),
-    /opencode unavailable/,
+    (actual) => expectAmbiguousPromptFailure(actual, err),
   )
   assert.equal(sent.length, 0)
   assert.equal(notices.length, 1)
   assert.equal(notices[0].ctxMeta.ctxKey, "100:7")
   assert.equal(notices[0].alias, "demo")
-  assert.equal(notices[0].error, err)
+  assert.equal(notices[0].error.cause, err)
   assert.ok(notices[0].options.fallbackReplyMarkup)
 })
 

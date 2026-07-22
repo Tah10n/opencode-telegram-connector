@@ -2,6 +2,19 @@ import { setTimeout as delay } from "node:timers/promises"
 import { boundaryErrorFromException, boundaryErrorFromHttpResponse, makeBoundaryError } from "../boundary-errors.js"
 import { escapeHtml } from "./formatter.js"
 import { getRequestContext } from "../runtime/request-context.js"
+import { TELEGRAM_ERROR_RESPONSE_MAX_BYTES, TELEGRAM_FILE_RESPONSE_MAX_BYTES, TELEGRAM_JSON_RESPONSE_MAX_BYTES, readBoundedResponseText } from "../http-response.js"
+import { redactSensitiveText } from "../url-utils.js"
+
+const TELEGRAM_ERROR_DIAGNOSTIC_MAX_CHARS = 500
+
+function nonJsonTelegramError(res, { truncated = false } = {}) {
+  return {
+    ok: false,
+    error_code: Number.isInteger(res?.status) ? res.status : undefined,
+    connector_non_json_error: true,
+    ...(truncated ? { connector_response_truncated: true } : {}),
+  }
+}
 
 function makeTimeoutSignal(timeoutMs = 30_000) {
   if (!timeoutMs) return { signal: undefined, cancel: () => {} }
@@ -38,7 +51,40 @@ function combineSignals(...signals) {
 
 async function readTelegramApiJsonResponse(res, { requestSignal, timeout, ...context }) {
   try {
-    return await res.json()
+    if (!res?.body?.getReader && typeof res?.text !== "function") {
+      try {
+        return await res.json()
+      } catch (err) {
+        if (err?.name === "AbortError" || requestSignal?.aborted === true || timeout.didTimeout?.() === true) throw err
+        if (res?.ok === false) return nonJsonTelegramError(res)
+        throw makeBoundaryError({
+          ...context,
+          status: res?.status,
+          kind: "protocol",
+          outcome: "fatal",
+          message: "Telegram API returned malformed JSON",
+          cause: err,
+        })
+      }
+    }
+    const { text, truncated } = await readBoundedResponseText(res, {
+      maxBytes: res.ok ? TELEGRAM_JSON_RESPONSE_MAX_BYTES : TELEGRAM_ERROR_RESPONSE_MAX_BYTES,
+      truncate: !res.ok,
+    })
+    if (truncated) return nonJsonTelegramError(res, { truncated: true })
+    try {
+      return JSON.parse(text)
+    } catch (err) {
+      if (res?.ok === false) return nonJsonTelegramError(res)
+      throw makeBoundaryError({
+        ...context,
+        status: res?.status,
+        kind: "protocol",
+        outcome: "fatal",
+        message: "Telegram API returned malformed JSON",
+        cause: err,
+      })
+    }
   } catch (err) {
     if (err?.name === "AbortError" || requestSignal?.aborted === true || timeout.didTimeout?.() === true) {
       throw boundaryErrorFromException(err, {
@@ -46,7 +92,17 @@ async function readTelegramApiJsonResponse(res, { requestSignal, timeout, ...con
         didTimeout: timeout.didTimeout?.() === true,
       })
     }
-    return null
+    if (err?.code === "RESPONSE_TOO_LARGE") {
+      throw makeBoundaryError({
+        ...context,
+        code: err.code,
+        kind: "response_too_large",
+        outcome: "fatal",
+        message: "Telegram API response body exceeds the safe limit",
+        cause: err,
+      })
+    }
+    throw err
   }
 }
 
@@ -54,6 +110,31 @@ function telegramRetryAfterMs(json) {
   const seconds = Number(json?.parameters?.retry_after)
   if (!Number.isFinite(seconds) || seconds <= 0) return null
   return Math.min(Math.ceil(seconds * 1000), 60 * 60 * 1000)
+}
+
+function safeTelegramErrorDescription(json, res, token) {
+  const fallback = json?.connector_response_truncated === true
+    ? "Telegram API error response exceeded the safe limit"
+    : json?.connector_non_json_error === true
+      ? "Telegram API returned a non-JSON error response"
+      : res?.statusText || "Telegram API error"
+  const raw = typeof json?.description === "string" && json.description.trim() ? json.description : fallback
+  const redacted = redactSensitiveText(raw, { knownSecrets: token ? [token] : [] })
+  return redacted.length > TELEGRAM_ERROR_DIAGNOSTIC_MAX_CHARS
+    ? `${redacted.slice(0, TELEGRAM_ERROR_DIAGNOSTIC_MAX_CHARS - 1)}…`
+    : redacted
+}
+
+function safeTelegramErrorDetails(json) {
+  const errorCode = Number(json?.error_code)
+  const retryAfterSeconds = Number(json?.parameters?.retry_after)
+  const details = {
+    ...(Number.isInteger(errorCode) ? { errorCode } : {}),
+    ...(Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0 ? { retryAfterSeconds } : {}),
+    ...(json?.connector_non_json_error === true ? { nonJson: true } : {}),
+    ...(json?.connector_response_truncated === true ? { responseTruncated: true } : {}),
+  }
+  return Object.keys(details).length ? details : null
 }
 
 export const TELEGRAM_SAFE_MESSAGE_MAX_LEN = 3900
@@ -306,13 +387,13 @@ export class TelegramClient {
       timeout.cancel()
     }
     if (!res.ok || !json || json.ok !== true) {
-      const msg = json?.description || res.statusText || "Telegram API error"
+      const msg = safeTelegramErrorDescription(json, res, this.token)
       throw boundaryErrorFromHttpResponse({
         ...context,
         status: res.status,
         statusText: res.statusText,
         bodyText: msg,
-        details: json,
+        details: safeTelegramErrorDetails(json),
         retryAfterMs: telegramRetryAfterMs(json),
         message: `${method} failed: ${msg}`,
       })
@@ -345,13 +426,13 @@ export class TelegramClient {
       timeout.cancel()
     }
     if (!res.ok || !json || json.ok !== true) {
-      const msg = json?.description || res.statusText || "Telegram API error"
+      const msg = safeTelegramErrorDescription(json, res, this.token)
       throw boundaryErrorFromHttpResponse({
         ...context,
         status: res.status,
         statusText: res.statusText,
         bodyText: msg,
-        details: json,
+        details: safeTelegramErrorDetails(json),
         retryAfterMs: telegramRetryAfterMs(json),
         message: `${method} failed: ${msg}`,
       })
@@ -396,6 +477,8 @@ export class TelegramClient {
       })
     }
     const encodedPath = pathParts.map((part) => encodeURIComponent(part)).join("/")
+    const requestedMaxBytes = Number.isSafeInteger(Number(maxBytes)) && Number(maxBytes) >= 0 ? Number(maxBytes) : TELEGRAM_FILE_RESPONSE_MAX_BYTES
+    const effectiveMaxBytes = Math.min(requestedMaxBytes, TELEGRAM_FILE_RESPONSE_MAX_BYTES)
     const url = `${this.fileBaseUrl.replace(/\/+$/, "")}/${encodedPath}`
     const timeout = makeTimeoutSignal(timeoutMs)
     let res
@@ -415,7 +498,7 @@ export class TelegramClient {
 
     try {
       if (!res.ok) {
-        const bodyText = await res.text().catch(() => "")
+        await readBoundedResponseText(res, { maxBytes: TELEGRAM_ERROR_RESPONSE_MAX_BYTES, truncate: true }).catch(() => ({ text: "" }))
         throw boundaryErrorFromHttpResponse({
           source: "telegram",
           operation: "GET file",
@@ -423,13 +506,12 @@ export class TelegramClient {
           pathname: `/file/${cleanPath}`,
           status: res.status,
           statusText: res.statusText,
-          bodyText,
-          message: `Telegram file download failed: ${res.status} ${bodyText || res.statusText || "Request failed"}`,
+          message: `Telegram file download failed: ${res.status} ${res.statusText || "Request failed"}`,
         })
       }
 
       const declaredLength = Number(res.headers?.get?.("content-length"))
-      if (Number.isFinite(declaredLength) && Number.isFinite(Number(maxBytes)) && declaredLength > Number(maxBytes)) {
+      if (Number.isFinite(declaredLength) && declaredLength > effectiveMaxBytes) {
         throw makeBoundaryError({
           source: "telegram",
           operation: "GET file",
@@ -441,7 +523,7 @@ export class TelegramClient {
 
       if (!res.body?.getReader) {
         const buffer = new Uint8Array(await res.arrayBuffer())
-        if (Number.isFinite(Number(maxBytes)) && buffer.byteLength > Number(maxBytes)) {
+        if (buffer.byteLength > effectiveMaxBytes) {
           throw makeBoundaryError({
             source: "telegram",
             operation: "GET file",
@@ -462,7 +544,7 @@ export class TelegramClient {
           if (done) break
           const chunk = value instanceof Uint8Array ? value : new Uint8Array(value)
           total += chunk.byteLength
-          if (Number.isFinite(Number(maxBytes)) && total > Number(maxBytes)) {
+          if (total > effectiveMaxBytes) {
             await reader.cancel().catch(() => {})
             throw makeBoundaryError({
               source: "telegram",
@@ -529,14 +611,14 @@ export class TelegramClient {
           : {}),
       }
       try {
-        last = await this.call("sendMessage", params, { timeoutMs: 20_000 })
+        last = await this.call("sendMessage", params, { timeoutMs: 20_000, signal: options.signal })
         this.rememberMessageContext(last, params)
       } catch (err) {
         this.recordApiFailure("sendMessage", params, err)
         throw err
       }
       // be nice to Telegram
-      await delay(60)
+      if (i < chunks.length - 1) await delay(60, undefined, options.signal ? { signal: options.signal } : undefined)
     }
     return last
   }
@@ -562,7 +644,7 @@ export class TelegramClient {
     if (options.message_thread_id) formData.set("message_thread_id", String(options.message_thread_id))
     if (caption) formData.set("caption", String(caption))
     formData.set("document", new Blob([contents], { type: "text/plain;charset=utf-8" }), filename || "output.txt")
-    return this.callMultipart("sendDocument", formData, { timeoutMs: 60_000 }).catch((err) => {
+    return this.callMultipart("sendDocument", formData, { timeoutMs: 60_000, signal: options.signal }).catch((err) => {
       this.recordApiFailure("sendDocument", formData, err)
       throw err
     })
@@ -578,7 +660,7 @@ export class TelegramClient {
       ...(options.parse_mode ? { parse_mode: options.parse_mode } : {}),
       ...(options.disable_web_page_preview != null ? { disable_web_page_preview: options.disable_web_page_preview } : {}),
     }
-    return this.call("editMessageText", params, { timeoutMs: 20_000 }).catch((err) => {
+    return this.call("editMessageText", params, { timeoutMs: 20_000, signal: options.signal }).catch((err) => {
       if (isMessageNotModifiedError(err)) return true
       this.recordApiFailure("editMessageText", this.paramsWithRememberedMessageContext(params), err)
       throw err

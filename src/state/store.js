@@ -7,11 +7,15 @@ import { isSafeOpenCodeId } from "../opencode/ids.js"
 import { redactSensitiveText } from "../url-utils.js"
 import { matchSupportedLocale } from "../i18n/index.js"
 
-export const STATE_SCHEMA_VERSION = 7
+export const STATE_SCHEMA_VERSION = 8
 export const DEFAULT_FEED_MODE = "main+changes"
 export const DEFAULT_IDEMPOTENCY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 export const DEFAULT_IDEMPOTENCY_MAX_ENTRIES = 5000
 export const DEFAULT_CALLBACK_PAYLOAD_MAX_ENTRIES = 4000
+export const DEFAULT_PROMPT_DELIVERY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000
+export const DEFAULT_PROMPT_DELIVERY_MAX_ENTRIES = 10_000
+export const DEFAULT_OUTBOX_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000
+export const DEFAULT_OUTBOX_MAX_ENTRIES = 2000
 export const DEFAULT_STATE_MIGRATION_BACKUP_MAX_FILES = 5
 export { DEFAULT_STATE_FILE_MODE }
 
@@ -53,12 +57,16 @@ function migrationOptionsForLoad(filePath) {
     normalizePendingRuntimeOnlineNotice,
     normalizeIdempotencyLedger,
     normalizeCallbackPayloads,
+    normalizePromptDeliveries,
+    normalizeOutbox,
     defaultFeedByContext,
     defaultLocaleByContext,
     defaultModelPrefsByContext,
     defaultPendingPrompts,
     defaultIdempotencyLedger,
     defaultCallbackPayloads,
+    defaultPromptDeliveries,
+    defaultOutbox,
   }
 }
 
@@ -91,6 +99,14 @@ function defaultCallbackPayloads() {
   return {}
 }
 
+function defaultPromptDeliveries() {
+  return { records: {} }
+}
+
+function defaultOutbox() {
+  return { items: {} }
+}
+
 export function defaultState() {
   return {
     schemaVersion: STATE_SCHEMA_VERSION,
@@ -104,6 +120,8 @@ export function defaultState() {
     pendingRuntimeOnlineNotice: null,
     idempotency: defaultIdempotencyLedger(),
     callbackPayloads: defaultCallbackPayloads(),
+    promptDeliveries: defaultPromptDeliveries(),
+    outbox: defaultOutbox(),
   }
 }
 
@@ -342,6 +360,106 @@ export class StateStore {
 
   getIdempotencyLedger() {
     return this.state.idempotency
+  }
+
+  getPromptDelivery(key) {
+    const normalized = normalizePromptDeliveryKey(key)
+    if (!normalized) return null
+    return this.state.promptDeliveries?.records?.[normalized] || null
+  }
+
+  setPromptDelivery(key, record) {
+    const normalized = normalizePromptDeliveryKey(key)
+    const entry = normalizePromptDeliveryRecord(record, normalized)
+    if (!normalized || !entry) return false
+    const previous = this.state.promptDeliveries.records[normalized]
+    this.state.promptDeliveries.records[normalized] = entry
+    this.prunePromptDeliveries()
+    if (!this.state.promptDeliveries.records[normalized] || Object.keys(this.state.promptDeliveries.records).length > DEFAULT_PROMPT_DELIVERY_MAX_ENTRIES) {
+      if (previous) this.state.promptDeliveries.records[normalized] = previous
+      else delete this.state.promptDeliveries.records[normalized]
+      return false
+    }
+    this.scheduleSave()
+    return true
+  }
+
+  deletePromptDelivery(key) {
+    const normalized = normalizePromptDeliveryKey(key)
+    if (!normalized || !this.state.promptDeliveries?.records?.[normalized]) return false
+    delete this.state.promptDeliveries.records[normalized]
+    this.scheduleSave()
+    return true
+  }
+
+  prunePromptDeliveries({ now = Date.now(), maxAgeMs = DEFAULT_PROMPT_DELIVERY_MAX_AGE_MS, maxEntries = DEFAULT_PROMPT_DELIVERY_MAX_ENTRIES } = {}) {
+    const records = this.state.promptDeliveries?.records
+    if (!records || typeof records !== "object") return 0
+    let removed = 0
+    for (const [key, entry] of Object.entries(records)) {
+      const updatedAt = isFiniteNumber(entry?.updatedAt) ? entry.updatedAt : 0
+      if (entry?.state === "accepted" && (!updatedAt || now - updatedAt > maxAgeMs)) {
+        delete records[key]
+        removed += 1
+      }
+    }
+    const entries = Object.entries(records)
+    if (entries.length > maxEntries) {
+      const removable = entries
+        .filter(([, entry]) => entry?.state === "accepted")
+        .sort((a, b) => (a[1]?.updatedAt || 0) - (b[1]?.updatedAt || 0) || a[0].localeCompare(b[0]))
+        .slice(0, entries.length - maxEntries)
+      removable
+        .forEach(([key]) => {
+          delete records[key]
+          removed += 1
+        })
+    }
+    if (removed) this.scheduleSave()
+    return removed
+  }
+
+  getOutboxItems() {
+    return this.state.outbox?.items || {}
+  }
+
+  getOutboxItem(id) {
+    const normalized = normalizeOutboxId(id)
+    return normalized ? this.state.outbox?.items?.[normalized] || null : null
+  }
+
+  setOutboxItem(item, { maxEntries = DEFAULT_OUTBOX_MAX_ENTRIES } = {}) {
+    const normalized = normalizeOutboxItem(item)
+    if (!normalized) return false
+    this.pruneOutbox()
+    const items = this.state.outbox.items
+    if (!items[normalized.id] && Object.keys(items).length >= maxEntries) return false
+    items[normalized.id] = normalized
+    this.scheduleSave()
+    return true
+  }
+
+  deleteOutboxItem(id) {
+    const normalized = normalizeOutboxId(id)
+    if (!normalized || !this.state.outbox?.items?.[normalized]) return false
+    delete this.state.outbox.items[normalized]
+    this.scheduleSave()
+    return true
+  }
+
+  pruneOutbox({ now = Date.now(), maxAgeMs = DEFAULT_OUTBOX_MAX_AGE_MS } = {}) {
+    const items = this.state.outbox?.items
+    if (!items || typeof items !== "object") return 0
+    let removed = 0
+    for (const [id, item] of Object.entries(items)) {
+      const createdAt = isFiniteNumber(item?.createdAt) ? item.createdAt : 0
+      if (!createdAt || now - createdAt > maxAgeMs) {
+        delete items[id]
+        removed += 1
+      }
+    }
+    if (removed) this.scheduleSave()
+    return removed
   }
 
   hasIdempotencyKey(key) {
@@ -851,7 +969,9 @@ function validateCurrentState(state) {
   const errors = []
   if (!pushRecordError(errors, state, "state")) return errors
   if (state.schemaVersion !== STATE_SCHEMA_VERSION) errors.push(`state.schemaVersion must be ${STATE_SCHEMA_VERSION}`)
-  if (!(state.updateOffset === null || Number.isInteger(state.updateOffset))) errors.push("state.updateOffset must be null or an integer")
+  if (!(state.updateOffset === null || (Number.isSafeInteger(state.updateOffset) && state.updateOffset >= -1))) {
+    errors.push("state.updateOffset must be null or a safe integer greater than or equal to -1")
+  }
   validateBindingsSection(state.bindings, errors)
   validateSessionIndexSection(state.sessionIndex, errors)
   validateBindingIndexConsistency(state.bindings, state.sessionIndex, errors)
@@ -862,6 +982,8 @@ function validateCurrentState(state) {
   validatePendingRuntimeOnlineNoticeSection(state.pendingRuntimeOnlineNotice, errors)
   validateIdempotencySection(state.idempotency, errors)
   validateCallbackPayloadsSection(state.callbackPayloads, errors)
+  validatePromptDeliveriesSection(state.promptDeliveries, errors)
+  validateOutboxSection(state.outbox, errors)
   return errors
 }
 
@@ -1082,6 +1204,109 @@ function validateCallbackPayloadsSection(value, errors) {
   }
 }
 
+function validatePromptDeliveriesSection(value, errors) {
+  if (!pushRecordError(errors, value, "state.promptDeliveries")) return
+  for (const key of Object.keys(value)) {
+    if (key !== "records") errors.push(`state.promptDeliveries${pathKey(key)} is not supported`)
+  }
+  if (!pushRecordError(errors, value.records, "state.promptDeliveries.records")) return
+  if (Object.keys(value.records).length > DEFAULT_PROMPT_DELIVERY_MAX_ENTRIES) {
+    errors.push(`state.promptDeliveries.records must contain at most ${DEFAULT_PROMPT_DELIVERY_MAX_ENTRIES} entries`)
+  }
+  for (const [key, entry] of Object.entries(value.records)) {
+    const statePath = `state.promptDeliveries.records${pathKey(key)}`
+    if (!normalizePromptDeliveryKey(key)) errors.push(`${statePath} key must be a stable OpenCode message id`)
+    if (!pushRecordError(errors, entry, statePath)) continue
+    const allowedFields = new Set(["openCodeMessageId", "promptHash", "state", "kind", "projectAlias", "sessionId", "chatId", "threadIdOr0", "messageId", "updateId", "attemptCount", "outcomeUnknownSince", "reconcileNotFoundCount", "createdAt", "updatedAt", "lastError"])
+    for (const field of Object.keys(entry)) {
+      if (!allowedFields.has(field)) errors.push(`${statePath}${pathKey(field)} is not supported`)
+    }
+    if (entry.openCodeMessageId !== key) errors.push(`${statePath}.openCodeMessageId must match its record key`)
+    if (typeof entry.promptHash !== "string" || !/^[a-f0-9]{64}$/.test(entry.promptHash)) errors.push(`${statePath}.promptHash must be a SHA-256 hex digest`)
+    if (!PROMPT_DELIVERY_STATES.has(entry.state)) errors.push(`${statePath}.state must be pending, outcome_unknown, or accepted`)
+    if (!PROMPT_DELIVERY_KINDS.has(entry.kind)) errors.push(`${statePath}.kind must be a supported Telegram prompt kind`)
+    validateProjectAlias(entry.projectAlias, `${statePath}.projectAlias`, errors)
+    validateStoredOpenCodeId(entry.sessionId, `${statePath}.sessionId`, errors)
+    if (!Number.isInteger(entry.chatId)) errors.push(`${statePath}.chatId must be an integer`)
+    if (!Number.isInteger(entry.threadIdOr0) || entry.threadIdOr0 < 0) errors.push(`${statePath}.threadIdOr0 must be a non-negative integer`)
+    if (!Number.isInteger(entry.messageId)) errors.push(`${statePath}.messageId must be an integer`)
+    if (entry.updateId != null && !Number.isInteger(entry.updateId)) errors.push(`${statePath}.updateId must be an integer when present`)
+    if (!Number.isInteger(entry.attemptCount) || entry.attemptCount < 0) errors.push(`${statePath}.attemptCount must be a non-negative integer`)
+    if (entry.state === "outcome_unknown") {
+      if (!isFiniteNumber(entry.outcomeUnknownSince)) errors.push(`${statePath}.outcomeUnknownSince must be a finite number for outcome_unknown records`)
+      if (!Number.isInteger(entry.reconcileNotFoundCount) || entry.reconcileNotFoundCount < 0) errors.push(`${statePath}.reconcileNotFoundCount must be a non-negative integer for outcome_unknown records`)
+    } else if (entry.outcomeUnknownSince != null || entry.reconcileNotFoundCount != null) {
+      errors.push(`${statePath} reconciliation fields are only supported for outcome_unknown records`)
+    }
+    if (!isFiniteNumber(entry.createdAt)) errors.push(`${statePath}.createdAt must be a finite number`)
+    if (!isFiniteNumber(entry.updatedAt)) errors.push(`${statePath}.updatedAt must be a finite number`)
+    if (!isOptionalString(entry.lastError) || String(entry.lastError || "").length > 200) errors.push(`${statePath}.lastError must be a string up to 200 characters when present`)
+  }
+}
+
+function validateOutboxSection(value, errors) {
+  if (!pushRecordError(errors, value, "state.outbox")) return
+  for (const key of Object.keys(value)) {
+    if (key !== "items") errors.push(`state.outbox${pathKey(key)} is not supported`)
+  }
+  if (!pushRecordError(errors, value.items, "state.outbox.items")) return
+  if (Object.keys(value.items).length > DEFAULT_OUTBOX_MAX_ENTRIES) {
+    errors.push(`state.outbox.items must contain at most ${DEFAULT_OUTBOX_MAX_ENTRIES} entries`)
+  }
+  for (const [key, entry] of Object.entries(value.items)) {
+    const statePath = `state.outbox.items${pathKey(key)}`
+    if (!normalizeOutboxId(key)) errors.push(`${statePath} key must be a stable outbox id`)
+    if (!pushRecordError(errors, entry, statePath)) continue
+    const allowedItemFields = new Set(["id", "type", "projectAlias", "sessionId", "boundSessionId", "messageId", "route", "progress", "attemptCount", "nextAttemptAt", "createdAt", "updatedAt", "lastError", "payload"])
+    for (const field of Object.keys(entry)) {
+      if (!allowedItemFields.has(field)) errors.push(`${statePath}${pathKey(field)} is not supported`)
+    }
+    if (entry.id !== key) errors.push(`${statePath}.id must match its item key`)
+    if (!OUTBOX_TYPES.has(entry.type)) errors.push(`${statePath}.type must be assistant-final, user-mirror, or agent-error`)
+    validateProjectAlias(entry.projectAlias, `${statePath}.projectAlias`, errors)
+    validateStoredOpenCodeId(entry.sessionId, `${statePath}.sessionId`, errors)
+    validateStoredOpenCodeId(entry.boundSessionId, `${statePath}.boundSessionId`, errors)
+    validateStoredOpenCodeId(entry.messageId, `${statePath}.messageId`, errors)
+    if (!pushRecordError(errors, entry.route, `${statePath}.route`)) {
+      // Route shape reported above.
+    } else {
+      for (const field of Object.keys(entry.route)) {
+        if (!["chatId", "threadIdOr0", "ctxKey"].includes(field)) errors.push(`${statePath}.route${pathKey(field)} is not supported`)
+      }
+      if (!Number.isInteger(entry.route.chatId)) errors.push(`${statePath}.route.chatId must be an integer`)
+      if (!Number.isInteger(entry.route.threadIdOr0) || entry.route.threadIdOr0 < 0) errors.push(`${statePath}.route.threadIdOr0 must be a non-negative integer`)
+      validateCtxKey(entry.route.ctxKey, `${statePath}.route.ctxKey`, errors)
+      if (Number.isInteger(entry.route.chatId) && Number.isInteger(entry.route.threadIdOr0) && entry.route.ctxKey !== `${entry.route.chatId}:${entry.route.threadIdOr0}`) {
+        errors.push(`${statePath}.route.ctxKey must match route chat and thread ids`)
+      }
+    }
+    if (!pushRecordError(errors, entry.progress, `${statePath}.progress`)) {
+      // Progress shape reported above.
+    } else {
+      if (Object.keys(entry.progress).length > 32) errors.push(`${statePath}.progress must contain at most 32 fields`)
+      for (const [progressKey, progressValue] of Object.entries(entry.progress)) {
+        if (!normalizeOutboxProgressKey(progressKey)) errors.push(`${statePath}.progress${pathKey(progressKey)} key is invalid`)
+        if (!isOutboxProgressValue(progressValue)) {
+          errors.push(`${statePath}.progress${pathKey(progressKey)} must be a boolean, a string up to 256 characters, or a non-negative integer`)
+        }
+      }
+    }
+    if (!Number.isInteger(entry.attemptCount) || entry.attemptCount < 0) errors.push(`${statePath}.attemptCount must be a non-negative integer`)
+    for (const field of ["nextAttemptAt", "createdAt", "updatedAt"]) {
+      if (!isFiniteNumber(entry[field])) errors.push(`${statePath}.${field} must be a finite number`)
+    }
+    if (!isOptionalString(entry.lastError) || String(entry.lastError || "").length > 200) errors.push(`${statePath}.lastError must be a string up to 200 characters when present`)
+    if (entry.payload != null) {
+      if (!pushRecordError(errors, entry.payload, `${statePath}.payload`)) continue
+      for (const field of Object.keys(entry.payload)) {
+        if (!["text", "requireMessageError"].includes(field)) errors.push(`${statePath}.payload${pathKey(field)} is not supported`)
+      }
+      if (!isOptionalString(entry.payload.text) || String(entry.payload.text || "").length > 8000) errors.push(`${statePath}.payload.text must be a string up to 8000 characters when present`)
+      if (entry.payload.requireMessageError != null && entry.payload.requireMessageError !== true) errors.push(`${statePath}.payload.requireMessageError must be true when present`)
+    }
+  }
+}
+
 function validatePendingRuntimeOnlineNoticeSection(value, errors) {
   if (value == null) return
   if (!pushRecordError(errors, value, "state.pendingRuntimeOnlineNotice")) return
@@ -1247,6 +1472,120 @@ function normalizeIdempotencyKey(key) {
   const normalized = typeof key === "string" ? key.trim() : ""
   if (!normalized || normalized.length > 512) return ""
   return normalized
+}
+
+const PROMPT_DELIVERY_STATES = new Set(["pending", "outcome_unknown", "accepted"])
+const PROMPT_DELIVERY_KINDS = new Set(["text", "attachment-direct", "attachment-confirmed"])
+
+function normalizePromptDeliveryKey(key) {
+  const normalized = typeof key === "string" ? key.trim() : ""
+  if (!/^msg_tgc_[a-f0-9]{32,64}$/.test(normalized)) return ""
+  return normalized
+}
+
+function normalizePromptDeliveryRecord(value, key = value?.openCodeMessageId) {
+  const openCodeMessageId = normalizePromptDeliveryKey(key)
+  if (!openCodeMessageId || !value || typeof value !== "object") return null
+  if (!PROMPT_DELIVERY_STATES.has(value.state) || !PROMPT_DELIVERY_KINDS.has(value.kind) || typeof value.promptHash !== "string" || !/^[a-f0-9]{64}$/.test(value.promptHash)) return null
+  if (!isSafeProjectAlias(value.projectAlias) || !isStoredOpenCodeId(value.sessionId)) return null
+  if (!Number.isInteger(value.chatId) || !Number.isInteger(value.threadIdOr0) || value.threadIdOr0 < 0 || !Number.isInteger(value.messageId)) return null
+  const createdAt = isFiniteNumber(value.createdAt) ? value.createdAt : Date.now()
+  const updatedAt = isFiniteNumber(value.updatedAt) ? value.updatedAt : createdAt
+  const lastError = normalizeMetadataString(value.lastError, 200)
+  return {
+    openCodeMessageId,
+    promptHash: value.promptHash,
+    state: value.state,
+    kind: value.kind,
+    projectAlias: value.projectAlias,
+    sessionId: value.sessionId,
+    chatId: value.chatId,
+    threadIdOr0: value.threadIdOr0,
+    messageId: value.messageId,
+    ...(Number.isInteger(value.updateId) ? { updateId: value.updateId } : {}),
+    attemptCount: Number.isInteger(value.attemptCount) && value.attemptCount >= 0 ? value.attemptCount : 0,
+    ...(value.state === "outcome_unknown" ? {
+      outcomeUnknownSince: isFiniteNumber(value.outcomeUnknownSince) ? value.outcomeUnknownSince : updatedAt,
+      reconcileNotFoundCount: Number.isInteger(value.reconcileNotFoundCount) && value.reconcileNotFoundCount >= 0 ? value.reconcileNotFoundCount : 0,
+    } : {}),
+    createdAt,
+    updatedAt,
+    ...(lastError ? { lastError } : {}),
+  }
+}
+
+function normalizePromptDeliveries(value) {
+  const source = value?.records && typeof value.records === "object" ? value.records : {}
+  const cutoff = Date.now() - DEFAULT_PROMPT_DELIVERY_MAX_AGE_MS
+  const entries = Object.entries(source)
+    .map(([key, entry]) => [normalizePromptDeliveryKey(key), normalizePromptDeliveryRecord(entry, key)])
+    .filter(([key, entry]) => !!key && !!entry && (entry.state !== "accepted" || entry.updatedAt >= cutoff))
+    .sort((a, b) => a[1].updatedAt - b[1].updatedAt || a[0].localeCompare(b[0]))
+    .slice(-DEFAULT_PROMPT_DELIVERY_MAX_ENTRIES)
+  return { records: Object.fromEntries(entries) }
+}
+
+const OUTBOX_TYPES = new Set(["assistant-final", "user-mirror", "agent-error"])
+
+function normalizeOutboxId(value) {
+  const id = typeof value === "string" ? value.trim() : ""
+  return /^out_[a-f0-9]{40}$/.test(id) ? id : ""
+}
+
+function normalizeOutboxProgressKey(value) {
+  const key = typeof value === "string" ? value.trim() : ""
+  return /^[a-z][a-zA-Z0-9]{0,63}$/.test(key) ? key : ""
+}
+
+function isOutboxProgressValue(value) {
+  return typeof value === "boolean" || (typeof value === "string" && value.length <= 256) || (Number.isInteger(value) && value >= 0)
+}
+
+function normalizeOutboxProgress(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {}
+  const entries = Object.entries(value)
+    .filter(([key, progress]) => !!normalizeOutboxProgressKey(key) && isOutboxProgressValue(progress))
+    .slice(0, 32)
+  return Object.fromEntries(entries)
+}
+
+function normalizeOutboxItem(value) {
+  const id = normalizeOutboxId(value?.id)
+  if (!id || !OUTBOX_TYPES.has(value?.type) || !isSafeProjectAlias(value?.projectAlias) || !isStoredOpenCodeId(value?.sessionId) || !isStoredOpenCodeId(value?.boundSessionId) || !isStoredOpenCodeId(value?.messageId)) return null
+  const route = value?.route
+  if (!route || !Number.isInteger(route.chatId) || !Number.isInteger(route.threadIdOr0) || route.threadIdOr0 < 0 || route.ctxKey !== `${route.chatId}:${route.threadIdOr0}`) return null
+  const createdAt = isFiniteNumber(value.createdAt) ? value.createdAt : Date.now()
+  const updatedAt = isFiniteNumber(value.updatedAt) ? value.updatedAt : createdAt
+  const lastError = normalizeMetadataString(value.lastError, 200)
+  const payloadText = typeof value?.payload?.text === "string" ? value.payload.text.slice(0, 8000) : ""
+  const requireMessageError = value?.payload?.requireMessageError === true
+  return {
+    id,
+    type: value.type,
+    projectAlias: value.projectAlias,
+    sessionId: value.sessionId,
+    boundSessionId: value.boundSessionId,
+    messageId: value.messageId,
+    route: { chatId: route.chatId, threadIdOr0: route.threadIdOr0, ctxKey: route.ctxKey },
+    progress: normalizeOutboxProgress(value.progress),
+    attemptCount: Number.isInteger(value.attemptCount) && value.attemptCount >= 0 ? value.attemptCount : 0,
+    nextAttemptAt: isFiniteNumber(value.nextAttemptAt) ? value.nextAttemptAt : createdAt,
+    createdAt,
+    updatedAt,
+    ...(lastError ? { lastError } : {}),
+    ...(payloadText || requireMessageError ? { payload: { ...(payloadText ? { text: payloadText } : {}), ...(requireMessageError ? { requireMessageError: true } : {}) } } : {}),
+  }
+}
+
+function normalizeOutbox(value) {
+  const source = value?.items && typeof value.items === "object" ? value.items : {}
+  const entries = Object.entries(source)
+    .map(([, item]) => normalizeOutboxItem(item))
+    .filter(Boolean)
+    .sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id))
+    .slice(-DEFAULT_OUTBOX_MAX_ENTRIES)
+    .map((item) => [item.id, item])
+  return { items: Object.fromEntries(entries) }
 }
 
 function normalizeMetadataString(value, maxLength = 200) {
