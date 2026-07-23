@@ -1,6 +1,19 @@
 import { classifyBoundaryError, isClearlyUnsentRequestError, makeBoundaryError } from "../boundary-errors.js"
 import { telegramUpdateIdempotencyKey } from "../connector/idempotency.js"
 
+function malformedGetUpdatesResponse(operation) {
+  return makeBoundaryError({
+    source: "telegram",
+    operation,
+    method: "POST",
+    pathname: "/getUpdates",
+    status: 200,
+    kind: "protocol",
+    outcome: "fatal",
+    message: "Telegram getUpdates returned a successful response with a non-array result",
+  })
+}
+
 export function createTelegramUpdateLoop({
   store,
   tg,
@@ -40,7 +53,6 @@ export function createTelegramUpdateLoop({
         recordLoopAbort("backlogDrain", { reason: "connector stop" })
         return
       }
-      let pollRetryAfterMs = null
       let updates
       try {
         updates = await tg.getUpdates({ offset: -1, timeout: 0, limit: 1, allowed_updates: ["message", "callback_query"], signal: abortController.signal })
@@ -53,7 +65,6 @@ export function createTelegramUpdateLoop({
           method: "POST",
           pathname: "/getUpdates",
         })
-        pollRetryAfterMs = classification.retryAfterMs
         logLoopIssue("backlogDrain", classification.error, {
           retryable: classification.retryable,
           source: "telegram",
@@ -75,7 +86,9 @@ export function createTelegramUpdateLoop({
           })
           return
         }
-        updates = null
+        await sleepWithAbort(classification.retryAfterMs || backoff)
+        backoff = Math.min(30_000, backoff * 2)
+        continue
       }
 
       if (abortController.signal.aborted) {
@@ -83,9 +96,7 @@ export function createTelegramUpdateLoop({
         return
       }
       if (!Array.isArray(updates)) {
-        await sleepWithAbort(pollRetryAfterMs || backoff)
-        backoff = Math.min(30_000, backoff * 2)
-        continue
+        throw malformedGetUpdatesResponse("getUpdates backlog cutoff")
       }
 
       backoff = 1000
@@ -115,7 +126,6 @@ export function createTelegramUpdateLoop({
     await drainTelegramBacklogIfNeeded()
     let backoff = 1000
     while (!abortController.signal.aborted) {
-      let pollRetryAfterMs = null
       const offset = store.get().updateOffset ?? 0
       let updates
       try {
@@ -128,7 +138,6 @@ export function createTelegramUpdateLoop({
           method: "POST",
           pathname: "/getUpdates",
         })
-        pollRetryAfterMs = classification.retryAfterMs
         logLoopIssue("telegramPoll", classification.error, {
           retryable: classification.retryable,
           source: "telegram",
@@ -137,17 +146,16 @@ export function createTelegramUpdateLoop({
           pathname: "/getUpdates",
         })
         if (!classification.retryable) throw classification.error
-        updates = null
+        await sleepWithAbort(classification.retryAfterMs || backoff)
+        backoff = Math.min(30_000, backoff * 2)
+        continue
       }
       if (abortController.signal.aborted) {
         recordLoopAbort("telegramPoll", { reason: "connector stop" })
         break
       }
       if (!Array.isArray(updates)) {
-        // Avoid a tight loop on network/API errors.
-        await sleepWithAbort(pollRetryAfterMs || backoff)
-        backoff = Math.min(30_000, backoff * 2)
-        continue
+        throw malformedGetUpdatesResponse("getUpdates")
       }
       runtimeObservability.recordLoopSuccess("telegramPoll")
       if (updates.length === 0) {

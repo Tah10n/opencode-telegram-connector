@@ -210,7 +210,7 @@ function acceptedThenLostOpenCodeOptions() {
   }
 }
 
-function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, setMyCommandsImpl, sendMessageImpl, sendHtmlBlocksImpl, sendDocumentImpl, editMessageTextImpl, getFileImpl, downloadFileImpl, beforeGetUpdates, afterNegativeOffsetSnapshot } = {}) {
+function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, setMyCommandsImpl, sendMessageImpl, sendHtmlBlocksImpl, sendDocumentImpl, editMessageTextImpl, getFileImpl, downloadFileImpl, beforeGetUpdates, getUpdatesImpl, afterNegativeOffsetSnapshot } = {}) {
   let nextMessageId = 1000
   const updates = []
   const sentMessages = []
@@ -266,6 +266,14 @@ function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, setMyComma
       })
       if (getUpdatesError) throw getUpdatesError
       if (getUpdatesErrors.length > 0) throw getUpdatesErrors.shift()
+      if (getUpdatesImpl) {
+        const overridden = await getUpdatesImpl({
+          input,
+          callIndex: getUpdatesCalls.length,
+          enqueue(update) { updates.push(update) },
+        })
+        if (overridden !== undefined) return overridden
+      }
       if (input?.offset < 0) {
         const pending = updates.splice(0).flatMap((entry) => Array.isArray(entry) ? entry : [entry])
         const count = Math.max(1, Math.abs(Math.trunc(input.offset)))
@@ -4788,6 +4796,39 @@ test("startConnector never repeats an ambiguous first-run backlog snapshot and e
   }
 })
 
+test("startConnector fails closed on a malformed first-run backlog result without another negative snapshot", async () => {
+  const fatalErrors = []
+  const harness = await createHarness({
+    statePatch: { updateOffset: null },
+    onFatalErrorImpl: (err) => fatalErrors.push(err),
+    tgOptions: {
+      getUpdatesImpl: async ({ input, enqueue }) => {
+        if (input?.offset !== -1) return undefined
+        enqueue(makeMessageUpdate(52, "/help"))
+        return { unexpected: "non-array result" }
+      },
+    },
+  })
+
+  try {
+    await waitFor(() => fatalErrors.length === 1)
+    const pollCount = harness.tg.getUpdatesCalls.length
+    await delay(30)
+    await harness.connector.stop()
+    const state = await readState(harness.stateFile)
+
+    assert.equal(fatalErrors[0].kind, "protocol")
+    assert.equal(fatalErrors[0].outcome, "fatal")
+    assert.equal(harness.tg.getUpdatesCalls.length, pollCount)
+    assert.equal(harness.tg.getUpdatesCalls.filter((call) => call?.offset === -1).length, 1)
+    assert.equal(harness.tg.getUpdatesCalls.some((call) => call?.offset === 0), false)
+    assert.equal(harness.tg.pendingUpdates, 1)
+    assert.equal(state.updateOffset, -1)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
 test("startConnector retries a first-run backlog snapshot only when the request was clearly unsent", async () => {
   let negativeAttempts = 0
   let snapshotCalls = 0
@@ -6868,19 +6909,12 @@ test("startConnector treats a malformed successful getUpdates response as one co
   const harness = await createHarness({
     statePatch: { updateOffset: 666 },
     onFatalErrorImpl: (err) => fatalErrors.push(err),
+    tgOptions: {
+      getUpdatesImpl: async () => ({ unexpected: "non-array result" }),
+    },
   })
 
   try {
-    harness.tg.setGetUpdatesError(makeBoundaryError({
-      source: "telegram",
-      operation: "POST getUpdates",
-      method: "POST",
-      pathname: "/getUpdates",
-      status: 200,
-      kind: "protocol",
-      outcome: "fatal",
-      message: "getUpdates returned malformed JSON",
-    }))
     await waitFor(() => fatalErrors.length === 1)
     const pollCount = harness.tg.getUpdatesCalls.length
     await delay(30)
