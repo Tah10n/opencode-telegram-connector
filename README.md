@@ -19,7 +19,7 @@ This Node.js connector binds each Telegram chat or forum topic to a specific `{ 
 - **Multi-project friendly** — different chats/topics can stay bound to different projects at the same time.
 - **Localized Telegram UI** — English and Russian bot menus/messages with per-thread `/language` selection.
 - **Optional local auto-start** — start local opencode servers and optionally open attach/TUI windows.
-- **Restart-safe, fail-closed state** — bindings, feed mode, model preference, pending prompts, prompt-delivery reconciliation, Telegram outbox items, offsets, and idempotency survive restarts; corrupt or unwritable state is surfaced instead of silently reset.
+- **Restart-safe, fail-closed state** — bindings, feed mode, model preference, pending prompts, attachment confirmations, prompt-delivery reconciliation, Telegram outbox items, offsets, and idempotency survive restarts; corrupt or unwritable state is surfaced instead of silently reset.
 - **Operator-safe observability** — compact Telegram runtime counters, redacted text/JSON logs with correlation IDs, and optional loopback health probes for supervisors.
 
 ## How it works
@@ -80,7 +80,7 @@ When you follow the quick start from the connector directory, local runtime file
 
 - `.env` — secrets and env-only overrides; create it from `.env.example` and do not commit it. The parser accepts optional `export`, single/double-quoted values, and `#` inside quoted or unspaced secret values; unquoted comments start at whitespace followed by `#`.
 - `connector.config.mjs` — preferred project configuration; create it from `connector.config.example.mjs` and keep secrets in `.env`.
-- `.data/state.json` — default persisted state path; treat it as sensitive because it contains bindings, offsets, pending prompts, prompt-delivery records, Telegram outbox routes/progress, packed callback payloads, and idempotency history.
+- `.data/state.json` — default persisted state path; treat it as sensitive because it contains bindings, offsets, pending prompts, attachment-confirmation metadata, prompt-delivery records, Telegram outbox routes/progress, packed callback payloads, and idempotency history.
 
 If you launch the connector from another working directory, pass explicit `--env-file`, `--config-file`, and/or `--state-file` paths, or set `cwd` / `stateFile` in `connector.config.mjs` so relative paths resolve where you expect.
 
@@ -265,6 +265,8 @@ Limits and intentionally unsupported media:
 
 If Telegram file download or opencode `prompt_async` is temporarily unavailable, the connector keeps the action retryable instead of pretending the file was delivered.
 
+Large-file confirmation records are flushed before their inline buttons become visible. They are bound to the exact Telegram context, project/session, message/update, and file identity, so a restart can safely resume the callback without downloading or POSTing twice. Records expire after **30 minutes**, are capped at **200**, and are deterministically removed after expiry, rebind, terminal failure, or successful hand-off to the prompt-delivery ledger.
+
 ### Outgoing long text and changed files
 
 Long assistant replies are still delivered as `.txt` attachments instead of oversized Telegram messages. Changed-file cards include buttons to:
@@ -290,7 +292,7 @@ Accepted prompt-delivery markers have a **30-day TTL**. Unresolved `pending` and
 
 All OpenCode message reads made by outbox recovery use one validated timeout for assistant finals, TUI user mirrors, agent-error verification, and other durable message fetches. `opencodeOutboxReadTimeoutMs` defaults to **20 seconds**; a read timeout remains retryable and does not stop the worker. Shutdown aborts an in-flight read immediately and leaves its item durable instead of waiting for the configured request deadline.
 
-Final assistant replies, changed-file cards, optional TUI user mirrors, and agent-error notices are persisted and flushed before the first Telegram API side effect. An entry is not visible to the worker until that flush succeeds, and a failed enqueue flush rolls its in-memory entry back. The worker restores pending entries on startup, honors Telegram `retry_after`, and retains retryable failures until delivery succeeds or the entry expires. Fatal authentication/protocol delivery errors leave the entry durable and trigger controlled runtime shutdown instead of an endless retry loop. Assistant and TUI-user multipart text checkpoints every confirmed block; changed-file summaries checkpoint every confirmed chunk as well as the assistant-text stage. Durable completion tombstones suppress repeated SSE events after restart.
+Final assistant replies, changed-file cards, optional TUI user mirrors, and agent-error notices are persisted and flushed before the first Telegram API side effect. An entry is not visible to the worker until that flush succeeds, and a failed enqueue flush rolls its in-memory entry back. The worker restores pending entries on startup, honors Telegram `retry_after`, and retains retryable failures until delivery succeeds or the entry expires. Item-scoped terminal Telegram `400`/`403` failures and removed project aliases are durably discarded with completion tombstones so the next item can proceed; authentication, state-durability, and global protocol failures remain fatal and leave the item durable. Assistant and TUI-user multipart text checkpoints every confirmed block; changed-file summaries checkpoint every confirmed chunk as well as the assistant-text stage. Durable completion tombstones suppress repeated SSE events after restart.
 
 Before delivery, the worker revalidates that the Telegram thread is still bound to the persisted project and `boundSessionId`. If the thread was unbound or rebound, sending would leak stale output into the wrong session context, so the item is terminally discarded with a completion tombstone and a `discarded` runtime counter. It is not counted as delivered and is not rerouted to the new binding.
 
@@ -300,7 +302,9 @@ The outbox is intentionally bounded:
 - pending-entry TTL of **30 days**;
 - fallback payload text capped at **8,000 characters** (normal content is re-fetched by OpenCode message ID);
 - completion tombstones share the bounded idempotency ledger (**5,000 entries**, **7-day TTL**);
-- a full queue applies retryable backpressure instead of evicting an undelivered item.
+- a full queue applies bounded, abortable FIFO backpressure instead of evicting an undelivered item; the producing SSE handler stays pending until capacity is durably released.
+
+Readiness is false when the outbox worker is absent/stopped, has a fatal error, is full, or has blocked capacity waiters. `/runtime` exposes queue size/capacity, in-flight and blocked counts, worker state, next due time, and the last fatal marker.
 
 Telegram does not offer an idempotency key for ordinary sends. A process or disk failure in the narrow interval after Telegram accepts a send but before its checkpoint flush can therefore still duplicate that single side effect; persisted per-block progress and completion tombstones cover confirmed checkpoints and ordinary restarts.
 
@@ -308,11 +312,11 @@ Telegram does not offer an idempotency key for ordinary sends. A process or disk
 
 `getMe` is a mandatory startup check. Telegram `401`/`403` responses at startup or during polling are fatal authentication/configuration failures: polling stops, controlled shutdown runs once, and the CLI exits non-zero without including the bot token. Network failures, timeouts, `429`, and retryable `5xx` responses remain retryable. Malformed or oversized successful Telegram JSON is a fatal protocol error instead of an endless retry loop.
 
-State schema **v8** adds durable prompt-delivery and Telegram-outbox sections. Current-schema corruption fails closed; v7 and older supported states are backed up and migrated. Atomic state replacement syncs and closes the temporary file before rename, then syncs the parent directory on POSIX. Windows keeps the recoverable replacement-backup fallback because Node does not expose a portable directory `fsync` there.
+State schema **v9** adds validated, bounded attachment-confirmation records; v8 introduced durable prompt-delivery and Telegram-outbox sections. Supported v8 and older states are backed up and migrated, while current-schema corruption fails closed. Atomic state replacement syncs and closes the temporary file before rename, then syncs the parent directory on POSIX. Windows keeps the recoverable replacement-backup fallback because Node does not expose a portable directory `fsync` there.
 
 Ordinary response bodies are byte-bounded even when `Content-Length` is absent: OpenCode success JSON is limited to **2 MiB**, OpenCode/Telegram error bodies to **64 KiB**, Telegram JSON to **8 MiB**, and Telegram file responses to an absolute **20 MiB** (incoming workflow limits are usually much smaller). Oversized bodies are cancelled and full error bodies are not logged.
 
-With the default first-run backlog policy, the connector persists a cutoff-intent sentinel and takes one Telegram tail snapshot (`offset=-1`, `limit=1`). Updates at or before that server-side snapshot are old backlog; updates arriving after it are handled by the normal loop. Readiness remains false until the cutoff offset is durably stored. If startup stops between intent and cutoff persistence, the next run processes the remaining queue from offset `0` rather than risk discarding a new update.
+With the default first-run backlog policy, the connector persists a cutoff-intent sentinel and takes one Telegram tail snapshot (`offset=-1`, `limit=1`). Updates at or before that server-side snapshot are old backlog; updates arriving after it are handled by the normal loop. A clearly unsent connection failure may retry that snapshot, but an ambiguous response never triggers a second negative-offset request: the connector durably falls back to offset `0`, records a backlog fallback hit, and may safely reprocess old backlog rather than discard a new message. A restart with the persisted `-1` sentinel follows the same offset-`0` recovery. Readiness remains false until the cutoff or fallback is durably stored.
 
 ## Configuration overview
 
@@ -419,7 +423,7 @@ CONNECTOR_HEALTH_PORT=8787
 - Disabled by default.
 - Bound to `127.0.0.1` by default; expose it beyond loopback only behind your own trusted network/proxy controls.
 - `GET /livez` returns process liveness.
-- `GET /readyz` and `GET /healthz` return readiness based on shutdown state, state load/flush health, completion of any first-run Telegram backlog cutoff, Telegram polling observation, and lifecycle task presence.
+- `GET /readyz` and `GET /healthz` return readiness based on shutdown state, state load/flush health, durable completion of any first-run Telegram backlog cutoff/fallback, Telegram polling observation, lifecycle task presence, and an active outbox worker with available capacity and no fatal marker.
 - This is **not** Telegram webhook support and does not change the long-polling runtime model.
 - It does not make multiple connector instances safe; keep one connector per Telegram bot token.
 
@@ -611,7 +615,7 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 2. `/projects` offers Status and Close for every project, Start only where auto-start is configured and supported, and Show sessions only in private chats.
 3. Tap `/runtime` Restart or Stop, confirm the warning screen appears, then Cancel once to verify confirmation without stopping the process.
 4. In a supervised environment, confirm `/runtime` Restart exits, is relaunched by the supervisor, and sends the online-again notice; confirm `/runtime` Stop exits cleanly and remains stopped.
-5. Stop and restart the supervisor-managed process; bindings, offset, feed mode, model preference, pending prompts, prompt reconciliation records, and pending Telegram outbox deliveries should recover without repeating confirmed checkpoints.
+5. Stop and restart the supervisor-managed process; bindings, offset, feed mode, model preference, pending prompts, attachment confirmations, prompt reconciliation records, and pending Telegram outbox deliveries should recover without repeating confirmed checkpoints.
 6. Temporarily stop one opencode server, use `/projects` → Status, then restore the server and check Status again to confirm project-scoped recovery works without restarting the connector.
 7. If `healthServer.enabled` is on, confirm `/livez` returns `200` and `/readyz` returns `200` only after Telegram polling/state health are ready.
 8. In a group, confirm `/start@OtherBot` is ignored and `/start@<this bot username>` is handled.
@@ -620,6 +624,7 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 11. If a normal Telegram prompt loses the `prompt_async` response after acceptance, replay the update and confirm reconciliation finds the deterministic OpenCode message instead of creating a second turn.
 12. Send long formatted output and confirm Telegram chunks remain parseable HTML.
 13. Make Telegram return a temporary `503`/`429` for an outbound reply, restart if desired, and confirm `/runtime` shows the durable retry before the item is delivered and removed.
+14. Restart after a large-file confirmation button is shown, then confirm the same button resumes the exact file prompt without a second download or POST.
 
 ## Troubleshooting matrix
 
@@ -629,10 +634,10 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 | Connector exits after `getMe` or polling | Telegram returned fatal `401`/`403`, malformed success JSON, or an oversized protocol response. | Replace/re-authorize the bot token or fix the upstream response, then let the supervisor restart the connector. Do not configure a supervisor to hide a permanently invalid token with a tight restart loop. |
 | OpenCode unavailable | Use `/projects` and the project's Status button. `/status` also shows the current project's SSE and sanitized base URL. | Start opencode manually, or press Start if the project exposes a Start button. Check Status after the server is up. |
 | Windows TUI/attach window appears hung | Check logs for watchdog restarts or repeated retryable SSE/prompt-poll failures. A stale attach window can remain after a server restart. | Let the auto-start watchdog recover the project; it closes matching stale attach windows and opens a fresh one. If needed, close the old TUI window manually and use `/projects` → Start/Status. |
-| State file cannot be read, written, or validated | Startup or runtime logs report a state read/write/schema failure. The connector fails closed instead of silently resetting state. Schema errors include the malformed section path, and migration/invalid-state backups are written next to `state.json` when possible. | Fix permissions/path/corruption, repair the reported section, or restore a known-good `state.json.backup.*` file. Treat backups as sensitive; they contain the same bindings, offset, prompts, packed callback payloads, and idempotency history as `state.json`. |
+| State file cannot be read, written, or validated | Startup or runtime logs report a state read/write/schema failure. The connector fails closed instead of silently resetting state. Schema errors include the malformed section path, and migration/invalid-state backups are written next to `state.json` when possible. | Fix permissions/path/corruption, repair the reported section, or restore a known-good `state.json.backup.*` file. Treat backups as sensitive; they contain the same bindings, offset, prompts, attachment confirmations, outbox routes/progress, packed callback payloads, and idempotency history as `state.json`. |
 | Prompt send reports project unavailable | A clearly unsent OpenCode request is retryable, or an earlier POST has an ambiguous outcome that must be reconciled by deterministic message ID. | Restore the project and let the Telegram update replay. If an `outcome_unknown` record remains on exact-message `404`, do not blindly retry or delete it; verify independently that OpenCode never accepted that message ID before the stopped-connector recovery described above. |
 | Assistant/TUI/error delivery is delayed | Check `/runtime` durable-outbox retry/backpressure counters and redacted retry metadata. | Restore Telegram connectivity or respect the reported rate limit. Do not delete state: pending routes and per-block checkpoints are stored there. |
-| Durable outbox reports `discarded` | The original Telegram route was unbound or rebound before delivery, so its persisted `boundSessionId` no longer matches. | Confirm the rebind was intentional. Trigger fresh output in the new session if needed; stale output is never rerouted automatically. |
+| Durable outbox reports `discarded` | The route was unbound/rebound, its project alias was removed, or Telegram returned an item-scoped terminal `400`/`403`. | Inspect the redacted discard reason. Confirm rebind/project removal was intentional or repair the Telegram destination, then trigger fresh output if needed; discarded output is tombstoned and never rerouted automatically. |
 | OpenCode works but assistant replies do not appear in Telegram | Check logs for `SSE disabled for project`, rapid `SSE connected` / `SSE disconnected` loops, or `drop=global_directory_missing` SSE debug lines. Current opencode builds expose the long-lived stream at `/global/event` with project directory metadata; older connector versions listening to `/event` may only receive `server.connected` before the stream closes. | Add the project `directory` and run `npm run setup:check`. If you run an older opencode build that lacks `/global/event` or does not send directory metadata there, set `OPENCODE_SSE_EVENT_PATH=/event` and restart. Prompt polling remains available while SSE is disabled or down. |
 | SSE stopped after protocol/size error | Logs show a fatal SSE protocol or size failure for one project followed by a fatal runtime error. | Inspect upstream event size/protocol, fix the source, then let the supervisor restart the connector or restart it manually. |
 | Group command ignored | The command may be addressed to another bot, for example `/start@OtherBot`. | Use `/command@<this bot username>` or an unsuffixed command that Telegram delivers to this bot. |
@@ -646,9 +651,9 @@ After changing runtime/recovery behavior, run the connector under your usual sup
 
 - The bot accepts messages from a single Telegram user ID only.
 - The connector is designed to run as a **single instance** per bot token.
-- On first start, it captures one Telegram tail snapshot by default. Updates at or before that cutoff are skipped; later arrivals are processed normally, and readiness stays false until the cutoff is persisted. Set `CONNECTOR_DRAIN_BACKLOG_ON_FIRST_RUN=0` or `drainTelegramBacklogOnFirstRun: false` to process queued updates from offset `0` instead.
+- On first start, it captures one Telegram tail snapshot by default. Updates at or before a confirmed cutoff are skipped; later arrivals are processed normally, and readiness stays false until the cutoff is persisted. An ambiguous tail response falls back durably to offset `0` without a second negative request. Set `CONNECTOR_DRAIN_BACKLOG_ON_FIRST_RUN=0` or `drainTelegramBacklogOnFirstRun: false` to process queued updates from offset `0` instead.
 - State load and critical state flush/write failures fail closed; the connector should not continue as if durability succeeded.
-- Current-schema state is validated on load, including binding/session-index consistency, prompt-delivery records, durable outbox routes/progress, and persisted callback payload expiry; unsupported schema versions fail closed, and schema migrations create bounded `state.json.backup.*` files before writing the migrated state.
+- Current-schema state is validated on load, including binding/session-index consistency, attachment confirmations, prompt-delivery records, durable outbox routes/progress, and persisted callback payload expiry; unsupported schema versions fail closed, and schema migrations create bounded `state.json.backup.*` files before writing the migrated state.
 - A confirmed `/runtime` Restart stores a short pending online-notice record in state until the next startup sends and clears it.
 - Feed mode is stored per Telegram thread/topic; the default is `Main + changes`.
 - Large assistant replies may be delivered as `.txt` attachments, and large changed-file diffs may be delivered as `.patch` attachments instead of many chat messages.
