@@ -591,6 +591,54 @@ test("missing outbox project alias is terminally discarded without an OpenCode c
   assert.deepEqual(store.getOutboxItems(), {})
 })
 
+test("outbox OpenCode reads share one configured timeout and abort signal", async (t) => {
+  const { store } = await makeStore(t)
+  store.get().bindings["100:7"] = { projectAlias: "demo", sessionId: "ses_1" }
+  store.get().sessionIndex["demo:ses_1"] = { chatId: 100, threadIdOr0: 7 }
+  const controller = new AbortController()
+  const reads = []
+  const expectedError = makeBoundaryError({
+    source: "opencode",
+    operation: "GET message",
+    kind: "timeout",
+    outcome: "retryable",
+    message: "controlled read stop",
+  })
+  const oc = {
+    async getMessage(_sessionId, _messageId, options) {
+      reads.push(options)
+      throw expectedError
+    },
+  }
+  const deliver = createOutboxDelivery({
+    store,
+    runtime: { mirrorCompaction: false },
+    ocByAlias: { demo: oc },
+    openCodeReadTimeoutMs: 2345,
+    ensureForwardedSets: () => ({
+      user: new Set(),
+      assistant: new Set(),
+      changes: new Set(),
+      agentStopErrors: new Set(),
+    }),
+    getAssistantMessageWithRetry: (_oc, sessionId, messageId, options) => oc.getMessage(sessionId, messageId, options),
+    logSseDebug() {},
+  })
+  const items = [
+    { ...baseItem, boundSessionId: "ses_1", route: { ...baseItem.route, ctxKey: "100:7" } },
+    { ...baseItem, type: "user-mirror", boundSessionId: "ses_1", messageId: "msg_user", route: { ...baseItem.route, ctxKey: "100:7" } },
+    { ...baseItem, type: "agent-error", boundSessionId: "ses_1", messageId: "msg_error", route: { ...baseItem.route, ctxKey: "100:7" }, payload: { requireMessageError: true } },
+  ]
+
+  for (const item of items) {
+    await assert.rejects(() => deliver(item, { signal: controller.signal }), /controlled read stop/)
+  }
+
+  assert.equal(reads.length, 3)
+  assert.deepEqual(reads.map((options) => options.timeoutMs), [2345, 2345, 2345])
+  assert.ok(reads.every((options) => options.signal === controller.signal))
+})
+
 test("durable outbox run stops promptly during a non-settling in-flight delivery", async (t) => {
   const { store } = await makeStore(t)
   const abortController = new AbortController()
@@ -620,6 +668,48 @@ test("durable outbox run stops promptly during a non-settling in-flight delivery
   assert.equal(retained.attemptCount, 0)
   assert.equal(outbox.snapshot().workerActive, false)
   assert.equal(outbox.snapshot().lastFatalError, "")
+})
+
+test("shutdown drain skips only the interrupted in-flight item and can finish another queued item", async (t) => {
+  const { store } = await makeStore(t)
+  const abortController = new AbortController()
+  let firstAttempts = 0
+  let markFirstStarted
+  const firstStarted = new Promise((resolve) => { markFirstStarted = resolve })
+  const delivered = []
+  const clock = { now: 1000 }
+  const outbox = createDurableOutbox({
+    store,
+    abortSignal: abortController.signal,
+    now: () => clock.now,
+    deliver: async (item, { signal }) => {
+      if (item.messageId === "msg_interrupted") {
+        firstAttempts += 1
+        if (firstAttempts > 1) assert.fail("shutdown drain must not restart the interrupted item")
+        markFirstStarted()
+        await new Promise((_resolve, reject) => {
+          const rejectAbort = () => reject(Object.assign(new Error("aborted"), { name: "AbortError" }))
+          if (signal?.aborted) rejectAbort()
+          else signal?.addEventListener?.("abort", rejectAbort, { once: true })
+        })
+      }
+      delivered.push(item.messageId)
+    },
+  })
+  await outbox.enqueue({ ...baseItem, messageId: "msg_interrupted" })
+  clock.now += 1
+  await outbox.enqueue({ ...baseItem, messageId: "msg_drainable" })
+
+  const runPromise = outbox.run()
+  await firstStarted
+  abortController.abort()
+  await runPromise
+  const drainController = new AbortController()
+  await outbox.drain({ signal: drainController.signal })
+
+  assert.equal(firstAttempts, 1)
+  assert.deepEqual(delivered, ["msg_drainable"])
+  assert.deepEqual(Object.values(store.getOutboxItems()).map((item) => item.messageId), ["msg_interrupted"])
 })
 
 test("durable outbox exposes a fatal worker failure and releases blocked waiters", async (t) => {

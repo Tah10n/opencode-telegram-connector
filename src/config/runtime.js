@@ -2,6 +2,10 @@ import path from "node:path"
 import { loadEnvFromFile, envOptional, envRequired, envInt, envBool } from "./env.js"
 import { loadConnectorConfigFile } from "./file.js"
 import { loadProjectsConfig } from "./projects.js"
+import {
+  DEFAULT_OPENCODE_OUTBOX_READ_TIMEOUT_MS,
+  normalizeOpenCodeOutboxReadTimeoutMs,
+} from "./outbox.js"
 import { normalizeI18nConfig } from "../i18n/index.js"
 import { normalizeLimits } from "../limits.js"
 
@@ -142,6 +146,11 @@ export async function buildRuntimeConfig({ args = {}, cwd = process.cwd() } = {}
     mirrorTuiUserMessages: configFromFile.mirrorTuiUserMessages ?? envBool("MIRROR_TUI_USER_MESSAGES", false),
     drainTelegramBacklogOnFirstRun: configFromFile.drainTelegramBacklogOnFirstRun ?? envBool("CONNECTOR_DRAIN_BACKLOG_ON_FIRST_RUN", true),
     allowInsecureHttp: configFromFile.allowInsecureHttp ?? envBool("OPENCODE_ALLOW_INSECURE_HTTP", false),
+    opencodeOutboxReadTimeoutMs: normalizeOpenCodeOutboxReadTimeoutMs(
+      configFromFile.opencodeOutboxReadTimeoutMs
+        ?? envInt("OPENCODE_OUTBOX_READ_TIMEOUT_MS", DEFAULT_OPENCODE_OUTBOX_READ_TIMEOUT_MS),
+      { fieldName: "opencodeOutboxReadTimeoutMs / OPENCODE_OUTBOX_READ_TIMEOUT_MS" },
+    ),
     logFormat: normalizeLogFormat(configFromFile.logFormat ?? envOptional("CONNECTOR_LOG_FORMAT", "text")),
     healthServer: normalizeHealthServerConfig({
       enabled: configFromFile.healthServer?.enabled ?? envBool("CONNECTOR_HEALTH_ENABLED", false),

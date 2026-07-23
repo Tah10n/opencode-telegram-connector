@@ -288,6 +288,8 @@ Accepted prompt-delivery markers have a **30-day TTL**. Unresolved `pending` and
 
 ### Telegram delivery outbox
 
+All OpenCode message reads made by outbox recovery use one validated timeout for assistant finals, TUI user mirrors, agent-error verification, and other durable message fetches. `opencodeOutboxReadTimeoutMs` defaults to **20 seconds**; a read timeout remains retryable and does not stop the worker. Shutdown aborts an in-flight read immediately and leaves its item durable instead of waiting for the configured request deadline.
+
 Final assistant replies, changed-file cards, optional TUI user mirrors, and agent-error notices are persisted and flushed before the first Telegram API side effect. An entry is not visible to the worker until that flush succeeds, and a failed enqueue flush rolls its in-memory entry back. The worker restores pending entries on startup, honors Telegram `retry_after`, and retains retryable failures until delivery succeeds or the entry expires. Fatal authentication/protocol delivery errors leave the entry durable and trigger controlled runtime shutdown instead of an endless retry loop. Assistant and TUI-user multipart text checkpoints every confirmed block; changed-file summaries checkpoint every confirmed chunk as well as the assistant-text stage. Durable completion tombstones suppress repeated SSE events after restart.
 
 Before delivery, the worker revalidates that the Telegram thread is still bound to the persisted project and `boundSessionId`. If the thread was unbound or rebound, sending would leak stale output into the wrong session context, so the item is terminally discarded with a completion tombstone and a `discarded` runtime counter. It is not counted as delivered and is not rerouted to the new binding.
@@ -329,6 +331,7 @@ With the default first-run backlog policy, the connector persists a cutoff-inten
 - `OPENCODE_ALLOW_INSECURE_HTTP=1` / `allowInsecureHttp`
 - `OPENCODE_TERMINAL` (Linux terminal launcher override)
 - `activeTurnStaleMs` (`connector.config.mjs` only; milliseconds before a running assistant turn is treated as stale)
+- `opencodeOutboxReadTimeoutMs` / `OPENCODE_OUTBOX_READ_TIMEOUT_MS` (OpenCode message-read timeout for durable Telegram outbox recovery; default `20000` ms, allowed range `100..120000`)
 - `cwd` (`connector.config.mjs` only; base directory for relative paths)
 
 Boolean env values accept `1`/`true`/`yes`/`y`/`on` and `0`/`false`/`no`/`n`/`off` case-insensitively. Invalid non-empty values fail fast instead of silently becoming disabled.

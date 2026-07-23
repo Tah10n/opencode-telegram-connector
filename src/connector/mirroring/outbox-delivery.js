@@ -1,4 +1,5 @@
 import { classifyBoundaryError, makeBoundaryError } from "../../boundary-errors.js"
+import { normalizeOpenCodeOutboxReadTimeoutMs } from "../../config/outbox.js"
 import { sessionKey } from "../../state/store.js"
 import { NOISY_SKIP_REASONS } from "../noisy-skip-reasons.js"
 import { agentStopErrorDedupeKey, extractTextParts, formatAgentStopErrorNotice } from "./assistant-format.js"
@@ -29,7 +30,12 @@ export function createOutboxDelivery({
   logSseDebug,
   recordNoisySkip,
   recordAssistantMirrored,
+  openCodeReadTimeoutMs,
 } = {}) {
+  const requestTimeoutMs = normalizeOpenCodeOutboxReadTimeoutMs(openCodeReadTimeoutMs ?? runtime?.config?.opencodeOutboxReadTimeoutMs, {
+    fieldName: "openCodeReadTimeoutMs",
+  })
+
   async function finalizePreview(routeCtx, telegramMessageId, text, signal) {
     const edited = await editPreviewOrNull(() => tg.editMessageText(routeCtx.chatId, telegramMessageId, text, null, { signal }))
     if (edited) return
@@ -57,7 +63,7 @@ export function createOutboxDelivery({
     }
 
     if (item.type === "user-mirror") {
-      const msg = await oc.getMessage(item.sessionId, item.messageId, { signal, timeoutMs: 1000 }).catch((err) => {
+      const msg = await oc.getMessage(item.sessionId, item.messageId, { signal, timeoutMs: requestTimeoutMs }).catch((err) => {
         if (!isMissingOpenCodeMessage(err)) throw err
         throw makeBoundaryError({
           source: "opencode",
@@ -91,7 +97,7 @@ export function createOutboxDelivery({
       const requireMessageError = item.payload?.requireMessageError === true
       let msg = null
       try {
-        msg = await oc.getMessage(item.sessionId, item.messageId, { signal, timeoutMs: 1000 })
+        msg = await oc.getMessage(item.sessionId, item.messageId, { signal, timeoutMs: requestTimeoutMs })
       } catch (err) {
         if (requireMessageError && !isMissingOpenCodeMessage(err)) throw err
         if (requireMessageError) return { delivered: false, completed: false, reason: "message-error-not-confirmed" }
@@ -110,7 +116,7 @@ export function createOutboxDelivery({
     }
 
     if (item.type !== "assistant-final") throw new Error(`Unsupported durable outbox type: ${item.type}`)
-    const msg = await getAssistantMessageWithRetry(oc, item.sessionId, item.messageId, { attempts: 1, signal, timeoutMs: 1000 })
+    const msg = await getAssistantMessageWithRetry(oc, item.sessionId, item.messageId, { attempts: 1, signal, timeoutMs: requestTimeoutMs })
     if (!msg) {
       throw makeBoundaryError({
         source: "opencode",

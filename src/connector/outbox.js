@@ -141,6 +141,7 @@ export function createDurableOutbox({
     : DEFAULT_CAPACITY_WAITER_LIMIT
   let deliverItem = deliver
   const inFlight = new Set()
+  const interruptedByShutdown = new Set()
   const pendingPersistence = new Map()
   const capacityWaiters = []
   const pause = typeof sleep === "function" ? sleep : (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -406,7 +407,7 @@ export function createDurableOutbox({
 
   function dueItems(at = now()) {
     return Object.values(store.getOutboxItems())
-      .filter((item) => !pendingPersistence.has(item.id) && !inFlight.has(item.id) && item.nextAttemptAt <= at)
+      .filter((item) => !pendingPersistence.has(item.id) && !inFlight.has(item.id) && !interruptedByShutdown.has(item.id) && item.nextAttemptAt <= at)
       .sort((a, b) => a.nextAttemptAt - b.nextAttemptAt || a.createdAt - b.createdAt || a.id.localeCompare(b.id))
   }
 
@@ -443,7 +444,10 @@ export function createDurableOutbox({
         }),
         signal,
       )
-      if (deliveryResult === DELIVERY_ABORTED || signal?.aborted) return false
+      if (deliveryResult === DELIVERY_ABORTED || signal?.aborted) {
+        if (abortSignal?.aborted) interruptedByShutdown.add(item.id)
+        return false
+      }
       if (deliveryResult?.completed === false) {
         store.deleteOutboxItem(item.id)
         await flushStore(store, "cancel unconfirmed durable Telegram delivery")
@@ -458,7 +462,10 @@ export function createDurableOutbox({
       if (discarded) observability?.recordOutboxDiscarded?.(item.projectAlias)
       else observability?.recordOutboxDelivered?.(item.projectAlias)
     } catch (err) {
-      if (signal?.aborted || err?.name === "AbortError") return false
+      if (signal?.aborted || err?.name === "AbortError") {
+        if (abortSignal?.aborted) interruptedByShutdown.add(item.id)
+        return false
+      }
       const current = store.getOutboxItem(item.id) || item
       const { classification, disposition } = failureDisposition(err)
       if (disposition === "terminal") {

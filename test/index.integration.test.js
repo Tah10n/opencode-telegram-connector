@@ -34,6 +34,38 @@ function shortDelay(ms) {
   return delay(Math.min(ms, 2))
 }
 
+function createDelayedOpenCodeMessageReader({ delayMs, message, onRequest } = {}) {
+  return async (_sessionId, _messageId, { signal, timeoutMs } = {}) => {
+    onRequest?.({ signal, timeoutMs })
+    return new Promise((resolve, reject) => {
+      let settled = false
+      let abortHandler = () => {}
+      const finish = (callback, value) => {
+        if (settled) return
+        settled = true
+        clearTimeout(responseTimer)
+        clearTimeout(timeoutTimer)
+        signal?.removeEventListener?.("abort", abortHandler)
+        callback(value)
+      }
+      const responseTimer = setTimeout(() => finish(resolve, message), delayMs)
+      const timeoutTimer = Number.isFinite(timeoutMs) && timeoutMs > 0
+        ? setTimeout(() => finish(reject, makeBoundaryError({
+          source: "opencode",
+          operation: "GET message",
+          kind: "timeout",
+          outcome: "retryable",
+          code: "ETIMEDOUT",
+          message: `OpenCode read timed out after ${timeoutMs}ms`,
+        })), timeoutMs)
+        : null
+      abortHandler = () => finish(reject, Object.assign(new Error("OpenCode read aborted"), { name: "AbortError" }))
+      if (signal?.aborted) abortHandler()
+      else signal?.addEventListener?.("abort", abortHandler, { once: true })
+    })
+  }
+}
+
 async function makeTempDir() {
   const dir = path.join(os.tmpdir(), `telegram-connector-${crypto.randomUUID()}`)
   await fs.mkdir(dir, { recursive: true })
@@ -619,6 +651,10 @@ test("startConnector validates public API config before runtime startup", async 
   await assert.rejects(
     () => startConnector({ config: { telegram: { botToken: "x", allowedUserId: 42 }, projects: { demo: {} } } }),
     /config\.projects\.demo\.baseUrl is required/,
+  )
+  await assert.rejects(
+    () => startConnector({ config: { telegram: { botToken: "x", allowedUserId: 42 }, opencodeOutboxReadTimeoutMs: 99, projects: { demo: { baseUrl: "http:\/\/127.0.0.1:4312" } } } }),
+    /config\.opencodeOutboxReadTimeoutMs.*100\.\.120000/,
   )
 })
 
@@ -6020,6 +6056,139 @@ test("startConnector retries a durable final assistant delivery after Telegram 5
 
     assert.equal(attempts, 2)
     assert.equal(harness.tg.sentHtmlBlocks[0].blocks[0].html, "recover after Telegram outage")
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector delivers an outbox item when a healthy OpenCode read takes longer than one second", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  let observedTimeoutMs = null
+  const message = {
+    info: { id: "msg_slow_opencode", role: "assistant", time: { completed: completedAt } },
+    parts: [{ type: "text", text: "slow but healthy OpenCode response" }],
+  }
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 663,
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+      sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+    },
+    ocOptions: {
+      getMessageImpl: createDelayedOpenCodeMessageReader({
+        delayMs: 1600,
+        message,
+        onRequest: ({ timeoutMs }) => { observedTimeoutMs = timeoutMs },
+      }),
+    },
+  })
+
+  try {
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_1", info: message.info },
+    })
+    await waitFor(async () =>
+      harness.tg.sentHtmlBlocks.some((entry) => entry.blocks[0]?.html === "slow but healthy OpenCode response")
+      && Object.keys((await readState(harness.stateFile)).outbox.items).length === 0,
+    { timeoutMs: 4000 })
+
+    assert.equal(observedTimeoutMs, 20_000)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector keeps a timed-out OpenCode outbox read retryable and the worker alive", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  let outbox
+  let observedTimeoutMs = null
+  const message = {
+    info: { id: "msg_short_opencode_timeout", role: "assistant", time: { completed: completedAt } },
+    parts: [{ type: "text", text: "not delivered before timeout" }],
+  }
+  const harness = await createHarness({
+    configPatch: { opencodeOutboxReadTimeoutMs: 100 },
+    statePatch: {
+      updateOffset: 663,
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+      sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+    },
+    ocOptions: {
+      getMessageImpl: createDelayedOpenCodeMessageReader({
+        delayMs: 500,
+        message,
+        onRequest: ({ timeoutMs }) => { observedTimeoutMs = timeoutMs },
+      }),
+    },
+    createDurableOutboxRuntimeImpl: (options) => {
+      const outboxRuntime = createDurableOutboxRuntime(options)
+      outbox = outboxRuntime.outbox
+      return outboxRuntime
+    },
+  })
+
+  try {
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_1", info: message.info },
+    })
+    const pending = await waitFor(async () => {
+      const item = Object.values((await readState(harness.stateFile)).outbox.items)[0]
+      return item?.attemptCount === 1 ? item : null
+    })
+
+    assert.equal(observedTimeoutMs, 100)
+    assert.match(pending.lastError, /unavailable/)
+    assert.equal(harness.tg.sentHtmlBlocks.length, 0)
+    assert.equal(outbox.snapshot().workerActive, true)
+    assert.equal(outbox.snapshot().lastFatalError, "")
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector aborts a slow OpenCode outbox read during shutdown without waiting for its timeout", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  let markReadStarted
+  let observedSignal = null
+  const readStarted = new Promise((resolve) => { markReadStarted = resolve })
+  const message = {
+    info: { id: "msg_abort_opencode_read", role: "assistant", time: { completed: completedAt } },
+    parts: [{ type: "text", text: "must remain queued" }],
+  }
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 663,
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+      sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+    },
+    ocOptions: {
+      getMessageImpl: createDelayedOpenCodeMessageReader({
+        delayMs: 10_000,
+        message,
+        onRequest: ({ signal }) => {
+          observedSignal = signal
+          markReadStarted()
+        },
+      }),
+    },
+  })
+
+  try {
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_1", info: message.info },
+    })
+    await readStarted
+
+    const startedAt = Date.now()
+    await harness.connector.stop()
+
+    assert.ok(Date.now() - startedAt < 500)
+    assert.equal(observedSignal?.aborted, true)
+    assert.equal(harness.tg.sentHtmlBlocks.length, 0)
+    assert.equal(Object.keys((await readState(harness.stateFile)).outbox.items).length, 1)
   } finally {
     await harness.connector.stop()
   }
