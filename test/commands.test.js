@@ -3828,6 +3828,43 @@ test("createCommandHandlers does not mark large attachment handled when confirma
   assert.equal(Object.keys(storeState.attachmentConfirmations.records).length, 1)
 })
 
+test("createCommandHandlers requires a successful attachment confirmation flush on retry before showing UI", async () => {
+  const storeState = { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } }
+  let flushAttempts = 0
+  const { runtime, sent } = makeRuntime({
+    storeState,
+    store: {
+      async flush() {
+        flushAttempts += 1
+        if (flushAttempts === 1) throw new Error("state write failed")
+      },
+    },
+    ocByAlias: { demo: { async promptAsync() {} } },
+  })
+  const handlers = createCommandHandlers(runtime)
+  const message = {
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 11,
+    message_thread_id: 7,
+    document: { file_id: "file_large", file_name: "large.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
+  }
+
+  await assert.rejects(
+    () => handlers.handleTelegramMessage(message, { updateId: 614 }),
+    (err) => err?.source === "state" && err?.kind === "durability" && err?.outcome === "retryable",
+  )
+  assert.equal(flushAttempts, 1)
+  assert.equal(sent.length, 0)
+  assert.equal(Object.keys(storeState.attachmentConfirmations.records).length, 1)
+
+  await handlers.handleTelegramMessage(message, { updateId: 614 })
+
+  assert.equal(flushAttempts, 2)
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Confirm sending this file/)
+})
+
 test("createCommandHandlers sends confirmed large text documents", async () => {
   const promptCalls = []
   const editCalls = []

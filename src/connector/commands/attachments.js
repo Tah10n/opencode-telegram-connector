@@ -358,8 +358,8 @@ export function createAttachmentHandlers({
           message: "Durable attachment confirmation ledger is full; confirmation was not shown",
         })
       }
-      await flushDurableState("persist attachment confirmation")
     }
+    await flushDurableState("persist attachment confirmation")
     await sendToThread(ctxMeta, attachmentConfirmationText(record.documentInfo, { limits, locale }), attachmentConfirmationKeyboard(token, locale))
     if (markMessageHandled) {
       await markMessageHandled("attachmentConfirmRequested", {
