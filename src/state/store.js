@@ -7,11 +7,13 @@ import { isSafeOpenCodeId } from "../opencode/ids.js"
 import { redactSensitiveText } from "../url-utils.js"
 import { matchSupportedLocale } from "../i18n/index.js"
 
-export const STATE_SCHEMA_VERSION = 8
+export const STATE_SCHEMA_VERSION = 9
 export const DEFAULT_FEED_MODE = "main+changes"
 export const DEFAULT_IDEMPOTENCY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 export const DEFAULT_IDEMPOTENCY_MAX_ENTRIES = 5000
 export const DEFAULT_CALLBACK_PAYLOAD_MAX_ENTRIES = 4000
+export const DEFAULT_ATTACHMENT_CONFIRMATION_MAX_AGE_MS = 30 * 60 * 1000
+export const DEFAULT_ATTACHMENT_CONFIRMATION_MAX_ENTRIES = 200
 export const DEFAULT_PROMPT_DELIVERY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000
 export const DEFAULT_PROMPT_DELIVERY_MAX_ENTRIES = 10_000
 export const DEFAULT_OUTBOX_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000
@@ -57,6 +59,7 @@ function migrationOptionsForLoad(filePath) {
     normalizePendingRuntimeOnlineNotice,
     normalizeIdempotencyLedger,
     normalizeCallbackPayloads,
+    normalizeAttachmentConfirmations,
     normalizePromptDeliveries,
     normalizeOutbox,
     defaultFeedByContext,
@@ -65,6 +68,7 @@ function migrationOptionsForLoad(filePath) {
     defaultPendingPrompts,
     defaultIdempotencyLedger,
     defaultCallbackPayloads,
+    defaultAttachmentConfirmations,
     defaultPromptDeliveries,
     defaultOutbox,
   }
@@ -99,6 +103,10 @@ function defaultCallbackPayloads() {
   return {}
 }
 
+function defaultAttachmentConfirmations() {
+  return { records: {} }
+}
+
 function defaultPromptDeliveries() {
   return { records: {} }
 }
@@ -120,6 +128,7 @@ export function defaultState() {
     pendingRuntimeOnlineNotice: null,
     idempotency: defaultIdempotencyLedger(),
     callbackPayloads: defaultCallbackPayloads(),
+    attachmentConfirmations: defaultAttachmentConfirmations(),
     promptDeliveries: defaultPromptDeliveries(),
     outbox: defaultOutbox(),
   }
@@ -334,6 +343,46 @@ export class StateStore {
         })
     }
 
+    if (removed) this.scheduleSave()
+    return removed
+  }
+
+  getAttachmentConfirmation(token, { now = Date.now() } = {}) {
+    const normalizedToken = normalizeAttachmentConfirmationToken(token)
+    const record = normalizedToken ? this.state.attachmentConfirmations?.records?.[normalizedToken] : null
+    if (!record || record.expiresAt <= now) return null
+    return cloneStateForWrite(record)
+  }
+
+  setAttachmentConfirmation(record, { maxEntries = DEFAULT_ATTACHMENT_CONFIRMATION_MAX_ENTRIES, now = Date.now() } = {}) {
+    const normalized = normalizeAttachmentConfirmationRecord(record, record?.token)
+    if (!normalized) return false
+    this.pruneAttachmentConfirmations({ now })
+    const records = this.state.attachmentConfirmations.records
+    if (!records[normalized.token] && Object.keys(records).length >= maxEntries) return false
+    records[normalized.token] = normalized
+    this.scheduleSave()
+    return true
+  }
+
+  deleteAttachmentConfirmation(token) {
+    const normalizedToken = normalizeAttachmentConfirmationToken(token)
+    if (!normalizedToken || !this.state.attachmentConfirmations?.records?.[normalizedToken]) return false
+    delete this.state.attachmentConfirmations.records[normalizedToken]
+    this.scheduleSave()
+    return true
+  }
+
+  pruneAttachmentConfirmations({ now = Date.now() } = {}) {
+    const records = this.state.attachmentConfirmations?.records
+    if (!records || typeof records !== "object") return 0
+    let removed = 0
+    for (const [token, record] of Object.entries(records)) {
+      if (!normalizeAttachmentConfirmationRecord(record, token) || record.expiresAt <= now) {
+        delete records[token]
+        removed += 1
+      }
+    }
     if (removed) this.scheduleSave()
     return removed
   }
@@ -982,6 +1031,7 @@ function validateCurrentState(state) {
   validatePendingRuntimeOnlineNoticeSection(state.pendingRuntimeOnlineNotice, errors)
   validateIdempotencySection(state.idempotency, errors)
   validateCallbackPayloadsSection(state.callbackPayloads, errors)
+  validateAttachmentConfirmationsSection(state.attachmentConfirmations, errors)
   validatePromptDeliveriesSection(state.promptDeliveries, errors)
   validateOutboxSection(state.outbox, errors)
   return errors
@@ -1200,6 +1250,52 @@ function validateCallbackPayloadsSection(value, errors) {
     if (!isFiniteNumber(entry.expiresAt)) errors.push(`${statePath}.expiresAt must be a finite number`)
     if (isFiniteNumber(entry.createdAt) && isFiniteNumber(entry.expiresAt) && entry.expiresAt <= entry.createdAt) {
       errors.push(`${statePath}.expiresAt must be greater than createdAt`)
+    }
+  }
+}
+
+function validateAttachmentConfirmationsSection(value, errors) {
+  if (!pushRecordError(errors, value, "state.attachmentConfirmations")) return
+  for (const key of Object.keys(value)) {
+    if (key !== "records") errors.push(`state.attachmentConfirmations${pathKey(key)} is not supported`)
+  }
+  if (!pushRecordError(errors, value.records, "state.attachmentConfirmations.records")) return
+  if (Object.keys(value.records).length > DEFAULT_ATTACHMENT_CONFIRMATION_MAX_ENTRIES) {
+    errors.push(`state.attachmentConfirmations.records must contain at most ${DEFAULT_ATTACHMENT_CONFIRMATION_MAX_ENTRIES} entries`)
+  }
+  for (const [token, record] of Object.entries(value.records)) {
+    const statePath = `state.attachmentConfirmations.records${pathKey(token)}`
+    if (!normalizeAttachmentConfirmationToken(token)) errors.push(`${statePath} key must be a 24-character lowercase hex token`)
+    if (!pushRecordError(errors, record, statePath)) continue
+    const allowedFields = new Set(["token", "ctxKey", "chatId", "threadIdOr0", "projectAlias", "sessionId", "messageId", "updateId", "fileId", "fileUniqueId", "fileName", "mimeType", "fileSize", "caption", "createdAt", "expiresAt"])
+    for (const field of Object.keys(record)) {
+      if (!allowedFields.has(field)) errors.push(`${statePath}${pathKey(field)} is not supported`)
+    }
+    if (record.token !== token) errors.push(`${statePath}.token must match its record key`)
+    validateCtxKey(record.ctxKey, `${statePath}.ctxKey`, errors)
+    if (!Number.isInteger(record.chatId)) errors.push(`${statePath}.chatId must be an integer`)
+    if (!Number.isInteger(record.threadIdOr0) || record.threadIdOr0 < 0) errors.push(`${statePath}.threadIdOr0 must be a non-negative integer`)
+    if (Number.isInteger(record.chatId) && Number.isInteger(record.threadIdOr0) && record.ctxKey !== `${record.chatId}:${record.threadIdOr0}`) {
+      errors.push(`${statePath}.ctxKey must match chatId and threadIdOr0`)
+    }
+    validateProjectAlias(record.projectAlias, `${statePath}.projectAlias`, errors)
+    validateStoredOpenCodeId(record.sessionId, `${statePath}.sessionId`, errors)
+    if (!Number.isSafeInteger(record.messageId)) errors.push(`${statePath}.messageId must be a safe integer`)
+    if (!Number.isSafeInteger(record.updateId)) errors.push(`${statePath}.updateId must be a safe integer`)
+    for (const [field, maxLength] of [["fileId", 512], ["fileUniqueId", 256], ["fileName", 255], ["mimeType", 200], ["caption", 4096]]) {
+      if (field === "fileUniqueId" && record[field] == null) continue
+      if (typeof record[field] !== "string" || record[field].length > maxLength || (field === "fileId" && !record[field])) {
+        errors.push(`${statePath}.${field} must be a string${field === "fileId" ? " with content" : ""} up to ${maxLength} characters`)
+      }
+    }
+    if (!Number.isFinite(record.fileSize) || record.fileSize < 0) errors.push(`${statePath}.fileSize must be a non-negative finite number`)
+    if (!isFiniteNumber(record.createdAt)) errors.push(`${statePath}.createdAt must be a finite number`)
+    if (!isFiniteNumber(record.expiresAt)) errors.push(`${statePath}.expiresAt must be a finite number`)
+    if (isFiniteNumber(record.createdAt) && isFiniteNumber(record.expiresAt)) {
+      if (record.expiresAt <= record.createdAt) errors.push(`${statePath}.expiresAt must be greater than createdAt`)
+      if (record.expiresAt - record.createdAt > DEFAULT_ATTACHMENT_CONFIRMATION_MAX_AGE_MS) {
+        errors.push(`${statePath}.expiresAt must be within the attachment confirmation TTL`)
+      }
     }
   }
 }
@@ -1641,6 +1737,58 @@ function normalizeCallbackPayloads(value) {
     .sort((a, b) => a[1].createdAt - b[1].createdAt)
     .slice(-DEFAULT_CALLBACK_PAYLOAD_MAX_ENTRIES)
   return Object.fromEntries(entries)
+}
+
+function normalizeAttachmentConfirmationToken(value) {
+  const token = typeof value === "string" ? value.trim() : ""
+  return /^[a-f0-9]{24}$/.test(token) ? token : ""
+}
+
+function normalizeAttachmentConfirmationRecord(value, key = value?.token) {
+  const token = normalizeAttachmentConfirmationToken(key)
+  if (!value || typeof value !== "object" || normalizeAttachmentConfirmationToken(value.token) !== token) return null
+  const chatId = Number(value.chatId)
+  const threadIdOr0 = Number(value.threadIdOr0)
+  const createdAt = Number(value.createdAt)
+  const expiresAt = Number(value.expiresAt)
+  if (!Number.isInteger(chatId) || !Number.isInteger(threadIdOr0) || threadIdOr0 < 0 || value.ctxKey !== `${chatId}:${threadIdOr0}`) return null
+  if (!isSafeProjectAlias(value.projectAlias) || !isStoredOpenCodeId(value.sessionId)) return null
+  if (!Number.isSafeInteger(value.messageId) || !Number.isSafeInteger(value.updateId)) return null
+  if (!isFiniteNumber(createdAt) || !isFiniteNumber(expiresAt) || expiresAt <= createdAt || expiresAt - createdAt > DEFAULT_ATTACHMENT_CONFIRMATION_MAX_AGE_MS) return null
+  if (typeof value.fileId !== "string" || !value.fileId || value.fileId.length > 512) return null
+  if (value.fileUniqueId != null && (typeof value.fileUniqueId !== "string" || value.fileUniqueId.length > 256)) return null
+  if (typeof value.fileName !== "string" || value.fileName.length > 255) return null
+  if (typeof value.mimeType !== "string" || value.mimeType.length > 200) return null
+  if (!Number.isFinite(value.fileSize) || value.fileSize < 0) return null
+  if (typeof value.caption !== "string" || value.caption.length > 4096) return null
+  return {
+    token,
+    ctxKey: value.ctxKey,
+    chatId,
+    threadIdOr0,
+    projectAlias: value.projectAlias,
+    sessionId: value.sessionId,
+    messageId: value.messageId,
+    updateId: value.updateId,
+    fileId: value.fileId,
+    ...(value.fileUniqueId ? { fileUniqueId: value.fileUniqueId } : {}),
+    fileName: value.fileName,
+    mimeType: value.mimeType,
+    fileSize: value.fileSize,
+    caption: value.caption,
+    createdAt,
+    expiresAt,
+  }
+}
+
+function normalizeAttachmentConfirmations(value) {
+  const source = value?.records && typeof value.records === "object" ? value.records : {}
+  const entries = Object.entries(source)
+    .map(([token, record]) => [token, normalizeAttachmentConfirmationRecord(record, token)])
+    .filter(([, record]) => !!record)
+    .sort((a, b) => a[1].createdAt - b[1].createdAt || a[0].localeCompare(b[0]))
+    .slice(-DEFAULT_ATTACHMENT_CONFIRMATION_MAX_ENTRIES)
+  return { records: Object.fromEntries(entries) }
 }
 
 function normalizeFeedByContext(value) {

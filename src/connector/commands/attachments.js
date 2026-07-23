@@ -1,5 +1,9 @@
 import { makeInlineKeyboard } from "../../telegram/client.js"
-import { sessionKey } from "../../state/store.js"
+import {
+  DEFAULT_ATTACHMENT_CONFIRMATION_MAX_AGE_MS,
+  DEFAULT_ATTACHMENT_CONFIRMATION_MAX_ENTRIES,
+  sessionKey,
+} from "../../state/store.js"
 import { classifyBoundaryError, makeBoundaryError } from "../../boundary-errors.js"
 import { userAttachmentLimitsFromConfig } from "../../limits.js"
 import {
@@ -16,9 +20,6 @@ import { hashIdempotencyValue } from "../idempotency.js"
 import { callbackPacker } from "./shared.js"
 import { t as translate } from "../../i18n/index.js"
 import { deliverPromptExactlyOnce, promptDeliveryIdentity, reconcilePromptDeliveryBeforePayload } from "../prompt-delivery.js"
-
-const ATTACHMENT_CONFIRMATION_TTL_MS = 30 * 60 * 1000
-const MAX_PENDING_ATTACHMENT_CONFIRMATIONS = 200
 
 function normalizeBytes(value) {
   const normalized = Number(value)
@@ -51,7 +52,6 @@ export function createAttachmentHandlers({
 }) {
   const packCallback = callbackPacker(cb)
   const limits = userAttachmentLimits || userAttachmentLimitsFromConfig(config?.limits)
-  const pendingAttachmentConfirmations = new Map()
   const pendingAttachmentSends = new Set()
 
   function attachmentConfirmationKeyboard(token, locale = "en") {
@@ -95,8 +95,8 @@ export function createAttachmentHandlers({
     return !!a && !!b && a.projectAlias === b.projectAlias && a.sessionId === b.sessionId
   }
 
-  function attachmentSendIdempotencyKey(record) {
-    return `tg-attachment-send:${hashIdempotencyValue(`${record?.messageKey || ""}:${record?.projectAlias || ""}:${record?.sessionId || ""}`)}`
+  function attachmentSendIdempotencyKey(token) {
+    return `tg-attachment-send:${String(token || "")}`
   }
 
   function hasIdempotencyKey(key) {
@@ -168,29 +168,121 @@ export function createAttachmentHandlers({
     return false
   }
 
-  function prunePendingAttachmentConfirmations(now = Date.now()) {
-    for (const [token, record] of pendingAttachmentConfirmations.entries()) {
-      if (!record?.expiresAt || record.expiresAt <= now) pendingAttachmentConfirmations.delete(token)
+  function attachmentConfirmationRecords() {
+    const state = store?.get?.()
+    if (!state) return null
+    state.attachmentConfirmations ||= { records: {} }
+    state.attachmentConfirmations.records ||= {}
+    return state.attachmentConfirmations.records
+  }
+
+  function getAttachmentConfirmation(token, { now = Date.now() } = {}) {
+    if (typeof store?.getAttachmentConfirmation === "function") {
+      return store.getAttachmentConfirmation(token, { now })
     }
-    while (pendingAttachmentConfirmations.size > MAX_PENDING_ATTACHMENT_CONFIRMATIONS) {
-      const oldest = pendingAttachmentConfirmations.keys().next().value
-      if (!oldest) break
-      pendingAttachmentConfirmations.delete(oldest)
+    const record = attachmentConfirmationRecords()?.[token]
+    return record?.expiresAt > now ? { ...record } : null
+  }
+
+  function setAttachmentConfirmation(record) {
+    if (typeof store?.setAttachmentConfirmation === "function") {
+      return store.setAttachmentConfirmation(record, { maxEntries: DEFAULT_ATTACHMENT_CONFIRMATION_MAX_ENTRIES })
+    }
+    const records = attachmentConfirmationRecords()
+    if (!records) return false
+    if (!records[record.token] && Object.keys(records).length >= DEFAULT_ATTACHMENT_CONFIRMATION_MAX_ENTRIES) return false
+    records[record.token] = { ...record }
+    store.scheduleSave?.()
+    return true
+  }
+
+  function deleteAttachmentConfirmation(token) {
+    if (typeof store?.deleteAttachmentConfirmation === "function") return store.deleteAttachmentConfirmation(token)
+    const records = attachmentConfirmationRecords()
+    if (!records?.[token]) return false
+    delete records[token]
+    store.scheduleSave?.()
+    return true
+  }
+
+  function pruneAttachmentConfirmations(now = Date.now()) {
+    if (typeof store?.pruneAttachmentConfirmations === "function") return store.pruneAttachmentConfirmations({ now })
+    const records = attachmentConfirmationRecords()
+    if (!records) return 0
+    let removed = 0
+    for (const [token, record] of Object.entries(records)) {
+      if (!record?.expiresAt || record.expiresAt <= now) {
+        delete records[token]
+        removed += 1
+      }
+    }
+    const entries = Object.entries(records)
+    if (entries.length > DEFAULT_ATTACHMENT_CONFIRMATION_MAX_ENTRIES) {
+      entries
+        .sort((a, b) => Number(a[1]?.createdAt || 0) - Number(b[1]?.createdAt || 0) || a[0].localeCompare(b[0]))
+        .slice(0, entries.length - DEFAULT_ATTACHMENT_CONFIRMATION_MAX_ENTRIES)
+        .forEach(([token]) => {
+          delete records[token]
+          removed += 1
+        })
+    }
+    if (removed) store.scheduleSave?.()
+    return removed
+  }
+
+  async function deleteAttachmentConfirmationDurably(token, operation) {
+    const deleted = deleteAttachmentConfirmation(token)
+    if (deleted) await flushDurableState(operation)
+    return deleted
+  }
+
+  function attachmentConfirmationToken(record) {
+    return hashIdempotencyValue([
+      record.ctxKey,
+      record.projectAlias,
+      record.sessionId,
+      record.messageId,
+      record.updateId,
+      record.documentInfo?.fileId,
+      record.documentInfo?.fileUniqueId || "",
+    ])
+  }
+
+  function storedAttachmentConfirmation(record, token, createdAt = Date.now()) {
+    return {
+      token,
+      ctxKey: record.ctxKey,
+      chatId: record.chatId,
+      threadIdOr0: record.threadIdOr0,
+      projectAlias: record.projectAlias,
+      sessionId: record.sessionId,
+      messageId: record.messageId,
+      updateId: record.updateId,
+      fileId: record.documentInfo.fileId,
+      ...(record.documentInfo.fileUniqueId ? { fileUniqueId: record.documentInfo.fileUniqueId } : {}),
+      fileName: record.documentInfo.safeName,
+      mimeType: record.documentInfo.mimeType,
+      fileSize: record.documentInfo.fileSize,
+      caption: record.caption,
+      createdAt,
+      expiresAt: createdAt + DEFAULT_ATTACHMENT_CONFIRMATION_MAX_AGE_MS,
     }
   }
 
-  function rememberPendingAttachmentConfirmation(record) {
-    prunePendingAttachmentConfirmations()
-    const createdAt = Date.now()
-    const token = hashIdempotencyValue(`${record.messageKey}:${record.documentInfo?.fileId}:${createdAt}:${Math.random()}`)
-    pendingAttachmentConfirmations.set(token, {
+  function runtimeAttachmentConfirmation(record) {
+    return {
       ...record,
-      token,
-      createdAt,
-      expiresAt: createdAt + ATTACHMENT_CONFIRMATION_TTL_MS,
-    })
-    prunePendingAttachmentConfirmations(createdAt)
-    return token
+      binding: { projectAlias: record.projectAlias, sessionId: record.sessionId },
+      documentInfo: {
+        supported: true,
+        fileId: record.fileId,
+        fileUniqueId: record.fileUniqueId || "",
+        originalName: record.fileName,
+        safeName: record.fileName,
+        mimeType: record.mimeType,
+        fileSize: record.fileSize,
+      },
+    }
   }
 
   async function loadTelegramAttachment(record) {
@@ -244,7 +336,30 @@ export function createAttachmentHandlers({
 
   async function requestAttachmentConfirmation(ctxMeta, record, markMessageHandled) {
     const locale = localeForCtx(ctxMeta)
-    const token = rememberPendingAttachmentConfirmation(record)
+    if (!Number.isSafeInteger(record.messageId) || !Number.isSafeInteger(record.updateId)) {
+      throw makeBoundaryError({
+        source: "telegram",
+        operation: "persist attachment confirmation",
+        kind: "invariant",
+        outcome: "fatal",
+        message: "Attachment confirmation requires durable Telegram message and update identity",
+      })
+    }
+    const token = attachmentConfirmationToken(record)
+    const existing = getAttachmentConfirmation(token)
+    if (!existing) {
+      const stored = setAttachmentConfirmation(storedAttachmentConfirmation(record, token))
+      if (!stored) {
+        throw makeBoundaryError({
+          source: "state",
+          operation: "persist attachment confirmation",
+          kind: "backpressure",
+          outcome: "retryable",
+          message: "Durable attachment confirmation ledger is full; confirmation was not shown",
+        })
+      }
+      await flushDurableState("persist attachment confirmation")
+    }
     await sendToThread(ctxMeta, attachmentConfirmationText(record.documentInfo, { limits, locale }), attachmentConfirmationKeyboard(token, locale))
     if (markMessageHandled) {
       await markMessageHandled("attachmentConfirmRequested", {
@@ -261,6 +376,8 @@ export function createAttachmentHandlers({
     const documentInfo = describeTelegramDocument(msg.document, { limits })
     const record = {
       ctxKey: ctxMeta.ctxKey,
+      chatId: ctxMeta.chatId,
+      threadIdOr0: ctxMeta.threadIdOr0,
       projectAlias: binding.projectAlias,
       sessionId: binding.sessionId,
       binding: { projectAlias: binding.projectAlias, sessionId: binding.sessionId },
@@ -371,25 +488,31 @@ export function createAttachmentHandlers({
 
   async function handleAttachmentConfirmation(ctxMeta, action, token, { editMessageId } = {}) {
     const locale = localeForCtx(ctxMeta)
-    prunePendingAttachmentConfirmations()
-    const record = pendingAttachmentConfirmations.get(token)
+    const pruned = pruneAttachmentConfirmations()
+    if (pruned) await flushDurableState("persist pruned attachment confirmations")
+    const storedRecord = getAttachmentConfirmation(token)
+    const record = storedRecord ? runtimeAttachmentConfirmation(storedRecord) : null
     if (record && record.ctxKey !== ctxMeta.ctxKey) {
       return { callbackText: "Wrong thread" }
     }
     if (action === "cancel" || action === "close") {
-      if (record) pendingAttachmentConfirmations.delete(token)
+      if (record) await deleteAttachmentConfirmationDurably(token, "delete cancelled attachment confirmation")
       if (action === "cancel") await safeEditMessage(ctxMeta, editMessageId, translate(locale, "attachments.cancelled"), closeOnlyKeyboard(locale))
       return { callbackText: action === "cancel" ? "Cancelled" : "Closed" }
     }
 
     if (!record) {
+      if (hasIdempotencyKey(attachmentSendIdempotencyKey(token))) {
+        await safeEditMessage(ctxMeta, editMessageId, translate(locale, "attachments.alreadySent"), closeOnlyKeyboard(locale))
+        return { callbackText: "Already sent" }
+      }
       await safeEditMessage(ctxMeta, editMessageId, translate(locale, "attachments.expired"), closeOnlyKeyboard(locale))
       return { callbackText: "Expired" }
     }
 
     const currentBinding = store.getBinding(ctxMeta.ctxKey)
     if (!bindingMatches(currentBinding, record.binding)) {
-      pendingAttachmentConfirmations.delete(token)
+      await deleteAttachmentConfirmationDurably(token, "delete rebound attachment confirmation")
       await safeEditMessage(
         ctxMeta,
         editMessageId,
@@ -399,7 +522,7 @@ export function createAttachmentHandlers({
       return { callbackText: "Binding changed" }
     }
     if (!ocByAlias[currentBinding.projectAlias]) {
-      pendingAttachmentConfirmations.delete(token)
+      await deleteAttachmentConfirmationDurably(token, "delete unconfigured attachment confirmation")
       await safeEditMessage(
         ctxMeta,
         editMessageId,
@@ -409,12 +532,12 @@ export function createAttachmentHandlers({
       return { callbackText: "Project missing" }
     }
 
-    const sendKey = attachmentSendIdempotencyKey(record)
+    const sendKey = attachmentSendIdempotencyKey(token)
     if (pendingAttachmentSends.has(sendKey)) {
       return { callbackText: "Already sending" }
     }
     if (hasIdempotencyKey(sendKey)) {
-      pendingAttachmentConfirmations.delete(token)
+      await deleteAttachmentConfirmationDurably(token, "delete completed attachment confirmation")
       await safeEditMessage(ctxMeta, editMessageId, translate(locale, "attachments.alreadySent"), closeOnlyKeyboard(locale))
       return { callbackText: "Already sent" }
     }
@@ -452,7 +575,7 @@ export function createAttachmentHandlers({
             messageId: record.messageId,
           },
         }], { rollbackOnFlushFailure: true })
-        pendingAttachmentConfirmations.delete(token)
+        await deleteAttachmentConfirmationDurably(token, "delete reconciled attachment confirmation")
         await safeEditMessage(ctxMeta, editMessageId, attachmentSentText(record.documentInfo, currentBinding, { locale }), closeOnlyKeyboard(locale))
         return { callbackText: "Sent" }
       }
@@ -466,16 +589,17 @@ export function createAttachmentHandlers({
       } catch (err) {
         const classification = classifyBoundaryError(err, { source: "telegram", operation: "download attachment" })
         await safeInformThread(ctxMeta, attachmentDownloadFailedText(record.documentInfo, { locale }), closeOnlyKeyboard(locale))
+        if (!classification.retryable) await deleteAttachmentConfirmationDurably(token, "delete failed attachment confirmation")
         return { callbackText: classification.retryable ? "Try again" : "Download failed" }
       }
 
       if (loaded.outcome === "too_large") {
-        pendingAttachmentConfirmations.delete(token)
+        await deleteAttachmentConfirmationDurably(token, "delete oversized attachment confirmation")
         await safeEditMessage(ctxMeta, editMessageId, unsupportedAttachmentText(loaded.documentInfo, { limits, locale }), closeOnlyKeyboard(locale))
         return { callbackText: "Too large" }
       }
       if (loaded.outcome === "unsupported_text") {
-        pendingAttachmentConfirmations.delete(token)
+        await deleteAttachmentConfirmationDurably(token, "delete unsupported attachment confirmation")
         await safeEditMessage(
           ctxMeta,
           editMessageId,
@@ -499,8 +623,10 @@ export function createAttachmentHandlers({
           })
         }
         await notifyUnavailableForThread(ctxMeta, alias, err, { locale, fallbackReplyMarkup: closeOnlyKeyboard(locale) })
-        if (isRetryableProjectError?.(err)) throw err
-        throw err
+        const classification = classifyBoundaryError(err, { source: "opencode", operation: "send confirmed attachment" })
+        if (classification.retryable || isRetryableProjectError?.(err)) throw err
+        await deleteAttachmentConfirmationDurably(token, "delete rejected attachment confirmation")
+        return { callbackText: "Send failed" }
       }
       // The original Telegram message was already marked when the confirmation
       // UI was sent, so the confirmed action keeps its own replay marker.
@@ -519,7 +645,7 @@ export function createAttachmentHandlers({
           },
         },
       ], { rollbackOnFlushFailure: true })
-      pendingAttachmentConfirmations.delete(token)
+      await deleteAttachmentConfirmationDurably(token, "delete sent attachment confirmation")
       await safeEditMessage(ctxMeta, editMessageId, attachmentSentText(loaded.documentInfo, currentBinding, { locale }), closeOnlyKeyboard(locale))
       return { callbackText: "Sent" }
     } finally {

@@ -67,6 +67,28 @@ function makePromptDelivery(index, { state = "outcome_unknown", updatedAt = Date
   }
 }
 
+function makeAttachmentConfirmation(index, { createdAt = Date.now(), expiresAt = createdAt + 30 * 60 * 1000 } = {}) {
+  const token = Number(index).toString(16).padStart(24, "0")
+  return {
+    token,
+    ctxKey: "100:7",
+    chatId: 100,
+    threadIdOr0: 7,
+    projectAlias: "demo",
+    sessionId: "ses_1",
+    messageId: index + 1,
+    updateId: index + 100,
+    fileId: `file_${index}`,
+    fileUniqueId: `unique_${index}`,
+    fileName: `attachment-${index}.txt`,
+    mimeType: "text/plain",
+    fileSize: 1024,
+    caption: "",
+    createdAt,
+    expiresAt,
+  }
+}
+
 test("StateStore exposes load and flush health", async () => {
   const dir = await makeTempDir()
   const store = new StateStore({ filePath: path.join(dir, "state.json"), logger: makeLogger() })
@@ -666,6 +688,48 @@ test("StateStore bounds and deterministically expires durable outbox entries", (
   assert.equal(DEFAULT_OUTBOX_MAX_AGE_MS, 30 * 24 * 60 * 60 * 1000)
 })
 
+test("StateStore bounds and deterministically expires attachment confirmations", () => {
+  const now = Date.now()
+  const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-attachment-confirmation-state.json"), logger: makeLogger() })
+  store.scheduleSave = () => {}
+
+  for (let index = 0; index < 200; index += 1) {
+    assert.equal(store.setAttachmentConfirmation(makeAttachmentConfirmation(index, {
+      createdAt: now - 1000 + index,
+      expiresAt: index === 0 ? now - 1 : now + 60_000,
+    })), true)
+  }
+  assert.equal(store.setAttachmentConfirmation(makeAttachmentConfirmation(200, { createdAt: now, expiresAt: now + 60_000 })), true)
+  assert.equal(Object.keys(store.get().attachmentConfirmations.records).length, 200)
+  assert.equal(store.getAttachmentConfirmation(makeAttachmentConfirmation(0).token), null)
+
+  assert.equal(store.setAttachmentConfirmation(makeAttachmentConfirmation(201, { createdAt: now, expiresAt: now + 60_000 })), false)
+  assert.equal(store.pruneAttachmentConfirmations({ now: now + 60_001 }), 200)
+  assert.deepEqual(store.get().attachmentConfirmations, { records: {} })
+})
+
+test("StateStore keeps current-schema expired attachment confirmations visible for prune and flush", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  const now = Date.now()
+  const expired = makeAttachmentConfirmation(301, { createdAt: now - 60_000, expiresAt: now - 30_000 })
+  const live = makeAttachmentConfirmation(302, { createdAt: now, expiresAt: now + 60_000 })
+  await fs.writeFile(filePath, JSON.stringify({
+    ...defaultState(),
+    attachmentConfirmations: { records: { [expired.token]: expired, [live.token]: live } },
+  }, null, 2), "utf8")
+
+  const store = new StateStore({ filePath, logger: makeLogger() })
+  const loaded = await store.load()
+
+  assert.deepEqual(Object.keys(loaded.attachmentConfirmations.records).sort(), [expired.token, live.token].sort())
+  assert.equal(store.pruneAttachmentConfirmations({ now }), 1)
+  await store.flush()
+
+  const persisted = JSON.parse(await fs.readFile(filePath, "utf8"))
+  assert.deepEqual(Object.keys(persisted.attachmentConfirmations.records), [live.token])
+})
+
 test("StateStore never evicts unresolved prompt markers and applies backpressure at the cap", () => {
   const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-prompt-state.json"), logger: makeLogger() })
   store.scheduleSave = () => {}
@@ -702,7 +766,7 @@ test("StateStore expires accepted prompt markers on load but retains unresolved 
   assert.deepEqual(loaded.promptDeliveries.records[unknown.openCodeMessageId], unknown)
 })
 
-test("StateStore migrates schema version 1 state to version 8", async () => {
+test("StateStore migrates schema version 1 state to the current schema", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -732,7 +796,7 @@ test("StateStore migrates schema version 1 state to version 8", async () => {
   assert.deepEqual(loaded.outbox, { items: {} })
 })
 
-test("StateStore migrates schema version 2 state to version 8", async () => {
+test("StateStore migrates schema version 2 state to the current schema", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -765,7 +829,7 @@ test("StateStore migrates schema version 2 state to version 8", async () => {
   assert.deepEqual(loaded.callbackPayloads, {})
 })
 
-test("StateStore migrates schema version 3 state to version 8", async () => {
+test("StateStore migrates schema version 3 state to the current schema", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -798,7 +862,7 @@ test("StateStore migrates schema version 3 state to version 8", async () => {
   assert.deepEqual(loaded.callbackPayloads, {})
 })
 
-test("StateStore migrates schema version 4 state to version 8", async () => {
+test("StateStore migrates schema version 4 state to the current schema", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -832,7 +896,7 @@ test("StateStore migrates schema version 4 state to version 8", async () => {
   assert.deepEqual(loaded.callbackPayloads, {})
 })
 
-test("StateStore migrates schema version 5 state to version 8", async () => {
+test("StateStore migrates schema version 5 state to the current schema", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   await fs.writeFile(
@@ -865,7 +929,7 @@ test("StateStore migrates schema version 5 state to version 8", async () => {
   assert.deepEqual(loaded.callbackPayloads, {})
 })
 
-test("StateStore migrates schema version 6 callback payloads to version 8", async () => {
+test("StateStore migrates schema version 6 callback payloads to the current schema", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   const future = Date.now() + 60_000
@@ -904,7 +968,7 @@ test("StateStore migrates schema version 6 callback payloads to version 8", asyn
   })
 })
 
-test("StateStore migrates schema version 7 to version 8 with empty prompt delivery and outbox sections", async () => {
+test("StateStore migrates schema version 7 to the current schema with empty durable delivery sections", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")
   const previous = { ...defaultState(), schemaVersion: 7, updateOffset: 114 }
@@ -915,12 +979,49 @@ test("StateStore migrates schema version 7 to version 8 with empty prompt delive
   const store = new StateStore({ filePath, logger: makeLogger() })
   const loaded = await store.load()
 
-  assert.equal(loaded.schemaVersion, 8)
+  assert.equal(loaded.schemaVersion, STATE_SCHEMA_VERSION)
   assert.equal(loaded.updateOffset, 114)
+  assert.deepEqual(loaded.attachmentConfirmations, { records: {} })
   assert.deepEqual(loaded.promptDeliveries, { records: {} })
   assert.deepEqual(loaded.outbox, { items: {} })
   const persisted = JSON.parse(await fs.readFile(filePath, "utf8"))
+  assert.deepEqual(persisted.attachmentConfirmations, { records: {} })
   assert.deepEqual(persisted.outbox, { items: {} })
+})
+
+test("StateStore migrates schema version 8 to version 9 with empty attachment confirmations", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  const previous = { ...defaultState(), schemaVersion: 8, updateOffset: 115 }
+  delete previous.attachmentConfirmations
+  await fs.writeFile(filePath, JSON.stringify(previous, null, 2), "utf8")
+
+  const store = new StateStore({ filePath, logger: makeLogger() })
+  const loaded = await store.load()
+
+  assert.equal(STATE_SCHEMA_VERSION, 9)
+  assert.equal(loaded.schemaVersion, 9)
+  assert.deepEqual(loaded.attachmentConfirmations, { records: {} })
+  const persisted = JSON.parse(await fs.readFile(filePath, "utf8"))
+  assert.equal(persisted.schemaVersion, 9)
+  assert.deepEqual(persisted.attachmentConfirmations, { records: {} })
+})
+
+test("StateStore fails closed on a corrupted current-schema attachment confirmation", async () => {
+  const dir = await makeTempDir()
+  const filePath = path.join(dir, "state.json")
+  const record = { ...makeAttachmentConfirmation(9), ctxKey: "999:0" }
+  await fs.writeFile(filePath, JSON.stringify({
+    ...defaultState(),
+    attachmentConfirmations: { records: { [record.token]: record } },
+  }, null, 2), "utf8")
+
+  const store = new StateStore({ filePath, logger: makeLogger() })
+  await assert.rejects(() => store.load(), (err) => {
+    assert.equal(err.code, "STATE_SCHEMA_INVALID")
+    assert.match(err.message, /state\.attachmentConfirmations\.records.*ctxKey must match/)
+    return true
+  })
 })
 
 test("StateStore fails closed on a corrupted current-schema outbox section", async () => {

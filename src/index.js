@@ -123,8 +123,8 @@ export async function startConnector({ config, logger: loggerIn, deps } = {}) {
     }
   }
 
-  const prunedCallbackPayloads = store.pruneCallbackPayloads?.({ now: Date.now() }) || 0
-  if (prunedCallbackPayloads > 0) await flushCriticalState("persist pruned callback payloads")
+  const prunedTransientEntries = (store.pruneCallbackPayloads?.({ now: Date.now() }) || 0) + (store.pruneAttachmentConfirmations?.({ now: Date.now() }) || 0)
+  if (prunedTransientEntries > 0) await flushCriticalState("persist pruned transient state")
 
   if (hasPendingPromptsOnStartup && !Number.isInteger(store.get().updateOffset)) {
     logger.warn("Pending prompts found without Telegram offset; processing queued updates instead of draining backlog.")

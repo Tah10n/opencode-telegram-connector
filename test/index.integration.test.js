@@ -5099,6 +5099,79 @@ test("startConnector replays and reconciles an accepted confirmed attachment cal
   }
 })
 
+test("startConnector reconciles an accepted confirmed attachment after restart without a second POST or download", async () => {
+  const lost = acceptedThenLostOpenCodeOptions()
+  let downloadCalls = 0
+  const first = await createHarness({
+    statePatch: {
+      updateOffset: 629,
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+      sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+    },
+    ocOptions: lost.options,
+    tgOptions: {
+      downloadFileImpl: async () => {
+        downloadCalls += 1
+        return new TextEncoder().encode("attachment text")
+      },
+    },
+  })
+
+  let callback
+  let persistedState
+  try {
+    first.tg.enqueue(makeDocumentUpdate(629, {
+      file_id: "confirmed_restart_file",
+      file_unique_id: "confirmed_restart_unique",
+      file_name: "confirmed-restart.txt",
+      mime_type: "text/plain",
+      file_size: USER_ATTACHMENT_LIMITS.confirmBytes,
+    }, { messageId: 5055 }))
+    const confirmation = await waitFor(() => first.tg.sentMessages.find((entry) => entry.text.includes("Confirm sending this file")))
+    const sendButton = confirmation.replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file")
+    callback = makeCallbackUpdate(630, sendButton.callback_data, { messageId: confirmation.result.message_id })
+    first.tg.enqueue(callback)
+
+    await waitFor(async () => {
+      const state = await readState(first.stateFile)
+      return Object.values(state.promptDeliveries.records).some((record) => record.state === "outcome_unknown")
+    })
+  } finally {
+    await first.connector.stop()
+    persistedState = await readState(first.stateFile)
+  }
+
+  assert.equal(Object.keys(persistedState.attachmentConfirmations.records).length, 1)
+  assert.equal(first.ocCalls.promptAsync.length, 1)
+  assert.equal(downloadCalls, 1)
+
+  const restarted = await createHarness({
+    statePatch: persistedState,
+    ocOptions: lost.options,
+    tgOptions: {
+      downloadFileImpl: async () => {
+        downloadCalls += 1
+        throw new Error("reconciliation must happen before a second download")
+      },
+    },
+    initialUpdates: [[callback]],
+  })
+  try {
+    await waitFor(async () => (await readState(restarted.stateFile)).updateOffset === 631)
+    const state = await readState(restarted.stateFile)
+
+    assert.equal(restarted.ocCalls.promptAsync.length, 0)
+    assert.equal(restarted.ocCalls.getMessage.length, 1)
+    assert.equal(downloadCalls, 1)
+    assert.deepEqual(state.attachmentConfirmations, { records: {} })
+    assert.ok(Object.keys(state.idempotency.keys).some((key) => key.startsWith("tg-attachment-send:")))
+    assert.ok(restarted.tg.callbackAnswers.some((entry) => entry.callbackQueryId === "cb_630" && entry.text === "Sending…"))
+    assert.ok(restarted.tg.editedMessages.some((entry) => /Attachment sent to demo\/ses_1/.test(entry.text)))
+  } finally {
+    await restarted.connector.stop()
+  }
+})
+
 test("startConnector skips duplicate permission callback replays after ledger persistence", async () => {
   const pendingPermission = {
     projectAlias: "demo",
