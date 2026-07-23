@@ -241,8 +241,10 @@ test("durable outbox honors Telegram retry_after for 429 responses", async (t) =
 
 test("durable outbox preserves fatal delivery items and propagates the failure", async (t) => {
   const { store } = await makeStore(t)
+  let discarded = 0
   const outbox = createDurableOutbox({
     store,
+    observability: { recordOutboxDiscarded: () => { discarded += 1 } },
     deliver: async () => {
       throw makeBoundaryError({ source: "telegram", operation: "sendMessage", status: 401, outcome: "fatal", message: "unauthorized" })
     },
@@ -256,6 +258,101 @@ test("durable outbox preserves fatal delivery items and propagates the failure",
   const retained = Object.values(store.getOutboxItems())[0]
   assert.equal(retained.attemptCount, 0)
   assert.equal(retained.lastError, undefined)
+  assert.equal(discarded, 0)
+})
+
+test("durable outbox terminally discards item-scoped Telegram 400 and 403 failures", async (t) => {
+  for (const status of [400, 403]) {
+    const { store } = await makeStore(t)
+    let discarded = 0
+    const outbox = createDurableOutbox({
+      store,
+      observability: { recordOutboxDiscarded: () => { discarded += 1 } },
+      deliver: async () => {
+        throw makeBoundaryError({
+          source: "telegram",
+          operation: "POST sendMessage",
+          method: "POST",
+          pathname: "/sendMessage",
+          status,
+          outcome: "fatal",
+          message: status === 403 ? "bot was blocked by the user" : "chat not found",
+        })
+      },
+    })
+
+    await outbox.enqueue({ ...baseItem, messageId: `msg_terminal_${status}` })
+    assert.equal(await outbox.processNext(), true)
+    assert.equal(discarded, 1)
+    assert.deepEqual(store.getOutboxItems(), {})
+    assert.ok(
+      Object.values(store.get().idempotency.keys).some((entry) =>
+        entry.kind === "telegram-outbox-discarded" && entry.operation === `telegram:http:${status}`),
+    )
+  }
+})
+
+test("terminal discard is durable across restart and does not block the next outbox item", async (t) => {
+  const first = await makeStore(t)
+  const delivered = []
+  let discarded = 0
+  const badItem = { ...baseItem, projectAlias: "bad", messageId: "msg_bad" }
+  const goodItem = { ...baseItem, messageId: "msg_good" }
+  const outbox1 = createDurableOutbox({
+    store: first.store,
+    observability: { recordOutboxDiscarded: () => { discarded += 1 } },
+    deliver: async (item) => {
+      if (item.projectAlias === "bad") {
+        throw makeBoundaryError({
+          source: "telegram",
+          operation: "POST sendMessage",
+          pathname: "/sendMessage",
+          status: 400,
+          outcome: "fatal",
+          message: "chat not found",
+        })
+      }
+      delivered.push(item.messageId)
+    },
+  })
+
+  await outbox1.enqueue(badItem)
+  await outbox1.enqueue(goodItem)
+  assert.equal(await outbox1.processNext(), true)
+  assert.equal(discarded, 1)
+
+  const second = await makeStore(t, { filePath: first.filePath })
+  const outbox2 = createDurableOutbox({
+    store: second.store,
+    deliver: async (item) => delivered.push(item.messageId),
+  })
+  const replay = await outbox2.enqueue(badItem)
+  assert.equal(replay.completed, true)
+  assert.equal(await outbox2.processNext(), true)
+  assert.deepEqual(delivered, ["msg_good"])
+  assert.deepEqual(second.store.getOutboxItems(), {})
+})
+
+test("missing outbox project alias is terminally discarded without an OpenCode call", async (t) => {
+  const { store } = await makeStore(t)
+  store.get().bindings["100:7"] = { projectAlias: "removed", sessionId: "ses_1" }
+  store.get().sessionIndex["removed:ses_1"] = { chatId: 100, threadIdOr0: 7 }
+  let discarded = 0
+  const deliver = createOutboxDelivery({
+    store,
+    ocByAlias: {},
+    logSseDebug() {},
+  })
+  const outbox = createDurableOutbox({
+    store,
+    deliver,
+    observability: { recordOutboxDiscarded: () => { discarded += 1 } },
+  })
+
+  await outbox.enqueue({ ...baseItem, projectAlias: "removed" })
+  assert.equal(await outbox.processNext(), true)
+  assert.equal(discarded, 1)
+  assert.deepEqual(store.getOutboxItems(), {})
 })
 
 test("durable outbox run stops promptly during a non-settling in-flight delivery", async (t) => {

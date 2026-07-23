@@ -45,13 +45,8 @@ export function createOutboxDelivery({
     }
     const oc = ocByAlias[item.projectAlias]
     if (!oc) {
-      throw makeBoundaryError({
-        source: "opencode",
-        operation: "deliver durable Telegram outbox item",
-        kind: "configuration",
-        outcome: "fatal",
-        message: `Outbox project is no longer configured: ${item.projectAlias}`,
-      })
+      logSseDebug(item.projectAlias, item.sessionId, `drop=outbox_project_missing msg=${item.messageId}`)
+      return { delivered: false, reason: "project-not-configured" }
     }
     const sk = sessionKey(item.projectAlias, item.sessionId)
     const sets = ensureForwardedSets(sk)

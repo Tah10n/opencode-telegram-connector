@@ -5,6 +5,7 @@ import { redactSensitiveText } from "../url-utils.js"
 const RETRY_BASE_MS = 1000
 const RETRY_MAX_MS = 5 * 60 * 1000
 const DELIVERY_ABORTED = Symbol("delivery-aborted")
+const ITEM_SCOPED_TELEGRAM_OPERATIONS = ["sendmessage", "senddocument", "sendhtmlblocks", "editmessagetext", "editmessagereplymarkup"]
 
 export function outboxItemId({ type, projectAlias, sessionId, messageId, dedupeVariant }) {
   const identity = [type, projectAlias, sessionId, messageId]
@@ -53,6 +54,48 @@ function retryDelay(item, classification) {
   return Math.min(RETRY_MAX_MS, RETRY_BASE_MS * (2 ** Math.min(8, item.attemptCount || 0)))
 }
 
+function isItemScopedTelegramOperation(classification) {
+  const operation = [classification.error?.operation, classification.error?.pathname]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase()
+  return ITEM_SCOPED_TELEGRAM_OPERATIONS.some((candidate) => operation.includes(candidate))
+}
+
+function failureDisposition(err) {
+  const classification = classifyBoundaryError(err)
+  if (classification.source === "state" || classification.kind === "durability" || classification.kind === "invariant") {
+    return { classification, disposition: "global-fatal" }
+  }
+  if (classification.retryable) return { classification, disposition: "retryable" }
+  if (classification.source === "telegram") {
+    const itemScoped = isItemScopedTelegramOperation(classification)
+    const terminalStatus = Number.isInteger(classification.status)
+      && classification.status >= 400
+      && classification.status < 500
+      && ![401, 408, 425, 429].includes(classification.status)
+    if (itemScoped && terminalStatus) return { classification, disposition: "terminal" }
+    return { classification, disposition: "global-fatal" }
+  }
+  if (classification.source === "opencode") {
+    const terminalStatus = Number.isInteger(classification.status)
+      && classification.status >= 400
+      && classification.status < 500
+      && ![408, 425, 429].includes(classification.status)
+    if (classification.stale || classification.kind === "configuration" || terminalStatus) {
+      return { classification, disposition: "terminal" }
+    }
+  }
+  return { classification, disposition: "global-fatal" }
+}
+
+function safeDiscardReason(classification) {
+  return [classification.source, classification.kind, classification.status || classification.code]
+    .filter(Boolean)
+    .join(":")
+    .slice(0, 120) || "terminal-item-error"
+}
+
 function waitForDeliveryOrAbort(promise, signal) {
   const observed = Promise.resolve(promise)
   if (!signal) return observed
@@ -86,6 +129,36 @@ export function createDurableOutbox({ store, deliver, logger, observability, abo
   function setDeliver(next) {
     if (typeof next !== "function") throw new TypeError("Outbox deliver handler must be a function")
     deliverItem = next
+  }
+
+  async function persistCompletion(item, { discarded = false, reason } = {}) {
+    const kind = discarded ? "telegram-outbox-discarded" : "telegram-outbox-delivered"
+    if (!store.markIdempotencyKey || !store.markIdempotencyKey(completionIdempotencyKey(item), {
+      kind,
+      action: item.type,
+      projectAlias: item.projectAlias,
+      ...(reason ? { operation: reason } : {}),
+      createdAt: now(),
+    })) {
+      throw makeBoundaryError({
+        source: "state",
+        operation: "persist durable Telegram completion tombstone",
+        kind: "invariant",
+        outcome: "fatal",
+        message: `Failed to persist durable outbox completion: ${item.id}`,
+      })
+    }
+    await flushStore(store, "persist durable Telegram completion tombstone")
+    if (!store.deleteOutboxItem(item.id)) {
+      throw makeBoundaryError({
+        source: "state",
+        operation: "remove completed durable Telegram item",
+        kind: "invariant",
+        outcome: "fatal",
+        message: `Completed durable outbox item disappeared: ${item.id}`,
+      })
+    }
+    await flushStore(store, "remove completed durable Telegram item")
   }
 
   async function enqueue({ type, projectAlias, sessionId, boundSessionId = sessionId, messageId, route, payload, progress, delayMs = 0 } = {}) {
@@ -211,23 +284,31 @@ export function createDurableOutbox({ store, deliver, logger, observability, abo
         await flushStore(store, "cancel unconfirmed durable Telegram delivery")
         return true
       }
-      if (store.markIdempotencyKey && !store.markIdempotencyKey(completionIdempotencyKey(item), {
-        kind: deliveryResult?.delivered === false ? "telegram-outbox-discarded" : "telegram-outbox-delivered",
-        action: item.type,
-        projectAlias: item.projectAlias,
-        createdAt: now(),
-      })) {
-        throw new Error(`Failed to persist durable outbox completion: ${item.id}`)
-      }
-      store.deleteOutboxItem(item.id)
-      await flushStore(store, "complete durable Telegram delivery")
-      if (deliveryResult?.delivered === false) observability?.recordOutboxDiscarded?.(item.projectAlias)
+      const discarded = deliveryResult?.delivered === false
+      await persistCompletion(item, {
+        discarded,
+        ...(discarded && deliveryResult?.reason ? { reason: `delivery:${String(deliveryResult.reason).slice(0, 100)}` } : {}),
+      })
+      if (discarded) observability?.recordOutboxDiscarded?.(item.projectAlias)
       else observability?.recordOutboxDelivered?.(item.projectAlias)
     } catch (err) {
       if (signal?.aborted || err?.name === "AbortError") return false
       const current = store.getOutboxItem(item.id) || item
-      const classification = classifyBoundaryError(err)
-      if (!classification.retryable) throw err
+      const { classification, disposition } = failureDisposition(err)
+      if (disposition === "terminal") {
+        const reason = safeDiscardReason(classification)
+        await persistCompletion(current, { discarded: true, reason })
+        observability?.recordOutboxDiscarded?.(item.projectAlias)
+        logger?.warn?.("Durable Telegram delivery discarded", {
+          projectAlias: item.projectAlias,
+          sessionId: item.sessionId,
+          messageId: item.messageId,
+          type: item.type,
+          reason,
+        })
+        return true
+      }
+      if (disposition !== "retryable") throw err
       const failed = {
         ...current,
         attemptCount: (current.attemptCount || 0) + 1,

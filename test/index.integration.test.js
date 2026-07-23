@@ -5805,6 +5805,125 @@ test("startConnector retries a durable final assistant delivery after Telegram 5
   }
 })
 
+test("startConnector discards a terminal outbox item and continues delivery, polling, and readiness", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const fatalErrors = []
+  let rejectedTerminalItem = false
+  let getHealthSnapshot
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 664,
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+      sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+    },
+    configPatch: { healthServer: { enabled: true, host: "127.0.0.1", port: 0 } },
+    messagesById: {
+      msg_terminal_400: {
+        info: { id: "msg_terminal_400", role: "assistant", time: { completed: completedAt } },
+        parts: [{ type: "text", text: "terminal item" }],
+      },
+      msg_after_terminal: {
+        info: { id: "msg_after_terminal", role: "assistant", time: { completed: completedAt } },
+        parts: [{ type: "text", text: "delivered after terminal item" }],
+      },
+    },
+    tgOptions: {
+      sendHtmlBlocksImpl: async ({ blocks }) => {
+        if (!rejectedTerminalItem && blocks.some((block) => block.html === "terminal item")) {
+          rejectedTerminalItem = true
+          throw makeBoundaryError({
+            source: "telegram",
+            operation: "POST sendMessage",
+            pathname: "/sendMessage",
+            status: 400,
+            outcome: "fatal",
+            message: "chat not found",
+          })
+        }
+      },
+    },
+    startHealthServerImpl: async ({ getSnapshot }) => {
+      getHealthSnapshot = getSnapshot
+      return { address: { address: "127.0.0.1", port: 8787 }, stop() {} }
+    },
+    onFatalErrorImpl: (err) => fatalErrors.push(err),
+  })
+
+  try {
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_1", info: { id: "msg_terminal_400", role: "assistant", time: { completed: completedAt } } },
+    })
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_1", info: { id: "msg_after_terminal", role: "assistant", time: { completed: completedAt } } },
+    })
+    harness.tg.enqueue(makeMessageUpdate(664, "/help"))
+
+    await waitFor(async () => {
+      const state = await readState(harness.stateFile)
+      return state.updateOffset === 665
+        && Object.keys(state.outbox.items).length === 0
+        && harness.tg.sentHtmlBlocks.some((entry) => entry.blocks[0]?.html === "delivered after terminal item")
+    }, { timeoutMs: 4000 })
+
+    assert.equal(fatalErrors.length, 0)
+    assert.equal(getHealthSnapshot().ready, true)
+    const state = await readState(harness.stateFile)
+    assert.ok(Object.values(state.idempotency.keys).some((entry) => entry.kind === "telegram-outbox-discarded"))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector preserves a Telegram 401 outbox item and reports one controlled fatal shutdown", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  const fatalErrors = []
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 665,
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+      sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+    },
+    messagesById: {
+      msg_global_401: {
+        info: { id: "msg_global_401", role: "assistant", time: { completed: completedAt } },
+        parts: [{ type: "text", text: "global auth failure" }],
+      },
+    },
+    tgOptions: {
+      sendHtmlBlocksImpl: async () => {
+        throw makeBoundaryError({
+          source: "telegram",
+          operation: "POST sendMessage",
+          pathname: "/sendMessage",
+          status: 401,
+          outcome: "fatal",
+          message: "unauthorized",
+        })
+      },
+    },
+    onFatalErrorImpl: (err) => fatalErrors.push(err),
+  })
+
+  try {
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_1", info: { id: "msg_global_401", role: "assistant", time: { completed: completedAt } } },
+    })
+    await waitFor(() => fatalErrors.length === 1)
+    await delay(30)
+
+    assert.equal(fatalErrors.length, 1)
+    assert.equal(fatalErrors[0].status, 401)
+    const [retained] = Object.values((await readState(harness.stateFile)).outbox.items)
+    assert.equal(retained.messageId, "msg_global_401")
+    assert.equal(retained.attemptCount, 0)
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
 test("startConnector checkpoints assistant text before retrying changed-files delivery", async () => {
   const completedAt = new Date(Date.now() + 60_000).toISOString()
   let changedFilesAttempts = 0
