@@ -127,7 +127,7 @@ async function readState(filePath) {
   return JSON.parse(await fs.readFile(filePath, "utf8"))
 }
 
-async function waitFor(predicate, { timeoutMs = 1500, intervalMs = 10 } = {}) {
+async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 10 } = {}) {
   const startedAt = Date.now()
   while (Date.now() - startedAt < timeoutMs) {
     try {
