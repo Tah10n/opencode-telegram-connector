@@ -84,6 +84,15 @@ test("redactSensitiveText redacts bot tokens and sensitive state/config paths", 
   assert.doesNotMatch(redacted, /123456789:replace_me|C:\\repo|backup\.20260425/)
 })
 
+test("redactSensitiveText redacts Node-inspected paths with escaped separators and null bytes", () => {
+  const rawPath = "C:\\private\\connector\\bad\0state.json"
+  const inspectedError = "Received 'C:\\\\private\\\\connector\\\\bad\\x00state.json'"
+  const redacted = redactSensitiveText(inspectedError, { sensitivePaths: [{ path: rawPath, label: "state-file" }] })
+
+  assert.match(redacted, /<state-file>/)
+  assert.doesNotMatch(redacted, /private|connector|state\.json/)
+})
+
 test("redactSensitiveText masks high-entropy tokens via entropy heuristic", () => {
   // GitHub PAT (40 chars, high entropy) — must be redacted
   const githubPat = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef1234"

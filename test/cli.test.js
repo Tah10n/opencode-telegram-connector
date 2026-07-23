@@ -2,7 +2,7 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
-import { createShutdownHandler, isCliEntrypoint, runCli, safeErrorText } from "../src/cli.js"
+import { createShutdownHandler, isCliEntrypoint, runCli, runCliEntrypoint, safeErrorText } from "../src/cli.js"
 
 const indexPath = fileURLToPath(new URL("../index.mjs", import.meta.url))
 const cliPath = fileURLToPath(new URL("../src/cli.js", import.meta.url))
@@ -283,6 +283,28 @@ test("runCli emits JSON startup failures after config is loaded", async () => {
   assert.equal(entry.msg, "Connector startup failed")
   assert.match(entry.error, /\/bot\*\*\*/)
   assert.doesNotMatch(entry.error, new RegExp(token))
+})
+
+test("runCliEntrypoint exits with code 1 when Telegram authentication fails during startup", async () => {
+  const exits = []
+  const errors = []
+  await runCliEntrypoint({
+    argv: [],
+    processImpl: makeProcessStub(),
+    stdout: () => {},
+    stderr: (...args) => errors.push(args.join(" ")),
+    exit: (code) => exits.push(code),
+    buildRuntimeConfigImpl: async () => ({ config: { stateFile: "state.json" } }),
+    startConnectorImpl: async () => {
+      const err = new Error("getMe failed: Unauthorized")
+      err.status = 401
+      throw err
+    },
+  })
+
+  assert.deepEqual(exits, [1])
+  assert.match(errors.join("\n"), /Connector startup failed/)
+  assert.match(errors.join("\n"), /Unauthorized/)
 })
 
 test("safeErrorText redacts bot tokens and sensitive paths from error stacks", () => {

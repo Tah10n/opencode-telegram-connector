@@ -28,9 +28,10 @@ function createProjectState() {
     promptCleanup: { stale: 0 },
     callbacks: { stale: 0, retryable: 0, fatal: 0, legacyFallback: 0 },
     messages: { assistantMirrored: 0, noisySkipped: 0 },
-    prompts: { delivered: 0, answered: 0 },
+    prompts: { delivered: 0, answered: 0, pending: 0, accepted: 0, ambiguous: 0, reconciled: 0, retryable: 0, released: 0 },
     telegram: { sendFailures: 0, editFailures: 0 },
     attachments: { fallbacks: 0 },
+    outbox: { queued: 0, delivered: 0, discarded: 0, retries: 0, expired: 0, backpressure: 0 },
   }
 }
 
@@ -47,10 +48,11 @@ function createGlobalState() {
       skipped: 0,
     },
     messages: { assistantMirrored: 0, noisySkipped: 0 },
-    prompts: { delivered: 0, answered: 0 },
+    prompts: { delivered: 0, answered: 0, pending: 0, accepted: 0, ambiguous: 0, reconciled: 0, retryable: 0, released: 0 },
     telegram: { sendFailures: 0, editFailures: 0 },
     attachments: { fallbacks: 0 },
     callbacks: { legacyFallback: 0 },
+    outbox: { queued: 0, delivered: 0, discarded: 0, retries: 0, expired: 0, backpressure: 0 },
   }
 }
 
@@ -91,6 +93,32 @@ function summarizeTasks(tasks) {
 export function createRuntimeObservability({ projectAliases = [] } = {}) {
   const projectState = new Map(projectAliases.map((alias) => [alias, createProjectState()]))
   const globalState = createGlobalState()
+  let outboxSnapshotProvider = null
+
+  function setOutboxSnapshotProvider(provider) {
+    outboxSnapshotProvider = typeof provider === "function" ? provider : null
+  }
+
+  function readOutboxSnapshot() {
+    let raw = null
+    try {
+      raw = outboxSnapshotProvider?.()
+    } catch {
+      raw = { lastFatalError: "snapshot_unavailable" }
+    }
+    const queueSize = Number.isInteger(raw?.queueSize) && raw.queueSize >= 0 ? raw.queueSize : 0
+    const maxEntries = Number.isInteger(raw?.maxEntries) && raw.maxEntries >= 0 ? raw.maxEntries : 0
+    return {
+      queueSize,
+      maxEntries,
+      inFlight: Number.isInteger(raw?.inFlight) && raw.inFlight >= 0 ? raw.inFlight : 0,
+      blockedWaiters: Number.isInteger(raw?.blockedWaiters) && raw.blockedWaiters >= 0 ? raw.blockedWaiters : 0,
+      full: raw?.full === true || (maxEntries > 0 && queueSize >= maxEntries),
+      nextDueAt: Number.isFinite(raw?.nextDueAt) && raw.nextDueAt > 0 ? raw.nextDueAt : 0,
+      workerActive: raw?.workerActive === true,
+      lastFatalError: safeDiagnosticText(raw?.lastFatalError || ""),
+    }
+  }
 
   function getProjectState(projectAlias) {
     if (!projectAlias) return null
@@ -151,6 +179,7 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
     if (!loop) return
     loop.fallbackHits += 1
     loop.lastSuccessAt = Date.now()
+    loop.lastError = ""
   }
 
   function recordPromptRecovery(projectAlias, outcome) {
@@ -199,6 +228,11 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
     increment("prompts", "answered", { projectAlias })
   }
 
+  function recordPromptDeliveryOutcome(projectAlias, outcome) {
+    if (!["pending", "accepted", "ambiguous", "reconciled", "retryable", "released"].includes(outcome)) return
+    increment("prompts", outcome, { projectAlias })
+  }
+
   function recordTelegramFailure({ projectAlias, operation } = {}) {
     const op = String(operation || "").toLowerCase()
     const counter = op.includes("edit") ? "editFailures" : "sendFailures"
@@ -209,11 +243,37 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
     increment("attachments", "fallbacks", { projectAlias })
   }
 
+  function recordOutboxQueued(projectAlias) {
+    increment("outbox", "queued", { projectAlias })
+  }
+
+  function recordOutboxDelivered(projectAlias) {
+    increment("outbox", "delivered", { projectAlias })
+  }
+
+  function recordOutboxDiscarded(projectAlias) {
+    increment("outbox", "discarded", { projectAlias })
+  }
+
+  function recordOutboxRetry(projectAlias) {
+    increment("outbox", "retries", { projectAlias })
+  }
+
+  function recordOutboxExpired(projectAlias, by = 1) {
+    increment("outbox", "expired", { projectAlias, by })
+  }
+
+  function recordOutboxBackpressure(projectAlias) {
+    increment("outbox", "backpressure", { projectAlias })
+  }
+
   function formatCounterLines(state) {
     return [
       `Messages: assistant=${state.messages.assistantMirrored} skipped=${state.messages.noisySkipped} attachmentFallbacks=${state.attachments.fallbacks}`,
       `Prompts: delivered=${state.prompts.delivered} answered=${state.prompts.answered}`,
+      `Prompt delivery ledger: pending=${state.prompts.pending} accepted=${state.prompts.accepted} ambiguous=${state.prompts.ambiguous} reconciled=${state.prompts.reconciled} retryable=${state.prompts.retryable} released=${state.prompts.released}`,
       `Telegram delivery: sendFailures=${state.telegram.sendFailures} editFailures=${state.telegram.editFailures}`,
+      `Durable outbox: queued=${state.outbox.queued} delivered=${state.outbox.delivered} discarded=${state.outbox.discarded} retries=${state.outbox.retries} expired=${state.outbox.expired} backpressure=${state.outbox.backpressure}`,
     ]
   }
 
@@ -264,10 +324,12 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
   }
 
   function buildRuntimeStatusLines({ managedTasks = [], shutdownState = "running" } = {}) {
+    const outbox = readOutboxSnapshot()
     return [
       `Runtime: managedTasks=${Array.isArray(managedTasks) ? managedTasks.length : 0} taskKinds=${summarizeTasks(managedTasks)} shutdown=${shutdownState}`,
+      `Outbox runtime: size=${outbox.queueSize}/${outbox.maxEntries} inFlight=${outbox.inFlight} blocked=${outbox.blockedWaiters} full=${outbox.full} worker=${outbox.workerActive} nextDue=${formatTime(outbox.nextDueAt)}${outbox.lastFatalError ? ` lastFatal=${outbox.lastFatalError}` : ""}`,
       formatLoopLine("Telegram poll", globalState.loops.telegramPoll),
-      formatLoopLine("Backlog drain", globalState.loops.backlogDrain),
+      formatLoopLine("Backlog drain", globalState.loops.backlogDrain, { includeFallback: true }),
       formatLoopLine("Prompt poll", globalState.loops.promptPoll, { includeFallback: true }),
       formatLoopLine("Shutdown", globalState.loops.shutdown),
       `Updates: retryable=${globalState.updates.retryable} skipped=${globalState.updates.skipped}`,
@@ -286,6 +348,9 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
     const statePendingSave = state?.pendingSave === true
     const stateFlushInFlight = state?.flushInFlight === true
     const telegramLoopActive = activeTaskNames.has("telegramLoop")
+    const outbox = readOutboxSnapshot()
+    const outboxTaskActive = activeTaskNames.has("durableOutbox")
+    const outboxActive = outboxTaskActive && outbox.workerActive
     const telegramObservedAt = Math.max(telegramLoop.lastSuccessAt || 0, backlogDrain.lastSuccessAt || 0)
     const telegramObserved = telegramObservedAt > 0
     const telegramFailureAt = Math.max(telegramLoop.lastErrorAt || 0, telegramLoop.lastRetryAt || 0)
@@ -311,15 +376,20 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
         lastError: telegramLoop.lastError || "",
         lastErrorAt: telegramLoop.lastErrorAt || 0,
       },
+      outbox: {
+        ok: outboxActive && !outbox.full && outbox.blockedWaiters === 0 && !outbox.lastFatalError,
+        active: outboxTaskActive,
+        ...outbox,
+      },
       lifecycle: {
-        ok: telegramLoopActive,
+        ok: telegramLoopActive && outboxActive,
         managedTasks: taskList.length,
         activeTasks: taskList.filter((task) => task?.stopCalled !== true).length,
       },
     }
     return {
       live: shutdownState !== "stopped",
-      ready: checks.shutdown.ok && checks.state.ok && checks.telegramPoll.ok && checks.lifecycle.ok,
+      ready: checks.shutdown.ok && checks.state.ok && checks.telegramPoll.ok && checks.outbox.ok && checks.lifecycle.ok,
       checks,
     }
   }
@@ -340,8 +410,16 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
     recordNoisyEventSkipped,
     recordPromptDelivered,
     recordPromptAnswered,
+    recordPromptDeliveryOutcome,
     recordTelegramFailure,
     recordAttachmentFallback,
+    recordOutboxQueued,
+    recordOutboxDelivered,
+    recordOutboxDiscarded,
+    recordOutboxRetry,
+    recordOutboxExpired,
+    recordOutboxBackpressure,
+    setOutboxSnapshotProvider,
     buildStatusLines,
     buildRuntimeStatusLines,
     buildHealthSnapshot,

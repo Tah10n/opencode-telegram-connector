@@ -5,6 +5,8 @@ import { NOISY_SKIP_REASONS } from "../src/connector/noisy-skip-reasons.js"
 import { sessionKey } from "../src/state/store.js"
 import { makeBoundaryError } from "../src/boundary-errors.js"
 import { buildAssistantStreamPreviewHtml } from "../src/connector/mirroring/assistant-format.js"
+import { formatChangedFilesText } from "../src/message-display.js"
+import { splitTelegramText } from "../src/telegram/client.js"
 
 class FakeLruSet {
   constructor() {
@@ -95,6 +97,14 @@ function useFakeNow(t, initialNow = 1_000) {
 
 async function flushAsyncWork(iterations = 8) {
   for (let i = 0; i < iterations; i += 1) await Promise.resolve()
+}
+
+async function flushAsyncWorkUntil(predicate, iterations = 128) {
+  for (let i = 0; i < iterations; i += 1) {
+    if (predicate()) return
+    await Promise.resolve()
+  }
+  throw new Error("Async work did not reach the expected state")
 }
 
 function createHarness(overrides = {}) {
@@ -347,12 +357,19 @@ test("renderChangedFilesView refuses stale buttons after thread unbind", async (
   assert.equal(calls.sendDocument.length, 0)
 })
 
-test("deliverChangedFilesSummary falls back to sending a new message when edit fails", async () => {
+test("deliverChangedFilesSummary falls back only when Telegram proves the preview cannot be edited", async () => {
   const { calls, handlers } = createHarness({
     tg: {
       async editMessageText(...args) {
         calls.editMessageText.push(args)
-        throw new Error("cannot edit")
+        throw makeBoundaryError({
+          source: "telegram",
+          operation: "editMessageText",
+          kind: "http",
+          outcome: "fatal",
+          status: 400,
+          message: "Bad Request: message to edit not found",
+        })
       },
     },
   })
@@ -374,13 +391,80 @@ test("deliverChangedFilesSummary falls back to sending a new message when edit f
   assert.match(calls.sendToThread[0][1], /Changed files:/)
 })
 
-test("deliverAssistantText falls back to a notice message before attaching long output", async () => {
+test("deliverChangedFilesSummary propagates transient preview edit failures without a fallback send", async () => {
+  const transient = makeBoundaryError({
+    source: "telegram",
+    operation: "editMessageText",
+    kind: "http",
+    outcome: "retryable",
+    status: 503,
+    message: "Service Unavailable",
+  })
+  const { calls, handlers } = createHarness({
+    tg: {
+      async editMessageText(...args) {
+        calls.editMessageText.push(args)
+        throw transient
+      },
+    },
+  })
+
+  await assert.rejects(
+    handlers.deliverChangedFilesSummary(
+      { chatId: 11, threadIdOr0: 22, ctxKey: "11:22" },
+      "demo",
+      "ses_1",
+      "msg_1",
+      { parts: [{ type: "patch", files: ["/repo/src/app.js"] }] },
+      { replaceMessageId: 55 },
+    ),
+    (err) => err === transient,
+  )
+  assert.equal(calls.editMessageText.length, 1)
+  assert.equal(calls.sendToThread.length, 0)
+})
+
+test("deliverChangedFilesSummary edits and checkpoints the first chunk before sending the rest", async () => {
+  const files = Array.from({ length: 30 }, (_, index) => `/repo/src/${String(index).padStart(2, "0")}-${"nested-path-".repeat(20)}.js`)
+  const checkpoints = []
+  const { calls, handlers } = createHarness({ CHANGED_FILES_LIMIT: files.length })
+  const expectedChunks = splitTelegramText(formatChangedFilesText(files, { baseDir: "/repo", limit: files.length })).filter((chunk) => chunk.trim())
+  assert.ok(expectedChunks.length > 1)
+
+  const result = await handlers.deliverChangedFilesSummary(
+    { chatId: 11, threadIdOr0: 22, ctxKey: "11:22" },
+    "demo",
+    "ses_1",
+    "msg_long_changes",
+    { parts: [{ type: "patch", files }] },
+    {
+      replaceMessageId: 55,
+      deliveryOptions: { onProgress: async (patch) => checkpoints.push(patch.changedFilesChunkIndex) },
+    },
+  )
+
+  assert.deepEqual(result, { mode: "sent" })
+  assert.equal(calls.editMessageText[0][2], expectedChunks[0])
+  assert.equal(calls.editMessageText[0][3], null)
+  assert.deepEqual(calls.sendToThread.map((entry) => entry[1]), expectedChunks.slice(1))
+  assert.deepEqual(checkpoints, expectedChunks.map((_, index) => index + 1))
+  assert.equal(calls.sendToThread.at(-1)[2]?.inline_keyboard != null, true)
+})
+
+test("deliverAssistantText falls back to a notice only when Telegram proves the preview cannot be edited", async () => {
   const fallbacks = []
   const { calls, handlers } = createHarness({
     tg: {
       async editMessageText(...args) {
         calls.editMessageText.push(args)
-        throw new Error("cannot edit")
+        throw makeBoundaryError({
+          source: "telegram",
+          operation: "editMessageText",
+          kind: "http",
+          outcome: "fatal",
+          status: 400,
+          message: "Bad Request: message can't be edited",
+        })
       },
     },
     recordAttachmentFallback: (...args) => fallbacks.push(args),
@@ -402,6 +486,40 @@ test("deliverAssistantText falls back to a notice message before attaching long 
   assert.equal(calls.sendDocument.length, 1)
   assert.equal(calls.sendDocument[0][2], "demo-ses_1-msg_1-assistant.txt")
   assert.deepEqual(fallbacks, [["demo", "assistant-long-output"]])
+})
+
+test("deliverAssistantText propagates transient preview edit failures without a fallback send", async () => {
+  const transient = makeBoundaryError({
+    source: "telegram",
+    operation: "editMessageText",
+    kind: "http",
+    outcome: "retryable",
+    status: 503,
+    message: "Service Unavailable",
+  })
+  const { calls, handlers } = createHarness({
+    tg: {
+      async editMessageText(...args) {
+        calls.editMessageText.push(args)
+        throw transient
+      },
+    },
+  })
+
+  await assert.rejects(
+    handlers.deliverAssistantText(
+      { chatId: 11, threadIdOr0: 22, ctxKey: "11:22" },
+      "demo",
+      "ses_1",
+      "msg_1",
+      "Short final reply.",
+      { replaceMessageId: 66 },
+    ),
+    (err) => err === transient,
+  )
+  assert.equal(calls.editMessageText.length, 1)
+  assert.equal(calls.sendBlocksToThread.length, 0)
+  assert.equal(calls.sendToThread.length, 0)
 })
 
 test("buildAssistantStreamPreviewHtml keeps Telegram HTML entities whole at truncation boundary", () => {
@@ -1349,7 +1467,7 @@ test("handleMessageUpdated records mirrored final assistant replies", async (t) 
     projectAlias: "demo",
     props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", time: { completed: 1 } } },
   })
-  await flushAsyncWork()
+  await flushAsyncWorkUntil(() => mirrored.length === 1)
 
   assert.equal(calls.sendBlocksToThread.length, 1)
   assert.deepEqual(mirrored, [["demo"]])
@@ -1547,7 +1665,7 @@ test("handleMessageUpdated retries retryable route lookups before final delivery
     projectAlias: "demo",
     props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", time: { completed: 1 } } },
   })
-  await flushAsyncWork()
+  await flushAsyncWorkUntil(() => runtime.forwardedBySession.get(sessionKey("demo", "ses_1"))?.assistant.has("msg_1") === true)
 
   assert.equal(routeCalls, 3)
   assert.equal(calls.sendBlocksToThread.length, 1)
@@ -1591,7 +1709,7 @@ test("handleMessageUpdated retries retryable final assistant delivery failures",
     projectAlias: "demo",
     props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", time: { completed: 1 } } },
   })
-  await flushAsyncWork(20)
+  await flushAsyncWorkUntil(() => mirrored.length === 1)
 
   assert.equal(calls.sendBlocksToThread.length, 2)
   assert.deepEqual(mirrored, [["demo"]])
@@ -1697,7 +1815,7 @@ test("handleMessageUpdated resends assistant text when retry route changes", asy
     projectAlias: "demo",
     props: { sessionID: "ses_1", info: { id: "msg_1", role: "assistant", time: { completed: 1 } } },
   })
-  await flushAsyncWork(24)
+  await flushAsyncWorkUntil(() => runtime.forwardedBySession.get(sessionKey("demo", "ses_1"))?.assistant.has("msg_1") === true)
 
   assert.equal(calls.sendBlocksToThread.length, 2)
   assert.equal(calls.sendBlocksToThread[0][0].chatId, 11)

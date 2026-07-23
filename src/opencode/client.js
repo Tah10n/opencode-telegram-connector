@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer"
-import { boundaryErrorFromException, boundaryErrorFromHttpResponse } from "../boundary-errors.js"
+import { boundaryErrorFromException, boundaryErrorFromHttpResponse, makeBoundaryError } from "../boundary-errors.js"
+import { OPENCODE_ERROR_RESPONSE_MAX_BYTES, OPENCODE_SUCCESS_RESPONSE_MAX_BYTES, readBoundedResponseText } from "../http-response.js"
 import { appendPathToBaseUrl, isLoopbackHostname, normalizeEndpointBaseUrl } from "../url-utils.js"
 import { getRequestContext, normalizeCorrelationId } from "../runtime/request-context.js"
 import { sessionItemsFromResponse } from "../session-response.js"
@@ -98,8 +99,8 @@ export class OpenCodeClient {
 
       if (res.status === 204) return null
 
-      const text = await res.text()
       if (!res.ok) {
+        const { text } = await readBoundedResponseText(res, { maxBytes: OPENCODE_ERROR_RESPONSE_MAX_BYTES, truncate: true })
         const statusSummary = [res.status, res.statusText].filter(Boolean).join(" ")
         throw boundaryErrorFromHttpResponse({
           source: "opencode",
@@ -112,6 +113,7 @@ export class OpenCodeClient {
           message: `${operation} failed: ${statusSummary}`,
         })
       }
+      const { text } = await readBoundedResponseText(res, { maxBytes: OPENCODE_SUCCESS_RESPONSE_MAX_BYTES })
       if (!text) return null
       try {
         return JSON.parse(text)
@@ -119,6 +121,19 @@ export class OpenCodeClient {
         return text
       }
     } catch (err) {
+      if (err?.code === "RESPONSE_TOO_LARGE") {
+        throw makeBoundaryError({
+          source: "opencode",
+          operation,
+          method,
+          pathname: url.pathname,
+          code: err.code,
+          kind: "response_too_large",
+          outcome: "fatal",
+          message: `${operation} failed: response body exceeds the safe limit`,
+          cause: err,
+        })
+      }
       throw boundaryErrorFromException(err, {
         source: "opencode",
         operation,
@@ -167,6 +182,7 @@ export class OpenCodeClient {
     const payload = {
       parts: [{ type: "text", text }],
     }
+    if (options.messageID) payload.messageID = options.messageID
     if (options.model) payload.model = options.model
     if (options.variant) payload.variant = options.variant
     if (options.agent) payload.agent = options.agent

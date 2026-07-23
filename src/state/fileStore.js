@@ -60,6 +60,68 @@ async function chmodIfSupportedBestEffort(fsImpl, filePath, mode) {
   await chmodIfSupported(fsImpl, filePath, mode).catch(() => {})
 }
 
+async function writeFileAndSync(fsImpl, filePath, contents, { mode, encoding } = {}) {
+  const normalized = normalizedFileMode(mode)
+  if (typeof fsImpl?.open !== "function") {
+    await fsImpl.writeFile(filePath, contents, writeFileOptionsForMode(mode, encoding))
+    await chmodIfSupported(fsImpl, filePath, mode)
+    return
+  }
+
+  const handle = await fsImpl.open(filePath, "w", normalized)
+  try {
+    await handle.writeFile(contents, encoding)
+    if (normalized != null) {
+      if (typeof handle.chmod === "function") await handle.chmod(normalized)
+      else await chmodIfSupported(fsImpl, filePath, normalized)
+    }
+    if (typeof handle.sync !== "function") {
+      const err = new Error(`Cannot durably write '${filePath}'; file handle does not support sync().`)
+      err.code = "ENOTSUP"
+      throw err
+    }
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+}
+
+function directorySyncUnsupported(err) {
+  return hasCode(err, "EINVAL", "ENOTSUP", "EOPNOTSUPP", "EISDIR", "EBADF")
+}
+
+async function syncParentDirectory(fsImpl, filePath, { platform = process.platform } = {}) {
+  // Windows does not provide a portable directory fsync through Node. The
+  // already-synced temp file and recoverable replacement backup remain the
+  // strongest available guarantee there.
+  if (platform === "win32" || typeof fsImpl?.open !== "function") return false
+
+  let handle
+  try {
+    handle = await fsImpl.open(path.dirname(filePath), "r")
+    if (typeof handle.sync !== "function") return false
+    await handle.sync()
+    return true
+  } catch (err) {
+    if (directorySyncUnsupported(err)) return false
+    throw err
+  } finally {
+    await handle?.close?.()
+  }
+}
+
+async function syncFilePath(fsImpl, filePath) {
+  if (typeof fsImpl?.open !== "function") return false
+  const handle = await fsImpl.open(filePath, "r")
+  try {
+    if (typeof handle.sync !== "function") return false
+    await handle.sync()
+    return true
+  } finally {
+    await handle.close()
+  }
+}
+
 function comparablePath(value) {
   const normalized = path.normalize(String(value || ""))
   return process.platform === "win32" ? normalized.toLowerCase() : normalized
@@ -263,7 +325,7 @@ async function commitNewFileWithoutOverwrite(fsImpl, sourcePath, targetPath) {
   if (typeof fsImpl?.link === "function") {
     try {
       await fsImpl.link(sourcePath, targetPath)
-      return
+      return "link"
     } catch (err) {
       if (hasCode(err, "EEXIST", "ENOENT", "ENOTDIR")) throw err
     }
@@ -271,7 +333,7 @@ async function commitNewFileWithoutOverwrite(fsImpl, sourcePath, targetPath) {
   const exclusiveCopyFlag = fsImpl?.constants?.COPYFILE_EXCL ?? fsConstants?.COPYFILE_EXCL
   if (typeof fsImpl?.copyFile === "function" && exclusiveCopyFlag != null) {
     await fsImpl.copyFile(sourcePath, targetPath, exclusiveCopyFlag)
-    return
+    return "copy"
   }
 
   const err = new Error(
@@ -291,19 +353,20 @@ export async function readJsonFile(filePath, { fsImpl = fs, mode } = {}) {
   }
 }
 
-export async function writeJsonFileAtomic(filePath, data, { fsImpl = fs, mode, expectedParentRealPath, overwrite = true } = {}) {
+export async function writeJsonFileAtomic(filePath, data, { fsImpl = fs, mode, expectedParentRealPath, overwrite = true, platform = process.platform } = {}) {
   const operationFilePath = pathWithExpectedParent(filePath, expectedParentRealPath)
   await assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath)
   await fsImpl.mkdir(path.dirname(operationFilePath), { recursive: true })
   await assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath)
   const tmp = `${operationFilePath}.tmp.${process.pid}.${crypto.randomBytes(6).toString("hex")}`
-  await fsImpl.writeFile(tmp, JSON.stringify(data, null, 2) + "\n", writeFileOptionsForMode(mode, "utf8"))
   try {
-    await chmodIfSupported(fsImpl, tmp, mode)
+    await writeFileAndSync(fsImpl, tmp, JSON.stringify(data, null, 2) + "\n", { mode, encoding: "utf8" })
     await assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath)
     if (overwrite === false) {
-      await commitNewFileWithoutOverwrite(fsImpl, tmp, operationFilePath)
+      const commitMethod = await commitNewFileWithoutOverwrite(fsImpl, tmp, operationFilePath)
+      if (commitMethod === "copy") await syncFilePath(fsImpl, operationFilePath)
       await chmodIfSupportedBestEffort(fsImpl, operationFilePath, mode)
+      await syncParentDirectory(fsImpl, operationFilePath, { platform })
       return
     }
     try {
@@ -314,11 +377,13 @@ export async function writeJsonFileAtomic(filePath, data, { fsImpl = fs, mode, e
         await assertExpectedParentRealPath(fsImpl, filePath, expectedParentRealPath)
         await replaceFileWithoutLosingExisting(fsImpl, tmp, operationFilePath)
         await chmodIfSupportedBestEffort(fsImpl, operationFilePath, mode)
+        await syncParentDirectory(fsImpl, operationFilePath, { platform })
         return
       }
       throw err
     }
     await chmodIfSupportedBestEffort(fsImpl, operationFilePath, mode)
+    await syncParentDirectory(fsImpl, operationFilePath, { platform })
   } finally {
     await unlinkIfExists(fsImpl, tmp).catch(() => {})
   }

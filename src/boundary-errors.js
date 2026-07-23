@@ -1,5 +1,6 @@
 const RETRYABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504])
 const RETRYABLE_NETWORK_CODES = new Set([
+  "EAI_AGAIN",
   "ECONNREFUSED",
   "ECONNRESET",
   "EHOSTUNREACH",
@@ -9,6 +10,15 @@ const RETRYABLE_NETWORK_CODES = new Set([
   "ENOTFOUND",
   "EPIPE",
   "ETIMEDOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+])
+const CLEARLY_UNSENT_REQUEST_CODES = new Set([
+  "EAI_AGAIN",
+  "ECONNREFUSED",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "UND_ERR_CONNECT_TIMEOUT",
 ])
 
 function cleanString(value) {
@@ -17,6 +27,18 @@ function cleanString(value) {
 
 function normalizeCode(value) {
   return typeof value === "string" && value.trim() ? value.trim().toUpperCase() : null
+}
+
+function findErrorCode(err, { maxDepth = 8 } = {}) {
+  const seen = new Set()
+  let current = err
+  for (let depth = 0; current && depth < maxDepth && !seen.has(current); depth += 1) {
+    seen.add(current)
+    const code = normalizeCode(current?.code)
+    if (code) return code
+    current = current?.cause
+  }
+  return null
 }
 
 function normalizeRetryAfterMs(value) {
@@ -169,7 +191,7 @@ export function normalizeBoundaryError(err, context = {}) {
         : typeof err?.statusCode === "number"
           ? err.statusCode
           : parseStatus(message)
-  const code = context.code || err?.code || null
+  const code = context.code || findErrorCode(err)
 
   return makeBoundaryError({
     message,
@@ -215,6 +237,17 @@ export function isRetryableBoundaryError(err, context = {}) {
 
 export function isFatalBoundaryError(err, context = {}) {
   return classifyBoundaryError(err, context).fatal
+}
+
+export function isClearlyUnsentRequestError(err) {
+  const seen = new Set()
+  let current = err
+  for (let depth = 0; current && depth < 8 && !seen.has(current); depth += 1) {
+    seen.add(current)
+    if (CLEARLY_UNSENT_REQUEST_CODES.has(normalizeCode(current?.code))) return true
+    current = current?.cause
+  }
+  return false
 }
 
 export function isAbortBoundaryError(err, context = {}) {

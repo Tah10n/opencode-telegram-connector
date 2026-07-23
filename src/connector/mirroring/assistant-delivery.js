@@ -4,6 +4,7 @@ import {
   assistantAttachmentName as formatAssistantAttachmentName,
   shouldSendAssistantAsAttachment as isAssistantAttachmentSized,
 } from "./assistant-format.js"
+import { editPreviewOrNull } from "./preview-edit.js"
 
 export function createAssistantDelivery({
   tg,
@@ -12,6 +13,11 @@ export function createAssistantDelivery({
   recordAttachmentFallback,
   textAttachmentThreshold,
 } = {}) {
+  async function notifyProgress(deliveryOptions, patch) {
+    Object.assign(deliveryOptions, patch)
+    await deliveryOptions.onProgress?.(patch)
+  }
+
   function shouldSendAssistantAsAttachment(text) {
     return isAssistantAttachmentSized(text, textAttachmentThreshold)
   }
@@ -30,16 +36,17 @@ export function createAssistantDelivery({
     for (let index = nextBlockIndex; index < blocks.length; index += 1) {
       const block = blocks[index]
       if (!block || block.type !== "text") {
-        deliveryOptions.assistantTextBlockIndex = index + 1
+        await notifyProgress(deliveryOptions, { assistantTextBlockIndex: index + 1 })
         continue
       }
       await tg.sendMessage(ctxMeta.chatId, block.html, currentReplyMarkup, {
         parse_mode: "HTML",
         disable_web_page_preview: true,
         message_thread_id: ctxMeta.threadIdOr0 || undefined,
+        signal: deliveryOptions.signal,
       })
       currentReplyMarkup = null
-      deliveryOptions.assistantTextBlockIndex = index + 1
+      await notifyProgress(deliveryOptions, { assistantTextBlockIndex: index + 1 })
       nextBlockIndex = index + 1
       sentAny = true
     }
@@ -53,20 +60,21 @@ export function createAssistantDelivery({
       const notice = ATTACHMENT_NOTICES.assistantTooLong
       if (deliveryOptions.assistantLongNoticeDelivered !== true) {
         if (replaceMessageId) {
-          const edited = await tg.editMessageText(ctxMeta.chatId, replaceMessageId, notice, null).catch(() => null)
-          if (!edited) await sendToThread(ctxMeta, notice)
+          const edited = await editPreviewOrNull(() => tg.editMessageText(ctxMeta.chatId, replaceMessageId, notice, null, { signal: deliveryOptions.signal }))
+          if (!edited) await sendToThread(ctxMeta, notice, null, { signal: deliveryOptions.signal })
         } else {
-          await sendToThread(ctxMeta, notice)
+          await sendToThread(ctxMeta, notice, null, { signal: deliveryOptions.signal })
         }
-        deliveryOptions.assistantLongNoticeDelivered = true
+        await notifyProgress(deliveryOptions, { assistantLongNoticeDelivered: true })
       }
       await tg.sendDocument(
         ctxMeta.chatId,
         text,
         assistantAttachmentName(projectAlias, sessionId, messageId),
         attachmentCaption("assistant", { projectAlias, sessionId }),
-        { message_thread_id: ctxMeta.threadIdOr0 || undefined },
+        { message_thread_id: ctxMeta.threadIdOr0 || undefined, signal: deliveryOptions.signal },
       )
+      await notifyProgress(deliveryOptions, { assistantTextDelivered: true })
       recordAttachmentFallback?.(projectAlias, "assistant-long-output")
       return { mode: "attachment" }
     }
@@ -75,14 +83,13 @@ export function createAssistantDelivery({
     if (!blocks.length) return null
     if (blocks.length > 1) {
       if (replaceMessageId && blocks[0]?.type === "text" && !deliveryOptions.assistantTextBlockIndex) {
-        const edited = await tg
-          .editMessageText(ctxMeta.chatId, replaceMessageId, blocks[0].html, null, {
+        const edited = await editPreviewOrNull(() => tg.editMessageText(ctxMeta.chatId, replaceMessageId, blocks[0].html, null, {
             parse_mode: "HTML",
             disable_web_page_preview: true,
-          })
-          .catch(() => null)
+            signal: deliveryOptions.signal,
+          }))
         if (edited) {
-          deliveryOptions.assistantTextBlockIndex = 1
+          await notifyProgress(deliveryOptions, { assistantTextBlockIndex: 1 })
           await sendAssistantBlocksWithProgress(ctxMeta, blocks, null, deliveryOptions)
           return { mode: "edited" }
         }
@@ -91,20 +98,22 @@ export function createAssistantDelivery({
       return delivered ? { mode: replaceMessageId ? "resent" : "sent" } : null
     }
     if (replaceMessageId && blocks[0]?.type === "text") {
-      const edited = await tg
-        .editMessageText(ctxMeta.chatId, replaceMessageId, blocks[0].html, null, {
-          parse_mode: "HTML",
-          disable_web_page_preview: true,
-        })
-        .catch(() => null)
+      const edited = await editPreviewOrNull(() => tg.editMessageText(ctxMeta.chatId, replaceMessageId, blocks[0].html, null, {
+            parse_mode: "HTML",
+            disable_web_page_preview: true,
+            signal: deliveryOptions.signal,
+        }))
       if (!edited) {
-        await sendBlocksToThread(ctxMeta, blocks, null)
+        await sendBlocksToThread(ctxMeta, blocks, null, { signal: deliveryOptions.signal })
+        await notifyProgress(deliveryOptions, { assistantTextDelivered: true })
         return { mode: "resent" }
       }
-      if (blocks.length > 1) await sendBlocksToThread(ctxMeta, blocks.slice(1), null)
+      if (blocks.length > 1) await sendBlocksToThread(ctxMeta, blocks.slice(1), null, { signal: deliveryOptions.signal })
+      await notifyProgress(deliveryOptions, { assistantTextDelivered: true })
       return { mode: "edited" }
     }
-    await sendBlocksToThread(ctxMeta, blocks, null)
+    await sendBlocksToThread(ctxMeta, blocks, null, { signal: deliveryOptions.signal })
+    await notifyProgress(deliveryOptions, { assistantTextDelivered: true })
     return { mode: "sent" }
   }
 

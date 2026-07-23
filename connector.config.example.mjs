@@ -10,9 +10,13 @@ export default {
   defaultProject: "localDesktop",
   // Optional: mirror user messages typed directly in opencode TUI to Telegram.
   // mirrorTuiUserMessages: true,
-  // Optional: default true drains queued Telegram updates on first run without
-  // handling them. Set false to process existing updates from offset 0.
+  // Optional: default true captures one server-side tail cutoff on first run,
+  // skips updates at/before it, and processes later arrivals normally.
+  // Set false to process existing updates from offset 0.
   // drainTelegramBacklogOnFirstRun: true,
+  // OpenCode reads used to recover durable Telegram outbox items.
+  // Integer milliseconds in the range 100..120000; default: 20000.
+  // opencodeOutboxReadTimeoutMs: 20_000,
   logFormat: "text", // "text" or "json"
 
   // Optional localization. Supported locales in this release: "en", "ru".

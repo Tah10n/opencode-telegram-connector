@@ -131,9 +131,16 @@ function redactSensitivePaths(text, sensitivePaths = []) {
     const label = typeof entry === "string" ? "sensitive-path" : entry?.label || "sensitive-path"
     const raw = String(rawPath || "").trim()
     if (!raw) continue
-    out = out.replace(new RegExp(escapeRegExp(raw), "g"), `<${label}>`)
-    const slashNormalized = raw.replace(/\\/g, "/")
-    if (slashNormalized !== raw) out = out.replace(new RegExp(escapeRegExp(slashNormalized), "g"), `<${label}>`)
+    const variants = new Set([
+      raw,
+      raw.replace(/\\/g, "/"),
+      raw.replace(/\\/g, "\\\\"),
+      raw.replace(/\0/g, "\\x00"),
+      raw.replace(/\\/g, "\\\\").replace(/\0/g, "\\x00"),
+    ])
+    for (const variant of variants) {
+      if (variant) out = out.replace(new RegExp(escapeRegExp(variant), "g"), `<${label}>`)
+    }
   }
 
   // Generic path redaction for runtime-sensitive connector files. These files can

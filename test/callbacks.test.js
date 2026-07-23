@@ -268,6 +268,21 @@ test("createCallbackHandlers rejects invalid callback payloads", async () => {
   assert.deepEqual(callbackAnswers, [{ callbackQueryId: "cb_1", text: "Invalid" }])
 })
 
+test("createCallbackHandlers acknowledges unauthorized callbacks exactly once without dispatching them", async () => {
+  const { runtime, callbackAnswers, sentMessages } = makeRuntime({
+    isAllowedUser: () => false,
+    cb: { unpack: () => { throw new Error("callback payload must not be decoded") } },
+    store: { getBinding: () => { throw new Error("state must not be read") } },
+    sendToThread: async () => { throw new Error("business action must not run") },
+  })
+  const handlers = createCallbackHandlers(runtime)
+
+  await handlers.handleTelegramCallback(makeCallback("feed|verbose", { userId: 99 }))
+
+  assert.deepEqual(callbackAnswers, [{ callbackQueryId: "cb_1", text: undefined }])
+  assert.deepEqual(sentMessages, [])
+})
+
 test("createCallbackHandlers reports expired packed callback payloads clearly", async () => {
   const { runtime, callbackAnswers } = makeRuntime({
     cb: {

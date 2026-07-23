@@ -2,6 +2,7 @@ import fs from "node:fs/promises"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { normalizeProjectsConfig } from "./projects.js"
+import { normalizeOpenCodeOutboxReadTimeoutMs } from "./outbox.js"
 import { normalizeI18nConfig } from "../i18n/index.js"
 
 function isPlainObject(v) {
@@ -101,6 +102,11 @@ export function normalizeConnectorConfig(raw, { configFilePath } = {}) {
   if (raw.allowInsecureHttp != null) out.allowInsecureHttp = parseConfigBool("allowInsecureHttp", raw.allowInsecureHttp)
   if (raw.activeTurnStaleMs != null && raw.activeTurnStaleMs !== "") {
     out.activeTurnStaleMs = parseConfigInteger("activeTurnStaleMs", raw.activeTurnStaleMs)
+  }
+  if (raw.opencodeOutboxReadTimeoutMs != null && raw.opencodeOutboxReadTimeoutMs !== "") {
+    out.opencodeOutboxReadTimeoutMs = normalizeOpenCodeOutboxReadTimeoutMs(raw.opencodeOutboxReadTimeoutMs, {
+      fieldName: "Config field 'opencodeOutboxReadTimeoutMs'",
+    })
   }
   if (raw.opencodeWatchdog != null) out.opencodeWatchdog = normalizeOpenCodeWatchdog(raw.opencodeWatchdog)
   if (raw.healthServer != null) out.healthServer = normalizeHealthServer(raw.healthServer)

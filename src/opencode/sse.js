@@ -104,7 +104,9 @@ export function getOpenCodeSseEventMeta(evt) {
 }
 
 function shouldPropagateHandlerError(err) {
-  return err?.isBoundaryError === true && err.source === "state" && err.kind === "durability"
+  return err?.isBoundaryError === true
+    && err.source === "state"
+    && ["backpressure", "durability", "invariant"].includes(err.kind)
 }
 
 async function* readLines(readableStream) {

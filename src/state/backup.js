@@ -68,14 +68,27 @@ export function migrateStateIfNeeded(
     normalizePendingRuntimeOnlineNotice,
     normalizeIdempotencyLedger,
     normalizeCallbackPayloads,
+    normalizeAttachmentConfirmations,
+    normalizePromptDeliveries,
+    normalizeOutbox,
     defaultFeedByContext,
     defaultLocaleByContext,
     defaultModelPrefsByContext,
     defaultPendingPrompts,
     defaultIdempotencyLedger,
     defaultCallbackPayloads,
+    defaultAttachmentConfirmations,
+    defaultPromptDeliveries,
+    defaultOutbox,
   } = {},
 ) {
+  const finishMigrated = (state, options) => migratedState({
+    ...state,
+    attachmentConfirmations: state.attachmentConfirmations ?? defaultAttachmentConfirmations(),
+    promptDeliveries: state.promptDeliveries ?? defaultPromptDeliveries(),
+    outbox: state.outbox ?? defaultOutbox(),
+  }, options)
+
   // New schema.
   if (loaded && typeof loaded === "object" && loaded.schemaVersion === schemaVersion) {
     assertValidCurrentState(loaded, { filePath })
@@ -94,13 +107,58 @@ export function migrateStateIfNeeded(
         pendingRuntimeOnlineNotice: normalizePendingRuntimeOnlineNotice(loaded.pendingRuntimeOnlineNotice),
         idempotency: normalizeIdempotencyLedger(loaded.idempotency),
         callbackPayloads: cloneStateForWrite(loaded.callbackPayloads),
+        attachmentConfirmations: normalizeAttachmentConfirmations(loaded.attachmentConfirmations),
+        promptDeliveries: normalizePromptDeliveries(loaded.promptDeliveries),
+        outbox: normalizeOutbox(loaded.outbox),
       },
     }
   }
 
+  if (loaded && typeof loaded === "object" && loaded.schemaVersion === 8) {
+    const bindingState = normalizeBindingState(loaded, { normalizeBindings, normalizeSessionIndex, normalizeBindingSections })
+    return finishMigrated(
+      {
+        schemaVersion,
+        updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
+        bindings: bindingState.bindings,
+        sessionIndex: bindingState.sessionIndex,
+        feedByContext: normalizeFeedByContext(loaded.feedByContext),
+        localeByContext: normalizeLocaleByContext(loaded.localeByContext),
+        modelPrefsByContext: normalizeModelPrefsByContext(loaded.modelPrefsByContext),
+        pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
+        pendingRuntimeOnlineNotice: normalizePendingRuntimeOnlineNotice(loaded.pendingRuntimeOnlineNotice),
+        idempotency: normalizeIdempotencyLedger(loaded.idempotency),
+        callbackPayloads: normalizeCallbackPayloads(loaded.callbackPayloads),
+        promptDeliveries: normalizePromptDeliveries(loaded.promptDeliveries),
+        outbox: normalizeOutbox(loaded.outbox),
+      },
+      { filePath, assertValidCurrentState },
+    )
+  }
+
+  if (loaded && typeof loaded === "object" && loaded.schemaVersion === 7) {
+    const bindingState = normalizeBindingState(loaded, { normalizeBindings, normalizeSessionIndex, normalizeBindingSections })
+    return finishMigrated(
+      {
+        schemaVersion,
+        updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
+        bindings: bindingState.bindings,
+        sessionIndex: bindingState.sessionIndex,
+        feedByContext: normalizeFeedByContext(loaded.feedByContext),
+        localeByContext: normalizeLocaleByContext(loaded.localeByContext),
+        modelPrefsByContext: normalizeModelPrefsByContext(loaded.modelPrefsByContext),
+        pendingPrompts: normalizePendingPrompts(loaded.pendingPrompts),
+        pendingRuntimeOnlineNotice: normalizePendingRuntimeOnlineNotice(loaded.pendingRuntimeOnlineNotice),
+        idempotency: normalizeIdempotencyLedger(loaded.idempotency),
+        callbackPayloads: normalizeCallbackPayloads(loaded.callbackPayloads),
+      },
+      { filePath, assertValidCurrentState },
+    )
+  }
+
   if (loaded && typeof loaded === "object" && loaded.schemaVersion === 6) {
     const bindingState = normalizeBindingState(loaded, { normalizeBindings, normalizeSessionIndex, normalizeBindingSections })
-    return migratedState(
+    return finishMigrated(
       {
         schemaVersion,
         updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
@@ -120,7 +178,7 @@ export function migrateStateIfNeeded(
 
   if (loaded && typeof loaded === "object" && loaded.schemaVersion === 5) {
     const bindingState = normalizeBindingState(loaded, { normalizeBindings, normalizeSessionIndex, normalizeBindingSections })
-    return migratedState(
+    return finishMigrated(
       {
         schemaVersion,
         updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
@@ -140,7 +198,7 @@ export function migrateStateIfNeeded(
 
   if (loaded && typeof loaded === "object" && loaded.schemaVersion === 4) {
     const bindingState = normalizeBindingState(loaded, { normalizeBindings, normalizeSessionIndex, normalizeBindingSections })
-    return migratedState(
+    return finishMigrated(
       {
         schemaVersion,
         updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
@@ -160,7 +218,7 @@ export function migrateStateIfNeeded(
 
   if (loaded && typeof loaded === "object" && loaded.schemaVersion === 3) {
     const bindingState = normalizeBindingState(loaded, { normalizeBindings, normalizeSessionIndex, normalizeBindingSections })
-    return migratedState(
+    return finishMigrated(
       {
         schemaVersion,
         updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
@@ -180,7 +238,7 @@ export function migrateStateIfNeeded(
 
   if (loaded && typeof loaded === "object" && loaded.schemaVersion === 2) {
     const bindingState = normalizeBindingState(loaded, { normalizeBindings, normalizeSessionIndex, normalizeBindingSections })
-    return migratedState(
+    return finishMigrated(
       {
         schemaVersion,
         updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
@@ -200,7 +258,7 @@ export function migrateStateIfNeeded(
 
   if (loaded && typeof loaded === "object" && loaded.schemaVersion === 1) {
     const bindingState = normalizeBindingState(loaded, { normalizeBindings, normalizeSessionIndex, normalizeBindingSections })
-    return migratedState(
+    return finishMigrated(
       {
         schemaVersion,
         updateOffset: Number.isInteger(loaded.updateOffset) ? loaded.updateOffset : null,
@@ -221,7 +279,7 @@ export function migrateStateIfNeeded(
   // Best-effort migration from the old single-session state.
   // Old format example: { telegram: { updateOffset, chatId }, opencode: { directory } }
   if (loaded && typeof loaded === "object" && loaded.telegram && typeof loaded.telegram === "object") {
-    return migratedState(
+    return finishMigrated(
       {
         schemaVersion,
         updateOffset: Number.isInteger(loaded.telegram.updateOffset) ? loaded.telegram.updateOffset : null,

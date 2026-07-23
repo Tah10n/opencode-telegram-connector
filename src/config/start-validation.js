@@ -1,3 +1,5 @@
+import { normalizeOpenCodeOutboxReadTimeoutMs } from "./outbox.js"
+
 function isPlainObject(value) {
   return !!value && typeof value === "object" && !Array.isArray(value)
 }
@@ -11,6 +13,9 @@ export function validateRuntimeConfigForStart(config) {
   if (!Number.isInteger(config.telegram.allowedUserId)) {
     throw new Error("config.telegram.allowedUserId must be an integer")
   }
+  normalizeOpenCodeOutboxReadTimeoutMs(config.opencodeOutboxReadTimeoutMs, {
+    fieldName: "config.opencodeOutboxReadTimeoutMs",
+  })
   if (!isPlainObject(config.projects)) {
     throw new Error("config.projects is required and must be an object")
   }

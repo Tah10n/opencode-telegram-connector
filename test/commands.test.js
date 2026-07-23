@@ -26,6 +26,13 @@ function attachmentTokenFromButton(button) {
   return parts[2]
 }
 
+function expectAmbiguousPromptFailure(err, cause) {
+  assert.equal(err?.kind, "ambiguous_delivery")
+  assert.equal(err?.outcome, "retryable")
+  if (cause) assert.equal(err.cause, cause)
+  return true
+}
+
 function makeRuntime(overrides = {}) {
   const { store: storeOverrides, ...runtimeOverrides } = overrides
   const sent = []
@@ -1308,6 +1315,7 @@ test("createCommandHandlers clears stale awaiting custom-answer state", async ()
   await handlers.handleTelegramMessage({
     chat: { id: 100, type: "supergroup" },
     from: { id: 42 },
+    message_id: 319,
     message_thread_id: 7,
     text: "first reply",
   })
@@ -2863,17 +2871,17 @@ test("createCommandHandlers handleTelegramMessage forwards the custom model over
   await handlers.handleTelegramMessage({
     chat: { id: 100, type: "supergroup" },
     from: { id: 42 },
+    message_id: 319,
     message_thread_id: 7,
     text: "hello model",
   })
 
-  assert.deepEqual(promptCalls, [
-    {
-      sessionId: "ses_current",
-      text: "[TG] hello model",
-      options: { model: { providerID: "openai", modelID: "gpt-5" }, variant: "xhigh" },
-    },
-  ])
+  assert.equal(promptCalls.length, 1)
+  assert.equal(promptCalls[0].sessionId, "ses_current")
+  assert.equal(promptCalls[0].text, "[TG] hello model")
+  assert.deepEqual(promptCalls[0].options.model, { providerID: "openai", modelID: "gpt-5" })
+  assert.equal(promptCalls[0].options.variant, "xhigh")
+  assert.match(promptCalls[0].options.messageID, /^msg_tgc_[a-f0-9]{48}$/)
   assert.deepEqual(markProjectUpCalls, ["demo"])
 })
 
@@ -2950,13 +2958,16 @@ test("createCommandHandlers handleTelegramMessage rethrows retryable promptAsync
     () => handlers.handleTelegramMessage({
       chat: { id: 100, type: "supergroup" },
       from: { id: 42 },
+      message_id: 320,
       message_thread_id: 7,
       text: "retry me",
     }),
-    /opencode unavailable/,
+    (actual) => expectAmbiguousPromptFailure(actual, err),
   )
 
-  assert.deepEqual(promptCalls, [{ sessionId: "ses_current", text: "[TG] retry me" }])
+  assert.equal(promptCalls.length, 1)
+  assert.equal(promptCalls[0].sessionId, "ses_current")
+  assert.equal(promptCalls[0].text, "[TG] retry me")
   assert.match(sent[0].text, /Project 'demo' is unavailable/)
 })
 
@@ -3046,19 +3057,20 @@ test("createCommandHandlers delegates retryable promptAsync failure notices to t
   await assert.rejects(() => handlers.handleTelegramMessage({
     chat: { id: 100, type: "supergroup" },
     from: { id: 42 },
+    message_id: 322,
     message_thread_id: 7,
     text: "retry me",
-  }), /opencode unavailable/)
+  }), (actual) => expectAmbiguousPromptFailure(actual, err))
 
   assert.equal(sent.length, 0)
   assert.equal(notices.length, 1)
   assert.equal(notices[0].ctxMeta.ctxKey, "100:7")
   assert.equal(notices[0].alias, "demo")
-  assert.equal(notices[0].error, err)
+  assert.equal(notices[0].error.cause, err)
   assert.equal(notices[0].options.platform, "win32")
 })
 
-test("createCommandHandlers clears preflight prompt idempotency after promptAsync failure", async () => {
+test("createCommandHandlers keeps ambiguous prompt delivery state without a Telegram handled marker", async () => {
   const keys = new Set()
   const deletes = []
   const { runtime } = makeRuntime({
@@ -3092,13 +3104,14 @@ test("createCommandHandlers clears preflight prompt idempotency after promptAsyn
     message_id: 320,
     message_thread_id: 7,
     text: "retry me",
-  }), /down/)
+  }), (actual) => expectAmbiguousPromptFailure(actual))
 
-  assert.equal(deletes.length, 1)
+  assert.equal(deletes.length, 0)
   assert.equal(keys.size, 0)
+  assert.equal(Object.values(runtime.store.get().promptDeliveries.records)[0].state, "outcome_unknown")
 })
 
-test("createCommandHandlers persists prompt idempotency before promptAsync", async () => {
+test("createCommandHandlers persists pending prompt delivery before promptAsync", async () => {
   const promptCalls = []
   const marked = []
   const keys = new Set()
@@ -3147,8 +3160,9 @@ test("createCommandHandlers persists prompt idempotency before promptAsync", asy
   )
 
   assert.deepEqual(promptCalls, [])
-  assert.equal(marked.length, 1)
+  assert.equal(marked.length, 0)
   assert.equal(keys.size, 0)
+  assert.equal(Object.values(runtime.store.get().promptDeliveries.records)[0].state, "pending")
   assert.deepEqual(sent, [])
 })
 
@@ -3403,7 +3417,7 @@ test("createCommandHandlers handleTelegramMessage forwards small text documents 
   assert.match(promptCalls[0].text, /^\[TG\] Review this file/)
   assert.match(promptCalls[0].text, /Filename: app\.js/)
   assert.match(promptCalls[0].text, /console\.log\(1\)/)
-  assert.deepEqual(events.slice(0, 3), ["mark:promptAsyncAttachment", "flush", "prompt"])
+  assert.deepEqual(events, ["flush", "flush", "prompt", "flush", "mark:promptAsyncAttachment", "flush"])
   assert.deepEqual(markProjectUpCalls, ["demo"])
   assert.match(sent.at(-1).text, /Attachment sent to demo\/ses_current: app\.js/)
 })
@@ -3509,11 +3523,12 @@ test("createCommandHandlers rolls back small attachment idempotency when OpenCod
       message_thread_id: 7,
       document: { file_id: "file_1", file_name: "a.txt", mime_type: "text/plain", file_size: 10 },
     }),
-    /opencode unavailable/,
+    (actual) => expectAmbiguousPromptFailure(actual, err),
   )
 
-  assert.deepEqual(events.slice(0, 5), ["mark:promptAsyncAttachment", "flush", "prompt", "delete", "flush"])
+  assert.deepEqual(events, ["flush", "flush", "prompt", "flush"])
   assert.equal(idempotencyKeys.size, 0)
+  assert.equal(Object.values(runtime.store.get().promptDeliveries.records)[0].state, "outcome_unknown")
   assert.match(sent[0].text, /Project 'demo' is unavailable/)
 })
 
@@ -3573,9 +3588,10 @@ test("createCommandHandlers rolls back small attachment idempotency when pre-sen
     },
   )
 
-  assert.deepEqual(events, ["mark:promptAsyncAttachment", "flush", "delete"])
+  assert.deepEqual(events, ["flush"])
   assert.equal(idempotencyKeys.size, 0)
   assert.deepEqual(promptCalls, [])
+  assert.equal(Object.values(runtime.store.get().promptDeliveries.records)[0].state, "pending")
 })
 
 test("createCommandHandlers requires confirmation for large text documents and can cancel", async () => {
@@ -3605,7 +3621,7 @@ test("createCommandHandlers requires confirmation for large text documents and c
     message_id: 11,
     message_thread_id: 7,
     document: { file_id: "file_large", file_name: "large.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
-  })
+  }, { updateId: 611 })
 
   assert.equal(promptCalls.length, 0)
   assert.match(sent[0].text, /Confirm sending this file/)
@@ -3619,6 +3635,109 @@ test("createCommandHandlers requires confirmation for large text documents and c
   assert.deepEqual(result, { callbackText: "Cancelled" })
   assert.equal(promptCalls.length, 0)
   assert.equal(editCalls[0][2], "Attachment sending cancelled.")
+})
+
+test("createCommandHandlers restores a durably flushed attachment confirmation after handler restart", async () => {
+  const events = []
+  const promptCalls = []
+  const records = {}
+  const idempotencyKeys = new Set()
+  const storeState = {
+    bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } },
+    attachmentConfirmations: { records },
+    promptDeliveries: { records: {} },
+    idempotency: { keys: {} },
+  }
+  const store = {
+    get: () => storeState,
+    getBinding: (ctxKey) => storeState.bindings[ctxKey] || null,
+    getAttachmentConfirmation: (token) => records[token] || null,
+    setAttachmentConfirmation(record) {
+      events.push(`set:${record.token}`)
+      records[record.token] = { ...record }
+      return true
+    },
+    deleteAttachmentConfirmation(token) {
+      events.push(`delete:${token}`)
+      if (!records[token]) return false
+      delete records[token]
+      return true
+    },
+    pruneAttachmentConfirmations: () => 0,
+    hasIdempotencyKey: (key) => idempotencyKeys.has(key),
+    markIdempotencyKey(key) {
+      idempotencyKeys.add(key)
+      return true
+    },
+    deleteIdempotencyKey: (key) => idempotencyKeys.delete(key),
+    async flush() {
+      events.push("flush")
+    },
+  }
+  const msg = {
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 111,
+    message_thread_id: 7,
+    document: {
+      file_id: "file_restart",
+      file_unique_id: "unique_restart",
+      file_name: "restart.log",
+      mime_type: "text/plain",
+      file_size: USER_ATTACHMENT_LIMITS.confirmBytes,
+    },
+  }
+  const first = makeRuntime({
+    storeState,
+    store,
+    tg: { async editMessageText() { return true } },
+    ocByAlias: { demo: { async promptAsync() {} } },
+    sendToThread: async (ctxMeta, text, replyMarkup) => {
+      events.push("ui")
+      first.sent.push({ ctxMeta, text, replyMarkup })
+    },
+  })
+  const firstHandlers = createCommandHandlers(first.runtime)
+
+  await firstHandlers.handleTelegramMessage(msg, { updateId: 711 })
+  const sendButton = first.sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file")
+  const token = attachmentTokenFromButton(sendButton)
+  assert.deepEqual(events.slice(0, 3), [`set:${token}`, "flush", "ui"])
+  assert.equal(records[token].fileUniqueId, "unique_restart")
+
+  const restarted = makeRuntime({
+    storeState,
+    store,
+    tg: {
+      async getFile() {
+        return { file_path: "files/restart.log", file_size: USER_ATTACHMENT_LIMITS.confirmBytes }
+      },
+      async downloadFile() {
+        return new TextEncoder().encode("restart-safe")
+      },
+      async editMessageText() {
+        return true
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async promptAsync(...args) {
+          promptCalls.push(args)
+        },
+      },
+    },
+  })
+  const restartedHandlers = createCommandHandlers(restarted.runtime)
+  const result = await restartedHandlers.handleAttachmentConfirmation(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    "send",
+    token,
+    { editMessageId: 901 },
+  )
+
+  assert.deepEqual(result, { callbackText: "Sent" })
+  assert.equal(promptCalls.length, 1)
+  assert.equal(records[token], undefined)
 })
 
 test("createCommandHandlers refuses confirmed attachment when bound project is no longer configured", async () => {
@@ -3658,7 +3777,7 @@ test("createCommandHandlers refuses confirmed attachment when bound project is n
     message_id: 12,
     message_thread_id: 7,
     document: { file_id: "file_large", file_name: "large.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
-  })
+  }, { updateId: 612 })
   const sendButton = sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file")
   const token = attachmentTokenFromButton(sendButton)
 
@@ -3673,18 +3792,23 @@ test("createCommandHandlers refuses confirmed attachment when bound project is n
 
 test("createCommandHandlers does not mark large attachment handled when confirmation send fails", async () => {
   const marked = []
+  const storeState = { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } }
+  let flushes = 0
   const { runtime } = makeRuntime({
-    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    storeState,
     store: {
       markIdempotencyKey(key, metadata) {
         marked.push({ key, metadata })
         return true
       },
-      async flush() {},
+      async flush() {
+        flushes += 1
+      },
     },
     sendToThread: async () => {
       throw new Error("telegram send failed")
     },
+    ocByAlias: { demo: { async promptAsync() {} } },
   })
   const handlers = createCommandHandlers(runtime)
 
@@ -3695,11 +3819,50 @@ test("createCommandHandlers does not mark large attachment handled when confirma
       message_id: 11,
       message_thread_id: 7,
       document: { file_id: "file_large", file_name: "large.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
-    }),
+    }, { updateId: 613 }),
     /telegram send failed/,
   )
 
   assert.deepEqual(marked, [])
+  assert.equal(flushes, 1)
+  assert.equal(Object.keys(storeState.attachmentConfirmations.records).length, 1)
+})
+
+test("createCommandHandlers requires a successful attachment confirmation flush on retry before showing UI", async () => {
+  const storeState = { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } }
+  let flushAttempts = 0
+  const { runtime, sent } = makeRuntime({
+    storeState,
+    store: {
+      async flush() {
+        flushAttempts += 1
+        if (flushAttempts === 1) throw new Error("state write failed")
+      },
+    },
+    ocByAlias: { demo: { async promptAsync() {} } },
+  })
+  const handlers = createCommandHandlers(runtime)
+  const message = {
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 11,
+    message_thread_id: 7,
+    document: { file_id: "file_large", file_name: "large.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
+  }
+
+  await assert.rejects(
+    () => handlers.handleTelegramMessage(message, { updateId: 614 }),
+    (err) => err?.source === "state" && err?.kind === "durability" && err?.outcome === "retryable",
+  )
+  assert.equal(flushAttempts, 1)
+  assert.equal(sent.length, 0)
+  assert.equal(Object.keys(storeState.attachmentConfirmations.records).length, 1)
+
+  await handlers.handleTelegramMessage(message, { updateId: 614 })
+
+  assert.equal(flushAttempts, 2)
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].text, /Confirm sending this file/)
 })
 
 test("createCommandHandlers sends confirmed large text documents", async () => {
@@ -3749,8 +3912,9 @@ test("createCommandHandlers sends confirmed large text documents", async () => {
     message_id: 12,
     message_thread_id: 7,
     document: { file_id: "file_large", file_name: "large.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
-  })
+  }, { updateId: 614 })
   const token = attachmentTokenFromButton(sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file"))
+  events.length = 0
 
   const result = await handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", token, { editMessageId: 78 })
 
@@ -3760,7 +3924,7 @@ test("createCommandHandlers sends confirmed large text documents", async () => {
   assert.match(promptCalls[0].text, /log line/)
   assert.match(editCalls.at(-1)[2], /Attachment sent to demo\/ses_current: large\.log/)
   assert.equal(storeState.marked.some((entry) => entry.metadata.kind === "telegram-attachment"), true)
-  assert.deepEqual(events.slice(-3), ["mark:send-confirmed", "flush", "prompt"])
+  assert.deepEqual(events, ["flush", "flush", "prompt", "flush", "mark:send-confirmed", "flush", "flush"])
 })
 
 test("createCommandHandlers rolls back confirmed attachment send idempotency when OpenCode send fails", async () => {
@@ -3824,14 +3988,17 @@ test("createCommandHandlers rolls back confirmed attachment send idempotency whe
     message_id: 12,
     message_thread_id: 7,
     document: { file_id: "file_large", file_name: "large.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
-  })
+  }, { updateId: 615 })
   const token = attachmentTokenFromButton(sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file"))
+  events.length = 0
 
-  const result = await handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", token, { editMessageId: 78 })
-
-  assert.deepEqual(result, { callbackText: "Temporarily unavailable" })
-  assert.deepEqual(events.slice(-5), ["mark:send-confirmed", "flush", "prompt", "delete:send-confirmed", "flush"])
+  await assert.rejects(
+    () => handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", token, { editMessageId: 78 }),
+    (actual) => expectAmbiguousPromptFailure(actual, err),
+  )
+  assert.deepEqual(events, ["flush", "flush", "prompt", "flush"])
   assert.equal([...metadataByKey.values()].some((metadata) => metadata.action === "send-confirmed"), false)
+  assert.equal(Object.values(runtime.store.get().promptDeliveries.records)[0].state, "outcome_unknown")
 })
 
 test("createCommandHandlers suppresses parallel confirmed attachment sends", async () => {
@@ -3881,7 +4048,7 @@ test("createCommandHandlers suppresses parallel confirmed attachment sends", asy
     message_id: 16,
     message_thread_id: 7,
     document: { file_id: "file_large", file_name: "large.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
-  })
+  }, { updateId: 616 })
   const token = attachmentTokenFromButton(sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file"))
 
   const first = handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", token, { editMessageId: 79 })
@@ -3915,12 +4082,52 @@ test("createCommandHandlers reports expired attachment confirmations", async () 
   assert.match(editCalls[0][2], /confirmation expired/i)
 })
 
+test("createCommandHandlers durably removes expired attachment confirmations", async () => {
+  const token = "a".repeat(24)
+  const storeState = {
+    bindings: {},
+    attachmentConfirmations: {
+      records: {
+        [token]: { token, expiresAt: Date.now() - 1 },
+      },
+    },
+  }
+  let flushes = 0
+  const { runtime } = makeRuntime({
+    storeState,
+    store: {
+      async flush() {
+        flushes += 1
+      },
+    },
+    tg: { async editMessageText() { return true } },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  const result = await handlers.handleAttachmentConfirmation(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    "send",
+    token,
+    { editMessageId: 80 },
+  )
+
+  assert.deepEqual(result, { callbackText: "Expired" })
+  assert.deepEqual(storeState.attachmentConfirmations, { records: {} })
+  assert.equal(flushes, 1)
+})
+
 test("createCommandHandlers refuses confirmed attachment when binding changed", async () => {
   const editCalls = []
   const promptCalls = []
   const storeState = { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } }
+  let flushes = 0
   const { runtime, sent } = makeRuntime({
     storeState,
+    store: {
+      async flush() {
+        flushes += 1
+      },
+    },
     tg: {
       async downloadFile() {
         throw new Error("should not download")
@@ -3946,7 +4153,7 @@ test("createCommandHandlers refuses confirmed attachment when binding changed", 
     message_id: 17,
     message_thread_id: 7,
     document: { file_id: "file_large", file_name: "large.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
-  })
+  }, { updateId: 617 })
   const token = attachmentTokenFromButton(sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file"))
   storeState.bindings["100:7"] = { projectAlias: "demo", sessionId: "ses_new" }
 
@@ -3954,6 +4161,8 @@ test("createCommandHandlers refuses confirmed attachment when binding changed", 
 
   assert.deepEqual(result, { callbackText: "Binding changed" })
   assert.equal(promptCalls.length, 0)
+  assert.equal(storeState.attachmentConfirmations.records[token], undefined)
+  assert.equal(flushes, 2)
   assert.match(editCalls.at(-1)[2], /binding changed/i)
 })
 
@@ -3969,7 +4178,7 @@ test("createCommandHandlers treats repeated confirmed attachment sends as alread
     document: { file_id: "file_large", file_name: "large.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
   }
   const messageKey = telegramMessageIdempotencyKey({ chatId: 100, threadIdOr0: 7 }, msg)
-  const sendKey = `tg-attachment-send:${hashIdempotencyValue(`${messageKey}:demo:ses_current`)}`
+  let sendKey = ""
   const { runtime, sent } = makeRuntime({
     storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
     store: {
@@ -3997,8 +4206,9 @@ test("createCommandHandlers treats repeated confirmed attachment sends as alread
   })
   const handlers = createCommandHandlers(runtime)
 
-  await handlers.handleTelegramMessage(msg)
+  await handlers.handleTelegramMessage(msg, { updateId: 618 })
   const token = attachmentTokenFromButton(sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file"))
+  sendKey = `tg-attachment-send:${token}`
 
   const result = await handlers.handleAttachmentConfirmation({ chatId: 100, threadIdOr0: 7, ctxKey: "100:7" }, "send", token, { editMessageId: 82 })
 
@@ -4012,8 +4222,15 @@ test("createCommandHandlers returns retry guidance for confirmed attachment down
   const retryableErr = makeBoundaryError({ source: "telegram", method: "POST", pathname: "/getFile", status: 503, message: "getFile unavailable" })
   const fatalErr = new Error("file path missing")
   const downloadErrors = [retryableErr, fatalErr]
+  const storeState = { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } }
+  let flushes = 0
   const { runtime, sent } = makeRuntime({
-    storeState: { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } },
+    storeState,
+    store: {
+      async flush() {
+        flushes += 1
+      },
+    },
     tg: {
       async getFile() {
         throw downloadErrors.shift()
@@ -4035,14 +4252,14 @@ test("createCommandHandlers returns retry guidance for confirmed attachment down
     message_id: 19,
     message_thread_id: 7,
     document: { file_id: "file_large_1", file_name: "one.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
-  })
+  }, { updateId: 619 })
   await handlers.handleTelegramMessage({
     chat: { id: 100, type: "supergroup" },
     from: { id: 42 },
     message_id: 20,
     message_thread_id: 7,
     document: { file_id: "file_large_2", file_name: "two.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
-  })
+  }, { updateId: 620 })
   const tokens = sent
     .filter((entry) => /Confirm sending this file/.test(entry.text))
     .map((entry) => attachmentTokenFromButton(entry.replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file")))
@@ -4052,8 +4269,76 @@ test("createCommandHandlers returns retry guidance for confirmed attachment down
 
   assert.deepEqual(retryable, { callbackText: "Try again" })
   assert.deepEqual(fatal, { callbackText: "Download failed" })
+  assert.ok(storeState.attachmentConfirmations.records[tokens[0]])
+  assert.equal(storeState.attachmentConfirmations.records[tokens[1]], undefined)
+  assert.equal(flushes, 3)
   assert.match(sent.at(-2).text, /could not be downloaded/)
   assert.match(sent.at(-1).text, /could not be downloaded/)
+})
+
+test("createCommandHandlers durably removes confirmed attachments after definitive OpenCode rejection", async () => {
+  const storeState = { bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_current" } } }
+  const promptCalls = []
+  let flushes = 0
+  const rejected = makeBoundaryError({
+    source: "opencode",
+    operation: "POST /session/ses_current/prompt_async",
+    method: "POST",
+    pathname: "/session/ses_current/prompt_async",
+    status: 400,
+    outcome: "fatal",
+    message: "invalid request",
+  })
+  const { runtime, sent } = makeRuntime({
+    storeState,
+    store: {
+      async flush() {
+        flushes += 1
+      },
+    },
+    tg: {
+      async getFile() {
+        return { file_path: "files/rejected.log", file_size: USER_ATTACHMENT_LIMITS.confirmBytes }
+      },
+      async downloadFile() {
+        return new TextEncoder().encode("rejected")
+      },
+      async editMessageText() {
+        return true
+      },
+    },
+    ocByAlias: {
+      demo: {
+        async promptAsync(...args) {
+          promptCalls.push(args)
+          throw rejected
+        },
+      },
+    },
+  })
+  const handlers = createCommandHandlers(runtime)
+
+  await handlers.handleTelegramMessage({
+    chat: { id: 100, type: "supergroup" },
+    from: { id: 42 },
+    message_id: 21,
+    message_thread_id: 7,
+    document: { file_id: "file_rejected", file_name: "rejected.log", mime_type: "text/plain", file_size: USER_ATTACHMENT_LIMITS.confirmBytes },
+  }, { updateId: 621 })
+  const token = attachmentTokenFromButton(sent[0].replyMarkup.inline_keyboard.flat().find((button) => button.text === "Send file"))
+
+  const result = await handlers.handleAttachmentConfirmation(
+    { chatId: 100, threadIdOr0: 7, ctxKey: "100:7" },
+    "send",
+    token,
+    { editMessageId: 85 },
+  )
+
+  assert.deepEqual(result, { callbackText: "Send failed" })
+  assert.equal(promptCalls.length, 1)
+  assert.equal(storeState.attachmentConfirmations.records[token], undefined)
+  assert.deepEqual(storeState.promptDeliveries, { records: {} })
+  assert.ok(flushes >= 5)
 })
 
 test("createCommandHandlers rejects attachments that Telegram reports over the size limit", async () => {
@@ -4272,13 +4557,13 @@ test("createCommandHandlers rethrows retryable OpenCode send failures for attach
       message_thread_id: 7,
       document: { file_id: "file_1", file_name: "a.txt", mime_type: "text/plain", file_size: 10 },
     }),
-    /opencode unavailable/,
+    (actual) => expectAmbiguousPromptFailure(actual, err),
   )
   assert.equal(sent.length, 0)
   assert.equal(notices.length, 1)
   assert.equal(notices[0].ctxMeta.ctxKey, "100:7")
   assert.equal(notices[0].alias, "demo")
-  assert.equal(notices[0].error, err)
+  assert.equal(notices[0].error.cause, err)
   assert.ok(notices[0].options.fallbackReplyMarkup)
 })
 

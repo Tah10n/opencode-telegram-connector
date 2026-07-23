@@ -8,6 +8,17 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ## [Unreleased]
 
 ### Fixed
+- Telegram text and document prompts now use deterministic OpenCode message IDs, persisted prompt fingerprints, and fail-closed durable reconciliation. A lost `prompt_async` response does not create a second agent turn when the Telegram update is replayed, and ambiguous attempts are never automatically re-POSTed on a later `404`.
+- Telegram `getMe` is now a mandatory startup check; `401`/`403` and malformed or oversized successful Telegram responses trigger one controlled fatal shutdown instead of an endless retry loop, while `429` and retryable `5xx` responses still back off.
+- Final assistant replies, changed-file cards, optional TUI user mirrors, and agent-error notices now pass through a bounded durable outbox with persist-before-publish enqueue, per-block/per-chunk checkpoints, `retry_after` support, startup replay, and durable completion tombstones. Item-scoped terminal Telegram `400`/`403` failures and removed aliases are discarded without restarting the runtime, while global authentication/state/protocol failures remain fatal.
+- Provisional agent-error notices now use a separate durable queue identity while sharing the definitive notice's completion tombstone. Missing or incomplete messages and OpenCode `401`/`403` reads remain retryable; a definitive clean completion or terminal verification failure removes only the provisional entry without tombstoning a later confirmed error, including after restart.
+- Durable outbox capacity now applies abortable FIFO backpressure without dropping SSE events; readiness and `/runtime` expose full/blocked capacity, worker state, in-flight work, next due time, and fatal markers.
+- Large-file attachment confirmations are now persisted and successfully re-flushed before Telegram buttons become visible, including same-process retry after a failed flush. Records are strictly bound to the original context/project/session/message/update/file identity and reconciled after restart without repeating a completed download or OpenCode POST.
+- Durable OpenCode outbox reads now share a validated configurable timeout (`opencodeOutboxReadTimeoutMs` / `OPENCODE_OUTBOX_READ_TIMEOUT_MS`, default 20 seconds); timeouts remain retryable and shutdown aborts an in-flight read promptly.
+- Atomic state writes now sync and close the temporary file before rename and sync the parent directory on POSIX, while retaining the recoverable Windows replacement fallback.
+- First-run Telegram backlog skipping now uses one durable server-side tail cutoff; later arrivals are processed by the normal loop, and readiness stays false until recovery state is persisted. Clearly unsent requests may retry the snapshot, ambiguous responses and interrupted cutoff intent fall back durably to offset `0`, and malformed successful results fail closed without issuing another negative-offset request.
+- Unauthorized Telegram button presses are acknowledged exactly once without decoding or dispatching the callback action.
+- OpenCode and Telegram success/error response bodies now have byte limits enforced for declared and chunked bodies, including multibyte UTF-8, without logging full oversized error bodies.
 - OpenCode SSE mirroring now uses the current `/global/event` stream by default, unwraps `payload`-wrapped events, drops unscoped global events fail-closed, and keeps `OPENCODE_SSE_EVENT_PATH=/event` as a compatibility override for older opencode builds.
 - `setup:check` and runtime startup now fail/degrade loudly when `/global/event` is used without a configured project `directory`, instead of silently dropping every global SSE event for that project.
 - `/global/event` directory matching is now path-flavor aware, so remote POSIX paths remain case-sensitive even when the connector runs on Windows while Windows drive/UNC paths still compare case-insensitively.
@@ -45,6 +56,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - OpenCode auto-start now reports immediate background launcher exits and stops the spawned process when startup observation is aborted.
 
 ### Security
+- Telegram bot tokens remain redacted from fatal authentication/protocol diagnostics, and oversized HTTP error bodies are truncated before classification or logging.
 - Logs now redact bot tokens, Basic Auth credentials, URL userinfo/query/hash values, auth-like command-line flags, and sensitive state/config paths before writing text or JSON output.
 - High-entropy token strings of 32 or more characters are automatically redacted even when the token type is not pre-listed in the known-secrets configuration.
 - Logged `Error` objects include a `stack_redacted: true` field instead of the raw stack trace so sensitive paths in stacks are not leaked while the omission remains visible.
@@ -54,6 +66,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - State migrations and invalid parsed state files are preserved in bounded `state.json.backup.*` files before recovery attempts.
 
 ### Added
+- State schema v9 adds validated, bounded, expiring attachment-confirmation records; v8 introduced migrated prompt-delivery reconciliation records and the bounded Telegram delivery outbox.
 - `npm run check` now includes relative import and CheckJS hard-reference guards to catch missing import targets and unresolved runtime/export references earlier.
 - `/permissions` can show and switch Codex-like OpenCode permission profiles (`suggest`, `auto-edit`, `full-auto`, and reset) from Telegram private chats, with read-only group views and backed-up local `opencode.json`/`opencode.jsonc` writes. Built-in profiles deny `.env`/`.env.*` content for both read and grep while allowing `.env.example`. `full-auto` asks on unknown future permissions, explicit permission config paths are constrained to local OpenCode config filenames, local project boundaries, and explicit remote-directory opt-in for same-platform remote paths, and `setup:check` validates permission config targets only after explicit permission-control opt-in or `permissionConfigPath` configuration.
 - Full Telegram UI localization infrastructure with English and Russian catalogs, `/language` per-thread selection, Telegram command menus per locale, and config/env overrides.

@@ -58,12 +58,14 @@ export function createAgentActionDelivery({
     const eventInfo = partEventTimeInfo(part, props)
     markAgentToolStatus(projectAlias, sessionId, `${messageId}:${partId}`, status, text, { messageId, eventInfo })
     if (status === "error") {
-      scheduleAgentStopErrorFallback({
+      await scheduleAgentStopErrorFallback({
         projectAlias,
         sessionId,
         messageId,
         partId,
         text: formatAgentStopErrorNotice({ reason: "Agent action failed; no successful completion was seen yet.", details: text }),
+        routeCtx,
+        boundKey: sessionKey(projectAlias, resolved.boundSessionId),
         allowParentRoute: isChildAction,
         verifyMessageError: true,
       })

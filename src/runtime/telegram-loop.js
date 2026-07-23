@@ -1,5 +1,18 @@
-import { classifyBoundaryError } from "../boundary-errors.js"
+import { classifyBoundaryError, isClearlyUnsentRequestError, makeBoundaryError } from "../boundary-errors.js"
 import { telegramUpdateIdempotencyKey } from "../connector/idempotency.js"
+
+function malformedGetUpdatesResponse(operation) {
+  return makeBoundaryError({
+    source: "telegram",
+    operation,
+    method: "POST",
+    pathname: "/getUpdates",
+    status: 200,
+    kind: "protocol",
+    outcome: "fatal",
+    message: "Telegram getUpdates returned a successful response with a non-array result",
+  })
+}
 
 export function createTelegramUpdateLoop({
   store,
@@ -17,101 +30,132 @@ export function createTelegramUpdateLoop({
   drainTelegramBacklogOnFirstRun = true,
 } = {}) {
   async function drainTelegramBacklogIfNeeded() {
-    if (store.get().updateOffset != null) return
+    const persistedOffset = store.get().updateOffset
+    if (persistedOffset != null && persistedOffset !== -1) return
+    if (persistedOffset === -1) {
+      logger.warn("Recovering an interrupted Telegram backlog cutoff without discarding queued updates.")
+      store.setUpdateOffset(0)
+      await flushCriticalState("recover interrupted Telegram backlog cutoff")
+      return
+    }
     if (drainTelegramBacklogOnFirstRun === false) {
       logger.info("Telegram backlog drain disabled on first run. Processing queued updates from offset 0.")
       store.setUpdateOffset(0)
       await flushCriticalState("persist Telegram first-run offset")
       return
     }
-    logger.info("Draining Telegram backlog (first run)…")
-    let offset = 0
-    let skipped = 0
+    logger.info("Capturing Telegram backlog cutoff (first run)…")
+    store.setUpdateOffset(-1)
+    await flushCriticalState("persist Telegram backlog cutoff intent")
     let backoff = 1000
     while (true) {
       if (abortController.signal.aborted) {
         recordLoopAbort("backlogDrain", { reason: "connector stop" })
         return
       }
-      let pollRetryAfterMs = null
-      const updates = await tg
-        .getUpdates({ offset, timeout: 0, limit: 100, allowed_updates: ["message", "callback_query"], signal: abortController.signal })
-        .catch((err) => {
-          if (abortController.signal.aborted) return null
-          const classification = classifyBoundaryError(err, {
-            source: "telegram",
-            operation: "getUpdates",
-            method: "POST",
-            pathname: "/getUpdates",
-          })
-          pollRetryAfterMs = classification.retryAfterMs
-          logLoopIssue("backlogDrain", classification.error, {
-            retryable: classification.retryable,
-            source: "telegram",
-            operation: "getUpdates",
-            method: "POST",
-            pathname: "/getUpdates",
-          })
-          return null
+      let updates
+      try {
+        updates = await tg.getUpdates({ offset: -1, timeout: 0, limit: 1, allowed_updates: ["message", "callback_query"], signal: abortController.signal })
+      } catch (err) {
+        if (abortController.signal.aborted) return
+        const clearlyUnsent = isClearlyUnsentRequestError(err)
+        const classification = classifyBoundaryError(err, {
+          source: "telegram",
+          operation: "getUpdates",
+          method: "POST",
+          pathname: "/getUpdates",
         })
+        logLoopIssue("backlogDrain", classification.error, {
+          retryable: classification.retryable,
+          source: "telegram",
+          operation: "getUpdates",
+          method: "POST",
+          pathname: "/getUpdates",
+        })
+        if (!classification.retryable) throw classification.error
+        if (!clearlyUnsent) {
+          store.setUpdateOffset(0)
+          await flushCriticalState("persist Telegram backlog cutoff fallback")
+          runtimeObservability.recordLoopFallbackHit("backlogDrain")
+          logger.warn("Telegram backlog cutoff response was ambiguous. Continuing safely from offset 0.", {
+            outcome: classification.outcome,
+            kind: classification.kind,
+            status: classification.status,
+            code: classification.code,
+            offset: 0,
+          })
+          return
+        }
+        await sleepWithAbort(classification.retryAfterMs || backoff)
+        backoff = Math.min(30_000, backoff * 2)
+        continue
+      }
 
       if (abortController.signal.aborted) {
         recordLoopAbort("backlogDrain", { reason: "connector stop" })
         return
       }
       if (!Array.isArray(updates)) {
-        await sleepWithAbort(pollRetryAfterMs || backoff)
-        backoff = Math.min(30_000, backoff * 2)
-        continue
+        throw malformedGetUpdatesResponse("getUpdates backlog cutoff")
       }
 
-      runtimeObservability.recordLoopSuccess("backlogDrain")
       backoff = 1000
-      if (updates.length === 0) break
-      skipped += updates.length
-      offset = updates[updates.length - 1].update_id + 1
-      await sleepWithAbort(200)
+      const updateIds = updates.map((update) => update?.update_id)
+      if (updateIds.some((updateId) => !Number.isSafeInteger(updateId) || updateId < 0)) {
+        throw makeBoundaryError({
+          source: "telegram",
+          operation: "getUpdates backlog cutoff",
+          method: "POST",
+          pathname: "/getUpdates",
+          kind: "protocol",
+          outcome: "fatal",
+          message: "Telegram backlog cutoff response contained an invalid update_id",
+        })
+      }
+      const cutoffUpdateId = updateIds.length > 0 ? Math.max(...updateIds) : null
+      const offset = cutoffUpdateId == null ? 0 : cutoffUpdateId + 1
+      store.setUpdateOffset(offset)
+      await flushCriticalState("persist Telegram backlog cutoff")
+      runtimeObservability.recordLoopSuccess("backlogDrain")
+      logger.info("Telegram backlog cutoff captured.", { cutoffUpdateId, offset })
+      return
     }
-    store.setUpdateOffset(offset)
-    await flushCriticalState("persist Telegram backlog offset")
-    logger.info("Telegram backlog drained.", { skipped, offset })
   }
 
   async function telegramLoop() {
     await drainTelegramBacklogIfNeeded()
     let backoff = 1000
     while (!abortController.signal.aborted) {
-      let pollRetryAfterMs = null
       const offset = store.get().updateOffset ?? 0
-      const updates = await tg
-        .getUpdates({ offset, timeout: 30, limit: 100, allowed_updates: ["message", "callback_query"], signal: abortController.signal })
-        .catch((err) => {
-          if (abortController.signal.aborted) return null
-          const classification = classifyBoundaryError(err, {
-            source: "telegram",
-            operation: "getUpdates",
-            method: "POST",
-            pathname: "/getUpdates",
-          })
-          pollRetryAfterMs = classification.retryAfterMs
-          logLoopIssue("telegramPoll", classification.error, {
-            retryable: classification.retryable,
-            source: "telegram",
-            operation: "getUpdates",
-            method: "POST",
-            pathname: "/getUpdates",
-          })
-          return null
+      let updates
+      try {
+        updates = await tg.getUpdates({ offset, timeout: 30, limit: 100, allowed_updates: ["message", "callback_query"], signal: abortController.signal })
+      } catch (err) {
+        if (abortController.signal.aborted) break
+        const classification = classifyBoundaryError(err, {
+          source: "telegram",
+          operation: "getUpdates",
+          method: "POST",
+          pathname: "/getUpdates",
         })
+        logLoopIssue("telegramPoll", classification.error, {
+          retryable: classification.retryable,
+          source: "telegram",
+          operation: "getUpdates",
+          method: "POST",
+          pathname: "/getUpdates",
+        })
+        if (!classification.retryable) throw classification.error
+        await sleepWithAbort(classification.retryAfterMs || backoff)
+        backoff = Math.min(30_000, backoff * 2)
+        continue
+      }
       if (abortController.signal.aborted) {
         recordLoopAbort("telegramPoll", { reason: "connector stop" })
         break
       }
       if (!Array.isArray(updates)) {
-        // Avoid a tight loop on network/API errors.
-        await sleepWithAbort(pollRetryAfterMs || backoff)
-        backoff = Math.min(30_000, backoff * 2)
-        continue
+        throw malformedGetUpdatesResponse("getUpdates")
       }
       runtimeObservability.recordLoopSuccess("telegramPoll")
       if (updates.length === 0) {

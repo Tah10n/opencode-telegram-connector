@@ -126,6 +126,7 @@ function randomConnectorShape(rng) {
   maybe("allowInsecureHttp", randomJsonishValue(rng))
   maybe("logFormat", randomJsonishValue(rng))
   maybe("activeTurnStaleMs", randomJsonishValue(rng))
+  maybe("opencodeOutboxReadTimeoutMs", randomJsonishValue(rng))
   maybe("healthServer", randomJsonishValue(rng))
   maybe("opencodeWatchdog", randomJsonishValue(rng))
   maybe("i18n", randomJsonishValue(rng))
@@ -153,6 +154,7 @@ function randomValidConnectorConfig(rng) {
   const port = randomInt(rng, 1024, 65000)
   const defaultLocale = pick(rng, ["en", "ru"])
   const healthPort = randomInt(rng, 0, 65535)
+  const outboxReadTimeoutMs = randomInt(rng, 100, 120000)
   return {
     raw: {
       cwd,
@@ -163,6 +165,7 @@ function randomValidConnectorConfig(rng) {
       mirrorTuiUserMessages: chance(rng),
       allowInsecureHttp: chance(rng),
       activeTurnStaleMs: randomInt(rng, 1, 300000),
+      opencodeOutboxReadTimeoutMs: outboxReadTimeoutMs,
       healthServer: { enabled: chance(rng), host: "127.0.0.1", port: healthPort },
       opencodeWatchdog: {
         failureThreshold: randomInt(rng, 1, 10),
@@ -194,7 +197,7 @@ function randomValidConnectorConfig(rng) {
         },
       },
     },
-    expected: { cwd, stateFile, alias, projectDirectory, port, healthPort, defaultLocale },
+    expected: { cwd, stateFile, alias, projectDirectory, port, healthPort, defaultLocale, outboxReadTimeoutMs },
   }
 }
 
@@ -293,6 +296,7 @@ test("normalizeConnectorConfig generated valid configs normalize paths and neste
     assert.equal(normalized.config.stateFile, path.resolve(runtimeBaseDir, expected.stateFile))
     assert.equal(normalized.config.defaultProject, expected.alias)
     assert.equal(normalized.config.healthServer.port, expected.healthPort)
+    assert.equal(normalized.config.opencodeOutboxReadTimeoutMs, expected.outboxReadTimeoutMs)
     assert.equal(normalized.config.i18n.defaultLocale, expected.defaultLocale)
     assert.equal(normalized.config.projects[expected.alias].baseUrl, `http://127.0.0.1:${expected.port}`)
     assert.equal(normalized.config.projects[expected.alias].directory, path.resolve(runtimeBaseDir, expected.projectDirectory))

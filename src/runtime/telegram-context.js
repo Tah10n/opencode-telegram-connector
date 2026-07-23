@@ -110,12 +110,13 @@ export function createTelegramContextTools({ config, store, tg } = {}) {
     })
   }
 
-  async function sendBlocksToThread(ctxMeta, blocks, replyMarkup) {
+  async function sendBlocksToThread(ctxMeta, blocks, replyMarkup, options = {}) {
     ctxMeta = ctxMetaWithLocale(ctxMeta)
     if (!ctxMeta?.chatId) return
     return withRequestContextFields(requestContextForCtxMeta(ctxMeta, store.getBinding(ctxMeta.ctxKey)), async () => {
       try {
         await tg.sendHtmlBlocks(ctxMeta.chatId, blocks, replyMarkup, {
+          ...options,
           message_thread_id: ctxMeta.threadIdOr0 || undefined,
         })
       } catch (err) {

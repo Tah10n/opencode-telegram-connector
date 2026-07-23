@@ -17,7 +17,7 @@ import { createAssistantDelivery } from "./mirroring/assistant-delivery.js"
 import { createChangedFilesView } from "./mirroring/changed-files-view.js"
 import { createFeedUi } from "./mirroring/feed-ui.js"
 import { formatUserMirrorBlocks } from "./mirroring/user-format.js"
-
+import { createOutboxDelivery } from "./mirroring/outbox-delivery.js"
 export function createMirroringHandlers(runtime) {
   const {
     tg,
@@ -46,9 +46,9 @@ export function createMirroringHandlers(runtime) {
     recordAssistantMirrored,
     recordNoisyEventSkipped,
     recordAttachmentFallback,
+    outbox,
   } = runtime
   const packCallback = callbackPacker(cb)
-
   const pause = typeof sleep === "function" ? sleep : (ms) => new Promise((resolve) => setTimeout(resolve, ms))
   const isStopping = () => abortSignal?.aborted === true
   const changedFilesExportInFlight = new Set()
@@ -60,11 +60,9 @@ export function createMirroringHandlers(runtime) {
   const AGENT_ACTIVITY_TOMBSTONE_SWEEP_MS = 60 * 1000
   const ROUTE_LOOKUP_MAX_ATTEMPTS = 3
   const ROUTE_LOOKUP_INITIAL_DELAY_MS = 150
-  const ASSISTANT_FINAL_DELIVERY_MAX_ATTEMPTS = 4
   const ASSISTANT_FINAL_DELIVERY_RETRY_DELAYS_MS = [500, 1500, 5000]
   const AGENT_STOP_ERROR_FALLBACK_GRACE_MS = 5000
   let nextAgentActivityTombstoneSweepAt = 0
-
   function ensureForwardedSets(sk) {
     let s = forwardedBySession.get(sk)
     if (!s) {
@@ -469,7 +467,7 @@ export function createMirroringHandlers(runtime) {
     }
     const route = resolved.route
     const routeCtx = routeCtxFromRoute(route)
-    return { route, routeCtx, boundKey: sessionKey(projectAlias, resolved.boundSessionId) }
+    return { route, routeCtx, boundSessionId: resolved.boundSessionId, boundKey: sessionKey(projectAlias, resolved.boundSessionId) }
   }
 
   async function deliverAgentStopErrorNotice({
@@ -491,6 +489,25 @@ export function createMirroringHandlers(runtime) {
     const sets = ensureForwardedSets(sk)
     if (sets.agentStopErrors.has(dedupeKey)) {
       logSseDebug(projectAlias, sessionId, `drop=agent_stop_error_already_forwarded key=${dedupeKey}`)
+      return true
+    }
+    if (outbox?.enqueue) {
+      let durableRouteCtx = routeCtx
+      if (!durableRouteCtx) {
+        const resolved = await resolveFreshAssistantDeliveryRoute(projectAlias, sessionId, messageId || dedupeKey, { allowParentRoute, signal: deliveryOptions.signal || abortSignal })
+        durableRouteCtx = resolved?.routeCtx
+      }
+      if (!durableRouteCtx) return false
+      const durableBinding = store.getBinding?.(durableRouteCtx.ctxKey)
+      if (!durableBinding || durableBinding.projectAlias !== projectAlias) return false
+      const stableMessageId = String(messageId || "").trim() || `msg_agent_${crypto.createHash("sha1").update(String(dedupeKey)).digest("hex")}`
+      await outbox.enqueue({
+        type: "agent-error", projectAlias, sessionId, boundSessionId: durableBinding.sessionId, messageId: stableMessageId,
+        route: durableRouteCtx,
+        payload: { text, ...(verifyMessageError ? { requireMessageError: true } : {}) },
+        delayMs: deliveryOptions.outboxDelayMs,
+      }, { signal: deliveryOptions.signal || abortSignal, waitForCapacity: true })
+      logSseDebug(projectAlias, sessionId, `queue=agent_stop_error msg=${stableMessageId}`)
       return true
     }
 
@@ -528,7 +545,7 @@ export function createMirroringHandlers(runtime) {
       } catch (err) {
         const attempt = Number.isInteger(deliveryOptions.agentStopErrorVerifyAttempt) && deliveryOptions.agentStopErrorVerifyAttempt > 0 ? deliveryOptions.agentStopErrorVerifyAttempt : 1
         const classification = classifyBoundaryError(err)
-        const canRetry = deliveryOptions.ignoreStopping !== true && deliveryOptions.signal?.aborted !== true && !isStopping() && attempt < ASSISTANT_FINAL_DELIVERY_MAX_ATTEMPTS && classification.retryable
+        const canRetry = deliveryOptions.ignoreStopping !== true && deliveryOptions.signal?.aborted !== true && !isStopping() && classification.retryable
         if (canRetry) {
           const nextAttempt = attempt + 1
           const delayMs = classification.retryAfterMs || assistantRetryDelayMs(attempt)
@@ -608,7 +625,6 @@ export function createMirroringHandlers(runtime) {
         deliveryOptions.ignoreStopping !== true &&
         deliveryOptions.signal?.aborted !== true &&
         !isStopping() &&
-        attempt < ASSISTANT_FINAL_DELIVERY_MAX_ATTEMPTS &&
         classification.retryable
       if (canRetry) {
         const nextAttempt = attempt + 1
@@ -656,13 +672,19 @@ export function createMirroringHandlers(runtime) {
     }
   }
 
-  function scheduleAgentStopErrorFallback({ projectAlias, sessionId, messageId = "", partId = "", text, dedupeKey, allowParentRoute = false, verifyMessageError = false } = {}) {
+  async function scheduleAgentStopErrorFallback({ projectAlias, sessionId, messageId = "", partId = "", text, dedupeKey, routeCtx, boundKey, allowParentRoute = false, verifyMessageError = false } = {}) {
     if (!projectAlias || !sessionId || !text) return false
     if (verifyMessageError && !messageId) return false
     const key = dedupeKey || agentStopErrorDedupeKey({ messageId, partId, details: text })
     const sk = sessionKey(projectAlias, sessionId)
     const sets = ensureForwardedSets(sk)
     if (sets.agentStopErrors.has(key)) return false
+    if (outbox?.enqueue) {
+      return deliverAgentStopErrorNotice({
+        projectAlias, sessionId, messageId, dedupeKey: key, text, routeCtx, boundKey, allowParentRoute, verifyMessageError,
+        deliveryOptions: { outboxDelayMs: AGENT_STOP_ERROR_FALLBACK_GRACE_MS },
+      })
+    }
     const deliveryKey = agentStopErrorDebounceKey(projectAlias, sessionId, key)
     if (isAgentStopErrorDebounce(assistantDebounce.get(deliveryKey))) return false
     const run = bindRequestContext((deliveryOptions = {}) =>
@@ -781,6 +803,18 @@ export function createMirroringHandlers(runtime) {
         recordNoisySkip(projectAlias, NOISY_SKIP_REASONS.USER_MIRROR_DISABLED)
         return
       }
+      if (outbox?.enqueue) {
+        await outbox.enqueue({
+          type: "user-mirror",
+          projectAlias,
+          sessionId,
+          boundSessionId: resolved.boundSessionId,
+          messageId: info.id,
+          route: routeCtx,
+        }, { signal: abortSignal, waitForCapacity: true })
+        logSseDebug(projectAlias, sessionId, `queue=user msg=${info.id} thread=${route.threadIdOr0 || 0}`)
+        return
+      }
       const blocks = formatUserMirrorBlocks(text)
       await tg.sendHtmlBlocks(route.chatId, blocks, null, { message_thread_id: route.threadIdOr0 || undefined })
       sets.user.add(info.id)
@@ -807,6 +841,7 @@ export function createMirroringHandlers(runtime) {
       await deliverAgentStopErrorNotice({
         projectAlias,
         sessionId,
+        boundSessionId: resolved.boundSessionId,
         messageId: info.id,
         dedupeKey: agentStopErrorDedupeKey({ messageId: info.id }),
         text: formatAgentStopErrorNotice({ reason: "Assistant reply failed.", details: info.error }),
@@ -876,6 +911,22 @@ export function createMirroringHandlers(runtime) {
       state.routeCtx = routeCtx
       assistantPreviewBySession.set(boundKey, state)
       logSseDebug(projectAlias, sessionId, `stream=assistant msg=${info.id} thread=${route.threadIdOr0 || 0}`)
+      return
+    }
+
+    if (outbox?.enqueue) {
+      if (sets.assistant.has(info.id)) {
+        logSseDebug(projectAlias, sessionId, `drop=assistant_already_forwarded msg=${info.id}`)
+        return
+      }
+      await outbox.enqueue({
+        type: "assistant-final",
+        projectAlias,
+        sessionId,
+        messageId: info.id,
+        route: routeCtx,
+      }, { signal: abortSignal, waitForCapacity: true })
+      logSseDebug(projectAlias, sessionId, `queue=assistant msg=${info.id} thread=${route.threadIdOr0 || 0}`)
       return
     }
 
@@ -1029,7 +1080,6 @@ export function createMirroringHandlers(runtime) {
           deliveryOptions.ignoreStopping !== true &&
           deliveryOptions.signal?.aborted !== true &&
           !isStopping() &&
-          attempt < ASSISTANT_FINAL_DELIVERY_MAX_ATTEMPTS &&
           classification.retryable
         if (canRetry) {
           const nextAttempt = attempt + 1
@@ -1065,6 +1115,27 @@ export function createMirroringHandlers(runtime) {
       kind: "debounce",
     })
   }
+
+  const deliverOutboxItem = createOutboxDelivery({
+    tg,
+    store,
+    ocByAlias,
+    runtime,
+    assistantPreviewBySession,
+    lastAssistantBySession,
+    ensureForwardedSets,
+    extractAssistantDisplayText,
+    extractChangedFilesSummary,
+    getAssistantMessageWithRetry,
+    deliverAssistantText,
+    deliverChangedFilesSummary,
+    shouldMirrorToFeed,
+    previewMatchesRoute,
+    sendToThread,
+    logSseDebug,
+    recordNoisySkip,
+    recordAssistantMirrored,
+  })
 
   async function flushPendingAssistantDeliveries({ timeoutMs = 5000 } = {}) {
     const pending = [...assistantDebounce.values()]
@@ -1122,6 +1193,7 @@ export function createMirroringHandlers(runtime) {
     handleMessageUpdated,
     clearAgentActivity,
     getAgentActivityStatus,
+    deliverOutboxItem,
     flushPendingAssistantDeliveries,
   }
 }

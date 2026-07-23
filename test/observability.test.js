@@ -25,10 +25,19 @@ test("createRuntimeObservability records compact privacy-safe counters", () => {
   observability.recordNoisyEventSkipped("demo", "compaction")
   observability.recordPromptDelivered("demo", "permission")
   observability.recordPromptAnswered("demo", "permission", "ok")
+  for (const outcome of ["pending", "accepted", "ambiguous", "reconciled", "retryable", "released"]) {
+    observability.recordPromptDeliveryOutcome("demo", outcome)
+  }
   observability.recordTelegramFailure({ projectAlias: "demo", operation: "sendMessage" })
   observability.recordTelegramFailure({ projectAlias: "demo", operation: "editMessageText" })
   observability.recordAttachmentFallback("demo", "assistant-long-output")
   observability.recordLegacyCallbackFallback("demo")
+  observability.recordOutboxQueued("demo")
+  observability.recordOutboxDelivered("demo")
+  observability.recordOutboxDiscarded("demo")
+  observability.recordOutboxRetry("demo")
+  observability.recordOutboxExpired("demo", 2)
+  observability.recordOutboxBackpressure("demo")
 
   const projectText = observability.buildStatusLines("demo").join("\n")
   const runtimeText = observability.buildRuntimeStatusLines().join("\n")
@@ -36,7 +45,9 @@ test("createRuntimeObservability records compact privacy-safe counters", () => {
   for (const text of [projectText, runtimeText]) {
     assert.match(text, /Messages: assistant=1 skipped=1 attachmentFallbacks=1/)
     assert.match(text, /Prompts: delivered=1 answered=1/)
+    assert.match(text, /Prompt delivery ledger: pending=1 accepted=1 ambiguous=1 reconciled=1 retryable=1 released=1/)
     assert.match(text, /Telegram delivery: sendFailures=1 editFailures=1/)
+    assert.match(text, /Durable outbox: queued=1 delivered=1 discarded=1 retries=1 expired=2 backpressure=1/)
     assert.match(text, /legacyFallback=1|Legacy callbacks: fallback=1/)
     assert.doesNotMatch(text, /chat|session|state\.json|token/i)
   }
@@ -44,8 +55,22 @@ test("createRuntimeObservability records compact privacy-safe counters", () => {
 
 test("createRuntimeObservability builds readiness health snapshots", () => {
   const observability = createRuntimeObservability({ projectAliases: ["demo"] })
+  let outboxSnapshot = {
+    queueSize: 0,
+    maxEntries: 2000,
+    inFlight: 0,
+    blockedWaiters: 0,
+    full: false,
+    nextDueAt: 0,
+    workerActive: true,
+    lastFatalError: "",
+  }
+  observability.setOutboxSnapshotProvider(() => outboxSnapshot)
   const readyInputs = {
-    managedTasks: [{ name: "telegramLoop", kind: "loop", stopCalled: false }],
+    managedTasks: [
+      { name: "telegramLoop", kind: "loop", stopCalled: false },
+      { name: "durableOutbox", kind: "loop", stopCalled: false },
+    ],
     shutdownState: "running",
     state: { loaded: true, lastFlushError: "", lastFlushOk: true },
   }
@@ -69,8 +94,51 @@ test("createRuntimeObservability builds readiness health snapshots", () => {
   snapshot = observability.buildHealthSnapshot(readyInputs)
   assert.equal(snapshot.ready, true)
 
+  outboxSnapshot = { ...outboxSnapshot, queueSize: 2000, blockedWaiters: 1, full: true }
+  snapshot = observability.buildHealthSnapshot(readyInputs)
+  assert.equal(snapshot.ready, false)
+  assert.deepEqual(snapshot.checks.outbox, {
+    ok: false,
+    active: true,
+    queueSize: 2000,
+    maxEntries: 2000,
+    inFlight: 0,
+    blockedWaiters: 1,
+    full: true,
+    nextDueAt: 0,
+    workerActive: true,
+    lastFatalError: "",
+  })
+  assert.match(observability.buildRuntimeStatusLines().join("\n"), /Outbox runtime: size=2000\/2000 inFlight=0 blocked=1 full=true worker=true/)
+
+  outboxSnapshot = { ...outboxSnapshot, queueSize: 0, blockedWaiters: 0, full: false }
+  snapshot = observability.buildHealthSnapshot(readyInputs)
+  assert.equal(snapshot.ready, true)
+
+  outboxSnapshot = { ...outboxSnapshot, workerActive: false }
+  snapshot = observability.buildHealthSnapshot(readyInputs)
+  assert.equal(snapshot.ready, false)
+  assert.equal(snapshot.checks.outbox.ok, false)
+  outboxSnapshot = { ...outboxSnapshot, workerActive: true }
+
   snapshot = observability.buildHealthSnapshot({
+    ...readyInputs,
     managedTasks: [{ name: "telegramLoop", kind: "loop", stopCalled: false }],
+  })
+  assert.equal(snapshot.ready, false)
+  assert.equal(snapshot.checks.outbox.active, false)
+
+  outboxSnapshot = { ...outboxSnapshot, lastFatalError: "http:401" }
+  snapshot = observability.buildHealthSnapshot(readyInputs)
+  assert.equal(snapshot.ready, false)
+  assert.equal(snapshot.checks.outbox.lastFatalError, "http:401")
+  outboxSnapshot = { ...outboxSnapshot, lastFatalError: "" }
+
+  snapshot = observability.buildHealthSnapshot({
+    managedTasks: [
+      { name: "telegramLoop", kind: "loop", stopCalled: false },
+      { name: "durableOutbox", kind: "loop", stopCalled: false },
+    ],
     shutdownState: "running",
     state: { loaded: true, lastFlushError: "disk full", lastFlushOk: false },
   })

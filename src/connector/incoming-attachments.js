@@ -109,6 +109,7 @@ function fileExtension(fileName) {
 export function describeTelegramDocument(document, { limits = USER_ATTACHMENT_LIMITS } = {}) {
   if (!document || typeof document !== "object") return { supported: false, reason: "missing", safeName: "attachment.txt" }
   const fileId = cleanString(document.file_id)
+  const fileUniqueId = cleanString(document.file_unique_id)
   const originalName = cleanString(document.file_name) || "attachment.txt"
   const safeName = sanitizeFilename(originalName, { fallback: "attachment", defaultExtension: ".txt" })
   const mimeType = cleanString(document.mime_type).toLowerCase()
@@ -118,15 +119,15 @@ export function describeTelegramDocument(document, { limits = USER_ATTACHMENT_LI
   const isTextExtension = SUPPORTED_EXTENSIONS.has(extension)
 
   if (!fileId) {
-    return { supported: false, reason: "missing_file_id", fileId, originalName, safeName, mimeType, extension, fileSize }
+    return { supported: false, reason: "missing_file_id", fileId, fileUniqueId, originalName, safeName, mimeType, extension, fileSize }
   }
   if (!isTextMime && !isTextExtension) {
-    return { supported: false, reason: "unsupported_type", fileId, originalName, safeName, mimeType, extension, fileSize }
+    return { supported: false, reason: "unsupported_type", fileId, fileUniqueId, originalName, safeName, mimeType, extension, fileSize }
   }
   if (fileSize != null && fileSize > limits.maxBytes) {
-    return { supported: false, reason: "too_large", fileId, originalName, safeName, mimeType, extension, fileSize }
+    return { supported: false, reason: "too_large", fileId, fileUniqueId, originalName, safeName, mimeType, extension, fileSize }
   }
-  return { supported: true, fileId, originalName, safeName, mimeType, extension, fileSize }
+  return { supported: true, fileId, fileUniqueId, originalName, safeName, mimeType, extension, fileSize }
 }
 
 export function unsupportedMediaKind(message) {

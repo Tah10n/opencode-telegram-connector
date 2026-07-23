@@ -43,6 +43,7 @@ test("buildRuntimeConfig loads connector.config.mjs and resolves relative paths"
     CONNECTOR_HEALTH_ENABLED: undefined,
     CONNECTOR_HEALTH_HOST: undefined,
     CONNECTOR_HEALTH_PORT: undefined,
+    OPENCODE_OUTBOX_READ_TIMEOUT_MS: undefined,
     OPENCODE_ALLOW_INSECURE_HTTP: undefined,
     PROJECTS_FILE: undefined,
     PROJECTS_JSON: undefined,
@@ -57,6 +58,7 @@ test("buildRuntimeConfig loads connector.config.mjs and resolves relative paths"
       echoFilterMode: "recent",
       mirrorTuiUserMessages: true,
       drainTelegramBacklogOnFirstRun: false,
+      opencodeOutboxReadTimeoutMs: "25000",
       logFormat: "json",
       healthServer: { enabled: true, host: "127.0.0.1", port: 0 },
       i18n: {
@@ -110,6 +112,7 @@ test("buildRuntimeConfig loads connector.config.mjs and resolves relative paths"
   })
   assert.equal(config.mirrorTuiUserMessages, true)
   assert.equal(config.drainTelegramBacklogOnFirstRun, false)
+  assert.equal(config.opencodeOutboxReadTimeoutMs, 25000)
   assert.equal(config.activeTurnStaleMs, 60000)
   assert.deepEqual(config.opencodeWatchdog, {
     failureThreshold: 3,
@@ -265,6 +268,30 @@ test("buildRuntimeConfig loads first-run backlog drain policy from env", async (
   assert.equal(config.drainTelegramBacklogOnFirstRun, false)
 })
 
+test("buildRuntimeConfig loads a bounded OpenCode outbox read timeout from env", async (t) => {
+  const dir = await makeTempDir()
+  swapEnv(t, {
+    TELEGRAM_BOT_TOKEN: undefined,
+    TELEGRAM_ALLOWED_USER_ID: undefined,
+    PROJECTS_JSON: undefined,
+    OPENCODE_OUTBOX_READ_TIMEOUT_MS: undefined,
+  })
+  await fs.writeFile(
+    path.join(dir, ".env"),
+    [
+      "TELEGRAM_BOT_TOKEN=env-token",
+      "TELEGRAM_ALLOWED_USER_ID=77",
+      'PROJECTS_JSON={"demo":{"baseUrl":"http://127.0.0.1:4312"}}',
+      "OPENCODE_OUTBOX_READ_TIMEOUT_MS=17500",
+    ].join("\n"),
+    "utf8",
+  )
+
+  const { config } = await buildRuntimeConfig({ cwd: dir })
+
+  assert.equal(config.opencodeOutboxReadTimeoutMs, 17500)
+})
+
 test("buildRuntimeConfig loads i18n options from env", async (t) => {
   const dir = await makeTempDir()
   swapEnv(t, {
@@ -361,6 +388,8 @@ test("buildRuntimeConfig rejects invalid connector.config runtime knobs", async 
     ["opencodeWatchdog: 1", /Config field 'opencodeWatchdog' must be an object/],
     ["opencodeWatchdog: { failureThreshold: 'many' }", /Config field 'opencodeWatchdog\.failureThreshold' must be a positive integer/],
     ["opencodeWatchdog: { cooldownMs: -1 }", /Config field 'opencodeWatchdog\.cooldownMs' must be a non-negative integer/],
+    ["opencodeOutboxReadTimeoutMs: 99", /opencodeOutboxReadTimeoutMs.*100\.\.120000/],
+    ["opencodeOutboxReadTimeoutMs: 120001", /opencodeOutboxReadTimeoutMs.*100\.\.120000/],
   ]
 
   for (const [snippet, expected] of cases) {
