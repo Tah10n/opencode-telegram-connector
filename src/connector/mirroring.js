@@ -506,7 +506,7 @@ export function createMirroringHandlers(runtime) {
         route: durableRouteCtx,
         payload: { text, ...(verifyMessageError ? { requireMessageError: true } : {}) },
         delayMs: deliveryOptions.outboxDelayMs,
-      })
+      }, { signal: deliveryOptions.signal || abortSignal, waitForCapacity: true })
       logSseDebug(projectAlias, sessionId, `queue=agent_stop_error msg=${stableMessageId}`)
       return true
     }
@@ -811,7 +811,7 @@ export function createMirroringHandlers(runtime) {
           boundSessionId: resolved.boundSessionId,
           messageId: info.id,
           route: routeCtx,
-        })
+        }, { signal: abortSignal, waitForCapacity: true })
         logSseDebug(projectAlias, sessionId, `queue=user msg=${info.id} thread=${route.threadIdOr0 || 0}`)
         return
       }
@@ -925,7 +925,7 @@ export function createMirroringHandlers(runtime) {
         sessionId,
         messageId: info.id,
         route: routeCtx,
-      })
+      }, { signal: abortSignal, waitForCapacity: true })
       logSseDebug(projectAlias, sessionId, `queue=assistant msg=${info.id} thread=${route.threadIdOr0 || 0}`)
       return
     }

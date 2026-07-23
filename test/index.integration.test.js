@@ -18,6 +18,7 @@ import { formatMarkdownToTelegramHtmlBlocks } from "../src/telegram/formatter.js
 import { formatUserMirrorBlocks } from "../src/connector/mirroring/user-format.js"
 import { formatChangedFilesText } from "../src/message-display.js"
 import { splitTelegramText } from "../src/telegram/client.js"
+import { createDurableOutboxRuntime } from "../src/runtime/durable-outbox-runtime.js"
 
 function makeLogger(entries) {
   const push = (level, args) => entries?.push({ level, args })
@@ -5874,6 +5875,85 @@ test("startConnector retries a durable final assistant delivery after Telegram 5
     assert.equal(attempts, 2)
     assert.equal(harness.tg.sentHtmlBlocks[0].blocks[0].html, "recover after Telegram outage")
   } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector holds an SSE event until durable outbox capacity is released", async () => {
+  const completedAt = new Date(Date.now() + 60_000).toISOString()
+  let releaseFirstSend
+  let markFirstSendStarted
+  const firstSendStarted = new Promise((resolve) => { markFirstSendStarted = resolve })
+  const firstSendGate = new Promise((resolve) => { releaseFirstSend = resolve })
+  const attempts = []
+  let getHealthSnapshot
+  const harness = await createHarness({
+    statePatch: {
+      updateOffset: 664,
+      bindings: { "100:7": { projectAlias: "demo", sessionId: "ses_1" } },
+      sessionIndex: { "demo:ses_1": { chatId: 100, threadIdOr0: 7 } },
+    },
+    configPatch: { healthServer: { enabled: true, host: "127.0.0.1", port: 0 } },
+    messagesById: {
+      msg_capacity_1: {
+        info: { id: "msg_capacity_1", role: "assistant", time: { completed: completedAt } },
+        parts: [{ type: "text", text: "capacity item one" }],
+      },
+      msg_capacity_2: {
+        info: { id: "msg_capacity_2", role: "assistant", time: { completed: completedAt } },
+        parts: [{ type: "text", text: "capacity item two" }],
+      },
+    },
+    tgOptions: {
+      sendHtmlBlocksImpl: async ({ blocks }) => {
+        const text = blocks.map((block) => block.html).join("")
+        attempts.push(text)
+        if (text === "capacity item one") {
+          markFirstSendStarted()
+          await firstSendGate
+        }
+      },
+    },
+    createDurableOutboxRuntimeImpl: (options) => createDurableOutboxRuntime({ ...options, maxEntries: 1 }),
+    startHealthServerImpl: async ({ getSnapshot }) => {
+      getHealthSnapshot = getSnapshot
+      return { address: { address: "127.0.0.1", port: 8787 }, stop() {} }
+    },
+  })
+
+  try {
+    await harness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_1", info: { id: "msg_capacity_1", role: "assistant", time: { completed: completedAt } } },
+    })
+    await firstSendStarted
+
+    let secondSettled = false
+    const secondEvent = harness.emitSse("demo", {
+      type: "message.updated",
+      properties: { sessionID: "ses_1", info: { id: "msg_capacity_2", role: "assistant", time: { completed: completedAt } } },
+    }).then(() => {
+      secondSettled = true
+    })
+
+    await waitFor(() => getHealthSnapshot?.().checks?.outbox?.blockedWaiters === 1)
+    assert.equal(secondSettled, false)
+    assert.equal(getHealthSnapshot().ready, false)
+    assert.equal(getHealthSnapshot().checks.outbox.full, true)
+    assert.equal(Object.keys((await readState(harness.stateFile)).outbox.items).length, 1)
+
+    releaseFirstSend()
+    await secondEvent
+    await waitFor(async () =>
+      harness.tg.sentHtmlBlocks.length === 2
+      && Object.keys((await readState(harness.stateFile)).outbox.items).length === 0
+      && getHealthSnapshot().ready === true,
+    )
+
+    assert.deepEqual(attempts, ["capacity item one", "capacity item two"])
+    assert.deepEqual(harness.tg.sentHtmlBlocks.map((entry) => entry.blocks[0].html), ["capacity item one", "capacity item two"])
+  } finally {
+    releaseFirstSend()
     await harness.connector.stop()
   }
 })

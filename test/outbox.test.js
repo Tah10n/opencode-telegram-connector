@@ -30,6 +30,28 @@ const baseItem = {
   route: { chatId: 100, threadIdOr0: 7 },
 }
 
+function makeTrackedAbortSignal() {
+  const listeners = new Set()
+  const signal = {
+    aborted: false,
+    addEventListener(type, listener) {
+      if (type === "abort") listeners.add(listener)
+    },
+    removeEventListener(type, listener) {
+      if (type === "abort") listeners.delete(listener)
+    },
+  }
+  return {
+    signal,
+    abort() {
+      if (signal.aborted) return
+      signal.aborted = true
+      for (const listener of [...listeners]) listener()
+    },
+    listenerCount: () => listeners.size,
+  }
+}
+
 test("durable outbox flushes before delivery, deduplicates repeated events, and deletes only after success", async (t) => {
   const { store } = await makeStore(t)
   const events = []
@@ -174,7 +196,7 @@ test("durable outbox retains failed items for bounded backoff and reports cap ba
   })
 
   await outbox.enqueue(baseItem)
-  await assert.rejects(() => outbox.enqueue({ ...baseItem, messageId: "msg_2" }), (err) => {
+  await assert.rejects(() => outbox.enqueue({ ...baseItem, messageId: "msg_2" }, { waitForCapacity: false }), (err) => {
     assert.equal(err.kind, "backpressure")
     assert.equal(err.outcome, "retryable")
     return true
@@ -184,6 +206,220 @@ test("durable outbox retains failed items for bounded backoff and reports cap ba
   assert.equal(retained.attemptCount, 1)
   assert.equal(retained.nextAttemptAt, now + 1000)
   assert.equal(retained.lastError, "network")
+})
+
+test("durable outbox holds a capacity waiter until the first item is durably removed", async (t) => {
+  const { store } = await makeStore(t)
+  const delivered = []
+  const tracked = makeTrackedAbortSignal()
+  const outbox = createDurableOutbox({
+    store,
+    maxEntries: 1,
+    deliver: async (item) => delivered.push(item.messageId),
+  })
+
+  await outbox.enqueue(baseItem)
+  let secondSettled = false
+  const secondPromise = outbox
+    .enqueue({ ...baseItem, messageId: "msg_2" }, { signal: tracked.signal, waitForCapacity: true })
+    .then((result) => {
+      secondSettled = true
+      return result
+    })
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.equal(secondSettled, false)
+  const blockedSnapshot = outbox.snapshot()
+  assert.deepEqual(
+    { ...blockedSnapshot, nextDueAt: 0 },
+    {
+      queueSize: 1,
+      maxEntries: 1,
+      inFlight: 0,
+      blockedWaiters: 1,
+      full: true,
+      nextDueAt: 0,
+      workerActive: false,
+      lastFatalError: "",
+    },
+  )
+  assert.equal(Number.isFinite(blockedSnapshot.nextDueAt), true)
+
+  assert.equal(await outbox.processNext(), true)
+  const second = await secondPromise
+  assert.equal(second.deduped, false)
+  assert.equal(tracked.listenerCount(), 0)
+  assert.equal(Object.values(store.getOutboxItems())[0].messageId, "msg_2")
+  assert.equal(await outbox.processNext(), true)
+  assert.deepEqual(delivered, ["msg_1", "msg_2"])
+  assert.deepEqual(store.getOutboxItems(), {})
+})
+
+test("durable outbox removes an aborted capacity waiter and its listener", async (t) => {
+  const { store } = await makeStore(t)
+  const tracked = makeTrackedAbortSignal()
+  const outbox = createDurableOutbox({ store, maxEntries: 1, deliver: async () => {} })
+  await outbox.enqueue(baseItem)
+
+  const pending = outbox.enqueue(
+    { ...baseItem, messageId: "msg_abort_waiter" },
+    { signal: tracked.signal, waitForCapacity: true },
+  )
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(outbox.snapshot().blockedWaiters, 1)
+  assert.equal(tracked.listenerCount(), 1)
+
+  tracked.abort()
+  await assert.rejects(pending, (err) => err?.name === "AbortError")
+  assert.equal(outbox.snapshot().blockedWaiters, 0)
+  assert.equal(tracked.listenerCount(), 0)
+  assert.equal(Object.keys(store.getOutboxItems()).length, 1)
+})
+
+test("durable outbox serves multiple capacity waiters in FIFO order", async (t) => {
+  const { store } = await makeStore(t)
+  const delivered = []
+  const settled = []
+  const outbox = createDurableOutbox({
+    store,
+    maxEntries: 1,
+    deliver: async (item) => delivered.push(item.messageId),
+  })
+  await outbox.enqueue(baseItem)
+
+  const second = outbox.enqueue(
+    { ...baseItem, messageId: "msg_2" },
+    { waitForCapacity: true },
+  ).then((result) => {
+    settled.push("msg_2")
+    return result
+  })
+  const third = outbox.enqueue(
+    { ...baseItem, messageId: "msg_3" },
+    { waitForCapacity: true },
+  ).then((result) => {
+    settled.push("msg_3")
+    return result
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(outbox.snapshot().blockedWaiters, 2)
+
+  await outbox.processNext()
+  await second
+  assert.deepEqual(settled, ["msg_2"])
+  assert.equal(outbox.snapshot().blockedWaiters, 1)
+
+  await outbox.processNext()
+  await third
+  assert.deepEqual(settled, ["msg_2", "msg_3"])
+  await outbox.processNext()
+  assert.deepEqual(delivered, ["msg_1", "msg_2", "msg_3"])
+})
+
+test("durable outbox rejects malformed items as fatal invariants even while full", async (t) => {
+  const { store } = await makeStore(t)
+  const outbox = createDurableOutbox({ store, maxEntries: 1, deliver: async () => {} })
+  await outbox.enqueue(baseItem)
+
+  await assert.rejects(
+    () => outbox.enqueue({ ...baseItem, type: "unknown", messageId: "msg_invalid" }, { waitForCapacity: true }),
+    (err) => {
+      assert.equal(err.source, "state")
+      assert.equal(err.kind, "invariant")
+      assert.equal(err.outcome, "fatal")
+      return true
+    },
+  )
+  assert.equal(outbox.snapshot().blockedWaiters, 0)
+})
+
+test("durable outbox bounds its capacity waiter queue", async (t) => {
+  const { store } = await makeStore(t)
+  const tracked = makeTrackedAbortSignal()
+  const outbox = createDurableOutbox({
+    store,
+    maxEntries: 1,
+    maxCapacityWaiters: 1,
+    deliver: async () => {},
+  })
+  await outbox.enqueue(baseItem)
+  const waiting = outbox.enqueue(
+    { ...baseItem, messageId: "msg_waiting" },
+    { signal: tracked.signal, waitForCapacity: true },
+  )
+  await new Promise((resolve) => setImmediate(resolve))
+
+  await assert.rejects(
+    () => outbox.enqueue({ ...baseItem, messageId: "msg_overflow" }, { waitForCapacity: true }),
+    (err) => {
+      assert.equal(err.kind, "invariant")
+      assert.equal(err.outcome, "fatal")
+      return true
+    },
+  )
+  assert.equal(outbox.snapshot().blockedWaiters, 1)
+  tracked.abort()
+  await assert.rejects(waiting, (err) => err?.name === "AbortError")
+  assert.equal(outbox.snapshot().blockedWaiters, 0)
+})
+
+test("durable outbox releases capacity after a terminal discard", async (t) => {
+  const { store } = await makeStore(t)
+  const delivered = []
+  const outbox = createDurableOutbox({
+    store,
+    maxEntries: 1,
+    deliver: async (item) => {
+      if (item.messageId === "msg_1") {
+        throw makeBoundaryError({
+          source: "telegram",
+          operation: "sendMessage",
+          status: 400,
+          outcome: "fatal",
+          message: "chat not found",
+        })
+      }
+      delivered.push(item.messageId)
+    },
+  })
+  await outbox.enqueue(baseItem)
+  const waiting = outbox.enqueue(
+    { ...baseItem, messageId: "msg_after_discard" },
+    { waitForCapacity: true },
+  )
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.equal(await outbox.processNext(), true)
+  await waiting
+  assert.equal(await outbox.processNext(), true)
+  assert.deepEqual(delivered, ["msg_after_discard"])
+})
+
+test("durable outbox releases capacity after durable expiry cleanup", async (t) => {
+  const { store } = await makeStore(t)
+  const clock = { now: Date.now() - DEFAULT_OUTBOX_MAX_AGE_MS - 1000 }
+  const delivered = []
+  const outbox = createDurableOutbox({
+    store,
+    maxEntries: 1,
+    now: () => clock.now,
+    deliver: async (item) => delivered.push(item.messageId),
+  })
+  await outbox.enqueue(baseItem)
+  const waiting = outbox.enqueue(
+    { ...baseItem, messageId: "msg_after_expiry" },
+    { waitForCapacity: true },
+  )
+  await new Promise((resolve) => setImmediate(resolve))
+
+  clock.now = Date.now()
+  assert.equal(await outbox.processNext({ at: clock.now }), false)
+  await waiting
+  const [pending] = Object.values(store.getOutboxItems())
+  assert.equal(pending.messageId, "msg_after_expiry")
+  assert.ok(pending.nextAttemptAt <= clock.now)
+  assert.equal(await outbox.processNext({ at: clock.now }), true)
+  assert.deepEqual(delivered, ["msg_after_expiry"])
 })
 
 test("durable outbox recovers a Telegram 503 without dropping the item", async (t) => {
@@ -372,6 +608,8 @@ test("durable outbox run stops promptly during a non-settling in-flight delivery
 
   const runPromise = outbox.run()
   await deliveryStarted
+  assert.equal(outbox.snapshot().workerActive, true)
+  assert.equal(outbox.snapshot().inFlight, 1)
   abortController.abort()
   await Promise.race([
     runPromise,
@@ -380,6 +618,42 @@ test("durable outbox run stops promptly during a non-settling in-flight delivery
 
   const retained = Object.values(store.getOutboxItems())[0]
   assert.equal(retained.attemptCount, 0)
+  assert.equal(outbox.snapshot().workerActive, false)
+  assert.equal(outbox.snapshot().lastFatalError, "")
+})
+
+test("durable outbox exposes a fatal worker failure and releases blocked waiters", async (t) => {
+  const { store } = await makeStore(t)
+  const tracked = makeTrackedAbortSignal()
+  const unauthorized = makeBoundaryError({
+    source: "telegram",
+    operation: "sendMessage",
+    status: 401,
+    outcome: "fatal",
+    message: "unauthorized",
+  })
+  const outbox = createDurableOutbox({
+    store,
+    maxEntries: 1,
+    deliver: async () => {
+      throw unauthorized
+    },
+  })
+  await outbox.enqueue(baseItem)
+  const waiting = outbox.enqueue(
+    { ...baseItem, messageId: "msg_waiting_after_fatal" },
+    { signal: tracked.signal, waitForCapacity: true },
+  )
+  await new Promise((resolve) => setImmediate(resolve))
+
+  await assert.rejects(outbox.run(), (err) => err === unauthorized)
+  await assert.rejects(waiting, (err) => err === unauthorized)
+
+  const runtime = outbox.snapshot()
+  assert.equal(runtime.workerActive, false)
+  assert.equal(runtime.lastFatalError, "http:401")
+  assert.equal(runtime.blockedWaiters, 0)
+  assert.equal(tracked.listenerCount(), 0)
 })
 
 test("durable outbox replays an item persisted before delivery after restart", async (t) => {

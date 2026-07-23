@@ -477,15 +477,19 @@ export class StateStore {
     return normalized ? this.state.outbox?.items?.[normalized] || null : null
   }
 
-  setOutboxItem(item, { maxEntries = DEFAULT_OUTBOX_MAX_ENTRIES } = {}) {
+  trySetOutboxItem(item, { maxEntries = DEFAULT_OUTBOX_MAX_ENTRIES, now = Date.now() } = {}) {
     const normalized = normalizeOutboxItem(item)
-    if (!normalized) return false
-    this.pruneOutbox()
+    if (!normalized) return { ok: false, reason: "invalid" }
+    this.pruneOutbox({ now })
     const items = this.state.outbox.items
-    if (!items[normalized.id] && Object.keys(items).length >= maxEntries) return false
+    if (!items[normalized.id] && Object.keys(items).length >= maxEntries) return { ok: false, reason: "full" }
     items[normalized.id] = normalized
     this.scheduleSave()
-    return true
+    return { ok: true, item: normalized }
+  }
+
+  setOutboxItem(item, options) {
+    return this.trySetOutboxItem(item, options).ok
   }
 
   deleteOutboxItem(id) {

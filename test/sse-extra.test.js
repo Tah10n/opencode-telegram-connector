@@ -219,6 +219,42 @@ test("startOpenCodeSseLoop reports handler failures via onError", async (t) => {
   })
 })
 
+test("startOpenCodeSseLoop propagates durable outbox backpressure handler failures", async (t) => {
+  usePatchedDelay(t, async () => {})
+  useFetchStub(t, async () => makeSseResponse(['data: {"id":"evt_outbox","type":"message.updated"}\n', "\n"]))
+
+  let loop
+  t.after(() => loop?.stop())
+  await new Promise((resolve, reject) => {
+    const timeout = originalGlobalSetTimeout(() => {
+      loop?.stop()
+      reject(new Error("Timed out waiting for outbox backpressure onError"))
+    }, 1000)
+    loop = startOpenCodeSseLoop({
+      projectAlias: "demo",
+      ocClient: makeClient(),
+      logger: makeLogger(),
+      onEvent: async () => {
+        throw makeBoundaryError({
+          source: "state",
+          operation: "enqueue durable Telegram delivery",
+          kind: "backpressure",
+          outcome: "retryable",
+          message: "durable outbox waiter capacity exhausted",
+        })
+      },
+      onError: async ({ projectAlias, err }) => {
+        assert.equal(projectAlias, "demo")
+        assert.equal(err.source, "state")
+        assert.equal(err.kind, "backpressure")
+        loop.stop()
+        clearTimeout(timeout)
+        resolve()
+      },
+    })
+  })
+})
+
 test("startOpenCodeSseLoop aborts oversized SSE events and reports a protocol error", async (t) => {
   usePatchedDelay(t, async () => {})
   swapEnv(t, { OPENCODE_SSE_MAX_EVENT_BYTES: "10" })

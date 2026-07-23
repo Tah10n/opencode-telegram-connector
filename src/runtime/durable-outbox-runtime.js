@@ -1,7 +1,25 @@
 import { createDurableOutbox } from "../connector/outbox.js"
 
-export function createDurableOutboxRuntime({ store, logger, observability, abortSignal, sleep, startManagedTask } = {}) {
-  const outbox = createDurableOutbox({ store, logger, observability, abortSignal, sleep })
+export function createDurableOutboxRuntime({
+  store,
+  logger,
+  observability,
+  abortSignal,
+  sleep,
+  startManagedTask,
+  maxEntries,
+  maxCapacityWaiters,
+} = {}) {
+  const outbox = createDurableOutbox({
+    store,
+    logger,
+    observability,
+    abortSignal,
+    sleep,
+    maxEntries,
+    maxCapacityWaiters,
+  })
+  observability?.setOutboxSnapshotProvider?.(() => outbox.snapshot())
   return {
     outbox,
     start(deliver) {

@@ -688,6 +688,17 @@ test("StateStore bounds and deterministically expires durable outbox entries", (
   assert.equal(DEFAULT_OUTBOX_MAX_AGE_MS, 30 * 24 * 60 * 60 * 1000)
 })
 
+test("StateStore distinguishes malformed outbox items from full capacity", () => {
+  const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-outbox-result-state.json"), logger: makeLogger() })
+  store.scheduleSave = () => {}
+  const first = makeOutboxItem(11)
+  const malformed = { ...makeOutboxItem(12), type: "unknown" }
+
+  assert.deepEqual(store.trySetOutboxItem(first, { maxEntries: 1 }), { ok: true, item: first })
+  assert.deepEqual(store.trySetOutboxItem(malformed, { maxEntries: 1 }), { ok: false, reason: "invalid" })
+  assert.deepEqual(store.trySetOutboxItem(makeOutboxItem(13), { maxEntries: 1 }), { ok: false, reason: "full" })
+})
+
 test("StateStore bounds and deterministically expires attachment confirmations", () => {
   const now = Date.now()
   const store = new StateStore({ filePath: path.join(os.tmpdir(), "unused-attachment-confirmation-state.json"), logger: makeLogger() })

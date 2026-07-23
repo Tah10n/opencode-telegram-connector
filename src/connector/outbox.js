@@ -1,10 +1,12 @@
 import crypto from "node:crypto"
 import { classifyBoundaryError, makeBoundaryError } from "../boundary-errors.js"
+import { DEFAULT_OUTBOX_MAX_ENTRIES } from "../state/store.js"
 import { redactSensitiveText } from "../url-utils.js"
 
 const RETRY_BASE_MS = 1000
 const RETRY_MAX_MS = 5 * 60 * 1000
 const DELIVERY_ABORTED = Symbol("delivery-aborted")
+const DEFAULT_CAPACITY_WAITER_LIMIT = 1000
 const ITEM_SCOPED_TELEGRAM_OPERATIONS = ["sendmessage", "senddocument", "sendhtmlblocks", "editmessagetext", "editmessagereplymarkup"]
 
 export function outboxItemId({ type, projectAlias, sessionId, messageId, dedupeVariant }) {
@@ -117,14 +119,143 @@ function waitForDeliveryOrAbort(promise, signal) {
   })
 }
 
-export function createDurableOutbox({ store, deliver, logger, observability, abortSignal, sleep, now = () => Date.now(), maxEntries } = {}) {
+export function createDurableOutbox({
+  store,
+  deliver,
+  logger,
+  observability,
+  abortSignal,
+  sleep,
+  now = () => Date.now(),
+  maxEntries,
+  maxCapacityWaiters,
+} = {}) {
   if (!store?.getOutboxItems || !store?.setOutboxItem || !store?.deleteOutboxItem || !store?.flush) {
     throw new Error("Durable outbox requires a compatible state store")
   }
+  const capacityLimit = Number.isInteger(maxEntries) && maxEntries > 0
+    ? Math.min(maxEntries, DEFAULT_OUTBOX_MAX_ENTRIES)
+    : DEFAULT_OUTBOX_MAX_ENTRIES
+  const capacityWaiterLimit = Number.isInteger(maxCapacityWaiters) && maxCapacityWaiters > 0
+    ? maxCapacityWaiters
+    : DEFAULT_CAPACITY_WAITER_LIMIT
   let deliverItem = deliver
   const inFlight = new Set()
   const pendingPersistence = new Map()
+  const capacityWaiters = []
   const pause = typeof sleep === "function" ? sleep : (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+  let capacityReservations = 0
+  let workerActive = false
+  let lastFatalError = ""
+
+  function abortError(message = "Durable outbox capacity wait aborted") {
+    return Object.assign(new Error(message), { name: "AbortError" })
+  }
+
+  function queueSize() {
+    return Object.keys(store.getOutboxItems()).length
+  }
+
+  function hasCapacity() {
+    return queueSize() + capacityReservations < capacityLimit
+  }
+
+  function removeCapacityWaiter(waiter) {
+    const index = capacityWaiters.indexOf(waiter)
+    if (index >= 0) capacityWaiters.splice(index, 1)
+    waiter.signal?.removeEventListener?.("abort", waiter.onAbort)
+  }
+
+  function releaseCapacityReservation(reservation) {
+    if (!reservation || reservation.released) return
+    reservation.released = true
+    capacityReservations = Math.max(0, capacityReservations - 1)
+    notifyCapacityAvailable()
+  }
+
+  function notifyCapacityAvailable() {
+    while (capacityWaiters.length && hasCapacity()) {
+      const waiter = capacityWaiters.shift()
+      waiter.signal?.removeEventListener?.("abort", waiter.onAbort)
+      if (waiter.signal?.aborted) {
+        waiter.reject(abortError())
+        continue
+      }
+      capacityReservations += 1
+      const reservation = { released: false }
+      reservation.release = () => releaseCapacityReservation(reservation)
+      waiter.resolve(reservation)
+    }
+  }
+
+  function rejectCapacityWaiters(err) {
+    while (capacityWaiters.length) {
+      const waiter = capacityWaiters.shift()
+      waiter.signal?.removeEventListener?.("abort", waiter.onAbort)
+      waiter.reject(err)
+    }
+  }
+
+  function waitForCapacity(signal, projectAlias) {
+    if (signal?.aborted) return Promise.reject(abortError())
+    if (capacityWaiters.length >= capacityWaiterLimit) {
+      return Promise.reject(makeBoundaryError({
+        source: "state",
+        operation: "wait for durable Telegram outbox capacity",
+        kind: "invariant",
+        outcome: "fatal",
+        message: "Durable Telegram outbox capacity waiter limit exceeded",
+      }))
+    }
+    return new Promise((resolve, reject) => {
+      const waiter = { signal, resolve, reject, onAbort: null }
+      waiter.onAbort = () => {
+        removeCapacityWaiter(waiter)
+        reject(abortError())
+        notifyCapacityAvailable()
+      }
+      capacityWaiters.push(waiter)
+      signal?.addEventListener?.("abort", waiter.onAbort, { once: true })
+      notifyCapacityAvailable()
+    })
+  }
+
+  function snapshot() {
+    const items = Object.values(store.getOutboxItems())
+    const nextDueAt = items.length
+      ? Math.min(...items.map((item) => Number.isFinite(item?.nextAttemptAt) ? item.nextAttemptAt : 0))
+      : 0
+    return {
+      queueSize: items.length,
+      maxEntries: capacityLimit,
+      inFlight: inFlight.size,
+      blockedWaiters: capacityWaiters.length,
+      full: items.length + capacityReservations >= capacityLimit,
+      nextDueAt,
+      workerActive,
+      lastFatalError,
+    }
+  }
+
+  function tryStoreItem(item, { reservation = false } = {}) {
+    const effectiveLimit = Math.max(0, capacityLimit - capacityReservations + (reservation ? 1 : 0))
+    if (typeof store.trySetOutboxItem === "function") {
+      return store.trySetOutboxItem(item, { maxEntries: effectiveLimit, now: now() })
+    }
+    if (store.setOutboxItem(item, { maxEntries: effectiveLimit, now: now() })) return { ok: true, item: store.getOutboxItem(item.id) }
+    return { ok: false, reason: queueSize() >= effectiveLimit ? "full" : "invalid" }
+  }
+
+  function malformedItemError(cause) {
+    return makeBoundaryError({
+      source: "state",
+      operation: "enqueue durable Telegram delivery",
+      kind: "invariant",
+      outcome: "fatal",
+      message: "Durable Telegram outbox item is malformed",
+      cause,
+    })
+  }
 
   function setDeliver(next) {
     if (typeof next !== "function") throw new TypeError("Outbox deliver handler must be a function")
@@ -159,73 +290,105 @@ export function createDurableOutbox({ store, deliver, logger, observability, abo
       })
     }
     await flushStore(store, "remove completed durable Telegram item")
+    notifyCapacityAvailable()
   }
 
-  async function enqueue({ type, projectAlias, sessionId, boundSessionId = sessionId, messageId, route, payload, progress, delayMs = 0 } = {}) {
+  async function enqueue(
+    { type, projectAlias, sessionId, boundSessionId = sessionId, messageId, route, payload, progress, delayMs = 0 } = {},
+    { signal = abortSignal, waitForCapacity: shouldWaitForCapacity = false } = {},
+  ) {
     const dedupeVariant = type === "agent-error" && payload?.requireMessageError === true ? "verify-message-error" : ""
     const identity = { type, projectAlias, sessionId, messageId }
     const id = outboxItemId({ ...identity, dedupeVariant })
     store.pruneIdempotency?.({ now: now() })
-    if (store.hasIdempotencyKey?.(completionIdempotencyKey(identity))) {
-      return { item: null, deduped: true, completed: true }
-    }
-    const existingPersistence = pendingPersistence.get(id)
-    if (existingPersistence) {
-      await existingPersistence
-      return { item: store.getOutboxItem(id), deduped: true }
-    }
-    const existing = store.getOutboxItem(id)
-    if (existing) return { item: existing, deduped: true }
-
-    const expired = store.pruneOutbox?.({ now: now() }) || 0
-    if (expired) observability?.recordOutboxExpired?.(projectAlias, expired)
-    const createdAt = now()
-    const item = {
-      id,
-      type,
-      projectAlias,
-      sessionId,
-      boundSessionId,
-      messageId,
-      route: routeRecord(route),
-      progress: progress && typeof progress === "object" && !Array.isArray(progress) ? { ...progress } : {},
-      attemptCount: 0,
-      nextAttemptAt: createdAt + Math.max(0, Number.isFinite(Number(delayMs)) ? Math.trunc(Number(delayMs)) : 0),
-      createdAt,
-      updatedAt: createdAt,
-      ...((typeof payload?.text === "string" && payload.text) || payload?.requireMessageError === true
-        ? { payload: {
-            ...(typeof payload?.text === "string" && payload.text ? { text: payload.text.slice(0, 8000) } : {}),
-            ...(payload?.requireMessageError === true ? { requireMessageError: true } : {}),
-          } }
-        : {}),
-    }
-    if (!store.setOutboxItem(item, maxEntries == null ? undefined : { maxEntries })) {
-      observability?.recordOutboxBackpressure?.(projectAlias)
-      throw makeBoundaryError({
-        source: "state",
-        operation: "enqueue durable Telegram delivery",
-        kind: "backpressure",
-        outcome: "retryable",
-        message: "Durable Telegram outbox is full or the item is invalid",
-      })
-    }
-    const persistence = (async () => {
-      try {
-        await flushStore(store, "persist durable Telegram delivery")
-      } catch (err) {
-        store.deleteOutboxItem(id)
-        throw err
-      }
-    })()
-    pendingPersistence.set(id, persistence)
+    let reservation = null
     try {
-      await persistence
+      while (true) {
+        if (signal?.aborted) throw abortError()
+        if (store.hasIdempotencyKey?.(completionIdempotencyKey(identity))) {
+          return { item: null, deduped: true, completed: true }
+        }
+        const existingPersistence = pendingPersistence.get(id)
+        if (existingPersistence) {
+          await existingPersistence
+          return { item: store.getOutboxItem(id), deduped: true }
+        }
+        const existing = store.getOutboxItem(id)
+        if (existing) return { item: existing, deduped: true }
+
+        const expired = store.pruneOutbox?.({ now: now() }) || 0
+        if (expired) {
+          observability?.recordOutboxExpired?.(projectAlias, expired)
+          await flushStore(store, "persist expired durable Telegram deliveries")
+          notifyCapacityAvailable()
+        }
+        const createdAt = now()
+        let item
+        try {
+          item = {
+            id,
+            type,
+            projectAlias,
+            sessionId,
+            boundSessionId,
+            messageId,
+            route: routeRecord(route),
+            progress: progress && typeof progress === "object" && !Array.isArray(progress) ? { ...progress } : {},
+            attemptCount: 0,
+            nextAttemptAt: createdAt + Math.max(0, Number.isFinite(Number(delayMs)) ? Math.trunc(Number(delayMs)) : 0),
+            createdAt,
+            updatedAt: createdAt,
+            ...((typeof payload?.text === "string" && payload.text) || payload?.requireMessageError === true
+              ? { payload: {
+                  ...(typeof payload?.text === "string" && payload.text ? { text: payload.text.slice(0, 8000) } : {}),
+                  ...(payload?.requireMessageError === true ? { requireMessageError: true } : {}),
+                } }
+              : {}),
+          }
+        } catch (err) {
+          throw malformedItemError(err)
+        }
+        const stored = tryStoreItem(item, { reservation: !!reservation })
+        if (!stored.ok && stored.reason === "invalid") throw malformedItemError()
+        if (!stored.ok) {
+          reservation?.release()
+          reservation = null
+          observability?.recordOutboxBackpressure?.(projectAlias)
+          if (!shouldWaitForCapacity) {
+            throw makeBoundaryError({
+              source: "state",
+              operation: "enqueue durable Telegram delivery",
+              kind: "backpressure",
+              outcome: "retryable",
+              message: "Durable Telegram outbox is full",
+            })
+          }
+          reservation = await waitForCapacity(signal, projectAlias)
+          continue
+        }
+        reservation?.release()
+        reservation = null
+        const persistence = (async () => {
+          try {
+            await flushStore(store, "persist durable Telegram delivery")
+          } catch (err) {
+            store.deleteOutboxItem(id)
+            notifyCapacityAvailable()
+            throw err
+          }
+        })()
+        pendingPersistence.set(id, persistence)
+        try {
+          await persistence
+        } finally {
+          if (pendingPersistence.get(id) === persistence) pendingPersistence.delete(id)
+        }
+        observability?.recordOutboxQueued?.(projectAlias)
+        return { item: store.getOutboxItem(id), deduped: false }
+      }
     } finally {
-      if (pendingPersistence.get(id) === persistence) pendingPersistence.delete(id)
+      reservation?.release()
     }
-    observability?.recordOutboxQueued?.(projectAlias)
-    return { item: store.getOutboxItem(id), deduped: false }
   }
 
   async function checkpoint(id, progressPatch) {
@@ -252,6 +415,7 @@ export function createDurableOutbox({ store, deliver, logger, observability, abo
     if (expired) {
       observability?.recordOutboxExpired?.(null, expired)
       await flushStore(store, "persist expired durable Telegram deliveries")
+      notifyCapacityAvailable()
     }
     const item = dueItems(at)[0]
     if (!item) return false
@@ -259,6 +423,7 @@ export function createDurableOutbox({ store, deliver, logger, observability, abo
     if (store.hasIdempotencyKey?.(completionIdempotencyKey(item))) {
       store.deleteOutboxItem(item.id)
       await flushStore(store, "complete previously delivered durable Telegram item")
+      notifyCapacityAvailable()
       return true
     }
     inFlight.add(item.id)
@@ -282,6 +447,7 @@ export function createDurableOutbox({ store, deliver, logger, observability, abo
       if (deliveryResult?.completed === false) {
         store.deleteOutboxItem(item.id)
         await flushStore(store, "cancel unconfirmed durable Telegram delivery")
+        notifyCapacityAvailable()
         return true
       }
       const discarded = deliveryResult?.delivered === false
@@ -335,9 +501,20 @@ export function createDurableOutbox({ store, deliver, logger, observability, abo
   }
 
   async function run() {
-    while (!abortSignal?.aborted) {
-      const processed = await processNext({ signal: abortSignal })
-      if (!processed && !abortSignal?.aborted) await waitForDeliveryOrAbort(pause(250), abortSignal)
+    workerActive = true
+    lastFatalError = ""
+    try {
+      while (!abortSignal?.aborted) {
+        const processed = await processNext({ signal: abortSignal })
+        if (!processed && !abortSignal?.aborted) await waitForDeliveryOrAbort(pause(250), abortSignal)
+      }
+    } catch (err) {
+      lastFatalError = safeLastError(err)
+      rejectCapacityWaiters(err)
+      throw err
+    } finally {
+      workerActive = false
+      if (abortSignal?.aborted) rejectCapacityWaiters(abortError())
     }
   }
 
@@ -347,5 +524,5 @@ export function createDurableOutbox({ store, deliver, logger, observability, abo
     return processed
   }
 
-  return { enqueue, processNext, run, drain, setDeliver }
+  return { enqueue, processNext, run, drain, setDeliver, snapshot }
 }
