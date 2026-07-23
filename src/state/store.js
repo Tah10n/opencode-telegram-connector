@@ -1357,12 +1357,24 @@ function validateOutboxSection(value, errors) {
     const statePath = `state.outbox.items${pathKey(key)}`
     if (!normalizeOutboxId(key)) errors.push(`${statePath} key must be a stable outbox id`)
     if (!pushRecordError(errors, entry, statePath)) continue
-    const allowedItemFields = new Set(["id", "type", "projectAlias", "sessionId", "boundSessionId", "messageId", "route", "progress", "attemptCount", "nextAttemptAt", "createdAt", "updatedAt", "lastError", "payload"])
+    const allowedItemFields = new Set(["id", "type", "projectAlias", "sessionId", "boundSessionId", "messageId", "dedupeVariant", "route", "progress", "attemptCount", "nextAttemptAt", "createdAt", "updatedAt", "lastError", "payload"])
     for (const field of Object.keys(entry)) {
       if (!allowedItemFields.has(field)) errors.push(`${statePath}${pathKey(field)} is not supported`)
     }
     if (entry.id !== key) errors.push(`${statePath}.id must match its item key`)
     if (!OUTBOX_TYPES.has(entry.type)) errors.push(`${statePath}.type must be assistant-final, user-mirror, or agent-error`)
+    // A pre-fix build briefly persisted this marker. Accept only its exact safe shape;
+    // normalizeOutboxItem intentionally drops it from the canonical state.
+    if (
+      Object.hasOwn(entry, "dedupeVariant")
+      && (
+        entry.dedupeVariant !== LEGACY_PROVISIONAL_DEDUPE_VARIANT
+        || entry.type !== "agent-error"
+        || entry.payload?.requireMessageError !== true
+      )
+    ) {
+      errors.push(`${statePath}.dedupeVariant is only supported for legacy provisional agent-error entries`)
+    }
     validateProjectAlias(entry.projectAlias, `${statePath}.projectAlias`, errors)
     validateStoredOpenCodeId(entry.sessionId, `${statePath}.sessionId`, errors)
     validateStoredOpenCodeId(entry.boundSessionId, `${statePath}.boundSessionId`, errors)
@@ -1626,6 +1638,7 @@ function normalizePromptDeliveries(value) {
 }
 
 const OUTBOX_TYPES = new Set(["assistant-final", "user-mirror", "agent-error"])
+const LEGACY_PROVISIONAL_DEDUPE_VARIANT = "verify-message-error"
 
 function normalizeOutboxId(value) {
   const id = typeof value === "string" ? value.trim() : ""

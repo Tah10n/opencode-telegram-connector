@@ -6,6 +6,7 @@ import { redactSensitiveText } from "../url-utils.js"
 const RETRY_BASE_MS = 1000
 const RETRY_MAX_MS = 5 * 60 * 1000
 const DELIVERY_ABORTED = Symbol("delivery-aborted")
+const CAPACITY_DEDUPED = Symbol("capacity-deduped")
 const DEFAULT_CAPACITY_WAITER_LIMIT = 1000
 const ITEM_SCOPED_TELEGRAM_OPERATIONS = ["sendmessage", "senddocument", "sendhtmlblocks", "editmessagetext", "editmessagereplymarkup"]
 
@@ -19,8 +20,12 @@ export function outboxItemId({ type, projectAlias, sessionId, messageId, dedupeV
   return `out_${hash}`
 }
 
-function completionIdempotencyKey(item) {
-  return `telegram-outbox-completed:${outboxItemId(item)}`
+function completionIdempotencyKey({ type, projectAlias, sessionId, messageId }) {
+  return `telegram-outbox-completed:${outboxItemId({ type, projectAlias, sessionId, messageId })}`
+}
+
+function isProvisionalAgentError(item) {
+  return item?.type === "agent-error" && item?.payload?.requireMessageError === true
 }
 
 function routeRecord(route) {
@@ -80,10 +85,13 @@ function failureDisposition(err) {
     return { classification, disposition: "global-fatal" }
   }
   if (classification.source === "opencode") {
+    if (Number.isInteger(classification.status) && [401, 403].includes(classification.status)) {
+      return { classification, disposition: "retryable" }
+    }
     const terminalStatus = Number.isInteger(classification.status)
       && classification.status >= 400
       && classification.status < 500
-      && ![408, 425, 429].includes(classification.status)
+      && ![401, 403, 408, 425, 429].includes(classification.status)
     if (classification.stale || classification.kind === "configuration" || terminalStatus) {
       return { classification, disposition: "terminal" }
     }
@@ -197,7 +205,21 @@ export function createDurableOutbox({
     }
   }
 
-  function waitForCapacity(signal, projectAlias) {
+  function resolveSameIdCapacityWaiters(outboxId) {
+    for (let i = capacityWaiters.length - 1; i >= 0; i--) {
+      const waiter = capacityWaiters[i]
+      if (waiter.outboxId !== outboxId) continue
+      capacityWaiters.splice(i, 1)
+      waiter.signal?.removeEventListener?.("abort", waiter.onAbort)
+      if (waiter.signal?.aborted) {
+        waiter.reject(abortError())
+        continue
+      }
+      waiter.resolve(CAPACITY_DEDUPED)
+    }
+  }
+
+  function waitForCapacity(signal, projectAlias, outboxId) {
     if (signal?.aborted) return Promise.reject(abortError())
     if (capacityWaiters.length >= capacityWaiterLimit) {
       return Promise.reject(makeBoundaryError({
@@ -209,7 +231,7 @@ export function createDurableOutbox({
       }))
     }
     return new Promise((resolve, reject) => {
-      const waiter = { signal, resolve, reject, onAbort: null }
+      const waiter = { signal, resolve, reject, onAbort: null, outboxId }
       waiter.onAbort = () => {
         removeCapacityWaiter(waiter)
         reject(abortError())
@@ -364,7 +386,11 @@ export function createDurableOutbox({
               message: "Durable Telegram outbox is full",
             })
           }
-          reservation = await waitForCapacity(signal, projectAlias)
+          const capacityResult = await waitForCapacity(signal, projectAlias, id)
+          if (capacityResult === CAPACITY_DEDUPED) {
+            return { item: store.getOutboxItem(id), deduped: true }
+          }
+          reservation = capacityResult
           continue
         }
         reservation?.release()
@@ -384,6 +410,7 @@ export function createDurableOutbox({
         } finally {
           if (pendingPersistence.get(id) === persistence) pendingPersistence.delete(id)
         }
+        resolveSameIdCapacityWaiters(id)
         observability?.recordOutboxQueued?.(projectAlias)
         return { item: store.getOutboxItem(id), deduped: false }
       }
@@ -470,6 +497,20 @@ export function createDurableOutbox({
       const { classification, disposition } = failureDisposition(err)
       if (disposition === "terminal") {
         const reason = safeDiscardReason(classification)
+        if (isProvisionalAgentError(current) && classification.source === "opencode") {
+          store.deleteOutboxItem(current.id)
+          await flushStore(store, "remove unverified provisional outbox item")
+          notifyCapacityAvailable()
+          observability?.recordOutboxDiscarded?.(item.projectAlias)
+          logger?.warn?.("Durable Telegram provisional delivery removed without tombstone", {
+            projectAlias: item.projectAlias,
+            sessionId: item.sessionId,
+            messageId: item.messageId,
+            type: item.type,
+            reason,
+          })
+          return true
+        }
         await persistCompletion(current, { discarded: true, reason })
         observability?.recordOutboxDiscarded?.(item.projectAlias)
         logger?.warn?.("Durable Telegram delivery discarded", {

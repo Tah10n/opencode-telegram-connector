@@ -1053,6 +1053,55 @@ test("StateStore fails closed on a corrupted current-schema outbox section", asy
   assert.equal(backups.length, 1)
 })
 
+test("StateStore loads and canonicalizes the provisional outbox marker written by pre-fix builds", async (t) => {
+  const dir = await makeTempDir()
+  t.after(async () => fs.rm(dir, { recursive: true, force: true }))
+  const filePath = path.join(dir, "state.json")
+  const item = {
+    ...makeOutboxItem(10),
+    type: "agent-error",
+    dedupeVariant: "verify-message-error",
+    payload: { text: "provisional", requireMessageError: true },
+  }
+  await fs.writeFile(filePath, JSON.stringify({
+    ...defaultState(),
+    outbox: { items: { [item.id]: item } },
+  }, null, 2), "utf8")
+
+  const store = new StateStore({ filePath, logger: makeLogger() })
+  const loaded = await store.load()
+  const restored = loaded.outbox.items[item.id]
+  assert.equal(restored.payload.requireMessageError, true)
+  assert.equal(Object.hasOwn(restored, "dedupeVariant"), false)
+
+  await store.flush()
+  const persisted = JSON.parse(await fs.readFile(filePath, "utf8"))
+  assert.equal(Object.hasOwn(persisted.outbox.items[item.id], "dedupeVariant"), false)
+})
+
+test("StateStore rejects unsupported provisional outbox markers", async (t) => {
+  const dir = await makeTempDir()
+  t.after(async () => fs.rm(dir, { recursive: true, force: true }))
+  const filePath = path.join(dir, "state.json")
+  const item = {
+    ...makeOutboxItem(11),
+    type: "agent-error",
+    dedupeVariant: "unsupported-variant",
+    payload: { text: "provisional", requireMessageError: true },
+  }
+  await fs.writeFile(filePath, JSON.stringify({
+    ...defaultState(),
+    outbox: { items: { [item.id]: item } },
+  }, null, 2), "utf8")
+
+  const store = new StateStore({ filePath, logger: makeLogger() })
+  await assert.rejects(() => store.load(), (err) => {
+    assert.equal(err.code, "STATE_SCHEMA_INVALID")
+    assert.match(err.message, /dedupeVariant is only supported for legacy provisional agent-error entries/)
+    return true
+  })
+})
+
 test("StateStore migration rebuilds binding routes and drops context sections that fail current validation", async () => {
   const dir = await makeTempDir()
   const filePath = path.join(dir, "state.json")

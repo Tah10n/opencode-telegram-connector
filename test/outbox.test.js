@@ -1037,3 +1037,330 @@ test("durable preview finalization retries a Telegram 503 instead of losing the 
   assert.equal(editAttempts, 2)
   assert.deepEqual(store.getOutboxItems(), {})
 })
+
+test("durable outbox retries an OpenCode 401 on user-mirror and delivers after credentials are fixed", async (t) => {
+  const { store } = await makeStore(t)
+  store.get().bindings["100:7"] = { projectAlias: "demo", sessionId: "ses_1" }
+  store.get().sessionIndex["demo:ses_1"] = { chatId: 100, threadIdOr0: 7 }
+  const clock = { now: 10_000 }
+  let unauthorized = true
+  const sent = []
+  const deliver = createOutboxDelivery({
+    store,
+    runtime: {},
+    ocByAlias: {
+      demo: {
+        async getMessage() {
+          if (unauthorized) {
+            throw makeBoundaryError({
+              source: "opencode",
+              operation: "GET message",
+              pathname: "/session/ses_1/message/msg_user",
+              status: 401,
+              outcome: "fatal",
+              message: "unauthorized",
+            })
+          }
+          return { info: { id: "msg_user", role: "user" }, parts: [{ type: "text", text: "hello from TUI" }] }
+        },
+      },
+    },
+    ensureForwardedSets: () => ({ user: new Set() }),
+    tg: { async sendHtmlBlocks(_chatId, blocks) { sent.push(blocks) } },
+    logSseDebug() {},
+  })
+  const outbox = createDurableOutbox({ store, deliver, now: () => clock.now })
+  await outbox.enqueue({
+    type: "user-mirror",
+    projectAlias: "demo",
+    sessionId: "ses_1",
+    messageId: "msg_user",
+    route: { chatId: 100, threadIdOr0: 7 },
+  })
+
+  await outbox.processNext({ at: clock.now })
+  const [pending] = Object.values(store.getOutboxItems())
+  assert.equal(pending.attemptCount, 1)
+  assert.ok(pending.nextAttemptAt > clock.now)
+  assert.equal(sent.length, 0)
+  assert.ok(
+    !Object.values(store.get().idempotency.keys).some((entry) =>
+      entry.kind === "telegram-outbox-discarded" || entry.kind === "telegram-outbox-delivered"),
+    "no completion or discard tombstone after 401",
+  )
+
+  unauthorized = false
+  clock.now = pending.nextAttemptAt
+  await outbox.processNext({ at: clock.now })
+  assert.equal(sent.length, 1)
+  assert.deepEqual(store.getOutboxItems(), {})
+})
+
+test("durable outbox retries an OpenCode 403 on user-mirror and preserves the item", async (t) => {
+  const { store } = await makeStore(t)
+  store.get().bindings["100:7"] = { projectAlias: "demo", sessionId: "ses_1" }
+  store.get().sessionIndex["demo:ses_1"] = { chatId: 100, threadIdOr0: 7 }
+  const clock = { now: 10_000 }
+  const deliver = createOutboxDelivery({
+    store,
+    runtime: {},
+    ocByAlias: {
+      demo: {
+        async getMessage() {
+          throw makeBoundaryError({
+            source: "opencode",
+            operation: "GET message",
+            pathname: "/session/ses_1/message/msg_user",
+            status: 403,
+            outcome: "fatal",
+            message: "forbidden",
+          })
+        },
+      },
+    },
+    ensureForwardedSets: () => ({ user: new Set() }),
+    logSseDebug() {},
+  })
+  const outbox = createDurableOutbox({ store, deliver, now: () => clock.now })
+  await outbox.enqueue({
+    type: "user-mirror",
+    projectAlias: "demo",
+    sessionId: "ses_1",
+    messageId: "msg_user",
+    route: { chatId: 100, threadIdOr0: 7 },
+  })
+
+  await outbox.processNext({ at: clock.now })
+  const [pending] = Object.values(store.getOutboxItems())
+  assert.equal(pending.attemptCount, 1)
+  assert.ok(pending.nextAttemptAt > clock.now)
+  assert.ok(
+    !Object.values(store.get().idempotency.keys).some((entry) =>
+      entry.kind === "telegram-outbox-discarded" || entry.kind === "telegram-outbox-delivered"),
+    "no completion or discard tombstone after 403",
+  )
+})
+
+test("provisional agent-error 403 retry does not suppress a later definitive error notice", async (t) => {
+  const { store } = await makeStore(t)
+  store.get().bindings["100:7"] = { projectAlias: "demo", sessionId: "ses_1" }
+  store.get().sessionIndex["demo:ses_1"] = { chatId: 100, threadIdOr0: 7 }
+  const clock = { now: 10_000 }
+  let forbidden = true
+  const currentMessage = { info: { id: "msg_agent_error", role: "assistant", error: { name: "AgentError", message: "tool failed" } }, parts: [] }
+  const sent = []
+  const forwarded = { agentStopErrors: new Set() }
+  const deliver = createOutboxDelivery({
+    store,
+    runtime: {},
+    ocByAlias: {
+      demo: {
+        async getMessage() {
+          if (forbidden) {
+            throw makeBoundaryError({
+              source: "opencode",
+              operation: "GET message",
+              pathname: "/session/ses_1/message/msg_agent_error",
+              status: 403,
+              outcome: "fatal",
+              message: "forbidden",
+            })
+          }
+          return currentMessage
+        },
+      },
+    },
+    ensureForwardedSets: () => forwarded,
+    sendToThread: async (_route, text) => sent.push(text),
+    logSseDebug() {},
+  })
+  const outbox = createDurableOutbox({ store, deliver, now: () => clock.now })
+  const item = {
+    type: "agent-error",
+    projectAlias: "demo",
+    sessionId: "ses_1",
+    messageId: "msg_agent_error",
+    route: { chatId: 100, threadIdOr0: 7 },
+  }
+
+  await outbox.enqueue({ ...item, payload: { text: "provisional", requireMessageError: true } })
+  await outbox.processNext({ at: clock.now })
+  const [pending] = Object.values(store.getOutboxItems())
+  assert.equal(pending.attemptCount, 1)
+  assert.deepEqual(sent, [])
+  assert.ok(
+    !Object.values(store.get().idempotency.keys).some((entry) =>
+      entry.kind === "telegram-outbox-discarded" || entry.kind === "telegram-outbox-delivered"),
+    "no tombstone after provisional 403",
+  )
+
+  forbidden = false
+  const definitive = await outbox.enqueue({ ...item, payload: { text: "definitive" } })
+  assert.equal(definitive.completed, undefined)
+  await outbox.processNext({ at: clock.now })
+  assert.equal(sent.length, 1)
+  assert.match(sent[0], /tool failed/)
+
+  clock.now = pending.nextAttemptAt
+  await outbox.processNext({ at: clock.now })
+  assert.deepEqual(store.getOutboxItems(), {})
+
+  const replay = await outbox.enqueue({ ...item, payload: { text: "definitive" } })
+  assert.equal(replay.completed, true)
+  assert.equal(sent.length, 1)
+})
+
+test("provisional agent-error state reloads and a terminal verification failure leaves definitive delivery eligible", async (t) => {
+  const first = await makeStore(t)
+  first.store.get().bindings["100:7"] = { projectAlias: "demo", sessionId: "ses_1" }
+  first.store.get().sessionIndex["demo:ses_1"] = { chatId: 100, threadIdOr0: 7 }
+  const clock = { now: 30_000 }
+  const item = {
+    type: "agent-error",
+    projectAlias: "demo",
+    sessionId: "ses_1",
+    messageId: "msg_agent_error_restart",
+    route: { chatId: 100, threadIdOr0: 7 },
+  }
+  const outbox1 = createDurableOutbox({
+    store: first.store,
+    now: () => clock.now,
+    deliver: async () => assert.fail("the first process only persists the item"),
+  })
+  const queued = await outbox1.enqueue({
+    ...item,
+    payload: { text: "provisional", requireMessageError: true },
+  })
+
+  const persisted = JSON.parse(await fs.readFile(first.filePath, "utf8"))
+  const [persistedItem] = Object.values(persisted.outbox.items)
+  assert.equal(persistedItem.id, queued.item.id)
+  assert.equal(persistedItem.payload.requireMessageError, true)
+  assert.equal(Object.hasOwn(persistedItem, "dedupeVariant"), false)
+
+  const second = await makeStore(t, { filePath: first.filePath })
+  const [restored] = Object.values(second.store.getOutboxItems())
+  assert.equal(restored.id, queued.item.id)
+  assert.equal(restored.payload.requireMessageError, true)
+  let verificationFails = true
+  const sent = []
+  const forwarded = { agentStopErrors: new Set() }
+  const deliver = createOutboxDelivery({
+    store: second.store,
+    runtime: {},
+    ocByAlias: {
+      demo: {
+        async getMessage() {
+          if (verificationFails) {
+            throw makeBoundaryError({
+              source: "opencode",
+              operation: "GET message",
+              pathname: "/session/ses_1/message/msg_agent_error_restart",
+              status: 400,
+              outcome: "fatal",
+              message: "bad request",
+            })
+          }
+          return {
+            info: {
+              id: "msg_agent_error_restart",
+              role: "assistant",
+              error: { name: "AgentError", message: "tool failed after restart" },
+            },
+            parts: [],
+          }
+        },
+      },
+    },
+    ensureForwardedSets: () => forwarded,
+    sendToThread: async (_route, text) => sent.push(text),
+    logSseDebug() {},
+  })
+  const outbox2 = createDurableOutbox({ store: second.store, deliver, now: () => clock.now })
+
+  assert.equal(await outbox2.processNext({ at: clock.now }), true)
+  assert.deepEqual(second.store.getOutboxItems(), {})
+  assert.ok(
+    !Object.values(second.store.get().idempotency.keys).some((entry) =>
+      entry.kind === "telegram-outbox-discarded" || entry.kind === "telegram-outbox-delivered"),
+    "terminal provisional verification must not create a shared completion tombstone",
+  )
+
+  verificationFails = false
+  const definitive = await outbox2.enqueue({ ...item, payload: { text: "definitive" } })
+  assert.equal(definitive.completed, undefined)
+  assert.notEqual(definitive.item.id, queued.item.id)
+  assert.equal(await outbox2.processNext({ at: clock.now }), true)
+  assert.equal(sent.length, 1)
+  assert.match(sent[0], /tool failed after restart/)
+
+  const replay = await outbox2.enqueue({ ...item, payload: { text: "definitive" } })
+  assert.equal(replay.completed, true)
+  assert.equal(sent.length, 1)
+})
+
+test("terminal OpenCode failures still tombstone non-provisional agent-error items", async (t) => {
+  const { store } = await makeStore(t)
+  const item = {
+    type: "agent-error",
+    projectAlias: "demo",
+    sessionId: "ses_1",
+    messageId: "msg_definitive_terminal",
+    route: { chatId: 100, threadIdOr0: 7 },
+    payload: { text: "definitive" },
+  }
+  const outbox = createDurableOutbox({
+    store,
+    deliver: async () => {
+      throw makeBoundaryError({
+        source: "opencode",
+        operation: "GET message",
+        pathname: "/session/ses_1/message/msg_definitive_terminal",
+        status: 400,
+        outcome: "fatal",
+        message: "bad request",
+      })
+    },
+  })
+
+  await outbox.enqueue(item)
+  assert.equal(await outbox.processNext(), true)
+  assert.deepEqual(store.getOutboxItems(), {})
+  const replay = await outbox.enqueue(item)
+  assert.equal(replay.completed, true)
+})
+
+test("concurrent same-ID enqueues both settle once the first duplicate is durably persisted", async (t) => {
+  const { store } = await makeStore(t)
+  const delivered = []
+  const outbox = createDurableOutbox({
+    store,
+    maxEntries: 1,
+    deliver: async (item) => delivered.push(item.messageId),
+  })
+  await outbox.enqueue(baseItem)
+
+  const duplicateA = outbox.enqueue(
+    { ...baseItem, messageId: "msg_dup" },
+    { waitForCapacity: true },
+  )
+  const duplicateB = outbox.enqueue(
+    { ...baseItem, messageId: "msg_dup" },
+    { waitForCapacity: true },
+  )
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(outbox.snapshot().blockedWaiters, 2)
+
+  assert.equal(await outbox.processNext(), true)
+  const [resultA, resultB] = await Promise.all([duplicateA, duplicateB])
+
+  const dedupedCount = [resultA, resultB].filter((r) => r.deduped).length
+  const freshCount = [resultA, resultB].filter((r) => !r.deduped).length
+  assert.equal(freshCount, 1)
+  assert.equal(dedupedCount, 1)
+  assert.equal(Object.keys(store.getOutboxItems()).length, 1)
+
+  assert.equal(await outbox.processNext(), true)
+  assert.deepEqual(delivered, ["msg_1", "msg_dup"])
+  assert.deepEqual(store.getOutboxItems(), {})
+})
