@@ -1,6 +1,7 @@
 import { classifyBoundaryError, makeBoundaryError } from "../../boundary-errors.js"
 import { normalizeOpenCodeOutboxReadTimeoutMs } from "../../config/outbox.js"
 import { sessionKey } from "../../state/store.js"
+import { normalizeEpochMs } from "../active-turns.js"
 import { NOISY_SKIP_REASONS } from "../noisy-skip-reasons.js"
 import { agentStopErrorDedupeKey, extractTextParts, formatAgentStopErrorNotice } from "./assistant-format.js"
 import { formatUserMirrorBlocks } from "./user-format.js"
@@ -9,6 +10,17 @@ import { editPreviewOrNull } from "./preview-edit.js"
 function isMissingOpenCodeMessage(err) {
   const classification = classifyBoundaryError(err)
   return classification.stale || classification.status === 404 || classification.status === 410
+}
+
+function unconfirmedAgentError(cause) {
+  return makeBoundaryError({
+    source: "opencode",
+    operation: "verify durable agent error",
+    kind: "unavailable",
+    outcome: "retryable",
+    message: "OpenCode agent error is not available for durable Telegram delivery yet",
+    ...(cause ? { cause } : {}),
+  })
 }
 
 export function createOutboxDelivery({
@@ -99,11 +111,16 @@ export function createOutboxDelivery({
       try {
         msg = await oc.getMessage(item.sessionId, item.messageId, { signal, timeoutMs: requestTimeoutMs })
       } catch (err) {
-        if (requireMessageError && !isMissingOpenCodeMessage(err)) throw err
-        if (requireMessageError) return { delivered: false, completed: false, reason: "message-error-not-confirmed" }
+        if (requireMessageError) {
+          if (isMissingOpenCodeMessage(err)) throw unconfirmedAgentError(err)
+          throw err
+        }
       }
       if (requireMessageError && !msg?.info?.error) {
-        return { delivered: false, completed: false, reason: "message-error-not-confirmed" }
+        if (normalizeEpochMs(msg?.info?.time?.completed) != null) {
+          return { delivered: false, completed: false, reason: "message-completed-without-error" }
+        }
+        throw unconfirmedAgentError()
       }
       const text = msg?.info?.error
         ? formatAgentStopErrorNotice({ reason: "Assistant reply failed.", details: msg.info.error })

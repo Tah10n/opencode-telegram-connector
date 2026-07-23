@@ -894,8 +894,9 @@ test("a provisional agent-error 404 cannot suppress a later definitive error not
   const { store } = await makeStore(t)
   store.get().bindings["100:7"] = { projectAlias: "demo", sessionId: "ses_1" }
   store.get().sessionIndex["demo:ses_1"] = { chatId: 100, threadIdOr0: 7 }
+  const clock = { now: 10_000 }
   let messageMissing = true
-  let currentMessage = { info: { id: "msg_agent_error", role: "assistant" }, parts: [] }
+  let currentMessage = { info: { id: "msg_agent_error", role: "assistant", error: { name: "AgentError", message: "tool failed" } }, parts: [] }
   const sent = []
   const forwarded = { agentStopErrors: new Set() }
   const deliver = createOutboxDelivery({
@@ -922,7 +923,7 @@ test("a provisional agent-error 404 cannot suppress a later definitive error not
     sendToThread: async (_route, text) => sent.push(text),
     logSseDebug() {},
   })
-  const outbox = createDurableOutbox({ store, deliver })
+  const outbox = createDurableOutbox({ store, deliver, now: () => clock.now })
   const item = {
     type: "agent-error",
     projectAlias: "demo",
@@ -932,26 +933,63 @@ test("a provisional agent-error 404 cannot suppress a later definitive error not
   }
 
   await outbox.enqueue({ ...item, payload: { text: "provisional", requireMessageError: true } })
-  await outbox.processNext()
+  await outbox.processNext({ at: clock.now })
   assert.deepEqual(sent, [])
-  assert.deepEqual(store.getOutboxItems(), {})
+  const [pending] = Object.values(store.getOutboxItems())
+  assert.equal(pending.attemptCount, 1)
+  assert.ok(pending.nextAttemptAt > clock.now)
 
   messageMissing = false
-  await outbox.enqueue({ ...item, payload: { text: "provisional", requireMessageError: true } })
-  await outbox.processNext()
-  assert.deepEqual(sent, [])
-  assert.deepEqual(store.getOutboxItems(), {})
-
-  currentMessage = { info: { id: "msg_agent_error", role: "assistant", error: { name: "AgentError", message: "tool failed" } }, parts: [] }
   const definitive = await outbox.enqueue({ ...item, payload: { text: "definitive" } })
   assert.equal(definitive.completed, undefined)
-  await outbox.processNext()
+  await outbox.processNext({ at: clock.now })
   assert.equal(sent.length, 1)
   assert.match(sent[0], /tool failed/)
+  clock.now = pending.nextAttemptAt
+  await outbox.processNext({ at: clock.now })
+  assert.deepEqual(store.getOutboxItems(), {})
 
   const replay = await outbox.enqueue({ ...item, payload: { text: "definitive" } })
   assert.equal(replay.completed, true)
   assert.equal(sent.length, 1)
+})
+
+test("a provisional agent-error retries while incomplete and cancels only after clean completion", async (t) => {
+  const { store } = await makeStore(t)
+  store.get().bindings["100:7"] = { projectAlias: "demo", sessionId: "ses_1" }
+  store.get().sessionIndex["demo:ses_1"] = { chatId: 100, threadIdOr0: 7 }
+  const clock = { now: 20_000 }
+  const currentMessage = { info: { id: "msg_agent_error_clean", role: "assistant", time: { created: clock.now } }, parts: [] }
+  const sent = []
+  const deliver = createOutboxDelivery({
+    store,
+    runtime: {},
+    ocByAlias: { demo: { async getMessage() { return currentMessage } } },
+    ensureForwardedSets: () => ({ agentStopErrors: new Set() }),
+    sendToThread: async (_route, text) => sent.push(text),
+    logSseDebug() {},
+  })
+  const outbox = createDurableOutbox({ store, deliver, now: () => clock.now })
+  await outbox.enqueue({
+    type: "agent-error",
+    projectAlias: "demo",
+    sessionId: "ses_1",
+    messageId: "msg_agent_error_clean",
+    route: { chatId: 100, threadIdOr0: 7 },
+    payload: { text: "provisional", requireMessageError: true },
+  })
+
+  await outbox.processNext({ at: clock.now })
+  const [pending] = Object.values(store.getOutboxItems())
+  assert.equal(pending.attemptCount, 1)
+  assert.deepEqual(sent, [])
+
+  currentMessage.info.time.completed = clock.now + 1
+  clock.now = pending.nextAttemptAt
+  await outbox.processNext({ at: clock.now })
+
+  assert.deepEqual(sent, [])
+  assert.deepEqual(store.getOutboxItems(), {})
 })
 
 test("durable preview finalization retries a Telegram 503 instead of losing the item", async (t) => {
