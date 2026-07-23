@@ -6378,6 +6378,7 @@ test("startConnector discards a terminal outbox item and continues delivery, pol
       return state.updateOffset === 665
         && Object.keys(state.outbox.items).length === 0
         && harness.tg.sentHtmlBlocks.some((entry) => entry.blocks[0]?.html === "delivered after terminal item")
+        && getHealthSnapshot?.().ready === true
     }, { timeoutMs: 4000 })
 
     assert.equal(fatalErrors.length, 0)
