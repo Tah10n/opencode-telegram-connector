@@ -179,6 +179,7 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
     if (!loop) return
     loop.fallbackHits += 1
     loop.lastSuccessAt = Date.now()
+    loop.lastError = ""
   }
 
   function recordPromptRecovery(projectAlias, outcome) {
@@ -328,7 +329,7 @@ export function createRuntimeObservability({ projectAliases = [] } = {}) {
       `Runtime: managedTasks=${Array.isArray(managedTasks) ? managedTasks.length : 0} taskKinds=${summarizeTasks(managedTasks)} shutdown=${shutdownState}`,
       `Outbox runtime: size=${outbox.queueSize}/${outbox.maxEntries} inFlight=${outbox.inFlight} blocked=${outbox.blockedWaiters} full=${outbox.full} worker=${outbox.workerActive} nextDue=${formatTime(outbox.nextDueAt)}${outbox.lastFatalError ? ` lastFatal=${outbox.lastFatalError}` : ""}`,
       formatLoopLine("Telegram poll", globalState.loops.telegramPoll),
-      formatLoopLine("Backlog drain", globalState.loops.backlogDrain),
+      formatLoopLine("Backlog drain", globalState.loops.backlogDrain, { includeFallback: true }),
       formatLoopLine("Prompt poll", globalState.loops.promptPoll, { includeFallback: true }),
       formatLoopLine("Shutdown", globalState.loops.shutdown),
       `Updates: retryable=${globalState.updates.retryable} skipped=${globalState.updates.skipped}`,

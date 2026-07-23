@@ -1,4 +1,4 @@
-import { classifyBoundaryError, makeBoundaryError } from "../boundary-errors.js"
+import { classifyBoundaryError, isClearlyUnsentRequestError, makeBoundaryError } from "../boundary-errors.js"
 import { telegramUpdateIdempotencyKey } from "../connector/idempotency.js"
 
 export function createTelegramUpdateLoop({
@@ -46,6 +46,7 @@ export function createTelegramUpdateLoop({
         updates = await tg.getUpdates({ offset: -1, timeout: 0, limit: 1, allowed_updates: ["message", "callback_query"], signal: abortController.signal })
       } catch (err) {
         if (abortController.signal.aborted) return
+        const clearlyUnsent = isClearlyUnsentRequestError(err)
         const classification = classifyBoundaryError(err, {
           source: "telegram",
           operation: "getUpdates",
@@ -61,6 +62,19 @@ export function createTelegramUpdateLoop({
           pathname: "/getUpdates",
         })
         if (!classification.retryable) throw classification.error
+        if (!clearlyUnsent) {
+          store.setUpdateOffset(0)
+          await flushCriticalState("persist Telegram backlog cutoff fallback")
+          runtimeObservability.recordLoopFallbackHit("backlogDrain")
+          logger.warn("Telegram backlog cutoff response was ambiguous. Continuing safely from offset 0.", {
+            outcome: classification.outcome,
+            kind: classification.kind,
+            status: classification.status,
+            code: classification.code,
+            offset: 0,
+          })
+          return
+        }
         updates = null
       }
 

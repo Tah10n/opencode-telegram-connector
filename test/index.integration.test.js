@@ -174,7 +174,7 @@ function acceptedThenLostOpenCodeOptions() {
   }
 }
 
-function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, setMyCommandsImpl, sendMessageImpl, sendHtmlBlocksImpl, sendDocumentImpl, editMessageTextImpl, getFileImpl, downloadFileImpl, afterNegativeOffsetSnapshot } = {}) {
+function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, setMyCommandsImpl, sendMessageImpl, sendHtmlBlocksImpl, sendDocumentImpl, editMessageTextImpl, getFileImpl, downloadFileImpl, beforeGetUpdates, afterNegativeOffsetSnapshot } = {}) {
   let nextMessageId = 1000
   const updates = []
   const sentMessages = []
@@ -223,6 +223,11 @@ function createFakeTelegramClient({ emptyPollDelayMs = 10, getMeImpl, setMyComma
     },
     async getUpdates(input) {
       getUpdatesCalls.push(input)
+      await beforeGetUpdates?.({
+        input,
+        callIndex: getUpdatesCalls.length,
+        enqueue(update) { updates.push(update) },
+      })
       if (getUpdatesError) throw getUpdatesError
       if (getUpdatesErrors.length > 0) throw getUpdatesErrors.shift()
       if (input?.offset < 0) {
@@ -4699,6 +4704,147 @@ test("startConnector preserves an update that arrives immediately after the firs
     assert.ok(harness.tg.getUpdatesCalls.some((call) => call?.offset === -1 && call?.limit === 1))
     assert.ok(harness.tg.getUpdatesCalls.some((call) => call?.offset === 32 && call?.timeout === 30))
   } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector never repeats an ambiguous first-run backlog snapshot and exposes the durable fallback", async () => {
+  let snapshotCalls = 0
+  const loggerEntries = []
+  const harness = await createHarness({
+    statePatch: { updateOffset: null },
+    initialUpdates: [makeMessageUpdate(30, "/help"), makeMessageUpdate(31, "/help")],
+    logger: makeLogger(loggerEntries),
+    tgOptions: {
+      afterNegativeOffsetSnapshot: async ({ enqueue }) => {
+        snapshotCalls += 1
+        if (snapshotCalls !== 1) return
+        enqueue(makeMessageUpdate(32, "/runtime", { chatType: "private", threadIdOr0: 0 }))
+        const err = new Error("Telegram response was lost after the cutoff reached the server")
+        err.code = "ECONNRESET"
+        throw err
+      },
+    },
+  })
+
+  try {
+    const runtimeMessage = await waitFor(() => harness.tg.sentMessages.find((entry) => /^Runtime:/.test(entry.text || "")))
+    const state = await waitFor(async () => {
+      const current = await readState(harness.stateFile)
+      return current.updateOffset === 33 ? current : null
+    })
+
+    assert.equal(snapshotCalls, 1)
+    assert.equal(state.updateOffset, 33)
+    assert.equal(harness.tg.getUpdatesCalls.filter((call) => call?.offset === -1).length, 1)
+    assert.ok(harness.tg.getUpdatesCalls.some((call) => call?.offset === 0 && call?.timeout === 30))
+    assert.match(runtimeMessage.text, /Backlog drain: retries=1 aborted=0 hits=1/)
+    assert.ok(loggerEntries.some((entry) =>
+      entry.level === "warn" &&
+      entry.args[0] === "Telegram backlog cutoff response was ambiguous. Continuing safely from offset 0.",
+    ))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector retries a first-run backlog snapshot only when the request was clearly unsent", async () => {
+  let negativeAttempts = 0
+  let snapshotCalls = 0
+  const harness = await createHarness({
+    statePatch: { updateOffset: null },
+    initialUpdates: [makeMessageUpdate(50, "/help")],
+    tgOptions: {
+      beforeGetUpdates: async ({ input }) => {
+        if (input?.offset !== -1) return
+        negativeAttempts += 1
+        if (negativeAttempts !== 1) return
+        const cause = new Error("DNS lookup failed before connecting")
+        cause.code = "ENOTFOUND"
+        throw new Error("fetch failed", { cause })
+      },
+      afterNegativeOffsetSnapshot: async ({ enqueue }) => {
+        snapshotCalls += 1
+        enqueue(makeMessageUpdate(51, "/help"))
+      },
+    },
+  })
+
+  try {
+    await waitFor(() => harness.tg.sentMessages.length === 1)
+    const state = await waitFor(async () => {
+      const current = await readState(harness.stateFile)
+      return current.updateOffset === 52 ? current : null
+    })
+
+    assert.equal(negativeAttempts, 2)
+    assert.equal(snapshotCalls, 1)
+    assert.equal(state.updateOffset, 52)
+    assert.equal(harness.tg.getUpdatesCalls.filter((call) => call?.offset === -1).length, 2)
+    assert.ok(harness.tg.getUpdatesCalls.some((call) => call?.offset === 51 && call?.timeout === 30))
+  } finally {
+    await harness.connector.stop()
+  }
+})
+
+test("startConnector readiness stays false until an ambiguous backlog fallback is durably persisted", async () => {
+  let healthAddress = null
+  let ambiguousResponseObserved = false
+  let fallbackFlushStarted = false
+  let releaseFallbackFlush
+  const fallbackFlushRelease = new Promise((resolve) => { releaseFallbackFlush = resolve })
+  const harness = await createHarness({
+    statePatch: { updateOffset: null },
+    configPatch: { healthServer: { enabled: true, host: "127.0.0.1", port: 0 } },
+    tgOptions: {
+      afterNegativeOffsetSnapshot: async () => {
+        ambiguousResponseObserved = true
+        const err = new Error("socket disconnected after request write")
+        err.code = "EPIPE"
+        throw err
+      },
+    },
+    createStateStoreImpl: (options) => {
+      const store = new StateStore(options)
+      const writeJsonFileAtomic = store._writeJsonFileAtomic
+      let fallbackFlushGated = false
+      store._writeJsonFileAtomic = async (filePath, state, writeOptions) => {
+        if (ambiguousResponseObserved && state.updateOffset === 0 && !fallbackFlushGated) {
+          fallbackFlushGated = true
+          fallbackFlushStarted = true
+          await fallbackFlushRelease
+        }
+        return writeJsonFileAtomic(filePath, state, writeOptions)
+      }
+      return store
+    },
+    startHealthServerImpl: async (options) => {
+      const handle = await startHealthServer(options)
+      healthAddress = handle.address
+      return handle
+    },
+  })
+
+  try {
+    await waitFor(() => fallbackFlushStarted)
+    const baseUrl = `http://127.0.0.1:${healthAddress.port}`
+    const pending = await fetch(`${baseUrl}/readyz`)
+    assert.equal(pending.status, 503)
+    const pendingBody = await pending.json()
+    assert.equal(pendingBody.status, "not_ready")
+    assert.equal(pendingBody.checks.state.ok, false)
+    assert.equal(pendingBody.checks.state.flushInFlight, true)
+    assert.equal(pendingBody.checks.telegramPoll.ok, false)
+    assert.equal((await readState(harness.stateFile)).updateOffset, -1)
+
+    releaseFallbackFlush()
+    const ready = await waitFor(async () => {
+      const response = await fetch(`${baseUrl}/readyz`)
+      return response.status === 200 ? response : null
+    })
+    assert.equal((await ready.json()).status, "ready")
+  } finally {
+    releaseFallbackFlush?.()
     await harness.connector.stop()
   }
 })

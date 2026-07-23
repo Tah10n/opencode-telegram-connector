@@ -3,6 +3,7 @@ import assert from "node:assert/strict"
 import {
   classifyBoundaryError,
   isAbortBoundaryError,
+  isClearlyUnsentRequestError,
   isDisconnectBoundaryError,
   makeBoundaryError,
   normalizeBoundaryError,
@@ -81,4 +82,32 @@ test("normalizeBoundaryError keeps abort and disconnect markers", () => {
 
   assert.equal(isAbortBoundaryError(abortErr), true)
   assert.equal(isDisconnectBoundaryError(disconnectErr), true)
+})
+
+test("normalizeBoundaryError lifts a nested transport code from the cause chain", () => {
+  const cause = new Error("DNS lookup failed")
+  cause.code = "ENOTFOUND"
+  const err = normalizeBoundaryError(new Error("request failed", { cause }), {
+    source: "telegram",
+    operation: "getUpdates",
+  })
+
+  assert.equal(err.code, "ENOTFOUND")
+  assert.equal(classifyBoundaryError(err).retryable, true)
+  assert.equal(isClearlyUnsentRequestError(err), true)
+})
+
+test("isClearlyUnsentRequestError stays conservative for ambiguous transport failures", () => {
+  for (const code of ["ECONNRESET", "EPIPE", "ETIMEDOUT"]) {
+    const err = new Error(`ambiguous ${code}`)
+    err.code = code
+    assert.equal(isClearlyUnsentRequestError(err), false, code)
+  }
+
+  for (const code of ["EAI_AGAIN", "ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "UND_ERR_CONNECT_TIMEOUT"]) {
+    const err = new Error(`clearly unsent ${code}`)
+    err.code = code
+    assert.equal(isClearlyUnsentRequestError(err), true, code)
+    assert.equal(classifyBoundaryError(err).retryable, true, code)
+  }
 })
