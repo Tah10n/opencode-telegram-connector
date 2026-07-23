@@ -130,8 +130,12 @@ async function readState(filePath) {
 async function waitFor(predicate, { timeoutMs = 1500, intervalMs = 10 } = {}) {
   const startedAt = Date.now()
   while (Date.now() - startedAt < timeoutMs) {
-    const value = await predicate()
-    if (value) return value
+    try {
+      const value = await predicate()
+      if (value) return value
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error
+    }
     await delay(intervalMs)
   }
   throw new Error("Timed out waiting for condition")
